@@ -49,6 +49,7 @@
 //! `n_ambiguous` is the per-sample uncertainty weight.
 
 use super::HetCounts;
+use crate::pileup_record::{AlleleSupportStats, PileupRecord};
 
 /// Ceiling on the per-site effective error rate `ε̂`. Kept below `½` so the
 /// hom-ref and het models stay distinguishable (at `ε̂ = ½` they coincide). A
@@ -58,15 +59,6 @@ use super::HetCounts;
 /// het. The exact value is a guardrail, not a tuning knob: any site with an
 /// effective error rate this high is already uncallable.
 pub const MAX_SITE_ERROR_RATE: f64 = 0.4;
-
-/// Default strand-bias veto threshold (research report §3.2): a confident het
-/// whose ALT allele's forward-strand fraction differs from the REF allele's by
-/// more than this many standard errors (a two-proportion z) is demoted to
-/// ambiguous as a likely strand artifact. `z ≈ 3` ⇒ a two-sided p ≈ 0.003.
-/// Strand confinement — unlike low MAPQ — has no biological confound
-/// (introgressed haplotypes are not strand-biased), so this veto targets pure
-/// artifacts. `f64::INFINITY` disables it.
-pub const DEFAULT_STRAND_BIAS_Z: f64 = 3.0;
 
 // ---------------------------------------------------------------------
 // Considered and rejected: an ALT-vs-REF MAPQ-diff veto (report §3.3)
@@ -103,22 +95,33 @@ pub const DEFAULT_STRAND_BIAS_Z: f64 = 3.0;
 // ---------------------------------------------------------------------
 
 /// Aggregated support for one allele group at a site — the reference allele,
-/// or all ALT alleles pooled. `obs` is the fragment count; the remaining
+/// or all ALT alleles pooled. `num_obs` is the fragment count; the remaining
 /// fields are the per-allele [`AlleleSupportStats`] moments summed over the
 /// group. Splitting REF vs ALT this way gives the strand veto its REF-vs-ALT
 /// contrast directly.
-///
-/// [`AlleleSupportStats`]: crate::pileup_record::AlleleSupportStats
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct AlleleGroupStats {
     /// Fragment observations supporting this group (post-dedup / mate-overlap).
-    pub obs: u64,
-    /// Forward-strand observations among `obs` (reverse = `obs − fwd`). The
-    /// 2×2 `(ref.fwd, ref.rev, alt.fwd, alt.rev)` table drives the strand veto.
+    /// Named to match the record's [`AlleleSupportStats::num_obs`].
+    pub num_obs: u64,
+    /// Forward-strand observations among `num_obs` (reverse = `num_obs − fwd`).
+    /// The 2×2 `(ref.fwd, ref.rev, alt.fwd, alt.rev)` table drives the strand
+    /// veto; `fwd ≤ num_obs` always (the pileup feed guarantees it).
     pub fwd: u64,
     /// Σ per-read log P(error) over the group (the record's `q_sum`; `≤ 0`).
     /// REF + ALT sum to the site's `log_error_sum` for `ε̂`.
     pub log_error_sum: f64,
+}
+
+impl AlleleGroupStats {
+    /// Build a group from one allele's per-read support scalars.
+    fn from_support(support: &AlleleSupportStats) -> Self {
+        AlleleGroupStats {
+            num_obs: u64::from(support.num_obs),
+            fwd: u64::from(support.fwd),
+            log_error_sum: support.q_sum,
+        }
+    }
 }
 
 /// Per-site evidence for the het classifier: the reference allele group vs the
@@ -134,10 +137,30 @@ pub struct SiteCounts {
 }
 
 impl SiteCounts {
+    /// Build the classifier input from a pileup record: `alleles[0]` is REF,
+    /// `alleles[1..]` are pooled into the ALT group. Returns `None` for a
+    /// record that carries no ALT allele (a pure-REF column), which the caller
+    /// skips. The ALT group is an exhaustive struct literal, so a new
+    /// [`AlleleGroupStats`] field is a compile error here rather than a
+    /// silently-unaggregated ALT scalar.
+    pub fn from_record(record: &PileupRecord) -> Option<SiteCounts> {
+        let ref_allele = record.alleles.first()?;
+        let alts = record.alleles.get(1..).filter(|a| !a.is_empty())?;
+        let alt = AlleleGroupStats {
+            num_obs: alts.iter().map(|a| u64::from(a.support.num_obs)).sum(),
+            fwd: alts.iter().map(|a| u64::from(a.support.fwd)).sum(),
+            log_error_sum: alts.iter().map(|a| a.support.q_sum).sum(),
+        };
+        Some(SiteCounts {
+            reference: AlleleGroupStats::from_support(&ref_allele.support),
+            alt,
+        })
+    }
+
     /// Total observations at the site (`ref + alt`), saturating at `u64::MAX`
     /// (unreachable for real fragment depths).
     pub fn total(&self) -> u64 {
-        self.reference.obs.saturating_add(self.alt.obs)
+        self.reference.num_obs.saturating_add(self.alt.num_obs)
     }
 
     /// Σ per-read log P(error) over **every** read at the site — the record's
@@ -166,7 +189,9 @@ pub struct HetClassifyParams {
     /// Confidence margin `M` (nats) for both the variant gate and the
     /// het-vs-hom-alt split. `>= 0`.
     pub lr_margin: f64,
-    /// Strand-bias veto threshold (see [`DEFAULT_STRAND_BIAS_Z`]). A confident
+    /// Strand-bias veto threshold (see
+    /// [`DEFAULT_HET_STRAND_BIAS_Z`](crate::sample_summary::DEFAULT_HET_STRAND_BIAS_Z)).
+    /// A confident
     /// het whose ALT strand fraction deviates from REF's by more than this
     /// many standard errors is demoted to ambiguous. `f64::INFINITY` disables
     /// the veto; must be `> 0` and not `NaN`.
@@ -197,11 +222,19 @@ impl HetAccumulator {
     ///
     /// # Panics
     ///
-    /// Panics (debug and release) if `error_rate` is not finite in
-    /// `(0, 1)` or `lr_margin` is not finite and `>= 0`. These are
-    /// CLI-validated config (C1); an invalid value here is a programmer
-    /// error and fails loudly rather than producing `NaN`/`±∞` scores.
+    /// Panics (debug and release) if any parameter is out of range:
+    /// `min_depth` must be `>= 1` (it divides the per-site depth in `ε̂`);
+    /// `error_rate` (the `ε̂` floor) must be finite in `(0, MAX_SITE_ERROR_RATE)`;
+    /// `lr_margin` must be finite and `>= 0`; `strand_bias_z` must be `> 0`
+    /// (or `+∞` to disable the veto) and not `NaN`. These are CLI-validated
+    /// config (C1); an invalid value here is a programmer error and fails
+    /// loudly rather than producing `NaN`/`±∞` scores.
     pub fn new(params: HetClassifyParams) -> Self {
+        assert!(
+            params.min_depth >= 1,
+            "min_depth must be >= 1 (it divides the site depth in ε̂), got {}",
+            params.min_depth,
+        );
         assert!(
             params.error_rate.is_finite()
                 && params.error_rate > 0.0
@@ -249,9 +282,9 @@ impl HetAccumulator {
         // `[error_rate, MAX_SITE_ERROR_RATE] ⊂ (0, ½)`, so `ln ε̂` and
         // `ln(1 − ε̂)` are finite and every LL below is finite — the `max` /
         // `<` / `>` comparisons are total and no NaN can arise.
-        let k = site.alt.obs as f64;
+        let k = site.alt.num_obs as f64;
         let n = n_total as f64;
-        let ref_obs = site.reference.obs as f64;
+        let ref_obs = site.reference.num_obs as f64;
 
         // Site-level effective error rate from the reads' own qualities
         // (research report §3.1, Option A). `log_error_sum ≤ 0`, so the
@@ -284,7 +317,7 @@ impl HetAccumulator {
             // that `obs_het` cares about. Only hets are vetoed; hom-alt and
             // ambiguous are untouched. (A MAPQ-diff veto was tried here and
             // rejected — see the note above `AlleleGroupStats`.)
-            if strand_biased(&site, self.params.strand_bias_z) {
+            if is_strand_biased(&site, self.params.strand_bias_z) {
                 self.n_ambiguous += 1;
             } else {
                 self.n_het += 1;
@@ -307,6 +340,7 @@ impl HetAccumulator {
             min_depth: self.params.min_depth,
             error_rate: self.params.error_rate,
             lr_margin: self.params.lr_margin,
+            strand_bias_z: self.params.strand_bias_z,
         }
     }
 }
@@ -322,14 +356,18 @@ impl HetAccumulator {
 /// both alleles to be meaningful, and this stops it firing on thin counts. The
 /// z is inherently depth-aware — a strand-confined ALT at low depth may be
 /// chance and is not vetoed until the deviation is significant.
-fn strand_biased(site: &SiteCounts, threshold: f64) -> bool {
+fn is_strand_biased(site: &SiteCounts, threshold: f64) -> bool {
     if threshold.is_infinite() {
         return false; // veto disabled
     }
-    let (nr, na) = (site.reference.obs, site.alt.obs);
+    let (nr, na) = (site.reference.num_obs, site.alt.num_obs);
     let (rf, af) = (site.reference.fwd, site.alt.fwd);
-    // Reverse-strand cells; `fwd ≤ obs` by construction so these don't wrap.
-    let (rr, ar) = (nr - rf, na - af);
+    // `fwd ≤ num_obs` is the pileup feed's invariant. Assert it in debug and
+    // saturate in release, so a violating *direct* construction degrades to
+    // "no veto" (the reverse cell drops to 0 → the margin guard rejects the
+    // site) rather than wrapping the `u64` subtraction into a huge value.
+    debug_assert!(rf <= nr && af <= na, "fwd must not exceed num_obs");
+    let (rr, ar) = (nr.saturating_sub(rf), na.saturating_sub(af));
     let fwd_total = rf + af;
     let rev_total = rr + ar;
     // Margin guard: both alleles present, both strands present.
@@ -342,8 +380,9 @@ fn strand_biased(site: &SiteCounts, threshold: f64) -> bool {
     let p_pooled = fwd_total as f64 / (nr + na);
     let variance = p_pooled * (1.0 - p_pooled) * (1.0 / na + 1.0 / nr);
     if variance <= 0.0 {
-        // Both alleles fully on one (the same) strand: no ALT-vs-REF strand
-        // contrast to speak of — not a strand artifact of the ALT allele.
+        // Unreachable after the margin guard — it forces `fwd_total ≥ 2` and
+        // `rev_total ≥ 2`, so `p_pooled ∈ (0, 1)` strictly and `variance > 0`.
+        // Kept as defense-in-depth against a NaN from a future refactor.
         return false;
     }
     let z = (p_alt - p_ref) / variance.sqrt();
@@ -360,18 +399,18 @@ mod tests {
             min_depth: 4,
             error_rate: 0.02,
             lr_margin: LN_10, // 10:1 odds
-            strand_bias_z: DEFAULT_STRAND_BIAS_Z,
+            strand_bias_z: 3.0,
         }
     }
 
     /// One allele group at `per_read_eps` quality with **balanced strands**
-    /// (`fwd = obs/2`) — so the strand veto never fires unless a test sets the
-    /// strands itself.
-    fn group(obs: u64, per_read_eps: f64) -> AlleleGroupStats {
+    /// (`fwd = num_obs/2`) — so the strand veto never fires unless a test sets
+    /// the strands itself.
+    fn group(num_obs: u64, per_read_eps: f64) -> AlleleGroupStats {
         AlleleGroupStats {
-            obs,
-            fwd: obs / 2,
-            log_error_sum: obs as f64 * per_read_eps.ln(),
+            num_obs,
+            fwd: num_obs / 2,
+            log_error_sum: num_obs as f64 * per_read_eps.ln(),
         }
     }
 
@@ -729,6 +768,154 @@ mod tests {
         let mut p = params();
         p.error_rate = 0.0;
         let _ = HetAccumulator::new(p);
+    }
+
+    /// The tightened `error_rate < MAX_SITE_ERROR_RATE` bound: a floor at the
+    /// ceiling would make `clamp(min=0.4, max=0.4)` degenerate (and `> 0.4`
+    /// makes `clamp(min>max)` panic in `observe_site`), so it must fail loudly
+    /// at construction. (M6)
+    #[test]
+    #[should_panic(expected = "error_rate (ε̂ floor) must be finite")]
+    fn error_rate_at_ceiling_panics() {
+        let mut p = params();
+        p.error_rate = MAX_SITE_ERROR_RATE; // 0.4 — no longer in the open range
+        let _ = HetAccumulator::new(p);
+    }
+
+    /// A `NaN` strand-bias threshold must panic at construction, not silently
+    /// disable the veto (`z.abs() > NaN` is always `false`). (M6)
+    #[test]
+    #[should_panic(expected = "strand_bias_z must be > 0")]
+    fn nan_strand_bias_z_panics() {
+        let mut p = params();
+        p.strand_bias_z = f64::NAN;
+        let _ = HetAccumulator::new(p);
+    }
+
+    /// A non-positive strand-bias threshold panics at construction. (M6)
+    #[test]
+    #[should_panic(expected = "strand_bias_z must be > 0")]
+    fn zero_strand_bias_z_panics() {
+        let mut p = params();
+        p.strand_bias_z = 0.0;
+        let _ = HetAccumulator::new(p);
+    }
+
+    /// `min_depth = 0` would let a zero-depth site divide by zero in `ε̂`; it
+    /// must panic at construction. (Mi6)
+    #[test]
+    #[should_panic(expected = "min_depth must be >= 1")]
+    fn zero_min_depth_panics() {
+        let mut p = params();
+        p.min_depth = 0;
+        let _ = HetAccumulator::new(p);
+    }
+
+    /// The `fwd ≤ num_obs` invariant is enforced in debug: a directly-built
+    /// group with `fwd > num_obs` trips the `debug_assert` in the strand veto
+    /// rather than wrapping the `u64` subtraction. (M5)
+    #[test]
+    #[should_panic(expected = "fwd must not exceed num_obs")]
+    fn strand_veto_rejects_fwd_exceeding_num_obs() {
+        // 15/15 balanced het (so the veto is reached), REF `fwd > num_obs`.
+        let site = SiteCounts {
+            reference: AlleleGroupStats {
+                num_obs: 15,
+                fwd: 20,
+                log_error_sum: 15.0 * 0.02_f64.ln(),
+            },
+            alt: group(15, 0.02),
+        };
+        HetAccumulator::new(params()).observe_site(site);
+    }
+
+    /// The veto touches only hets: a confident hom-alt with a strand-confined
+    /// ALT stays hom-alt (the veto call lives inside the het branch). (M5/Minor)
+    #[test]
+    fn strand_confined_hom_alt_is_not_vetoed() {
+        let mut acc = HetAccumulator::new(params());
+        // 1 ref / 59 alt (confident hom-alt) with every ALT read forward.
+        acc.observe_site(site_strand(1, 0, 59, 59));
+        assert_eq!(
+            acc.finish().n_hom_alt_sites,
+            1,
+            "hom-alt must survive strand skew"
+        );
+    }
+
+    /// A strand-skewed site that is not a confident het (a lone-alt hom-ref)
+    /// never reaches the veto and increments nothing. (reliability §8)
+    #[test]
+    fn strand_skew_on_non_het_does_not_touch_counts() {
+        let mut acc = HetAccumulator::new(params());
+        acc.observe_site(site_strand(29, 15, 1, 1)); // lone alt → hom-ref
+        assert_eq!(acc.finish().n_variant_sites, 0);
+    }
+
+    /// `SiteCounts::log_error_sum` sums the REF and ALT group contributions.
+    #[test]
+    fn log_error_sum_adds_ref_and_alt_groups() {
+        let s = SiteCounts {
+            reference: AlleleGroupStats {
+                num_obs: 3,
+                fwd: 1,
+                log_error_sum: -1.5,
+            },
+            alt: AlleleGroupStats {
+                num_obs: 2,
+                fwd: 1,
+                log_error_sum: -0.5,
+            },
+        };
+        assert_eq!(s.log_error_sum(), -2.0);
+    }
+
+    /// A `-inf` `log_error_sum` (a read with `P_err = 0`) clamps to the ε̂
+    /// floor without producing `NaN` — same call as a clean-floor 15/15 het.
+    #[test]
+    fn infinite_log_error_sum_clamps_to_floor_no_nan() {
+        let g = |num_obs: u64| AlleleGroupStats {
+            num_obs,
+            fwd: num_obs / 2,
+            log_error_sum: f64::NEG_INFINITY,
+        };
+        let mut acc = HetAccumulator::new(params());
+        acc.observe_site(SiteCounts {
+            reference: g(15),
+            alt: g(15),
+        });
+        assert_eq!(acc.finish().n_het_sites, 1);
+    }
+
+    /// `SiteCounts::from_record` pools ALT alleles and skips pure-REF columns.
+    #[test]
+    fn from_record_pools_alts_and_skips_pure_ref() {
+        use crate::pileup_record::{AlleleObservation, AlleleSupportStats, PileupRecord};
+        let allele = |seq: &[u8], num_obs: u32, fwd: u32, q_sum: f64| {
+            AlleleObservation::new(
+                seq.to_vec(),
+                AlleleSupportStats::new(num_obs, q_sum, fwd, 0, 0, 0, 0),
+                Vec::new(),
+            )
+        };
+        // Pure-REF column → None.
+        let ref_only = PileupRecord::new(0, 100, vec![allele(b"A", 10, 5, -1.0)]);
+        assert!(SiteCounts::from_record(&ref_only).is_none());
+        // REF + two ALT alleles → pooled ALT group.
+        let rec = PileupRecord::new(
+            0,
+            100,
+            vec![
+                allele(b"A", 10, 5, -1.0),
+                allele(b"C", 4, 1, -0.4),
+                allele(b"G", 2, 2, -0.2),
+            ],
+        );
+        let site = SiteCounts::from_record(&rec).expect("has ALT");
+        assert_eq!(site.reference.num_obs, 10);
+        assert_eq!(site.alt.num_obs, 6); // 4 + 2
+        assert_eq!(site.alt.fwd, 3); // 1 + 2
+        assert!((site.alt.log_error_sum - (-0.6)).abs() < 1e-12); // -0.4 + -0.2
     }
 
     proptest::proptest! {

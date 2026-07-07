@@ -43,9 +43,7 @@ use pop_var_caller::paralog::{
 };
 use pop_var_caller::psp::PspReader;
 use pop_var_caller::sample_summary::coverage::{CoverageBinScheme, CoverageByGcAccumulator};
-use pop_var_caller::sample_summary::het::{
-    AlleleGroupStats, HetAccumulator, HetClassifyParams, SiteCounts,
-};
+use pop_var_caller::sample_summary::het::{HetAccumulator, HetClassifyParams, SiteCounts};
 use pop_var_caller::sample_summary::{
     DEFAULT_DEPTH_BIN_WIDTH, DEFAULT_DEPTH_BINS, DEFAULT_GC_BINS, DEFAULT_GC_WINDOW_BP,
     DEFAULT_HET_ERROR_RATE, DEFAULT_HET_LR_MARGIN, DEFAULT_HET_MIN_DEPTH,
@@ -330,21 +328,8 @@ fn fit_sample(
         coverage.observe(record.chrom_id, record.pos, ref_base, depth);
         let gcid = psp_to_global[record.chrom_id as usize];
         windows.observe(gcid, record.pos, ref_base, depth);
-        if record.alleles.len() > 1 {
-            let s = &ref_allele.support;
-            let reference = AlleleGroupStats {
-                obs: u64::from(s.num_obs),
-                fwd: u64::from(s.fwd),
-                log_error_sum: s.q_sum,
-            };
-            let mut alt = AlleleGroupStats::default();
-            for a in &record.alleles[1..] {
-                let s = &a.support;
-                alt.obs += u64::from(s.num_obs);
-                alt.fwd += u64::from(s.fwd);
-                alt.log_error_sum += s.q_sum;
-            }
-            het.observe_site(SiteCounts { reference, alt });
+        if let Some(site) = SiteCounts::from_record(&record) {
+            het.observe_site(site);
         }
     }
 

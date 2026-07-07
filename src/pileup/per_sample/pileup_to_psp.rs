@@ -25,9 +25,7 @@ use crate::psp::writer::PspWriter;
 use crate::sample_summary::coverage::{
     CoverageBinScheme, SlidingWindowCoverageAccumulator, WindowCoverage,
 };
-use crate::sample_summary::het::{
-    AlleleGroupStats, HetAccumulator, HetClassifyParams, SiteCounts,
-};
+use crate::sample_summary::het::{HetAccumulator, HetClassifyParams, SiteCounts};
 use crate::sample_summary::{SAMPLE_SUMMARY_VERSION, SampleSummary};
 
 /// The REF base of a record — its REF allele's first byte, or `N` for the
@@ -90,25 +88,9 @@ impl SampleSummaryAccumulators {
         writer: &mut PspWriter<W>,
     ) -> Result<(), PspWriteError> {
         // Het: one candidate site per record that carries a non-reference
-        // allele. Pure-REF columns (one allele) are skipped.
-        if let Some(ref_allele) = record.alleles.first()
-            && record.alleles.len() > 1
-        {
-            // REF allele group; ALT groups pooled over every non-REF allele.
-            let s = &ref_allele.support;
-            let reference = AlleleGroupStats {
-                obs: u64::from(s.num_obs),
-                fwd: u64::from(s.fwd),
-                log_error_sum: s.q_sum,
-            };
-            let mut alt = AlleleGroupStats::default();
-            for a in &record.alleles[1..] {
-                let s = &a.support;
-                alt.obs += u64::from(s.num_obs);
-                alt.fwd += u64::from(s.fwd);
-                alt.log_error_sum += s.q_sum;
-            }
-            self.het.observe_site(SiteCounts { reference, alt });
+        // allele. Pure-REF columns (`from_record` returns `None`) are skipped.
+        if let Some(site) = SiteCounts::from_record(&record) {
+            self.het.observe_site(site);
         }
 
         // Coverage: ONE observation at the record's **anchor** position. The

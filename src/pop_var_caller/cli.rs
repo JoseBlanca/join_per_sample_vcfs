@@ -456,12 +456,7 @@ pub fn run_pileup(args: &PileupArgs) -> Result<(), PileupCliError> {
             min_depth: DEFAULT_HET_MIN_DEPTH,
             error_rate: DEFAULT_HET_ERROR_RATE,
             lr_margin: DEFAULT_HET_LR_MARGIN,
-            // Env override lets the het-heuristics work sweep the veto
-            // threshold without recompiling; defaults to the recorded value.
-            strand_bias_z: std::env::var("PVC_HET_STRAND_Z")
-                .ok()
-                .and_then(|s| s.parse::<f64>().ok())
-                .unwrap_or(DEFAULT_HET_STRAND_BIAS_Z),
+            strand_bias_z: DEFAULT_HET_STRAND_BIAS_Z,
         },
     );
 

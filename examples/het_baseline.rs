@@ -63,7 +63,14 @@ fn main() {
     );
     println!(
         "{:<28}{:>10}{:>9}{:>9}{:>9}{:>12}{:>11}{:>10}{:>9}",
-        "sample", "callable", "n_het", "n_homalt", "n_ambig", "obs_het/kb", "obs_het", "F_ratio",
+        "sample",
+        "callable",
+        "n_het",
+        "n_homalt",
+        "n_ambig",
+        "obs_het/kb",
+        "obs_het",
+        "F_ratio",
         "F_rate"
     );
 

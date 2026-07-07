@@ -381,7 +381,7 @@ pub struct DetachedFormatter {
 
 impl DetachedFormatter {
     /// The genotype-order table for `(ploidy, n_alleles)`, memoised in `cache`.
-    fn table<'a>(cache: &'a mut GenotypeTableCache, ploidy: u8, n_alleles: usize) -> &'a [Vec<u8>] {
+    fn table(cache: &mut GenotypeTableCache, ploidy: u8, n_alleles: usize) -> &[Vec<u8>] {
         cache
             .entry((ploidy, n_alleles))
             .or_insert_with(|| genotype_order(ploidy, n_alleles))

@@ -211,6 +211,7 @@ fn alt_allele_copies(het: &HetCounts) -> u64 {
         min_depth: _,
         error_rate: _,
         lr_margin: _,
+        strand_bias_z: _,
     } = het;
     n_het_sites.saturating_add(n_hom_alt_sites.saturating_mul(ALT_COPIES_PER_HOM_ALT))
 }
@@ -250,6 +251,7 @@ fn estimate_inbreeding(het: &HetCounts) -> f64 {
         min_depth: _,
         error_rate: _,
         lr_margin: _,
+        strand_bias_z: _,
     } = het;
     let n_het = *n_het_sites as f64;
     let n_hom_alt = *n_hom_alt_sites as f64;
@@ -293,6 +295,7 @@ mod tests {
                 min_depth: 1,
                 error_rate: 0.01,
                 lr_margin: std::f64::consts::LN_10,
+                strand_bias_z: 3.0,
             },
         }
     }
