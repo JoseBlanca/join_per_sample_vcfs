@@ -28,9 +28,11 @@
 use std::collections::HashMap;
 
 use rayon::prelude::*;
+use smallvec::SmallVec;
 
-use crate::ssr::cohort::attribution::nearest_parent;
+use crate::ssr::cohort::attribution::nearest_called_by_sequence;
 use crate::ssr::cohort::likelihood::LikelihoodScratch;
+use crate::ssr::cohort::pair_hmm::HmmScratch;
 use crate::ssr::cohort::param_estimation::{
     AlleleSpreadAccum, G0FitCfg, G0PseudocountDecay, LengthBin, MAX_SLIP, PurityLevel,
     SampleStutterStats, SlipProfile, StutterLevel, StutterShape, interruption_count,
@@ -224,12 +226,15 @@ pub(crate) fn merge_sample_stats(dst: &mut SampleStutterStats, src: &SampleStutt
 
 /// D1 — accumulate one locus's confident-genotype statistics into `stats`.
 ///
-/// BIAS NOTE: `ε` is taken off a peak's *faithful* reads by comparing each to the
-/// peak's representative allele. For a het this is mildly biased high — the other
-/// allele's rare same-length (`≥2`-step) stutter and any impure same-length variant
-/// both count as base mismatch. Negligible on homozygote-dominated cohorts; the
-/// deferred soft full-cohort EM reduce removes it by fractional attribution. Slips
-/// with `|Δ| > MAX_SLIP` are dropped (the spec cap; rare in practice).
+/// Reads are attributed to their parent allele **by sequence**
+/// ([`nearest_called_by_sequence`], scored with the gate's seed `ε`), so a same-length
+/// interruption het splits its reads by composition: an interrupted-allele read matches
+/// its own peak (faithful, no mismatch) instead of counting every interruption base as a
+/// substitution against the pure allele. This is what de-contaminates `ε` on interruption-
+/// rich cohorts (spec §7). The residual `ε` bias is only the genuine inner-valley soft-
+/// split approximation (a het's own `≥2`-step stutter landing on the other allele's
+/// length), which the deferred soft full-cohort EM reduce removes by fractional
+/// attribution. Slips with `|Δ| > MAX_SLIP` are dropped (the spec cap; rare in practice).
 pub(crate) fn accumulate_locus(
     stats: &mut PrepassStats,
     locus: &CohortLocus,
@@ -243,6 +248,10 @@ pub(crate) fn accumulate_locus(
     // Cohort-wide confident-allele tally for this locus (length in repeat units →
     // chromosome copies), used for the G₀ allele-spread fit below.
     let mut locus_alleles: Vec<AlleleCopies> = Vec::new();
+    // Reused per-locus buffer for the sequence-aware attribution's same-length tie-break
+    // (`align_subst`), allocated once and reused across all this locus's reads — mirrors
+    // `em::attribute_locus`.
+    let mut hmm_scratch = HmmScratch::new();
     for (k, evidence) in locus.samples.iter().enumerate() {
         let global = locus.present[k];
         let Resolution::Confident(ResolvedGenotype::Peaks(peaks)) =
@@ -269,7 +278,14 @@ pub(crate) fn accumulate_locus(
         // Accumulate locally first (avoids holding two &mut into `stats` at once).
         let mut local = SampleStutterStats::default();
         let mut slips: Vec<(i32, u32)> = Vec::new();
-        let peak_units: Vec<u16> = peaks.iter().map(|p| p.repeat_len).collect();
+        // The called alleles as (sequence, length-in-units), parallel to `peaks`, so a read
+        // is attributed to its parent **by sequence** — a same-length het's two peaks are
+        // told apart by composition, not collapsed by length (the D1c fix). Sized to the
+        // diploid ≤ 2 peaks on the stack, matching `em::attribute_locus`.
+        let called: SmallVec<[(&[u8], u16); 2]> = peaks
+            .iter()
+            .map(|p| (p.allele.as_ref(), p.repeat_len))
+            .collect();
         // Per-peak faithful/slipped totals, keyed to each peak's purity, feed the Phase-2
         // purity→level contrast (folded into `stats.purity_slip` after the read loop).
         let peak_interruptions: Vec<u32> = peaks
@@ -281,7 +297,8 @@ pub(crate) fn accumulate_locus(
         for (obs, count) in &evidence.seq_counts {
             let read_units = (obs.len() / period) as i32;
             let (peak_idx, delta) =
-                nearest_parent(read_units, &peak_units).expect("a confident genotype has ≥1 peak");
+                nearest_called_by_sequence(obs, read_units, &called, seed.eps, &mut hmm_scratch)
+                    .expect("a confident genotype has ≥1 peak");
             let peak = &peaks[peak_idx];
             if delta == 0 {
                 let (m, mm) = compare_bases(obs, &peak.allele);
@@ -1064,6 +1081,192 @@ mod tests {
         assert!(
             (f - 0.5).abs() < 0.05,
             "compounding per-interruption factor {f}"
+        );
+    }
+
+    // ── D1c: sequence-aware attribution (same-length het ε de-contamination) ──
+
+    use crate::ssr::cohort::types::{LocusId, SampleEvidence, SsrQc};
+
+    /// A `CA × units` tract (2·units bp).
+    fn ca_tract(units: u16) -> Box<[u8]> {
+        "CA".repeat(units as usize).into_bytes().into_boxed_slice()
+    }
+
+    /// A `SampleEvidence` from `(sequence, count)` reads, byte-sorted (Stage-1 contract).
+    fn evidence_from(reads: &[(Box<[u8]>, u32)]) -> SampleEvidence {
+        let mut seq_counts = reads.to_vec();
+        seq_counts.sort_by(|(a, _), (b, _)| a.cmp(b));
+        SampleEvidence {
+            seq_counts,
+            qc: SsrQc::default(),
+        }
+    }
+
+    /// A locus of `n` identical pure-9 / interrupted-9 hets (both 18 bp; the interruption
+    /// sibling differs at 2 interior bases), reads faithful (no injected error).
+    fn same_length_het_locus(start: u32, n: u32) -> CohortLocus {
+        let pure = ca_tract(9);
+        let interrupted = {
+            let mut s = pure.to_vec();
+            s[6] = b'G';
+            s[7] = b'G';
+            s.into_boxed_slice()
+        };
+        let mut ref_frame = b"GGGGGG".to_vec();
+        ref_frame.extend_from_slice(&pure);
+        ref_frame.extend_from_slice(b"TTTTTT");
+        let mut locus = CohortLocus::new(
+            LocusId {
+                chrom_id: 0,
+                start,
+                end: start + 18,
+            },
+            Motif::new(b"CA").unwrap(),
+            ref_frame.into_boxed_slice(),
+            pure.clone(),
+        );
+        for idx in 0..n {
+            locus.push(
+                idx,
+                evidence_from(&[(pure.clone(), 30), (interrupted.clone(), 30)]),
+            );
+        }
+        locus
+    }
+
+    /// A locus of `n` identical homozygotes at `units` with a ±1 stutter skirt.
+    fn pure_hom_locus(start: u32, units: u16, n: u32) -> CohortLocus {
+        let tract = ca_tract(units);
+        let mut ref_frame = b"GGGGGG".to_vec();
+        ref_frame.extend_from_slice(&tract);
+        ref_frame.extend_from_slice(b"TTTTTT");
+        let mut locus = CohortLocus::new(
+            LocusId {
+                chrom_id: 0,
+                start,
+                end: start + 2 * units as u32,
+            },
+            Motif::new(b"CA").unwrap(),
+            ref_frame.into_boxed_slice(),
+            tract.clone(),
+        );
+        for idx in 0..n {
+            locus.push(
+                idx,
+                evidence_from(&[
+                    (ca_tract(units - 1), 5),
+                    (tract.clone(), 50),
+                    (ca_tract(units + 1), 5),
+                ]),
+            );
+        }
+        locus
+    }
+
+    #[test]
+    fn same_length_hets_do_not_inflate_epsilon() {
+        // Three pure-9 / interrupted-9 hets, reads faithful (no injected sequencing error),
+        // the two alleles differing at 2 of 18 bases. Sequence-aware attribution (D1c)
+        // matches each read to its OWN allele → zero base mismatch → ε ≈ 0. The old
+        // length-only attribution would have scored the interrupted reads against the pure
+        // allele, counting 2 substitutions each and inflating ε to ≈ (2/18)·½ ≈ 0.056.
+        let loci = vec![same_length_het_locus(100, 3)];
+        let stats = run_prepass_stats(&loci, 2, &RungCfg::dev_default());
+        // The het must actually resolve — else ε would be 0 for the wrong reason (no stats).
+        assert!(
+            !stats.per_sample.is_empty(),
+            "the same-length het must resolve"
+        );
+        for st in stats.per_sample.values() {
+            assert!(st.base_match > 0, "faithful reads are recorded");
+            assert_eq!(
+                st.base_mismatch, 0,
+                "no faithful read is scored as a substitution (ε not inflated)"
+            );
+        }
+        let est = estimate(&stats, &G0FitCfg::dev_default());
+        assert!(
+            est.eps < 1e-9,
+            "ε must not be inflated by same-length hets, got {}",
+            est.eps
+        );
+    }
+
+    #[test]
+    fn same_length_het_slip_read_is_attributed_length_first() {
+        // A same-length het (pure-9 / interrupted-9) with a +1 stutter-skirt read
+        // (length 10). Sequence attribution resolves the same-length tie by composition,
+        // but the slip Δ is length-based (identical whichever same-length allele wins), so
+        // the read is booked as a +1 slip and never as a base mismatch — the integration
+        // path the primitive test covers in isolation.
+        let pure = ca_tract(9);
+        let interrupted = {
+            let mut s = pure.to_vec();
+            s[6] = b'G';
+            s[7] = b'G';
+            s.into_boxed_slice()
+        };
+        let slip10 = ca_tract(10);
+        let mut ref_frame = b"GGGGGG".to_vec();
+        ref_frame.extend_from_slice(&pure);
+        ref_frame.extend_from_slice(b"TTTTTT");
+        let mut locus = CohortLocus::new(
+            LocusId {
+                chrom_id: 0,
+                start: 100,
+                end: 118,
+            },
+            Motif::new(b"CA").unwrap(),
+            ref_frame.into_boxed_slice(),
+            pure.clone(),
+        );
+        for idx in 0..3 {
+            locus.push(
+                idx,
+                evidence_from(&[
+                    (pure.clone(), 30),
+                    (interrupted.clone(), 30),
+                    (slip10.clone(), 6),
+                ]),
+            );
+        }
+        let stats = run_prepass_stats(&[locus], 2, &RungCfg::dev_default());
+        assert!(
+            !stats.per_sample.is_empty(),
+            "the same-length het must resolve"
+        );
+        // The +1 slip reads are booked as expansions, not base mismatches.
+        let up1: u64 = stats.slip_by_period[&2].up[0];
+        assert_eq!(up1, 3 * 6, "each sample's six +1 reads are +1 slips");
+        for st in stats.per_sample.values() {
+            assert_eq!(
+                st.base_mismatch, 0,
+                "a slip read is not scored as a substitution"
+            );
+        }
+    }
+
+    #[test]
+    fn prepass_is_byte_identical_on_a_multi_locus_cohort() {
+        // Several loci (pure-hom loci at different lengths + a same-length-het locus)
+        // genuinely partition across threads, so the 1-vs-4-thread comparison exercises the
+        // cross-locus reduce — unlike the single-locus `recovery_spec` test above.
+        let loci = vec![
+            pure_hom_locus(100, 8, 4),
+            pure_hom_locus(200, 10, 4),
+            pure_hom_locus(300, 12, 4),
+            same_length_het_locus(400, 3),
+        ];
+        let single = with_threads(1, || {
+            run_prepass(&loci, 2, &RungCfg::dev_default(), &G0FitCfg::dev_default())
+        });
+        let multi = with_threads(4, || {
+            run_prepass(&loci, 2, &RungCfg::dev_default(), &G0FitCfg::dev_default())
+        });
+        assert_eq!(
+            single, multi,
+            "the pre-pass must be byte-identical across thread counts on a multi-locus cohort"
         );
     }
 }

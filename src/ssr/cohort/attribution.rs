@@ -1,16 +1,17 @@
 //! Shared read-to-allele attribution primitives.
 //!
-//! Two length-only stages still hard-attribute each spanning read to the nearest parent
-//! allele by repeat-length distance and act on the signed slip `Δ = read_units − parent_units`:
-//! the pre-pass confident-genotype stats ([`prepass::accumulate_locus`](super::prepass), a
-//! confident *single* genotype so no same-length ambiguity arises). That length-only primitive
-//! is [`nearest_parent`].
+//! [`nearest_parent`] is the length-only primitive: it attributes a spanning read to the
+//! nearest parent allele by repeat-length distance and acts on the signed slip
+//! `Δ = read_units − parent_units`. It stands where two same-length alleles can never be
+//! called together (a length-distance tie carries no composition signal).
 //!
-//! The genotyping stages — the per-locus slip refit ([`em::attribute_locus`](super::em)) and
-//! the allele-balance FP term (via the EM's final E-step, [`em`](super::em)) — instead key on
-//! the candidate **sequence**, so two same-length called alleles (an interruption
-//! polymorphism) are told apart by composition, not collapsed by length (spec §5.3, Mark-2 §6
-//! amendment). [`nearest_called_by_sequence`] is the hard version (slip stats);
+//! The stages that *can* call two same-length alleles — the pre-pass confident-genotype
+//! stats ([`prepass::accumulate_locus`](super::prepass), which since D1 resolves same-length
+//! interruption hets), the per-locus slip refit ([`em::attribute_locus`](super::em)), and the
+//! allele-balance FP term (via the EM's final E-step, [`em`](super::em)) — key on the candidate
+//! **sequence**, so two same-length called alleles (an interruption polymorphism) are told apart
+//! by composition, not collapsed by length (spec §5.3, Mark-2 §6 amendment).
+//! [`nearest_called_by_sequence`] is the hard version (slip stats);
 //! [`allele_responsibilities`] is the soft normalization the balance term consumes.
 
 use smallvec::{SmallVec, smallvec};
