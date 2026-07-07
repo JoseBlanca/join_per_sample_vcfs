@@ -2453,7 +2453,8 @@ pub(crate) fn run_em_columnar<M: MathBackend>(
         *slot = p_init;
     }
 
-    let diagnostics = run_em_loop(&SnpModel, ctx, config, math, ll_for_em, scratch)?;
+    let model = SnpModel;
+    let diagnostics = run_em_loop(&model, ctx, config, math, ll_for_em, scratch)?;
 
     // Final E-step under the converged parameters so the emitted
     // posteriors reflect the *post-final-M-step* state rather than the
@@ -2461,7 +2462,7 @@ pub(crate) fn run_em_columnar<M: MathBackend>(
     // Uses the steady-state prior variant (never the flat first-iteration
     // one): for a single sample the §9 species path; for a cohort the
     // leave-one-out prior read off the converged `expected_counts`.
-    dispatch_e_step(ctx, math, ll_for_em, scratch, EmStepPhase::SteadyState)?;
+    model.e_step(ctx, math, ll_for_em, scratch, EmStepPhase::SteadyState)?;
 
     summarise_posteriors(n_samples, n_genotypes, scratch, config.max_gq_phred);
     // Beta(α_alt, α_ref) prior shape for the AC marginalisation —
@@ -2632,6 +2633,20 @@ fn dispatch_e_step<M: MathBackend>(
 /// visibility bump comes in Phase 2.4 when the trait and loop move into their
 /// own module.
 trait GenotypeEmModel {
+    /// Fill `scratch.posteriors` from the current frequency parameters and the
+    /// per-(sample, genotype) read log-likelihoods. `phase` selects the
+    /// first-iteration (flat) vs steady-state prior for a cohort; single-sample
+    /// records ignore it. Also used for the post-loop final E-step (always
+    /// `SteadyState`).
+    fn e_step<M: MathBackend>(
+        &self,
+        ctx: EmContext<'_>,
+        math: &M,
+        log_likelihoods: &[f64],
+        scratch: &mut RecordScratch,
+        phase: EmStepPhase,
+    ) -> Result<(), PosteriorEngineError>;
+
     /// Advance the frequency parameters from the current posteriors:
     /// accumulate the posterior-weighted allele counts (the shared
     /// sufficient statistic) into `scratch.expected_counts`, then write the
@@ -2659,6 +2674,17 @@ trait GenotypeEmModel {
 struct SnpModel;
 
 impl GenotypeEmModel for SnpModel {
+    fn e_step<M: MathBackend>(
+        &self,
+        ctx: EmContext<'_>,
+        math: &M,
+        log_likelihoods: &[f64],
+        scratch: &mut RecordScratch,
+        phase: EmStepPhase,
+    ) -> Result<(), PosteriorEngineError> {
+        dispatch_e_step(ctx, math, log_likelihoods, scratch, phase)
+    }
+
     fn m_step(&self, ctx: EmContext<'_>, scratch: &mut RecordScratch) {
         // Writes `p_hat_next` and `expected_counts`, and overwrites
         // `f_hat_compound` in place. `p_hat` is double-buffered against
@@ -2724,7 +2750,7 @@ fn run_em_loop<M: MathBackend, Model: GenotypeEmModel>(
         } else {
             EmStepPhase::SteadyState
         };
-        dispatch_e_step(ctx, math, log_likelihoods, scratch, phase)?;
+        model.e_step(ctx, math, log_likelihoods, scratch, phase)?;
 
         // M-step (params from posteriors) then the convergence delta on the
         // model's driver, both supplied by the model. `p_hat` is
