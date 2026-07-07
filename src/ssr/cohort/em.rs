@@ -64,6 +64,13 @@ pub(crate) struct EmCfg {
     pub(crate) level_shrink: f64,
     /// Convergence tolerance on the per-locus level multiplier between rounds.
     pub(crate) level_tol: f64,
+    /// Genotype-prior model for the π-EM. `false` (default) = the plug-in
+    /// HWE(π̂) prior; `true` = the marginalized Dirichlet-multinomial prior with
+    /// leave-one-out cohort sharing (the improved SNP-path prior, seeded by the
+    /// same mode-centred `G₀`). Off by default so SSR output is byte-identical
+    /// until the benchmark (Phase 3.5) decides whether to flip it. See
+    /// [`marginalized_genotype_log_priors`].
+    pub(crate) marginalized_prior: bool,
 }
 
 impl EmCfg {
@@ -78,6 +85,7 @@ impl EmCfg {
             theta_tol: 1e-3,
             level_shrink: 20.0,
             level_tol: 1e-3,
+            marginalized_prior: false,
         }
     }
 }
@@ -151,6 +159,107 @@ fn genotype_prior(g: Genotype, pi: &[f64], f: f64) -> f64 {
     } else {
         (1.0 - f) * 2.0 * pi[g.i] * pi[g.j]
     }
+}
+
+// ------------------------------------------------------------------------
+// Marginalized Dirichlet-multinomial genotype prior (Phase 3.2).
+//
+// The improved SNP-path prior, ported to SSR: instead of plugging a point
+// frequency `π` into HWE ([`genotype_prior`]), average the genotype probability
+// over the frequency uncertainty using the Dirichlet-multinomial, seeded by the
+// **mode-centred `G₀`** concentration (§Q1 — SSR keeps its own hypervariable
+// seed, it does NOT inherit the SNP reference-is-common seed). Wright-`F` IBD is
+// mixed on top exactly as the SNP engine does. This is additive: the plug-in path
+// above is untouched, and the SNP engine is untouched (this mirrors its
+// `e_step_cohort_loo`, it does not extract from it — protecting the SNP SIMD
+// gains). Gated on behind an `EmCfg` toggle in a later step.
+// ------------------------------------------------------------------------
+
+/// The flat Dirichlet-multinomial inputs for a diploid candidate set of size `k`:
+/// `genotype_allele_counts` (row-major `n_genotypes × k`) and the per-genotype
+/// `log_multinomial_coeffs` (`ln 1 = 0` for a homozygote, `ln 2` for a het), in
+/// `genotypes` order. These are exactly what
+/// [`crate::genetics::dirichlet_multinomial_log_priors`] consumes.
+fn diploid_dm_inputs(genotypes: &[Genotype], k: usize) -> (Vec<u32>, Vec<f64>) {
+    let mut counts = vec![0u32; genotypes.len() * k];
+    let mut log_coeffs = vec![0.0_f64; genotypes.len()];
+    for (g_idx, g) in genotypes.iter().enumerate() {
+        // A candidate index `≥ k` would write into a later genotype's row and
+        // silently corrupt it (the flat buffer stays in-bounds), so guard loudly
+        // rather than let a shape bug escape as a wrong prior.
+        debug_assert!(
+            g.i < k && g.j < k,
+            "genotype ({}, {}) out of range k={k}",
+            g.i,
+            g.j
+        );
+        let base = g_idx * k;
+        if g.i == g.j {
+            counts[base + g.i] = 2;
+            // ln(2!/2!) = ln 1 = 0 (already).
+        } else {
+            counts[base + g.i] = 1;
+            counts[base + g.j] = 1;
+            log_coeffs[g_idx] = std::f64::consts::LN_2; // ln(2!/(1!1!)) = ln 2
+        }
+    }
+    (counts, log_coeffs)
+}
+
+/// Leave-one-out concentration `α'_s = G₀ + max(0, E[cohort copies] − E[own copies])`
+/// for one sample, mirroring the SNP engine's `e_step_cohort_loo`. `g0` is the
+/// mode-centred seed; `cohort_expected` / `own_expected` are posterior-weighted
+/// allele copies over the whole cohort and over this sample. The `max(0, …)`
+/// guards float noise on `cohort − own` (own is one non-negative addend of the
+/// total, so the true difference is `≥ 0`). All three slices are length `k`.
+fn leave_one_out_alpha(g0: &[f64], cohort_expected: &[f64], own_expected: &[f64]) -> Vec<f64> {
+    debug_assert_eq!(g0.len(), cohort_expected.len());
+    debug_assert_eq!(g0.len(), own_expected.len());
+    g0.iter()
+        .zip(cohort_expected)
+        .zip(own_expected)
+        .map(|((&g0_a, &total_a), &own_a)| g0_a + (total_a - own_a).max(0.0))
+        .collect()
+}
+
+/// Per-genotype log-prior under the marginalized Dirichlet-multinomial with a
+/// Wright-`F` IBD branch, for a diploid locus of `k` candidates. `alpha` is the
+/// per-candidate concentration (the sample's `α'_s` from [`leave_one_out_alpha`]);
+/// `f` is the sample's inbreeding coefficient. Returns one value per genotype in
+/// `genotypes` order, log-priors up to a shared additive constant (softmax-ready)
+/// — matching the SNP engine's convention and [`dirichlet_multinomial_log_priors`].
+///
+/// The IBD mixture mirrors the SNP `e_step`: a homozygote `(i, i)` is
+/// `logsumexp((1−f)·DM,  f·(α_i/Σα))`; a heterozygote is `(1−f)·DM`.
+fn marginalized_genotype_log_priors(
+    genotypes: &[Genotype],
+    k: usize,
+    alpha: &[f64],
+    f: f64,
+) -> Vec<f64> {
+    debug_assert_eq!(alpha.len(), k);
+    let (counts, log_coeffs) = diploid_dm_inputs(genotypes, k);
+    let log_indep =
+        crate::genetics::dirichlet_multinomial_log_priors(&counts, &log_coeffs, k, alpha);
+
+    let sum_alpha: f64 = alpha.iter().sum();
+    let log_sum_alpha = sum_alpha.ln();
+    let log_one_minus_f = (1.0 - f).ln(); // -∞ at f = 1
+    let log_f = f.ln(); // -∞ at f = 0
+
+    genotypes
+        .iter()
+        .zip(&log_indep)
+        .map(|(g, &log_indep_g)| {
+            if g.i == g.j {
+                // IBD marginal allele log-frequency log(α_i / Σα).
+                let log_p_effective_i = alpha[g.i].ln() - log_sum_alpha;
+                log_sum_exp(&[log_one_minus_f + log_indep_g, log_f + log_p_effective_i])
+            } else {
+                log_one_minus_f + log_indep_g
+            }
+        })
+        .collect()
 }
 
 /// The `G₀` decay for the locus period (the shared coded fallback if absent — review M3).
@@ -351,9 +460,16 @@ pub(crate) fn run_locus_em_with<M: ReadLikelihoodModel>(
         model,
         &mut scratch,
     );
-    let mut pi = run_pi_em(&data_ll, &genotypes, &g0, &seed.pi0, f_per_present, cfg);
-    let (mut calls, mut posterior_hom) =
-        final_calls(&data_ll, &genotypes, &pi, f_per_present, &cand_units);
+    let (mut pi, mut calls, mut posterior_hom) = genotype_pass(
+        &data_ll,
+        &genotypes,
+        &g0,
+        &seed.pi0,
+        f_per_present,
+        k,
+        &cand_units,
+        cfg,
+    );
 
     for _ in 0..cfg.refit_max_rounds {
         let fit = attribute_locus(locus, &calls, period, candidates, params, level_per_group);
@@ -376,8 +492,17 @@ pub(crate) fn run_locus_em_with<M: ReadLikelihoodModel>(
             model,
             &mut scratch,
         );
-        pi = run_pi_em(&data_ll, &genotypes, &g0, &seed.pi0, f_per_present, cfg);
-        let (c, ph) = final_calls(&data_ll, &genotypes, &pi, f_per_present, &cand_units);
+        let (p, c, ph) = genotype_pass(
+            &data_ll,
+            &genotypes,
+            &g0,
+            &seed.pi0,
+            f_per_present,
+            k,
+            &cand_units,
+            cfg,
+        );
+        pi = p;
         calls = c;
         posterior_hom = ph;
     }
@@ -587,6 +712,180 @@ fn final_calls(
     (calls, posterior_hom)
 }
 
+/// The converged state of the marginalized π-EM, carried into
+/// [`final_calls_marginalized`] so it can rebuild each sample's leave-one-out
+/// concentration `α'_s = G₀ + (E[cohort] − E[own_s])`.
+struct MarginalizedFit {
+    /// Reported allele frequencies `π = E[cohort copies] / Σ` (raw copies, no `G₀`).
+    pi: Vec<f64>,
+    /// Converged posterior-weighted allele copies over the whole cohort.
+    expected: Vec<f64>,
+    /// Per-sample posterior-weighted copies from the final iteration (the
+    /// leave-one-out subtrahend). Length `n_samples`, each entry length `k`.
+    own_counts: Vec<Vec<f64>>,
+}
+
+/// The π loop under the **marginalized Dirichlet-multinomial** prior with
+/// leave-one-out cohort sharing — the SSR analogue of the SNP engine's
+/// `e_step_cohort_loo`. The first iteration (0-indexed `iteration == 0`) uses a
+/// flat prior (`α = G₀`, the seed the whole cohort shares, no leave-one-out term
+/// yet); every later iteration gives each sample its own
+/// `α'_s = G₀ + (E[cohort] − E[own_s])`. Convergence is tested
+/// on the **driver** — the change in the posterior-weighted allele copies
+/// `E[cohort]` per chromosome — not on the reported `π` (the Phase-0 discipline:
+/// `π` is a `G₀`-rescaled readout, `E[cohort]` is what the leave-one-out prior
+/// actually feeds back). Diploid.
+fn run_pi_em_marginalized(
+    data_ll: &[Vec<f64>],
+    genotypes: &[Genotype],
+    g0: &[f64],
+    f_per_present: &[f64],
+    k: usize,
+    cfg: &EmCfg,
+) -> MarginalizedFit {
+    let n_samples = data_ll.len();
+    // A PASS locus always has ≥1 present sample. Guard the invariant loudly: with
+    // `n_samples == 0` the driver delta and `π` readout below would divide by zero
+    // and emit NaN (the plug-in `run_pi_em` seeds `expected = g0` and stays finite;
+    // this path seeds raw zeros).
+    debug_assert!(n_samples > 0, "marginalized π-EM needs ≥1 present sample");
+    let chromosomes = 2.0 * n_samples as f64; // diploid
+    let mut expected = vec![0.0_f64; k];
+    let mut own_counts = vec![vec![0.0_f64; k]; n_samples];
+
+    for iteration in 0..cfg.max_iters {
+        let mut next_expected = vec![0.0_f64; k];
+        let mut next_own = vec![vec![0.0_f64; k]; n_samples];
+        for (s, sample_ll) in data_ll.iter().enumerate() {
+            let f = f_per_present[s];
+            // Flat seed on the first iteration (no cohort counts yet); LOO after.
+            let alpha = if iteration == 0 {
+                g0.to_vec()
+            } else {
+                leave_one_out_alpha(g0, &expected, &own_counts[s])
+            };
+            let log_prior = marginalized_genotype_log_priors(genotypes, k, &alpha, f);
+            let log_joint: Vec<f64> = log_prior
+                .iter()
+                .zip(sample_ll)
+                .map(|(lp, ll)| lp + ll)
+                .collect();
+            let norm = log_sum_exp(&log_joint);
+            for (g, lj) in genotypes.iter().zip(&log_joint) {
+                let post = (lj - norm).exp();
+                next_expected[g.i] += post;
+                next_expected[g.j] += post;
+                next_own[s][g.i] += post;
+                next_own[s][g.j] += post;
+            }
+        }
+        // Driver delta on the per-chromosome allele copies. Never converge on the
+        // flat first iteration (its counts reflect the seed, not the LOO prior
+        // that produces the emitted calls) — the SSR analogue of the SNP guard.
+        let delta = next_expected
+            .iter()
+            .zip(&expected)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f64::max)
+            / chromosomes;
+        expected = next_expected;
+        own_counts = next_own;
+        if iteration > 0 && delta < cfg.tol {
+            break;
+        }
+    }
+
+    let total: f64 = expected.iter().sum();
+    let pi = expected.iter().map(|e| e / total).collect();
+    MarginalizedFit {
+        pi,
+        expected,
+        own_counts,
+    }
+}
+
+/// Final E-step under the converged marginalized prior → per sample the MAP
+/// genotype + GQ + posterior homozygosity, rebuilding each sample's `α'_s` from
+/// the converged [`MarginalizedFit`]. Mirrors [`final_calls`] (the plug-in tail),
+/// differing only in the per-sample prior.
+fn final_calls_marginalized(
+    data_ll: &[Vec<f64>],
+    genotypes: &[Genotype],
+    g0: &[f64],
+    fit: &MarginalizedFit,
+    f_per_present: &[f64],
+    k: usize,
+    cand_units: &[u16],
+) -> (Vec<SampleCall>, Vec<f64>) {
+    let mut calls = Vec::with_capacity(data_ll.len());
+    let mut posterior_hom = Vec::with_capacity(data_ll.len());
+    for (s, sample_ll) in data_ll.iter().enumerate() {
+        let f = f_per_present[s];
+        let alpha = leave_one_out_alpha(g0, &fit.expected, &fit.own_counts[s]);
+        let log_prior = marginalized_genotype_log_priors(genotypes, k, &alpha, f);
+        let log_joint: Vec<f64> = log_prior
+            .iter()
+            .zip(sample_ll)
+            .map(|(lp, ll)| lp + ll)
+            .collect();
+        let norm = log_sum_exp(&log_joint);
+        // PANIC-FREE, as in `final_calls`: a PASS locus enumerates ≥1 genotype so
+        // `log_joint` is non-empty, and every entry is finite-or-−∞, so `total_cmp`
+        // (a NaN-safe total order) cannot fail the argmax.
+        let (best, best_lj) = log_joint
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.total_cmp(b))
+            .expect("a PASS locus enumerates ≥1 genotype");
+        let posterior = (best_lj - norm).exp();
+        let p_hom: f64 = genotypes
+            .iter()
+            .zip(&log_joint)
+            .filter(|(g, _)| g.i == g.j)
+            .map(|(_, lj)| (lj - norm).exp())
+            .sum();
+        let g = genotypes[best];
+        calls.push(SampleCall {
+            allele_indices: vec![g.i, g.j],
+            genotype_units: vec![cand_units[g.i], cand_units[g.j]],
+            posterior,
+            gq: phred_gq(posterior),
+            allele_support: SmallVec::new(),
+        });
+        posterior_hom.push(p_hom);
+    }
+    (calls, posterior_hom)
+}
+
+/// One genotyping pass — the π-EM to convergence plus the final per-sample calls
+/// — dispatching on [`EmCfg::marginalized_prior`]. The plug-in branch is exactly
+/// the previous `run_pi_em` + `final_calls` sequence (byte-identical at the
+/// default); the marginalized branch runs the leave-one-out Dirichlet-multinomial
+/// prior. `k` is the candidate count.
+#[allow(clippy::too_many_arguments)]
+fn genotype_pass(
+    data_ll: &[Vec<f64>],
+    genotypes: &[Genotype],
+    g0: &[f64],
+    pi0: &[f64],
+    f_per_present: &[f64],
+    k: usize,
+    cand_units: &[u16],
+    cfg: &EmCfg,
+) -> (Vec<f64>, Vec<SampleCall>, Vec<f64>) {
+    if cfg.marginalized_prior {
+        let fit = run_pi_em_marginalized(data_ll, genotypes, g0, f_per_present, k, cfg);
+        let (calls, posterior_hom) =
+            final_calls_marginalized(data_ll, genotypes, g0, &fit, f_per_present, k, cand_units);
+        (fit.pi, calls, posterior_hom)
+    } else {
+        let pi = run_pi_em(data_ll, genotypes, g0, pi0, f_per_present, cfg);
+        let (calls, posterior_hom) =
+            final_calls(data_ll, genotypes, &pi, f_per_present, cand_units);
+        (pi, calls, posterior_hom)
+    }
+}
+
 /// The largest per-locus stutter-rate multiplier the refit may return (the
 /// `level_multiplier` clamp; the resulting per-read level is `[0,1]`-clamped anyway, but
 /// this bounds the multiplier itself against a degenerate `expected ≈ 0` denominator).
@@ -779,6 +1078,171 @@ mod tests {
     };
     use crate::ssr::types::Motif;
     use std::collections::HashMap;
+
+    /// softmax of a log-prior row, for the marginalized-prior tests.
+    fn softmax(logs: &[f64]) -> Vec<f64> {
+        let m = logs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let exps: Vec<f64> = logs.iter().map(|&l| (l - m).exp()).collect();
+        let z: f64 = exps.iter().sum();
+        exps.iter().map(|&e| e / z).collect()
+    }
+
+    #[test]
+    fn marginalized_prior_at_f_zero_is_the_bare_dm_prior() {
+        // With F = 0 the Wright mixture collapses: every genotype's log-prior is
+        // just its Dirichlet-multinomial term, so the wrapper must reproduce
+        // `dirichlet_multinomial_log_priors` exactly.
+        let genotypes = enumerate_diploid_genotypes(3);
+        let alpha = [0.6, 0.3, 0.1];
+        let (counts, coeffs) = diploid_dm_inputs(&genotypes, 3);
+        let bare = crate::genetics::dirichlet_multinomial_log_priors(&counts, &coeffs, 3, &alpha);
+        let got = marginalized_genotype_log_priors(&genotypes, 3, &alpha, 0.0);
+        assert_eq!(got.len(), bare.len());
+        for (g, b) in got.iter().zip(&bare) {
+            assert!((g - b).abs() < 1e-12, "got {g}, bare {b}");
+        }
+    }
+
+    #[test]
+    fn marginalized_prior_reduces_to_plugin_hwe_at_high_concentration() {
+        // As Σα → ∞ with α ∝ π the Dirichlet-multinomial collapses to the
+        // multinomial, i.e. plug-in HWE(π). The softmaxed marginalized prior must
+        // approach HWE(π) = [p0², 2·p0·p1, p1²].
+        let genotypes = enumerate_diploid_genotypes(2);
+        let pi = [0.7_f64, 0.3];
+        let big = 1.0e6;
+        let alpha = [big * pi[0], big * pi[1]];
+        let probs = softmax(&marginalized_genotype_log_priors(
+            &genotypes, 2, &alpha, 0.0,
+        ));
+        // HWE reference at F = 0 via the plug-in prior (already normalised: the
+        // three genotype priors sum to 1 for a biallelic locus).
+        let hwe: Vec<f64> = genotypes
+            .iter()
+            .map(|&g| genotype_prior(g, &pi, 0.0))
+            .collect();
+        for (p, h) in probs.iter().zip(&hwe) {
+            assert!((p - h).abs() < 1e-4, "marginalized {p} vs HWE {h}");
+        }
+    }
+
+    #[test]
+    fn marginalized_prior_at_f_one_forbids_heterozygotes() {
+        // Full inbreeding: every heterozygote is impossible (log-prior −∞) and
+        // the homozygotes carry finite mass at the IBD marginal allele frequency.
+        let genotypes = enumerate_diploid_genotypes(2);
+        let alpha = [0.6, 0.4];
+        let logs = marginalized_genotype_log_priors(&genotypes, 2, &alpha, 1.0);
+        for (g, &lp) in genotypes.iter().zip(&logs) {
+            if g.i == g.j {
+                assert!(
+                    lp.is_finite(),
+                    "homozygote {g:?} should be finite, got {lp}"
+                );
+            } else {
+                assert!(
+                    lp == f64::NEG_INFINITY,
+                    "heterozygote {g:?} must be forbidden at F=1, got {lp}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn leave_one_out_alpha_excludes_own_counts_and_floors_at_seed() {
+        let g0 = [1.0_f64, 0.5];
+        // α'_s = G₀ + (cohort − own); own is excluded.
+        let alpha = leave_one_out_alpha(&g0, &[3.0, 2.0], &[1.0, 1.0]);
+        assert!((alpha[0] - 3.0).abs() < 1e-12); // 1.0 + (3.0 − 1.0)
+        assert!((alpha[1] - 1.5).abs() < 1e-12); // 0.5 + (2.0 − 1.0)
+        // Float noise making (cohort − own) slightly negative floors at G₀, never
+        // below (keeps the concentration strictly positive).
+        let noisy = leave_one_out_alpha(&g0, &[1.0, 1.0], &[1.0 + 1e-15, 1.0 + 1e-15]);
+        assert!((noisy[0] - 1.0).abs() < 1e-12);
+        assert!((noisy[1] - 0.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn marginalized_prior_at_f_one_equals_ibd_marginal_log_frequency() {
+        // At F = 1 a homozygote collapses to the IBD term alone, so its value is
+        // the hand-computable marginal allele log-frequency ln(α_i / Σα). This
+        // pins the −log_sum_alpha normalization the boundary tests can't see (a
+        // shared constant washes out under softmax at F=1).
+        let genotypes = enumerate_diploid_genotypes(2);
+        let alpha = [0.6_f64, 0.4];
+        let sum: f64 = alpha.iter().sum();
+        let logs = marginalized_genotype_log_priors(&genotypes, 2, &alpha, 1.0);
+        for (g, &lp) in genotypes.iter().zip(&logs) {
+            if g.i == g.j {
+                let expected = (alpha[g.i] / sum).ln();
+                assert!(
+                    (lp - expected).abs() < 1e-12,
+                    "hom {g:?}: got {lp}, want {expected}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn marginalized_prior_mixes_dm_and_ibd_at_intermediate_f() {
+        // 0 < F < 1: reconstruct every genotype's log-prior from the documented
+        // formula, catching any error that vanishes at the F=0/F=1 boundaries
+        // (swapped log_f/log_one_minus_f, a shifted IBD term, or a het branch that
+        // wrongly picks up an IBD contribution).
+        let genotypes = enumerate_diploid_genotypes(3);
+        let alpha = [0.6_f64, 0.3, 0.1];
+        let f = 0.25_f64;
+        let (counts, coeffs) = diploid_dm_inputs(&genotypes, 3);
+        let dm = crate::genetics::dirichlet_multinomial_log_priors(&counts, &coeffs, 3, &alpha);
+        let sum: f64 = alpha.iter().sum();
+        let got = marginalized_genotype_log_priors(&genotypes, 3, &alpha, f);
+        for ((g, &dm_g), &lp) in genotypes.iter().zip(&dm).zip(&got) {
+            let expected = if g.i == g.j {
+                log_sum_exp(&[(1.0 - f).ln() + dm_g, f.ln() + (alpha[g.i] / sum).ln()])
+            } else {
+                (1.0 - f).ln() + dm_g
+            };
+            assert!(
+                (lp - expected).abs() < 1e-12,
+                "{g:?}: got {lp}, want {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn diploid_dm_inputs_encodes_homozygote_as_double_count_and_het_as_two_singles() {
+        // k=2 genotypes: (0,0), (0,1), (1,1). Isolates the flat-input builder from
+        // the DM math + mixture so a shape bug localizes here, not downstream.
+        let genotypes = enumerate_diploid_genotypes(2);
+        let (counts, coeffs) = diploid_dm_inputs(&genotypes, 2);
+        assert_eq!(counts, vec![2, 0, 1, 1, 0, 2]);
+        assert_eq!(coeffs, vec![0.0, std::f64::consts::LN_2, 0.0]);
+    }
+
+    #[test]
+    fn marginalized_prior_handles_single_candidate_locus() {
+        // k=1 boundary: one genotype (0,0); ln(α/α) = 0 so the homozygote's IBD
+        // term is 0 and the prior stays finite.
+        let genotypes = enumerate_diploid_genotypes(1);
+        let (counts, coeffs) = diploid_dm_inputs(&genotypes, 1);
+        assert_eq!(counts, vec![2]);
+        assert_eq!(coeffs, vec![0.0]);
+        let logs = marginalized_genotype_log_priors(&genotypes, 1, &[0.5], 0.3);
+        assert_eq!(logs.len(), 1);
+        assert!(
+            logs[0].is_finite(),
+            "single-candidate prior must be finite, got {}",
+            logs[0]
+        );
+    }
+
+    #[test]
+    fn marginalized_prior_returns_empty_on_empty_genotypes() {
+        // Degenerate empty candidate set: no genotypes in, no priors out (no
+        // index/unwrap on a first genotype, no empty-sum division).
+        let logs = marginalized_genotype_log_priors(&[], 2, &[0.6, 0.4], 0.5);
+        assert!(logs.is_empty());
+    }
 
     /// Params for a single low-stutter sample group matching the clean sim chemistry.
     fn clean_params(n_samples: usize) -> ParamSet {
@@ -1253,6 +1717,184 @@ mod tests {
             want.sort_unstable();
             assert_eq!(got, want, "sample {k} with θ refit disabled");
         }
+    }
+
+    #[test]
+    fn marginalized_prior_recovers_the_clean_truth_end_to_end() {
+        // The marginalize+LOO Dirichlet-multinomial prior (EmCfg toggle on) must
+        // genotype the clean high-depth checkpoint cohort exactly as the plug-in
+        // path does — end-to-end proof that the new π-EM loop + final calls are
+        // wired correctly and converge to the right genotypes.
+        let cohort = crate::ssr::cohort::sim::simulate(&checkpoint_spec());
+        let (_, locus) = cohort.merger().next().unwrap().expect("one locus");
+        let rungs = build_rungs(&locus, &RungCfg::dev_default());
+        let candidates = assemble_candidates(&locus, &rungs, 2, &CandidateCfg::dev_default());
+        let params = clean_params(locus.present.len());
+        let seed = seed_locus(&locus, &rungs, &candidates, &params, 2, 3);
+        let marginalized = EmCfg {
+            marginalized_prior: true,
+            ..EmCfg::dev_default()
+        };
+        let call = run_locus_em(
+            &locus,
+            &rungs,
+            &candidates,
+            &params,
+            &seed,
+            2,
+            &marginalized,
+        );
+
+        let truth = [[8, 8], [8, 8], [6, 10], [10, 10], [6, 10]];
+        for (k, expected) in truth.iter().enumerate() {
+            let mut got = call.calls[k].genotype_units.clone();
+            got.sort_unstable();
+            let mut want = expected.to_vec();
+            want.sort_unstable();
+            assert_eq!(got, want, "sample {k} under the marginalized DM prior");
+        }
+    }
+
+    #[test]
+    fn marginalized_and_plugin_agree_on_clean_high_depth() {
+        // On clean high-depth data the marginalized DM prior and the plug-in HWE
+        // prior should call the *same* genotypes — a drift-detector independent of
+        // the hardcoded truth array (a marginalized regression that still happened
+        // to match the truth would be caught here).
+        let cohort = crate::ssr::cohort::sim::simulate(&checkpoint_spec());
+        let (_, locus) = cohort.merger().next().unwrap().expect("one locus");
+        let rungs = build_rungs(&locus, &RungCfg::dev_default());
+        let candidates = assemble_candidates(&locus, &rungs, 2, &CandidateCfg::dev_default());
+        let params = clean_params(locus.present.len());
+        let seed = seed_locus(&locus, &rungs, &candidates, &params, 2, 3);
+        let plugin = run_locus_em(
+            &locus,
+            &rungs,
+            &candidates,
+            &params,
+            &seed,
+            2,
+            &EmCfg::dev_default(),
+        );
+        let marginalized_cfg = EmCfg {
+            marginalized_prior: true,
+            ..EmCfg::dev_default()
+        };
+        let marginalized = run_locus_em(
+            &locus,
+            &rungs,
+            &candidates,
+            &params,
+            &seed,
+            2,
+            &marginalized_cfg,
+        );
+        for (k, (p, m)) in plugin.calls.iter().zip(&marginalized.calls).enumerate() {
+            assert_eq!(
+                p.genotype_units, m.genotype_units,
+                "sample {k}: marginalized and plug-in disagree on clean data",
+            );
+        }
+    }
+
+    #[test]
+    fn run_pi_em_marginalized_single_sample_stays_finite_and_collapses_to_g0() {
+        // n_samples == 1 boundary: `total = 2` (finite π), and the leave-one-out
+        // subtraction removes the sample's whole contribution, so `α'_s == G₀` —
+        // `own_counts[0]` must equal the cohort `expected`.
+        let genotypes = enumerate_diploid_genotypes(2); // (0,0), (0,1), (1,1)
+        let g0 = [1.0, 1.0];
+        let data_ll = vec![vec![0.0, -20.0, -40.0]]; // strongly hom-ref (0,0)
+        let cfg = EmCfg {
+            marginalized_prior: true,
+            ..EmCfg::dev_default()
+        };
+        let fit = run_pi_em_marginalized(&data_ll, &genotypes, &g0, &[0.0], 2, &cfg);
+        assert!(
+            fit.pi.iter().all(|p| p.is_finite()),
+            "π must be finite: {:?}",
+            fit.pi
+        );
+        let sum: f64 = fit.expected.iter().sum();
+        assert!(
+            (sum - 2.0).abs() < 1e-9,
+            "expected copies must sum to 2·n_samples, got {sum}"
+        );
+        for (own, exp) in fit.own_counts[0].iter().zip(&fit.expected) {
+            assert!(
+                (own - exp).abs() < 1e-9,
+                "single sample: own must equal cohort expected"
+            );
+        }
+    }
+
+    #[test]
+    fn run_pi_em_marginalized_leave_one_out_moves_an_ambiguous_sample() {
+        // Three samples strongly hom-ref (0,0) and one ambiguous between (0,1) and
+        // (1,1). Running only the flat iteration (max_iters = 1, no LOO) vs the full
+        // loop must change the cohort `expected`, proving the leave-one-out
+        // iterations actually feed the three hom-ref samples' counts into the
+        // ambiguous sample's prior. Deterministic via hand-built likelihoods.
+        let genotypes = enumerate_diploid_genotypes(2);
+        let g0 = [1.0, 1.0];
+        let data_ll = vec![
+            vec![0.0, -30.0, -60.0],
+            vec![0.0, -30.0, -60.0],
+            vec![0.0, -30.0, -60.0],
+            vec![-5.0, 0.0, -0.5], // (0,1) vs (1,1) close; (0,0) unlikely
+        ];
+        let f = [0.0; 4];
+        let flat = EmCfg {
+            marginalized_prior: true,
+            max_iters: 1,
+            ..EmCfg::dev_default()
+        };
+        let full = EmCfg {
+            marginalized_prior: true,
+            ..EmCfg::dev_default()
+        };
+        let fit_flat = run_pi_em_marginalized(&data_ll, &genotypes, &g0, &f, 2, &flat);
+        let fit_full = run_pi_em_marginalized(&data_ll, &genotypes, &g0, &f, 2, &full);
+        let moved = fit_flat
+            .expected
+            .iter()
+            .zip(&fit_full.expected)
+            .any(|(a, b)| (a - b).abs() > 1e-6);
+        assert!(
+            moved,
+            "leave-one-out iterations did not move the cohort expected counts"
+        );
+    }
+
+    #[test]
+    fn marginalized_inbreeding_is_threaded_and_raises_posterior_homozygosity() {
+        // A sample whose reads slightly favour the het (0,1) over the hom (0,0):
+        // with F = 0 the het wins, but a strong F engages the IBD branch through
+        // the loop AND the final calls, raising the posterior homozygosity. Proves
+        // `f_per_present` is threaded end-to-end (not silently dropped to 0).
+        let genotypes = enumerate_diploid_genotypes(2);
+        let g0 = [1.0, 1.0];
+        let cand_units = [5u16, 6u16];
+        let data_ll = vec![vec![-1.0, 0.0, -3.0], vec![-1.0, 0.0, -3.0]];
+        let posterior_hom_at = |f: f64| {
+            let cfg = EmCfg {
+                marginalized_prior: true,
+                ..EmCfg::dev_default()
+            };
+            let fpp = [f; 2];
+            let fit = run_pi_em_marginalized(&data_ll, &genotypes, &g0, &fpp, 2, &cfg);
+            let (_, ph) =
+                final_calls_marginalized(&data_ll, &genotypes, &g0, &fit, &fpp, 2, &cand_units);
+            ph
+        };
+        let ph_outbred = posterior_hom_at(0.0);
+        let ph_inbred = posterior_hom_at(0.9);
+        assert!(
+            ph_inbred[0] > ph_outbred[0] + 1e-6,
+            "F>0 did not raise posterior homozygosity (F not threaded): {} vs {}",
+            ph_inbred[0],
+            ph_outbred[0],
+        );
     }
 
     #[test]
