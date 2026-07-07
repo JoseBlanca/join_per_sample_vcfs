@@ -157,19 +157,43 @@ rough seed stutter level** — the very failure mode that makes 1-apart hets del
 (§2.3) does not touch the same-length case. This is why D1 both *can* and *safely
 does* recover same-length hets.
 
-### 2.3 The 1-apart merged het — the case this must still reject
+### 2.3 The 1-apart merged het — the case this must still reject  *(design corrected in D1b — see below)*
 
-A `(A, A−1)` pair sits exactly where stutter lands: the second allele `A−1` is at the
-−1 slip position, so under `M₁ = (A, A)` those reads are *already explained* as `A`'s
-down-stutter (provided the seed level is not badly too low). `M₂`'s gain over `M₁` is
-then small — the reads move from "explained as stutter" to "explained as a faithful
-copy of a barely-different allele" — and it fails the conservative penalty. This is
-the roadmap-D1 test "a 1-apart het contributes nothing." The rejection comes from
-**the model + the penalty**, not from a separation rule (a separation rule keyed on
-length would wrongly reject the *same-length* het we want, §2.2). The residual risk —
-a seed level so low that `M₁` under-predicts its own stutter and `M₂ = (A, A−1)`
-wins — is controlled by (a) the conservative penalty and (b) the cohort-recurrence
-guard (§3), and is pinned on the simulator in F2.
+There are **two** distinct "1-apart" situations, and they are handled by two different
+mechanisms. Getting this wrong is easy, so it is spelled out.
+
+**(i) A homozygote with heavy −1 stutter** (`A`, with a −1 satellite from stutter, no
+real second allele). Under `M₁ = (A, A)` the satellite reads are *already explained* as
+`A`'s down-stutter, so `M₂ = (A, A−1)` earns little. Crucially, `M₂` also **pays the
+diploid mixing penalty on every faithful `A` read**: a het scores each majority read as
+`½·(Qᵣ(read|A) + Qᵣ(read|A−1)) ≈ ½·Qᵣ(read|A)`, i.e. ≈ `ln ½ ≈ −0.69` nats *per faithful
+read*. With most reads faithful, that penalty dominates the small satellite gain, so the
+BIC test **keeps one allele** → a confident homozygote. This is what "a hom+heavy-stutter
+contributes as a hom, not a het" means, and it is the mirror of §2.4 — the mixing penalty
+is the same force that stops an error halo from inventing an allele.
+
+**(ii) A genuine balanced `(A, A−1)` heterozygote** (~half the reads at each). Here the
+`A−1` reads are far more than stutter predicts, so the two-allele gain *overwhelms* the
+mixing penalty and the **BIC test correctly admits two alleles** — it *is* a real het.
+But a 1-apart het is **not a clean chemistry seed**: `A`'s down-stutter lands on `A−1`
+and `A−1`'s up-stutter lands on `A`, so the two alleles' skirts are entangled and cannot
+be cleanly labelled (Mark-2 §4.3 requires a seed het's alleles to be **≥ 2 units apart**).
+So D1 keeps an explicit **length-separation clean-seed guard**: when BIC admits a
+length-separated pair closer than `separation_min` (dev 2), the sample is left
+`Unresolved(Merged)` rather than seeded — we neither seed it as a het (skirts entangled)
+nor collapse it to a homozygote (that would bury a real allele's reads in `A`'s stutter
+and re-inflate the level). This guard is **scoped to length-separated pairs only**: a
+**same-length** het (§2.2) has a length gap of 0 and bypasses it entirely, because its
+two alleles are told apart by *composition*, not length, so there is no skirt overlap.
+
+> **Design correction (D1b, 2026-07-07).** An earlier draft of this section claimed the
+> separation guard was fully *subsumed* by "the model + the penalty" (that a 1-apart het
+> would simply fail the BIC penalty). That is wrong for case (ii): the BIC test *admits*
+> a genuine balanced 1-apart het (it really is two alleles), so a separation guard is
+> still needed — not to decide "is it a het" but to decide "is it a *clean seed*." The
+> guard survives, scoped to exclude same-length pairs. Only the **dosage-balance**
+> heuristic is fully subsumed (case (i) is handled by the mixing penalty). §3's table row
+> is corrected to match.
 
 ### 2.4 A low-frequency error vs a real same-length allele — the mirror bias, and why the model does not fall into it
 
@@ -242,21 +266,22 @@ directly, rather than trusting the argument above.
 
 ## 3. Which guards survive, which the model subsumes
 
-The heuristic's four guards were length-histogram proxies for "is this really a
-het." The model absorbs two of them and keeps two:
+The heuristic's four guards were length-histogram proxies for "is this really a het."
+Under D1 the model **subsumes one** (dosage balance), **re-scopes one** (separation, to
+length-separated pairs only — D1b correction, §2.3), and **keeps two** (min depth, and
+cohort recurrence generalised to sequence):
 
 | heuristic guard | fate under D1 | why |
 |---|---|---|
-| **separation ≥ 2 units** | **dropped** | Length separation cannot express the same-length het (0 units apart) we now want to admit; the model + penalty handle 1-apart directly (§2.3). |
-| **dosage balance** (minor ≥ ratio·major) | **dropped** | A homozygote-plus-heavy-stutter no longer needs a height rule: `Qᵣ` already *predicts* the stutter satellite, so `M₁` explains it and `M₂` earns no gain. The model is the balance test. |
+| **separation ≥ 2 units** | **kept, but re-scoped to length-separated pairs only** | Still needed as a *clean-seed* guard: the BIC test *admits* a genuine balanced 1-apart het, but a 1-apart het's skirts are entangled and cannot be cleanly labelled (Mark-2 §4.3), so it is left `Unresolved(Merged)` rather than seeded. **Same-length** hets (gap 0) bypass the guard — composition, not length, separates them (§2.2/§2.3). |
+| **dosage balance** (minor ≥ ratio·major) | **dropped (subsumed)** | A homozygote-plus-heavy-stutter no longer needs a height rule: `Qᵣ` *predicts* the stutter satellite (so `M₁` explains it) and `M₂` also pays the diploid mixing penalty on every faithful read, so the second allele earns no net gain. The model is the balance test (§2.3 case (i)). |
 | **min depth** | **kept** (a pre-BIC skip) | Too few reads to distinguish one allele from two; skip, do not guess (unchanged `Thin`). |
 | **cohort recurrence** | **kept, generalised to sequence** | An allele the BIC test admits must still recur across samples — a per-carrier substitution artefact is sporadic, a real interruption allele recurs (Phase 1's per-sequence sample tally, `RungSeq.samples`, supplies this for same-length alleles; the existing per-length `peak_recurrence` covers length-separated ones). This is the cohort-level false-allele defence the single-sample likelihood cannot provide, and a second purity lever. |
 
-The `UnresolvedReason` enum keeps `Thin` and `NonRecurrent`; `Merged` becomes "the
-BIC test did not admit a second allele" (the model's verdict, replacing the
-peak-cancellation meaning); `DosageInconsistent` is retired (or repurposed — arch
-doc decides the enum shape). A same-length het that fails recurrence is `NonRecurrent`,
-not silently dropped.
+The `UnresolvedReason` enum keeps `Thin` and `NonRecurrent`; `Merged` now means "BIC
+admitted a length-adjacent pair too close to seed cleanly" (§2.3 case (ii));
+`DosageInconsistent` is **removed** (the model subsumes it). A same-length het that
+fails recurrence is `NonRecurrent`, not silently dropped.
 
 ---
 

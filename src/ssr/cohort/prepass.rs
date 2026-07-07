@@ -2,26 +2,28 @@
 //! from confident genotypes (arch `ssr_call_parameters.md` §2–§4, spec §4.4,
 //! implementation plan §4 D1/D2).
 //!
-//! D1 — from each **confident genotype** (the B1 heuristic gate: homozygotes ∪
-//! well-separated hets), label every read against its nearest parent allele and
-//! accumulate two order-independent integer accumulators: a per-period
-//! [`SlipProfile`] (the cohort `θ_period` parent) and a per-sample
-//! [`SampleStutterStats`] (the level line + `ε` + the clustering input).
+//! D1 — from each **confident genotype** (the model-based BIC gate
+//! [`resolve_confident_genotype`](super::rung_ladder): homozygotes ∪ resolved hets,
+//! including **same-length interruption hets**, scored with coded [`GateParams`] seeds),
+//! label every read against its nearest parent allele and accumulate two order-
+//! independent integer accumulators: a per-period [`SlipProfile`] (the cohort `θ_period`
+//! parent) and a per-sample [`SampleStutterStats`] (the level line + `ε` + the
+//! clustering input).
 //!
 //! D2 — **measure**: turn those sufficient statistics into estimates — `ε` from the
 //! within-tract base mismatch fraction, the per-period stutter **shape** from the
 //! slip profile (direction split + geometric-decay MLE), and the per-sample stutter
 //! **level** line from the faithful-vs-slipped counts by length.
 //!
-//! Scope notes (the refinements this milestone defers): the gate here is B1's
-//! **heuristic** resolution (param-free), so the estimator is a single pass — the
-//! model-based 1-vs-2-peak BIC gate, the soft full-cohort EM responsibility reduce,
-//! the `ℓ_pen`-plateau burn-in iteration with multi-start, and the
-//! `FixedPointAccum` float reduce all matter once the gate co-evolves with the
-//! params / data is messy, and arrive with the parallel machinery (F1). On clean
-//! data the hard-label single pass recovers the injected parameters (checkpoint 2).
-//! Het inner-valley reads are hard-assigned to the nearer allele here (a documented
-//! approximation; the soft split is the refinement).
+//! Scope notes (the refinements this milestone defers): the gate scores with **coded
+//! seed params** (`GateParams`), so the estimator is a single pass — the gate's data-
+//! driven co-evolution (the `ℓ_pen`-plateau burn-in re-running it with the pre-pass's
+//! own fitted params, multi-start) and the soft full-cohort EM responsibility reduce
+//! arrive with the parallel machinery (D2/F1). The gate's own BIC log-likelihoods are
+//! computed within one locus (never crossing a thread boundary), so they need no
+//! `FixedPointAccum`. On clean data the hard-label single pass recovers the injected
+//! parameters (checkpoint 2). Het inner-valley reads are hard-assigned to the nearer
+//! allele here (a documented approximation; the soft split is the refinement).
 
 use std::collections::HashMap;
 
@@ -244,7 +246,7 @@ pub(crate) fn accumulate_locus(
     for (k, evidence) in locus.samples.iter().enumerate() {
         let global = locus.present[k];
         let Resolution::Confident(ResolvedGenotype::Peaks(peaks)) =
-            resolve_confident_genotype(evidence, rungs, ploidy, cfg, seed, scratch)
+            resolve_confident_genotype(evidence, rungs, ploidy, cfg, &locus.motif, seed, scratch)
         else {
             continue;
         };
