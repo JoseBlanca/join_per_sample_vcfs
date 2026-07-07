@@ -59,17 +59,36 @@ migration" principle.)
 
 **Phase 2 is therefore complete at 2.3.**
 
-## Deferred to Phase 3 (not in this plan)
+## Phase 3 — generalize the trait to host SSR + share the DM prior
 
-- Relocate the trait + generic loop to crate-level `src/genotype_em/` (was 2.4).
-- Crate-level hoist + splitting `RecordScratch` into shared-core vs per-model
-  state.
-- The `finalize` hook (SSR posterior-homozygosity vs SNP exact-AF QUAL).
-- `SsrModel` (mode-centred `G₀` seed + stutter read-model as model state) and the
-  SSR benchmark-gated call change.
+Design: architecture doc §7. Goal: SSR adopts the improved marginalized DM prior
+**and** rides the sensible shared parts of the loop (not its outer stutter-refit
+loop or read-model). Steps 3.2–3.4 are SNP-byte-identical refactors; 3.5–3.6 are
+additive behind a config toggle (SSR byte-identical at default); 3.7 is the
+benchmark-gated SSR call change.
+
+- **3.2** — Generalize `GenotypeEmModel`: associated `Scratch` type, model-carried
+  inputs (`SnpModel<'a, M>` holds math/ll/ctx/config), `allow_convergence`; add
+  generic `run_em` + `EmOutcome`. Move the `p_hat`/`p_hat_next` swap into
+  `SnpModel::m_step`. SNP byte-identical (tomato1 diff = 0).
+- **3.3** — Hoist the trait + `run_em` + `EmOutcome` to crate-level
+  `src/genotype_em/`; split `RecordScratch` so the EM-core fields are reachable.
+  SNP byte-identical.
+- **3.4** — Extract the shared **LOO α-update + Wright-`F` mixture** helper from
+  `SnpModel`'s E-step (SNP byte-identical), ready for SSR reuse.
+- **3.5** — Build the SSR marginalized-DM prior (mode-centred `G₀` seed + LOO +
+  Wright-`F` via the 3.4 helper + `genetics::dirichlet_multinomial_log_priors`),
+  unit-tested (high-concentration limit ≈ plug-in; hand-computed values).
+- **3.6** — `SsrModel: GenotypeEmModel`; wire `run_pi_em` onto `run_em` with the
+  new prior **behind an `EmCfg` toggle (default = current plug-in)**. SSR
+  byte-identical at default (ssr_tomato1 unchanged); new prior opt-in.
+- **3.7** — Benchmark ssr_tomato1 vs HipSTR (plug-in vs marginalized,
+  `ssr_vs_hipstr_dashboard.py`). Flip the default only if concordance
+  holds/improves; else keep opt-in and record the result.
 
 ## Validation per step
 
 `./scripts/dev.sh cargo fmt --check`, `cargo clippy --all-targets`,
 `cargo test`, plus the tomato1 byte-identity diff (`tmp/em_bench/compare_vcf.py`)
-against the pre-Phase-2 binary for the extraction steps.
+against the pre-Phase-2 binary for the SNP-refactor steps (2.2–3.4), and the
+ssr_tomato1 byte-identity / concordance checks for 3.6–3.7.
