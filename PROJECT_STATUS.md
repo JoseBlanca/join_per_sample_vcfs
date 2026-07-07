@@ -19,6 +19,8 @@ Skills and agents are instructed to leave it untouched.
 > **Current focus.** _Maintained by skills (last-completed) and the human
 > project manager (next-task)._
 >
+> - **Last completed task (2026-07-07):** **Shared genotype-EM core — Phase 2.2 (branch `em-convergence-criterion`)**
+>   Extracting a shared, hook-based genotype-EM loop from `posterior_engine.rs` so SNP and SSR eventually share one Dirichlet-multinomial core ([spec](doc/devel/specs/unified_genotype_em.md), [architecture](doc/devel/architecture/unified_genotype_em.md), [plan](doc/devel/implementation_plans/unified_genotype_em.md)). Preceded by Phase 0 (converge the SNP cohort EM on the `expected_counts` driver, not the pseudocount-scaled `p̂` readout — commit `a36f7dd`, benchmark-validated: GIAB single byte-identical, tomato1 63-sample cohort 0.017% of sites change a genotype) and the Phase-1 design (4 open questions resolved: share the SNP prior *machinery*, keep the frequency *seed* swappable so SSR stays mode-centred; unify toward the marginalized core, not plug-in). **Phase 2.2** introduced the `GenotypeEmModel` trait + zero-sized `SnpModel` and routed the M-step + convergence delta through it — **SNP byte-identical** (tomato1 cohort VCF diff = 0, 1616 tests). Reviewed (4 category agents) → fixes applied ([report](doc/devel/reports/reviews/genotype_em_phase2_2_2026-07-07.md)). **Next:** Phase 2.3 (E-step behind the trait), 2.4 (relocate the loop into `src/var_calling/genotype_em/`).
 > - **Last completed task (2026-07-06):** **SSR interrupted-repeat recall — applied the code-review fixes (branch `ssr-interruptions`)**
 >   Applied M1 + Mi1–Mi7 (8 of 12 findings) from the review. **M1** (the Major): `nearest_called_by_sequence` now takes the single length-nearest allele directly (no `align_subst`) and restricts the composition tie-break to *same-length* ties — restoring `nearest_parent`'s lowest-index rule for different-length equidistant reads (fixes both the θ_locus slip-sign flip and the per-slip-read pair-HMM DP; test-first, confirmed failing→passing). **Mi1:** `interruption_count` is now phase-robust (per-phase majority) so a first-unit interruption counts once. **Mi2:** `debug_assert!` + test guarding `allele_balance`'s empty-support skip. **Mi3:** hoisted `candidate_level` out of the per-read loop (byte-identical). Mi4–Mi7: PANIC-FREE marker, `sample_eps` panic test, two purity-const doc fixes. **9 tests added** (`ssr::cohort` 206→215); byte-identity e2e holds; benchmark re-run confirms **no recall regression** (1633 PASS / 74574 total identical, 70 rows differ only by GQ ±1 from M1's fix). Mi8–Mi11 + Nits deferred (convention/tuning/restructure). All crate-wide clippy/test/doc reds are pre-existing out-of-scope. Report: [fixes_applied_2026-07-06.md](doc/devel/reports/reviews/fixes_applied_2026-07-06.md).
 > - **Last completed task (2026-07-06):** **SSR interrupted-repeat recall — 11-category multi-agent code review (branch `ssr-interruptions`, `550b691`…`4b86518`)**
@@ -813,6 +815,17 @@ EM over merged records → final multi-sample VCF.
   - **Closed 2026-05-19** (cohort CLI slice): end-to-end
     PspReader → … → PosteriorEngine integration test lives in
     [tests/cohort_cli_integration.rs](tests/cohort_cli_integration.rs).
+
+#### Shared genotype-EM core (SNP + SSR unification)
+- **Status:** in-flight (branch `em-convergence-criterion`)
+- **Spec:** [unified_genotype_em.md](doc/devel/specs/unified_genotype_em.md) (why) · **Architecture:** [unified_genotype_em.md](doc/devel/architecture/unified_genotype_em.md) (how) · **Plan:** [unified_genotype_em.md](doc/devel/implementation_plans/unified_genotype_em.md)
+- **Precursor:** [em_convergence_criterion.md](doc/devel/specs/em_convergence_criterion.md) — Phase 0 fixed the SNP cohort EM to converge on the driver (`expected_counts`), not the pseudocount-scaled `p̂` readout (commit `a36f7dd`); benchmark-validated (GIAB single byte-identical, tomato1 63-sample cohort 0.017% of sites change a genotype).
+- **Code:** [src/var_calling/posterior_engine.rs](src/var_calling/posterior_engine.rs) — Phase 2.2 introduced the `GenotypeEmModel` trait + zero-sized `SnpModel`, routing the M-step + convergence delta through it; SNP byte-identical (tomato1 cohort VCF diff = 0).
+- **Latest review:** [genotype_em_phase2_2_2026-07-07.md](doc/devel/reports/reviews/genotype_em_phase2_2_2026-07-07.md) — Approve-with-changes → fixes applied (M1 regression-test iteration-count pin; convergent naming/reliability doc fix; 2 coverage tests added).
+- **Open:**
+  - Phase 2.3 — move the E-step behind the trait; 2.4 — relocate the generic loop into `src/var_calling/genotype_em/`.
+  - Phase 3 — crate-level hoist + split `RecordScratch`; `finalize` hook; `SsrModel` (mode-centred `G₀` seed + stutter read-model), benchmark-gated on ssr_tomato1-vs-HipSTR.
+  - Pre-existing minor (unchanged by this work): `f̂_C` excluded from the convergence test; `EMNoConv` population under the new criterion.
 
 #### Contamination-estimation side-pass
 - **Status:** fixes-applied
