@@ -59,36 +59,36 @@ migration" principle.)
 
 **Phase 2 is therefore complete at 2.3.**
 
-## Phase 3 — generalize the trait to host SSR + share the DM prior
+## Phase 3 — give SSR the improved prior (lightweight; SNP untouched)
 
-Design: architecture doc §7. Goal: SSR adopts the improved marginalized DM prior
-**and** rides the sensible shared parts of the loop (not its outer stutter-refit
-loop or read-model). Steps 3.2–3.4 are SNP-byte-identical refactors; 3.5–3.6 are
-additive behind a config toggle (SSR byte-identical at default); 3.7 is the
-benchmark-gated SSR call change.
+Design: architecture doc §7 (lightweight, decided 2026-07-07). Goal: SSR adopts
+the improved marginalize**+LOO** DM prior, seeded by its own mode-centred `G₀`,
+sharing `genetics::dirichlet_multinomial_log_priors` + a small convergence-
+discipline helper. **The SNP E-step is not touched** (protects the SIMD gains).
+Two slim loops stay separate.
 
-- **3.2** — Generalize `GenotypeEmModel`: associated `Scratch` type, model-carried
-  inputs (`SnpModel<'a, M>` holds math/ll/ctx/config), `allow_convergence`; add
-  generic `run_em` + `EmOutcome`. Move the `p_hat`/`p_hat_next` swap into
-  `SnpModel::m_step`. SNP byte-identical (tomato1 diff = 0).
-- **3.3** — Hoist the trait + `run_em` + `EmOutcome` to crate-level
-  `src/genotype_em/`; split `RecordScratch` so the EM-core fields are reachable.
-  SNP byte-identical.
-- **3.4** — Extract the shared **LOO α-update + Wright-`F` mixture** helper from
-  `SnpModel`'s E-step (SNP byte-identical), ready for SSR reuse.
-- **3.5** — Build the SSR marginalized-DM prior (mode-centred `G₀` seed + LOO +
-  Wright-`F` via the 3.4 helper + `genetics::dirichlet_multinomial_log_priors`),
-  unit-tested (high-concentration limit ≈ plug-in; hand-computed values).
-- **3.6** — `SsrModel: GenotypeEmModel`; wire `run_pi_em` onto `run_em` with the
-  new prior **behind an `EmCfg` toggle (default = current plug-in)**. SSR
-  byte-identical at default (ssr_tomato1 unchanged); new prior opt-in.
-- **3.7** — Benchmark ssr_tomato1 vs HipSTR (plug-in vs marginalized,
-  `ssr_vs_hipstr_dashboard.py`). Flip the default only if concordance
-  holds/improves; else keep opt-in and record the result.
+- **3.2** — Build the SSR marginalize+LOO+`F` DM prior wrapper (mode-centred `G₀`
+  seed, via the shared DM primitive), as **additive** SSR code with unit tests:
+  high-concentration limit ≈ plug-in HWE; hand-computed small cases; the LOO
+  exclusion. SNP untouched; SSR unchanged until the 3.4 toggle.
+- **3.3** — Extract a small shared convergence-discipline helper (test the driver
+  `expected_counts`, not the reported `π`); the new SSR prior path uses it. SNP
+  `run_em_loop` adopts it only if byte-identical, else left as-is.
+- **3.4** — Wire the new prior into `run_pi_em` behind an `EmCfg` toggle
+  (default = current plug-in). SSR byte-identical at default (ssr_tomato1
+  unchanged); new prior opt-in.
+- **3.5** — Benchmark ssr_tomato1 vs HipSTR (plug-in vs marginalized,
+  `ssr_vs_hipstr_dashboard.py`). Watch specifically for the `G₀`-as-concentration
+  effect (too-diffuse / too-tight prior), not just overall concordance. Flip the
+  default only if it holds/improves; else keep opt-in and record the result.
+
+Decisions folded in (2026-07-07): lightweight loop-sharing (not a generic
+`run_em`); marginalize **+ LOO** for SSR; `G₀`-as-DM-concentration is an explicit
+validation target in 3.5; SNP E-step untouched for perf safety.
 
 ## Validation per step
 
-`./scripts/dev.sh cargo fmt --check`, `cargo clippy --all-targets`,
-`cargo test`, plus the tomato1 byte-identity diff (`tmp/em_bench/compare_vcf.py`)
-against the pre-Phase-2 binary for the SNP-refactor steps (2.2–3.4), and the
-ssr_tomato1 byte-identity / concordance checks for 3.6–3.7.
+`./scripts/dev.sh cargo fmt --check`, `cargo clippy --all-targets`, `cargo test`.
+Phase 2 (2.2–2.3) used the tomato1 byte-identity diff vs the pre-Phase-2 binary.
+Phase 3: 3.2–3.3 additive/SNP-untouched (unit tests); 3.4 ssr_tomato1
+byte-identity at default; 3.5 ssr_tomato1-vs-HipSTR concordance.

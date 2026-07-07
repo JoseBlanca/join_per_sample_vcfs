@@ -170,93 +170,69 @@ Both then add leave-one-out cohort counts (`α'_s = α_seed + (E[cohort] − E[o
 and the Wright-`F` IBD mixture on top. SSR's current `genotype_prior` (plug-in
 HWE(π), no LOO) is replaced by this.
 
-### 7.2 The generalized trait
+### 7.2 Lightweight sharing — decided 2026-07-07
 
-The Phase-2 trait took concrete `RecordScratch` / `EmContext` / `math` / `phase`.
-To host SSR, generalize it: an **associated `Scratch` type**, and the **model
-carries its own inputs** (math backend, read likelihoods, context) so the loop is
-fully generic and touches nothing caller-shaped.
+**Share the meaningful bits, keep two slim loops. The SNP E-step is not
+touched.** The heavyweight alternative (one generic `run_em` both callers ride,
+via an associated-`Scratch` trait + model-carried inputs) was rejected: it forces
+a byte-identity/perf-risky SNP refactor and wraps SSR's deliberately-slim loop in
+trait machinery — the very thing the SSR `Q-G2` note pushed back on, and a threat
+to the SNP SIMD gains (Phase-1 §Q4). "The parts that make sense to share" are the
+prior and the convergence *discipline*, not a five-line `for` loop.
 
-```rust
-pub(crate) trait GenotypeEmModel {
-    /// Per-record/per-locus mutable EM buffers (SNP: the core of today's
-    /// RecordScratch; SSR: its own π / expected-count buffers).
-    type Scratch;
+Concretely:
 
-    /// Fill the posteriors from the current frequency parameters + read
-    /// likelihoods. `iteration` lets the model pick its own prior variant
-    /// (SNP cohort: flat on iter 1, leave-one-out after).
-    fn e_step(&self, iteration: u32, scratch: &mut Self::Scratch) -> Result<(), EmError>;
+- **Prior machinery — already shared.** `dirichlet_multinomial_log_priors`
+  (§7.1). SSR gets a *new, SSR-side* prior wrapper that builds `α'_s = G₀ +
+  (E[cohort] − E[own_s])` (marginalize **+ leave-one-out**, decided) and applies
+  the Wright-`F` IBD mixture, then calls that shared primitive. This wrapper is
+  written in SSR code (a scalar per-locus path — SSR has no SIMD to protect),
+  **mirroring** SNP's `e_step_cohort_loo` rather than extracting from it, so the
+  SNP E-step (scalar *and* SIMD) is left byte-for-byte alone. (If a genuinely
+  perf-neutral, byte-identical extraction of the scalar LOO+`F` fragment turns out
+  clean, it can be shared later — but only gated on the tomato1 timing *and* diff,
+  never at the cost of the SIMD path.)
+- **Convergence discipline — a tiny shared helper.** The Phase-0 rule "test the
+  driver (`expected_counts`), not a rescaled readout" becomes a small shared
+  function both loops call. It matters for the new SSR prior: with the marginalize
+  +LOO DM, SSR's E-step feeds back `expected_counts` (via the LOO `α`), so the new
+  path must converge on `expected_counts`, not on the reported `π` — exactly the
+  Phase-0 lesson, now applied to SSR. (SSR's *current* plug-in already tests its
+  own driver `π` correctly, so this only bites the new prior path.)
+- **Loops stay separate.** SNP keeps `run_em_loop`; SSR keeps `run_pi_em`. The
+  Phase-2 `GenotypeEmModel` trait stays a tidy SNP-internal abstraction (not
+  stretched over SSR).
 
-    /// Advance the frequency parameters from the posteriors (accumulate the
-    /// shared sufficient statistic, write the next params, rotate buffers).
-    fn m_step(&self, scratch: &mut Self::Scratch);
+### 7.3 What is shared vs per-caller (lightweight)
 
-    /// Max change in the model's driver — the Phase-0 discipline. Called once
-    /// per iteration, after `m_step`.
-    fn convergence_delta(&self, iteration: u32, scratch: &mut Self::Scratch) -> f64;
-
-    /// Whether this iteration is allowed to declare convergence. SNP cohort
-    /// overrides to `false` on iteration 1 (the flat-prior seed); default `true`.
-    fn allow_convergence(&self, _iteration: u32) -> bool { true }
-}
-```
-
-The shared loop is then genuinely generic and owns only the iteration scaffold +
-the convergence rule:
-
-```rust
-pub(crate) fn run_em<Model: GenotypeEmModel>(
-    model: &Model, scratch: &mut Model::Scratch, max_iters: u32, tol: f64,
-) -> Result<EmOutcome, EmError> {
-    let mut delta = f64::INFINITY;
-    for iteration in 1..=max_iters {
-        model.e_step(iteration, scratch)?;
-        model.m_step(scratch);
-        delta = model.convergence_delta(iteration, scratch);
-        if delta < tol && model.allow_convergence(iteration) {
-            return Ok(EmOutcome::converged(iteration, delta));
-        }
-    }
-    Ok(EmOutcome::capped(max_iters, delta))
-}
-```
-
-`SnpModel<'a, M>` carries `math`, `log_likelihoods`, `EmContext`, and `config` as
-borrows; its `Scratch` is the SNP EM buffers. The `p_hat`/`p_hat_next` swap moves
-*into* `SnpModel::m_step` (model-internal), so the loop no longer names SNP
-buffers. SNP stays **byte-identical** (same calls, reorganised behind the trait).
-
-### 7.3 What is shared vs per-model ("the parts that make sense")
-
-| Shared (in `src/genotype_em/`) | Per-model (caller-side) |
+| Shared | Per-caller |
 |---|---|
-| `run_em` loop skeleton + convergence rule | E-step / M-step bodies |
-| `EmOutcome` (converged? iters, delta) | `Scratch` type + context |
-| `genetics::dirichlet_multinomial_log_priors` (already shared) | frequency **seed** (SNP θ̂ vs SSR `G₀`) |
-| the LOO α-update + Wright-`F` mixture *pattern* (extract a helper both call) | read-likelihood model (SNP precomputed; SSR stutter) |
-| | finalize (SNP exact-AF QUAL; SSR posterior-hom) |
-| | SSR outer stutter-refit loop (wraps `run_em`) |
+| `genetics::dirichlet_multinomial_log_priors` (already) | the E/M loop (SNP `run_em_loop`; SSR `run_pi_em`) |
+| a small convergence-discipline helper (test the driver) | the frequency **seed** (SNP θ̂; SSR `G₀`) |
+| | the LOO+`F` prior wrapper (SNP has one; SSR gets its own, mirrored) |
+| | read-likelihood model, finalize, SSR outer stutter-refit loop |
 
-### 7.4 Phase-3 steps
+The SNP E-step (SIMD + fast paths) is **untouched** — the safest guarantee for the
+Phase-1 §Q4 perf gains.
 
-1. **3.1** — this design + plan update (no code).
-2. **3.2** — generalize the trait (associated `Scratch`, model-carried inputs,
-   `allow_convergence`) + generic `run_em`; `SnpModel` rides it **byte-identical**.
-3. **3.3** — hoist the shared trait + `run_em` + `EmOutcome` to crate-level
-   `src/genotype_em/`; split the SNP `RecordScratch` so its EM-core fields are
-   reachable. SNP byte-identical.
-4. **3.4** — extract the shared **LOO α-update + Wright-`F` mixture** helper from
-   `SnpModel`'s E-step (SNP byte-identical), so SSR can reuse it.
-5. **3.5** — build the SSR marginalized-DM prior (G₀ seed + LOO + Wright-`F` via
-   the shared helper + `dirichlet_multinomial_log_priors`), unit-tested against
-   the plug-in in the high-concentration limit and against hand-computed values.
-6. **3.6** — `SsrModel` implements `GenotypeEmModel`; wire `run_pi_em` onto
-   `run_em` with the new prior **behind a config toggle (default = current
-   plug-in)**, so SSR output stays byte-identical by default.
-7. **3.7** — benchmark ssr_tomato1 vs HipSTR (plug-in vs marginalized); flip the
-   default only if concordance holds/improves. Else keep opt-in.
+### 7.4 Phase-3 steps (lightweight)
 
-Steps 3.2–3.4 are SNP-byte-identical refactors (same guardrail as Phase 2).
-3.5–3.6 are additive + toggle-gated (SSR byte-identical at default). Only 3.7
-decides the SSR call change, on the benchmark.
+1. **3.1** — this design + plan (no code). *Done.*
+2. **3.2** — build the SSR marginalize+LOO+`F` DM prior wrapper (mode-centred `G₀`
+   seed, via `dirichlet_multinomial_log_priors`), as additive SSR code with unit
+   tests: the high-concentration limit ≈ plug-in HWE, hand-computed small cases,
+   and the LOO exclusion. **SNP untouched.**
+3. **3.3** — extract the small shared convergence-discipline helper; SSR's *new*
+   prior path converges on `expected_counts`. SNP `run_em_loop` adopts the same
+   helper only if byte-identical (else left as-is).
+4. **3.4** — wire the new prior into `run_pi_em` behind an `EmCfg` toggle
+   (default = current plug-in). SSR byte-identical at default (ssr_tomato1
+   unchanged); new prior opt-in.
+5. **3.5** — benchmark ssr_tomato1 vs HipSTR (plug-in vs marginalized). Watch
+   specifically for the `G₀`-as-concentration effect (a too-diffuse or too-tight
+   prior), not just overall concordance. Flip the default only if it
+   holds/improves; else keep opt-in and record the result.
+
+3.2 is additive (SNP untouched, SSR unchanged until the toggle). 3.4 is
+toggle-gated (SSR byte-identical at default). Only 3.5 decides the SSR call
+change, on the benchmark.
