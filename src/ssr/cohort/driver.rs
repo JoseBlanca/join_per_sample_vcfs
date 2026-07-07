@@ -205,7 +205,17 @@ struct FrozenParams {
 pub(crate) fn run(config: &SsrCallConfig) -> Result<(), SsrCallError> {
     let rung_cfg = RungCfg::dev_default();
     let cand_cfg = CandidateCfg::dev_default();
-    let em_cfg = EmCfg::dev_default();
+    // Experimental knob (Phase 3.5 benchmark): `PVC_SSR_MARGINALIZED_PRIOR=1`
+    // swaps the plug-in HWE genotype prior for the marginalized+leave-one-out
+    // Dirichlet-multinomial prior (seeded by the same mode-centred `G₀`). Off by
+    // default so `ssr-call` is byte-identical; enabled only to benchmark the two
+    // priors against HipSTR before deciding whether to make it the default. Mirrors
+    // the SNP engine's `PVC_*` env knobs. Remove once the default is settled.
+    let em_cfg = EmCfg {
+        marginalized_prior: std::env::var("PVC_SSR_MARGINALIZED_PRIOR")
+            .is_ok_and(|v| v == "1"),
+        ..EmCfg::dev_default()
+    };
     let outer_cfg = OuterCfg::dev_default();
     let cluster_cfg = ClusterCfg::dev_default();
     let g0_cfg = G0FitCfg::dev_default();
