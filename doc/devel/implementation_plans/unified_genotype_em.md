@@ -43,19 +43,27 @@ Pin the trait surface, module layout, SNP↔SSR mapping. No code.
 - `run_em_loop` and the post-loop final E-step in `run_em_columnar` call
   `model.e_step` instead of `dispatch_e_step`.
 
-### 2.4 — Relocate the generic loop into `src/var_calling/genotype_em/`
-- `git mv`-style extraction: the `GenotypeEmModel` trait + generic `run_em_loop`
-  move into a new `src/var_calling/genotype_em/` module. `SnpModel` and all SNP
-  specifics stay in `posterior_engine.rs` and implement the imported trait.
-- Pure move + `use` rewiring; no logic change.
+### 2.4 / 2.5 — Module relocation — **DEFERRED to Phase 3** (2026-07-07)
+Originally: move the trait + `run_em_loop` into `src/var_calling/genotype_em/`.
+**Folded into Phase 3** instead. Rationale: the architecture doc's real module
+home is crate-level `src/genotype_em/`, reached in Phase 3 alongside the
+`RecordScratch` split. Doing an intermediate move into `var_calling/genotype_em/`
+now would (a) move the code twice and (b) force `pub(crate)` bumps on several
+`EmContext` / `RecordScratch` fields (`n_samples`, `p_hat`, `p_hat_next`),
+`EmStepPhase`, `EmDiagnostics` that the Phase-3 split reworks anyway. The
+architectural value of Phase 2 — the `GenotypeEmModel` trait boundary + a generic
+`run_em_loop`, SNP byte-identical — is already delivered by 2.2–2.3. Phase 3 does
+the relocation once, at the crate-level destination, with the type split that
+makes the visibility boundary clean. (Matches the arch doc's "avoid premature
+migration" principle.)
 
-### 2.5 — Boundary tidy (only if a seam remains)
-- Clean up any awkward visibility/re-export left by 2.4. Skip if none.
+**Phase 2 is therefore complete at 2.3.**
 
 ## Deferred to Phase 3 (not in this plan)
 
-- Crate-level hoist to `src/genotype_em/` + splitting `RecordScratch` into
-  shared-core vs per-model state.
+- Relocate the trait + generic loop to crate-level `src/genotype_em/` (was 2.4).
+- Crate-level hoist + splitting `RecordScratch` into shared-core vs per-model
+  state.
 - The `finalize` hook (SSR posterior-homozygosity vs SNP exact-AF QUAL).
 - `SsrModel` (mode-centred `G₀` seed + stutter read-model as model state) and the
   SSR benchmark-gated call change.

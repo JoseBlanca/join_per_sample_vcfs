@@ -124,14 +124,16 @@ Each step is byte-identical for SNP and ends with the full suite green plus the
 tomato1 cohort VCF diff at zero against the pre-Phase-2 binary. See
 [../implementation_plans/unified_genotype_em.md](../implementation_plans/unified_genotype_em.md).
 
-1. **2.1** — this doc + the plan (design; no code).
+1. **2.1** — this doc + the plan (design; no code). *Done.*
 2. **2.2** — introduce `GenotypeEmModel` + `SnpModel`; route `m_step` +
-   `convergence_delta` through the trait. E-step still called directly.
+   `convergence_delta` through the trait. *Done, byte-identical.*
 3. **2.3** — move the E-step behind the trait (`SnpModel::e_step` delegates to the
-   existing `dispatch_e_step`).
-4. **2.4** — relocate the now-generic `run_em_loop` + trait into
-   `src/var_calling/genotype_em/`.
-5. **2.5** — boundary tidy only if a seam remains.
+   existing `dispatch_e_step`). *Done, byte-identical. Phase 2 ends here.*
+4. **2.4 / 2.5 — deferred to Phase 3.** The module relocation lands at its real
+   crate-level home (`src/genotype_em/`, §3) together with the `RecordScratch`
+   split, rather than an intermediate move into `var_calling/genotype_em/` that
+   would be redone. The trait boundary + generic loop (2.2–2.3) already deliver
+   Phase 2's value; Phase 3 does the physical move once.
 
 ## 6. Open (for Phase 3)
 
