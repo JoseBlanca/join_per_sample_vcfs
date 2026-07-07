@@ -41,7 +41,11 @@ use thiserror::Error;
 ///   change: like the v1→v2 case above, a stale v2 document is rejected at the
 ///   TOML layer (missing required `n-positions`) rather than by the version
 ///   guard. Same pre-alpha regenerate-by-re-running-`pileup` policy.
-pub const SAMPLE_SUMMARY_VERSION: u16 = 3;
+/// - v4: adds `heterozygosity.strand-bias-z` (the strand-bias veto threshold,
+///   recorded so the het counts are reproducible). A required field, so a stale
+///   v3 document is rejected at the TOML layer (missing `strand-bias-z`), same
+///   as the v2/v3 transitions above.
+pub const SAMPLE_SUMMARY_VERSION: u16 = 4;
 
 /// Default tile / GC covariate window in bp (architecture Premise 3). The
 /// `pileup --gc-window-bp` flag overrides it.
@@ -79,6 +83,16 @@ pub const DEFAULT_HET_ERROR_RATE: f64 = 0.02;
 
 /// Default het confidence margin `M` (nats) = `ln 10`, i.e. 10:1 odds.
 pub const DEFAULT_HET_LR_MARGIN: f64 = std::f64::consts::LN_10;
+
+/// Default strand-bias veto threshold for the het call (research report §3.2):
+/// a confident het whose ALT allele's forward-strand fraction differs from the
+/// REF allele's by more than this many standard errors (a two-proportion z) is
+/// demoted to ambiguous as a likely strand artifact. `z ≈ 3` ⇒ a two-sided
+/// p ≈ 0.003. Strand confinement — unlike low MAPQ — has no biological
+/// confound (introgressed haplotypes are not strand-biased), so this veto
+/// targets pure artifacts. `f64::INFINITY` disables it. The veto itself is the
+/// `is_strand_biased` two-proportion z in the [`het`] module.
+pub const DEFAULT_HET_STRAND_BIAS_Z: f64 = 3.0;
 
 /// The per-sample summary document stored (TOML, then zstd-framed) in the
 /// `.psp` metadata section. Serialises with kebab-case keys; `version`
@@ -175,6 +189,12 @@ pub struct HetCounts {
     /// Confidence margin `M` (nats) splitting het / hom-alt / ambiguous.
     /// `>= 0`.
     pub lr_margin: f64,
+    /// Strand-bias veto threshold used for the het call (recorded for
+    /// reproducibility of the rough genotype call, like the three knobs above).
+    /// `> 0`, or `+∞` when the veto is disabled. A **required** field (v4); a
+    /// pre-veto v3 document lacking it is rejected at the TOML layer, matching
+    /// the crate's regenerate-by-re-running-`pileup` policy.
+    pub strand_bias_z: f64,
 }
 
 /// Failure modes for building / parsing a [`SampleSummary`].
@@ -360,6 +380,16 @@ impl HetCounts {
                 format!("must be finite and >= 0, got {}", self.lr_margin),
             ));
         }
+        // `> 0`, or `+∞` (veto disabled). `NaN`/`<= 0` is invalid.
+        if self.strand_bias_z.is_nan() || self.strand_bias_z <= 0.0 {
+            return Err(bad(
+                "heterozygosity.strand-bias-z",
+                format!(
+                    "must be > 0 (or +inf to disable), got {}",
+                    self.strand_bias_z
+                ),
+            ));
+        }
         Ok(())
     }
 }
@@ -390,6 +420,7 @@ mod tests {
                 min_depth: 4,
                 error_rate: 0.02,
                 lr_margin: std::f64::consts::LN_10,
+                strand_bias_z: 3.0,
             },
         }
     }
@@ -419,6 +450,7 @@ mod tests {
             "n-variant-sites",
             "error-rate",
             "lr-margin",
+            "strand-bias-z",
         ] {
             assert!(body.contains(key), "wire key {key:?} absent from:\n{body}");
         }
@@ -464,6 +496,35 @@ mod tests {
                 "error_rate {bad_eps} -> {err:?}"
             );
         }
+    }
+
+    #[test]
+    fn rejects_strand_bias_z_out_of_range() {
+        for bad in [0.0, -1.0, f64::NAN] {
+            let mut s = sample();
+            s.heterozygosity.strand_bias_z = bad;
+            let err = s.to_toml_bytes().expect_err("bad strand-bias-z must fail");
+            assert!(
+                matches!(err, SampleSummaryError::InvalidField { field, .. } if field == "heterozygosity.strand-bias-z"),
+                "strand_bias_z {bad} -> {err:?}"
+            );
+        }
+    }
+
+    /// `strand-bias-z` is a required v4 field: a pre-veto v3 document lacking
+    /// it is rejected at the TOML layer (missing-field), matching the crate's
+    /// regenerate-by-re-running-`pileup` policy for the v1→v2 / v2→v3 breaks.
+    #[test]
+    fn document_missing_strand_bias_z_is_rejected() {
+        let body = String::from_utf8(sample().to_toml_bytes().unwrap()).unwrap();
+        let older: String = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("strand-bias-z"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!older.contains("strand-bias-z"));
+        SampleSummary::from_toml_bytes(older.as_bytes())
+            .expect_err("a document lacking the required strand-bias-z must be rejected");
     }
 
     #[test]
@@ -676,6 +737,7 @@ mod tests {
                     min_depth: 0,
                     error_rate,
                     lr_margin,
+                    strand_bias_z: 3.0,
                 },
             };
             let bytes = s.to_toml_bytes().expect("serialise");

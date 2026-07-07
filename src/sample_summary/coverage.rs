@@ -706,6 +706,7 @@ mod tests {
                 min_depth: 1,
                 error_rate: 0.02,
                 lr_margin: std::f64::consts::LN_10,
+                strand_bias_z: 3.0,
             },
         };
         summary

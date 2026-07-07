@@ -41,6 +41,7 @@ use crate::sample_summary::het::HetClassifyParams;
 use crate::sample_summary::{
     DEFAULT_DEPTH_BIN_WIDTH, DEFAULT_DEPTH_BINS, DEFAULT_GC_BINS, DEFAULT_GC_WINDOW_BP,
     DEFAULT_HET_ERROR_RATE, DEFAULT_HET_LR_MARGIN, DEFAULT_HET_MIN_DEPTH,
+    DEFAULT_HET_STRAND_BIAS_Z,
 };
 
 pub mod error_bridge;
@@ -455,6 +456,7 @@ pub fn run_pileup(args: &PileupArgs) -> Result<(), PileupCliError> {
             min_depth: DEFAULT_HET_MIN_DEPTH,
             error_rate: DEFAULT_HET_ERROR_RATE,
             lr_margin: DEFAULT_HET_LR_MARGIN,
+            strand_bias_z: DEFAULT_HET_STRAND_BIAS_Z,
         },
     );
 
