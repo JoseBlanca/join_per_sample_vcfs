@@ -81,6 +81,29 @@ LOO-moves-a-sample and F-threading) pass. This is a genuine model property.
 - Secondary open item if it is ever revived at scale: the `G₀`→DM-concentration
   mapping (§Q3) may still want re-tuning.
 
+## GIAB interim attempt (human trio) — unusable, too thin
+
+Ran the SSR pipeline on the GIAB HG002/3/4 trio (whole-genome GRCh38 catalog =
+515 352 loci; the M5-reheadered trio BAMs) to get an *outbred* read where the `F`
+confound should vanish. It does **not** work as a benchmark:
+
+- Only **20 loci are genotyped** (PASS). The trio BAMs are sliced to ~100
+  SNP-benchmark regions, so 515 260 / 515 284 emitted records are `lowDepth`
+  (no reads).
+- **F_IS is mis-estimated at 0.99** — a pre-pass artifact of the 515k empty
+  genome-wide loci plus low-depth het-dropout on the handful of covered ones. So
+  this is *not* the clean `F ≈ 0` test; it carries the same high-`F` confound as
+  tomato.
+- On the 20 genotyped loci, plug-in and marginalized make **identical genotype
+  calls** (16/20 identical; 4 differ only in GQ). A weak positive that the
+  marginalized prior does not change human genotype calls here — but 20 loci with
+  a broken `F` estimate cannot decide anything.
+
+**The cohort SSR caller needs a real cohort of many covered polymorphic loci
+(for the `F`/stutter/`G₀` pre-pass and for concordance). The GIAB 100-region trio
+cannot provide that.** The decision genuinely awaits the dedicated outbred human
+SSR benchmark (in preparation).
+
 ## Reproduce
 
 ```
