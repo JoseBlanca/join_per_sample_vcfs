@@ -1936,6 +1936,12 @@ pub(crate) struct RecordScratch {
     log_post_unnorm_lane: Vec<wide::f64x4>,
     /// Posterior-weighted allele counts E[n_a]. Length `n_alleles`.
     expected_counts: Vec<f64>,
+    /// Previous iteration's `expected_counts`, kept so the cohort
+    /// convergence test can measure the change in the *driver* of the
+    /// leave-one-out E-step (the posterior-weighted allele counts)
+    /// rather than in the pseudocount-scaled readout `p̂`. See
+    /// [`run_em_loop`]. Length `n_alleles`.
+    expected_counts_prev: Vec<f64>,
 
     // ===== Record-static intermediates (no copy-out). =====
     /// Per-sample fixation indices `f_s`. Length `n_samples`.
@@ -2043,6 +2049,7 @@ impl RecordScratch {
             log_post_unnorm: Vec::new(),
             log_post_unnorm_lane: Vec::new(),
             expected_counts: Vec::new(),
+            expected_counts_prev: Vec::new(),
             fixation_indices: Vec::new(),
             log_f_per_sample: Vec::new(),
             log_one_minus_f_per_sample: Vec::new(),
@@ -2095,6 +2102,7 @@ impl RecordScratch {
         self.log_post_unnorm_lane
             .resize(n_genotypes, wide::f64x4::ZERO);
         self.expected_counts.resize(n_alleles, 0.0);
+        self.expected_counts_prev.resize(n_alleles, 0.0);
 
         self.fixation_indices.resize(n_samples, 0.0);
         self.log_f_per_sample.resize(n_samples, 0.0);
@@ -2634,23 +2642,60 @@ fn run_em_loop<M: MathBackend>(
         };
         dispatch_e_step(ctx, math, log_likelihoods, scratch, phase)?;
 
-        // M-step writes `p_hat_next` and overwrites `f_hat_compound`
-        // in place. `p_hat` is double-buffered against `p_hat_next`
-        // so the convergence test can read both before we advance.
+        // M-step writes `p_hat_next` and `expected_counts`, and
+        // overwrites `f_hat_compound` in place. `p_hat` is
+        // double-buffered against `p_hat_next` so the (single-sample)
+        // convergence test can read both before we advance.
         m_step_p_hat(ctx, scratch);
         m_step_f_hat_compound(ctx, scratch);
 
-        last_delta = max_abs_diff(&scratch.p_hat, &scratch.p_hat_next);
+        // Convergence delta. The *quantity we test* differs by path,
+        // and the difference is the whole point of this loop's design:
+        //
+        // - Cohort (`n_samples > 1`): test the change in the
+        //   pseudocount-free empirical allele frequency
+        //   `q = expected_counts / (ploidy·n_samples)`. `expected_counts`
+        //   (the posterior-weighted allele copies) is the quantity the
+        //   leave-one-out E-step actually feeds back — its `α'_s` prior
+        //   is built from it — so it is the true driver of the
+        //   iteration. The reported `p̂ = (expected_counts + pseudocount)
+        //   / denom` is a pseudocount-*scaled* readout that does NOT feed
+        //   back; testing it let a larger pseudocount damp the delta and
+        //   trip this threshold earlier, halting the EM at a different
+        //   point on an otherwise-identical trajectory (the
+        //   `larger_ref_pseudocount_cannot_increase_p_alt` failure).
+        //   Dividing by the chromosome total keeps `q` on the same
+        //   `[0, 1]` frequency scale as `p̂`, so `convergence_threshold`
+        //   and its validation range carry over unchanged in meaning.
+        // - Single sample (`n_samples == 1`): the E-step is
+        //   `p̂`-independent, so the posteriors (hence `expected_counts`
+        //   and `p̂`) reach their fixed point in one iteration and there
+        //   is no trajectory to stop early on. Keep the historical `p̂`
+        //   test verbatim so the per-sample path stays byte-identical.
+        last_delta = if ctx.n_samples > 1 {
+            let inv_chromosomes = 1.0 / (ctx.ploidy as f64 * ctx.n_samples as f64);
+            let delta = max_abs_diff(&scratch.expected_counts_prev, &scratch.expected_counts)
+                * inv_chromosomes;
+            scratch
+                .expected_counts_prev
+                .copy_from_slice(&scratch.expected_counts);
+            delta
+        } else {
+            max_abs_diff(&scratch.p_hat, &scratch.p_hat_next)
+        };
         std::mem::swap(&mut scratch.p_hat, &mut scratch.p_hat_next);
 
         // For a cohort (`n_samples > 1`) iteration 1 runs the *flat* prior, so
-        // its `p̂` reflects the likelihood-only seed, not the leave-one-out
-        // prior that produces the emitted genotypes. Never converge on it:
-        // require at least one steady-state (LOO) iteration so `converged`
-        // means the LOO prior stabilised, and the post-loop final E-step is
-        // consistent with the last M-step's `expected_counts`. A single-sample
-        // record has no flat step and keeps its §9 convergence behaviour
-        // (byte-identical).
+        // its `expected_counts` reflects the likelihood-only seed, not the
+        // leave-one-out prior that produces the emitted genotypes. Never
+        // converge on it: require at least one steady-state (LOO) iteration so
+        // `converged` means the LOO driver stabilised, and the post-loop final
+        // E-step is consistent with the last M-step's `expected_counts`. This
+        // guard also makes iteration 1's delta irrelevant, so it does not
+        // matter that `expected_counts_prev` may still hold a prior record's
+        // counts (reused scratch); it is overwritten before iteration 2 reads
+        // it. A single-sample record has no flat step and keeps its §9
+        // convergence behaviour (byte-identical).
         let converged_this_iteration =
             last_delta < config.convergence_threshold && !(iterations == 1 && ctx.n_samples > 1);
         if converged_this_iteration {
@@ -6307,6 +6352,55 @@ mod tests {
             let pr_b = out_b.into_iter().next().unwrap().expect("posterior");
             prop_assert!(pr_b.allele_frequencies[1] <= pr_a.allele_frequencies[1] + 1e-9);
         }
+    }
+
+    /// The concrete cohort that shrank the `larger_ref_pseudocount_cannot_
+    /// increase_p_alt` proptest failure before the convergence criterion was
+    /// changed to test the driver (`expected_counts`) instead of the readout
+    /// `p̂`. Pinned as a deterministic regression: with the old p̂-delta test a
+    /// 10× REF pseudocount halted the EM at iteration 8 (vs 30) and emitted a
+    /// *higher* alt frequency (0.0191 vs 0.0020). The driver-delta test makes
+    /// the stopping point pseudocount-independent, so both configs now stop at
+    /// the same iteration and the alt frequency moves in the intended (down)
+    /// direction.
+    #[test]
+    fn ref_pseudocount_early_stop_regression_cohort() {
+        let likelihoods = vec![
+            vec![0.0, -49.96486689177389, -49.31268486965941],
+            vec![-15.157004725186411, -20.847257019297, -13.576536765741455],
+            vec![
+                -19.646777920695193,
+                -47.254575096881425,
+                -16.796760860963154,
+            ],
+        ];
+        let call = |ref_mult: f64| {
+            let config = PosteriorEngineConfig {
+                ref_pseudocount: DEFAULT_REF_PSEUDOCOUNT * ref_mult,
+                ..Default::default()
+            };
+            let record = merged_record_simple(1, 100, vec![b"A", b"C"], 2, likelihoods.clone());
+            engine_for_with_config(record, config)
+                .into_iter()
+                .next()
+                .unwrap()
+                .expect("posterior")
+        };
+        let base = call(1.0);
+        let heavy = call(10.0);
+
+        // Both converge (well within the iteration cap).
+        assert!(base.diagnostics.converged && heavy.diagnostics.converged);
+        // The invariant the proptest encodes: a stronger REF prior cannot
+        // raise the alt frequency.
+        assert!(heavy.allele_frequencies[1] <= base.allele_frequencies[1] + 1e-9);
+        // The deeper property the fix delivers: the stopping point no longer
+        // depends on the pseudocount magnitude, so the two runs halt on the
+        // same iteration of the shared `expected_counts` trajectory.
+        assert_eq!(
+            base.diagnostics.iterations, heavy.diagnostics.iterations,
+            "stopping iteration must be pseudocount-independent",
+        );
     }
 
     // ---------- PosteriorEngineConfig builder validation tests -----
