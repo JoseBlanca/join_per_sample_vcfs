@@ -256,10 +256,15 @@ call-site is the clean D2 seam.
   2 same-length peaks with distinct `allele` bytes (**new capability**); a 1-apart
   balanced pair → 1 peak (BIC rejects, "contributes nothing"); a hom+heavy-stutter →
   1 peak (model subsumes dosage); a non-recurrent same-length minority → `NonRecurrent`;
-  thin → `Thin`. Determinism: gate verdict identical under `--threads 1` vs `K`.
+  thin → `Thin`. **The mirror-bias test (spec §2.4):** a homozygote at an elevated `ε`
+  whose error halo is a *flat spread* of low-count single-base variants → **1 peak, no
+  invented allele** (the gate must not admit a second allele from dispersed error).
+  Determinism: gate verdict identical under `--threads 1` vs `K`.
 - `prepass.rs`: on an injected same-length-het simulator with known `ε`, the recovered
-  `ε` matches truth (where the pre-swap heuristic over-estimates it); `--threads 1` vs
-  `K` byte-identical params; the existing recovery/checkpoint-2 tests still pass
+  `ε` matches truth (where the pre-swap heuristic over-estimates it); **the mirror
+  case — true homozygotes with injected `ε` and no extra allele — recovers `ε`
+  *undeflated* and invents zero alleles** (spec §2.4 / §6 F2 calibration); `--threads 1`
+  vs `K` byte-identical params; the existing recovery/checkpoint-2 tests still pass
   (length-separated behaviour effect-neutral).
 
 ---

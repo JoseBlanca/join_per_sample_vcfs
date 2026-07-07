@@ -171,6 +171,73 @@ a seed level so low that `M₁` under-predicts its own stutter and `M₂ = (A, A
 wins — is controlled by (a) the conservative penalty and (b) the cohort-recurrence
 guard (§3), and is pinned on the simulator in F2.
 
+### 2.4 A low-frequency error vs a real same-length allele — the mirror bias, and why the model does not fall into it
+
+This is the sharpest risk in the whole design, and its exact mirror image of the bug
+we are fixing. The **heuristic** errs one way: it labels a same-length minority
+allele's reads as *base error* and so **inflates `ε`**. A **naïve** likelihood test
+would err the other way: label a cluster of `ε`-error reads as *a second allele*, and
+so **inflate the allele count and deflate `ε`** (every error read reclassified as some
+allele's faithful read — and, worse, self-reinforcing, since the deflated `ε` makes the
+next such call easier). D1 must land *between* these, and it does so on three
+mechanisms, in increasing order of decisiveness.
+
+**(a) The one-allele model already expects the error halo — so error reads do not
+force an allele.** `M₁`'s `Qᵣ(B | A)` for a same-length read `B` differing from `A` at
+`m` positions is ≈ `(1−level)·(1−ε)^(L−m)·(ε/3)^m`: M₁ *predicts* a thin halo of
+near-`A` reads at rate `ε`. A handful of them is exactly what M₁ expects; they earn the
+second allele nothing. The question is never "are there any non-`A` reads" (there
+always are) but "are there *far more, and far more concentrated,* than `ε` predicts."
+
+**(b) `M₂` can add only *one* allele, so it pays off only for a *spike*, not a
+*spread*.** This is the structural crux. Random sequencing error scatters the
+non-faithful mass across ~`3L` different single-base neighbours of `A`, each at
+frequency ~`ε/3` — a **flat spread**. A real same-length allele concentrates ~half the
+reads on **one** composition `B` — a **spike**. Because the two-allele model admits a
+single extra allele, it can capture the spike (large `ln L̂₂ − ln L̂₁`) but only
+~`1/(3L)` of the spread (a gain far below the penalty). So the gate discriminates on
+the *shape* of the excess mismatch mass — concentrated (allele) vs dispersed (error) —
+**not on its magnitude alone**, and this shape argument is *largely robust to the exact
+seed `ε`*: getting `ε` somewhat wrong rescales both hypotheses' halos together and does
+not turn a flat spread into a spike. The candidate search reinforces this: candidates
+are the sample's **top-M sequences by read support** (§2, arch §2.2), so a scattered
+error variant — low count by construction — never even enters the pair search, while a
+~50 %-dosage `B` ranks high.
+
+**(c) Cohort recurrence is the decisive backstop against `ε` deflation.** Even a
+per-sample spike can be a *systematic* artefact (a homopolymer miscall, a mapping
+edge). The sequence-keyed recurrence guard (§3) is what makes the design safe: a real
+interruption allele recurs at the **same composition** across ≥ `k` carriers (§5.2
+systematic signal), whereas a sporadic error lands at a **different base each time** and
+never recurs. An error-driven "allele" is therefore rejected `NonRecurrent`, so it never
+enters the confident set and never touches `ε`. A **private** (single-sample)
+same-length variant is *deliberately excluded* from the chemistry seed for exactly this
+reason — indistinguishable from an artefact without orthogonal data, so the pre-pass,
+which wants purity not recall, must not seed on it (the genotyping EM downstream is a
+separate stage and may still call it). This is the same recall/purity trade the
+`min_same_length_reads` / distinct-sample admission already makes at the Phase-1
+candidate level.
+
+**What remains genuinely ambiguous — and is treated honestly.** A same-length variant
+that (i) concentrates like an allele *and* (ii) recurs like an allele *is* seeded as
+one. If it is in truth a *systematic chemistry artefact* that reproduces across
+samples, no single-cohort caller can distinguish it from a biological allele without
+orthogonal evidence (HipSTR has the same limit). We accept this: it is a far smaller
+and rarer error than the systematic `ε` inflation the heuristic commits on *every*
+interruption-rich locus, and the penalty is tuned (§2.1) so that only strongly-supported,
+strongly-recurrent spikes clear it. The residual is surfaced, not hidden — the paralog /
+universal-het FP audit (interruption spec §10, already run in P1.5) is the cross-cutting
+check that a same-length het is not being called in *every* carrier (the collapsed-CNV
+signature).
+
+**The calibration that pins this (F2).** The penalty's operating point is set on a
+simulator built for *this* failure: a cohort of true homozygotes with an injected `ε`
+(sweeping `ε` up to interruption-rich levels) and **no** extra same-length alleles. The
+gate must invent **zero** alleles and recover the injected `ε` **undeflated**; the
+largest `het_admission_cost` that still recovers the genuine same-length hets of §2.2
+without inventing alleles here is the dev default. This measures the mirror bias
+directly, rather than trusting the argument above.
+
 ---
 
 ## 3. Which guards survive, which the model subsumes

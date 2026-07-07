@@ -51,8 +51,9 @@ admission, and the sequence-keyed recurrence guard (`all_recurrent`, arch §2.4)
 depth skip. *Tests (arch §6):* homozygote → 1 peak; length-separated het → 2 peaks;
 **same-length het → 2 same-length peaks, distinct bytes** (the new capability); 1-apart
 balanced → 1 peak ("contributes nothing"); hom+heavy-stutter → 1 peak (dosage subsumed);
-non-recurrent same-length minority → `NonRecurrent`; thin → `Thin`. *Review → apply →
-commit.* **Pause.**
+non-recurrent same-length minority → `NonRecurrent`; thin → `Thin`; **the mirror-bias
+case — a high-`ε` homozygote whose error halo is a flat spread of low-count variants →
+1 peak, no invented allele** (spec §2.4). *Review → apply → commit.* **Pause.**
 
 ### D1c. Sequence-aware attribution + wiring + determinism.  ☐ arch ☐ plan
 Swap `accumulate_locus`'s read attribution from `nearest_parent` to
@@ -60,10 +61,12 @@ Swap `accumulate_locus`'s read attribution from `nearest_parent` to
 `GateParams` + a per-thread `LikelihoodScratch` through `run_prepass_stats`/`run_prepass`
 (arch §4); the integer `reduce` is unchanged. Driver/D2-seam call site passes
 `GateParams::dev_default()`. *Tests:* on an injected same-length-het simulator with known
-`ε`, recovered `ε` matches truth where the pre-swap heuristic over-estimates it; the
-existing checkpoint-2 recovery + `separated_hets_contribute_two_length_bins` tests still
-pass (length-separated effect-neutral); **`--threads 1` vs `K` byte-identical** params
-(extend the existing `prepass_is_byte_identical_across_thread_counts`). *Review → apply →
+`ε`, recovered `ε` matches truth where the pre-swap heuristic over-estimates it; **the
+mirror case (true homozygotes, injected `ε`, no extra allele) recovers `ε` undeflated
+and invents zero alleles** (spec §2.4); the existing checkpoint-2 recovery +
+`separated_hets_contribute_two_length_bins` tests still pass (length-separated
+effect-neutral); **`--threads 1` vs `K` byte-identical** params (extend the existing
+`prepass_is_byte_identical_across_thread_counts`). *Review → apply →
 commit.* **Pause.**
 
 ### D1d. Validate on `ssr_tomato1`.  ☐ plan
