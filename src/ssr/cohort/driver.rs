@@ -211,9 +211,16 @@ pub(crate) fn run(config: &SsrCallConfig) -> Result<(), SsrCallError> {
     // default so `ssr-call` is byte-identical; enabled only to benchmark the two
     // priors against HipSTR before deciding whether to make it the default. Mirrors
     // the SNP engine's `PVC_*` env knobs. Remove once the default is settled.
+    // Experimental knob (freebayes-marginal emission benchmark):
+    // `PVC_SSR_FREEBAYES_EMIT=1` replaces the heuristic emit gate (`is_variable` +
+    // `apply_fp_control`) with the freebayes-style joint marginal-likelihood
+    // polymorphism test (site `QUAL = −10·log10 P(monomorphic)` from a neutral SFS
+    // prior over the cohort). Off by default so `ssr-call` is byte-identical; enabled
+    // only to benchmark it against the current gates and the BIC candidate before
+    // deciding the emission model. Spec `ssr_freebayes_marginal_emission.md`.
     let em_cfg = EmCfg {
-        marginalized_prior: std::env::var("PVC_SSR_MARGINALIZED_PRIOR")
-            .is_ok_and(|v| v == "1"),
+        marginalized_prior: std::env::var("PVC_SSR_MARGINALIZED_PRIOR").is_ok_and(|v| v == "1"),
+        freebayes_emit: std::env::var("PVC_SSR_FREEBAYES_EMIT").is_ok_and(|v| v == "1"),
         ..EmCfg::dev_default()
     };
     let outer_cfg = OuterCfg::dev_default();
@@ -439,13 +446,29 @@ fn genotype_locus(
         &frozen.level_per_group,
         &HipstrModel,
     );
-    apply_fp_control(&mut call, fp_cfg);
-
-    // PASS + monomorphic → drop; PASS + variable or any filtered verdict → emit.
-    if candidates.admit == Admission::Pass && !is_variable(&call, &candidates) {
-        return None;
-    }
-    let qual = site_qual(&call, &candidates, fp_cfg);
+    // Emission model. Default: the heuristic path — allele-balance FP no-call, then
+    // `is_variable`, then the plug-in `site_qual`. Toggle (`PVC_SSR_FREEBAYES_EMIT`):
+    // the freebayes-style joint marginal replaces both `apply_fp_control` and the QUAL
+    // (spec §4.2). The per-sample genotype columns are the same EM MAP calls in both.
+    let qual = if em_cfg.freebayes_emit {
+        // No heuristic no-call: the principled site test owns the emit decision via QUAL.
+        // A PASS locus whose MAP carries no non-ref allele is genuinely monomorphic
+        // (nothing to report) and dropped; everything else is emitted with the
+        // freebayes QUAL, and the QUAL threshold (applied downstream) is the real gate.
+        if candidates.admit == Admission::Pass && !is_variable(&call, &candidates) {
+            return None;
+        }
+        call.freebayes_qual
+            .unwrap_or(0.0)
+            .clamp(0.0, fp_cfg.qual_cap)
+    } else {
+        apply_fp_control(&mut call, fp_cfg);
+        // PASS + monomorphic → drop; PASS + variable or any filtered verdict → emit.
+        if candidates.admit == Admission::Pass && !is_variable(&call, &candidates) {
+            return None;
+        }
+        site_qual(&call, &candidates, fp_cfg)
+    };
     // PANIC-FREE: every emitted locus carries a chrom_id the merger resolved from the
     // cohort chromosome table (merge.rs hard-errors `UnknownCatalogChrom` otherwise), so
     // this indexes in range. Fail loud rather than emit a placeholder `"?"` contig — an

@@ -14,6 +14,7 @@ pub mod candidate_set;
 pub mod driver;
 pub mod em;
 pub mod em_init;
+pub mod freebayes_emit;
 pub mod inbreeding;
 pub mod likelihood;
 pub mod merge;

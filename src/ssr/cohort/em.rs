@@ -71,6 +71,18 @@ pub(crate) struct EmCfg {
     /// until the benchmark (Phase 3.5) decides whether to flip it. See
     /// [`marginalized_genotype_log_priors`].
     pub(crate) marginalized_prior: bool,
+    /// Emission model (env `PVC_SSR_FREEBAYES_EMIT=1`). `false` (default) = the
+    /// heuristic emit gate (`is_variable` + `apply_fp_control`). `true` = the
+    /// freebayes-style joint marginal-likelihood polymorphism test
+    /// ([`crate::ssr::cohort::freebayes_emit`]): compute `QUAL = −10·log10
+    /// P(monomorphic)` from a neutral SFS prior over `data_ll`, and drive the emit
+    /// decision from it. Off by default so SSR output is byte-identical. The
+    /// per-sample genotypes are unchanged either way; only the site QUAL / emit gate
+    /// differs (spec `ssr_freebayes_marginal_emission.md`).
+    pub(crate) freebayes_emit: bool,
+    /// Population-scaled diversity `θ` for the freebayes SFS prior (only read when
+    /// `freebayes_emit`). See [`crate::ssr::cohort::freebayes_emit::SFS_THETA`].
+    pub(crate) sfs_theta: f64,
 }
 
 impl EmCfg {
@@ -86,6 +98,8 @@ impl EmCfg {
             level_shrink: 20.0,
             level_tol: 1e-3,
             marginalized_prior: false,
+            freebayes_emit: false,
+            sfs_theta: crate::ssr::cohort::freebayes_emit::SFS_THETA,
         }
     }
 }
@@ -133,6 +147,11 @@ pub(crate) struct LocusCall {
     pub(crate) posterior_hom: Vec<f64>,
     /// The site admission verdict (drives the VCF FILTER).
     pub(crate) admit: Admission,
+    /// Freebayes-style site `QUAL = −10·log10 P(monomorphic)` when the
+    /// `freebayes_emit` toggle is on (`None` otherwise, i.e. the heuristic path).
+    /// Computed from `data_ll` inside [`run_locus_em_with`]; the driver uses it for
+    /// the QUAL column and the emit gate (spec `ssr_freebayes_marginal_emission.md`).
+    pub(crate) freebayes_qual: Option<f64>,
 }
 
 /// A diploid genotype as an ordered pair of candidate indices `i ≤ j`.
@@ -406,6 +425,7 @@ pub(crate) fn run_locus_em_with<M: ReadLikelihoodModel>(
             pi: seed.pi0.clone(),
             posterior_hom: vec![0.0; n_present],
             admit: candidates.admit,
+            freebayes_qual: None,
         };
     }
 
@@ -520,11 +540,25 @@ pub(crate) fn run_locus_em_with<M: ReadLikelihoodModel>(
         &mut scratch,
     );
 
+    // Freebayes-style emission QUAL (spec §3): the site polymorphism test over the
+    // final `data_ll` (Qᵣ read likelihoods), the cohort frequencies `pi`, and the frozen
+    // per-sample `F`. Only when the toggle is on; otherwise the heuristic path owns QUAL.
+    let freebayes_qual = cfg.freebayes_emit.then(|| {
+        crate::ssr::cohort::freebayes_emit::site_qual(
+            &data_ll,
+            &pi,
+            f_per_present,
+            k,
+            cfg.sfs_theta,
+        )
+    });
+
     LocusCall {
         calls,
         pi,
         posterior_hom,
         admit: candidates.admit,
+        freebayes_qual,
     }
 }
 

@@ -441,6 +441,7 @@ mod tests {
             pi: vec![0.5, 0.25, 0.25],
             posterior_hom: vec![0.99, 0.05],
             admit: Admission::Pass,
+            freebayes_qual: None,
         };
         let line = format_vcf_record("chr1", &locus(), &candidates(), &call, 50.0, 2);
         let cols: Vec<&str> = line.split('\t').collect();
@@ -496,6 +497,7 @@ mod tests {
             pi: vec![0.5, 0.5],
             posterior_hom: vec![0.1],
             admit: Admission::Pass,
+            freebayes_qual: None,
         };
         let line = format_vcf_record("chr1", &locus, &candidates, &call, 42.0, 1);
         let cols: Vec<&str> = line.split('\t').collect();
@@ -527,6 +529,7 @@ mod tests {
             pi: vec![1.0],
             posterior_hom: vec![0.0],
             admit: Admission::LowDepth,
+            freebayes_qual: None,
         };
         let q = site_qual(&call, &cands, &FpControlCfg::dev_default());
         assert_eq!(q, 0.0);
@@ -547,6 +550,7 @@ mod tests {
             pi: vec![1.0],
             posterior_hom: vec![0.0],
             admit: Admission::LowDepth,
+            freebayes_qual: None,
         };
         let cands = CandidateSet {
             alleles: vec![ca_seq(8)],
@@ -633,6 +637,7 @@ mod tests {
             pi: vec![0.2, 0.4, 0.4],
             posterior_hom: vec![0.0, 0.0],
             admit: Admission::Pass,
+            freebayes_qual: None,
         };
         apply_fp_control(&mut call, &FpControlCfg::dev_default());
         // The imbalanced het collapsed to a no-call; the balanced het survived.
@@ -651,6 +656,7 @@ mod tests {
             pi: vec![0.5, 0.25, 0.25],
             posterior_hom: vec![0.1],
             admit: Admission::Pass,
+            freebayes_qual: None,
         };
         assert!(is_variable(&variant, &cands));
 
@@ -665,6 +671,7 @@ mod tests {
             pi: vec![1.0, 0.0, 0.0],
             posterior_hom: vec![0.99],
             admit: Admission::Pass,
+            freebayes_qual: None,
         };
         assert!(!is_variable(&hom_ref, &cands));
     }
@@ -682,6 +689,7 @@ mod tests {
             pi: vec![0.2, 0.4, 0.4],
             posterior_hom: vec![0.0, 0.0],
             admit: Admission::Pass,
+            freebayes_qual: None,
         };
         let mono = LocusCall {
             calls: vec![
@@ -703,6 +711,7 @@ mod tests {
             pi: vec![1.0, 0.0, 0.0],
             posterior_hom: vec![0.99, 0.99],
             admit: Admission::Pass,
+            freebayes_qual: None,
         };
         assert!(site_qual(&variant, &cands, &cfg) > site_qual(&mono, &cands, &cfg));
         assert!(site_qual(&variant, &cands, &cfg) > 20.0);
