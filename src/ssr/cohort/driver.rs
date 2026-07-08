@@ -842,13 +842,13 @@ mod tests {
         // are `./.:.:.` placeholders in their own cohort positions.
         for col in &cols[9..15] {
             assert_ne!(
-                *col, "./.:.:.",
+                *col, "./.:.:.:.:.",
                 "present het sample should carry a call: {col}"
             );
         }
         for col in &cols[15..21] {
             assert_eq!(
-                *col, "./.:.:.",
+                *col, "./.:.:.:.:.",
                 "absent sample must be a no-call placeholder"
             );
         }
@@ -905,7 +905,10 @@ mod tests {
             "filtered locus is still dense over the cohort"
         );
         for col in &fcols[9..] {
-            assert_eq!(*col, "./.:.:.", "a filtered locus has all-no-call samples");
+            assert_eq!(
+                *col, "./.:.:.:.:.",
+                "a filtered locus has all-no-call samples"
+            );
         }
         assert!(
             records.iter().any(|r| r.contains("\tPASS\t")),

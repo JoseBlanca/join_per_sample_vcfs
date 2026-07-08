@@ -4,8 +4,9 @@
 //! `F_IS` warning.
 //!
 //! `format_vcf_record` turns one [`LocusCall`] into a VCF data line
-//! (`CHROM POS ID REF ALT QUAL FILTER INFO FORMAT <samples>`), with `GT:GQ:REPCN`
-//! per sample. `apply_fp_control` runs *first* — it penalises a depth-inflated false
+//! (`CHROM POS ID REF ALT QUAL FILTER INFO FORMAT <samples>`), with
+//! `GT:GQ:REPCN:DP:AD` per sample (DP = spanning reads; AD = per-allele read depth,
+//! REF then ALTs). `apply_fp_control` runs *first* — it penalises a depth-inflated false
 //! het (a wildly imbalanced "het" is a homozygote + stutter/error, the SNP-path
 //! blind spot) down to a low GQ / no-call. The site QUAL here is a posterior-based
 //! proxy; the exact-AF convolution kernel (verify-fix #7b) is an F2 refinement.
@@ -71,8 +72,8 @@ const FILTER_DESCRIPTIONS: &[(Admission, &str)] = &[
 /// Write the SSR VCF header (arch `ssr_call_driver.md` §5): `##fileformat`, any cohort
 /// warnings, one `##contig` per chromosome (the lengths come from the `.ssr.psp`
 /// headers via [`CohortMerger::chromosomes`](crate::ssr::cohort::merge::CohortMerger::chromosomes)),
-/// the `PERIOD` INFO, the `GT`/`GQ`/`REPCN` FORMATs, the SSR FILTER vocabulary, then the
-/// `#CHROM … <samples>` column line in cohort order.
+/// the `PERIOD` INFO, the `GT`/`GQ`/`REPCN`/`DP`/`AD` FORMATs, the SSR FILTER vocabulary,
+/// then the `#CHROM … <samples>` column line in cohort order.
 ///
 /// A dedicated SSR writer rather than the SNP `src/vcf/writer.rs`: the field vocabulary
 /// differs and the data lines are the plain text [`format_vcf_record`] emits, so the
@@ -113,6 +114,14 @@ pub(crate) fn write_vcf_header<W: Write>(
     writeln!(
         out,
         "##FORMAT=<ID=REPCN,Number=.,Type=Integer,Description=\"Repeat copy number of each called allele\">"
+    )?;
+    writeln!(
+        out,
+        "##FORMAT=<ID=DP,Number=1,Type=Integer,Description=\"Usable read depth at the locus for the sample\">"
+    )?;
+    writeln!(
+        out,
+        "##FORMAT=<ID=AD,Number=R,Type=Integer,Description=\"Read depth for each allele (REF then ALT, in order), deconvolved to the sample's called genotype\">"
     )?;
     for (admit, description) in FILTER_DESCRIPTIONS {
         writeln!(
@@ -266,10 +275,10 @@ pub(crate) fn format_vcf_record(
     qual: f64,
     n_samples: usize,
 ) -> String {
-    let k = candidates.alleles.len();
+    let n_alleles = candidates.alleles.len();
 
     // Map each candidate index to its VCF allele number (ref → 0, others → 1..).
-    let mut vcf_number = vec![0usize; k];
+    let mut vcf_number = vec![0usize; n_alleles];
     let mut next = 1usize;
     for (idx, slot) in vcf_number.iter_mut().enumerate() {
         if idx == candidates.ref_idx {
@@ -285,7 +294,7 @@ pub(crate) fn format_vcf_record(
     // upstream guarantee surfaces loudly rather than as a silent U+FFFD in REF/ALT.
     const ACGTN_GUARANTEE: &str = "alleles are A/C/G/T/N-validated at the merge boundary";
     let ref_bytes = candidates.alleles[candidates.ref_idx].as_ref();
-    let alt_bytes: Vec<&[u8]> = (0..k)
+    let alt_bytes: Vec<&[u8]> = (0..n_alleles)
         .filter(|&idx| idx != candidates.ref_idx)
         .map(|idx| candidates.alleles[idx].as_ref())
         .collect();
@@ -330,9 +339,10 @@ pub(crate) fn format_vcf_record(
 
     let period = locus.motif.period();
 
-    // Dense over the cohort: every absent sample stays a `./.:.:.` no-call; each present
-    // call lands in its own cohort column via `locus.present` (B1).
-    let mut sample_fields = vec!["./.:.:.".to_string(); n_samples];
+    // Dense over the cohort: every absent sample stays a `./.:.:.:.:.` no-call (five
+    // fields — GT:GQ:REPCN:DP:AD); each present call lands in its own cohort column via
+    // `locus.present` (B1).
+    let mut sample_fields = vec!["./.:.:.:.:.".to_string(); n_samples];
     for (k, sample) in call.calls.iter().enumerate() {
         if sample.allele_indices.is_empty() {
             continue; // a present-but-no-call sample keeps the placeholder
@@ -354,7 +364,31 @@ pub(crate) fn format_vcf_record(
             .map(u16::to_string)
             .collect::<Vec<_>>()
             .join(",");
-        sample_fields[locus.present[k] as usize] = format!("{gt}:{}:{repcn}", sample.gq);
+        // DP = spanning reads that yielded a tract observation (the pool the genotyper
+        // deconvolves — so `DP − Σ AD` is the reads explaining no called allele, i.e.
+        // stutter/junk). AD = per-allele read depth over REF+ALTs (Number=R), summing the
+        // EM's deconvolved per-called-allele support into each allele's VCF slot.
+        // `allele_support` is filled at the final E-step for every called sample; if it is
+        // absent (an unfilled call), AD prints `.` rather than a bogus zero vector.
+        let dp: u32 = locus
+            .samples
+            .get(k)
+            .map_or(0, |s| s.seq_counts.iter().map(|(_, c)| c).sum());
+        let ad = if sample.allele_support.len() == sample.allele_indices.len() {
+            let mut per_allele = vec![0.0f64; n_alleles];
+            for (m, &cand) in sample.allele_indices.iter().enumerate() {
+                per_allele[vcf_number[cand]] += sample.allele_support[m];
+            }
+            per_allele
+                .iter()
+                .map(|x| x.round() as u32)
+                .map(|n| n.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        } else {
+            ".".to_string()
+        };
+        sample_fields[locus.present[k] as usize] = format!("{gt}:{}:{repcn}:{dp}:{ad}", sample.gq);
     }
 
     // Every emitted record carries a numeric QUAL — `site_qual` always returns a finite
@@ -362,7 +396,7 @@ pub(crate) fn format_vcf_record(
     // (downstream QUAL filters then read "lowest", not "missing"; review Mi14). `.` is
     // reserved for a genuinely unscored site, which this path never produces.
     format!(
-        "{chrom}\t{pos}\t.\t{ref_allele}\t{alt_field}\t{qual:.1}\t{}\tPERIOD={period}\tGT:GQ:REPCN\t{}",
+        "{chrom}\t{pos}\t.\t{ref_allele}\t{alt_field}\t{qual:.1}\t{}\tPERIOD={period}\tGT:GQ:REPCN:DP:AD\t{}",
         filter_text(call.admit),
         sample_fields.join("\t"),
     )
@@ -397,14 +431,20 @@ mod tests {
             0,
             SampleEvidence {
                 seq_counts: vec![(ca_seq(8), 100)],
-                qc: SsrQc::default(),
+                qc: SsrQc {
+                    depth: 100,
+                    ..SsrQc::default()
+                },
             },
         );
         locus.push(
             1,
             SampleEvidence {
                 seq_counts: vec![(ca_seq(6), 50), (ca_seq(10), 50)],
-                qc: SsrQc::default(),
+                qc: SsrQc {
+                    depth: 100,
+                    ..SsrQc::default()
+                },
             },
         );
         locus
@@ -428,14 +468,14 @@ mod tests {
                     genotype_units: vec![8, 8],
                     posterior: 0.99,
                     gq: 40,
-                    allele_support: Default::default(),
+                    allele_support: smallvec![50.0, 50.0],
                 },
                 SampleCall {
                     allele_indices: vec![1, 2], // het 6/10
                     genotype_units: vec![6, 10],
                     posterior: 0.95,
                     gq: 30,
-                    allele_support: Default::default(),
+                    allele_support: smallvec![50.0, 50.0],
                 },
             ],
             pi: vec![0.5, 0.25, 0.25],
@@ -451,9 +491,11 @@ mod tests {
         assert_eq!(cols[4], "CACACACACACA,CACACACACACACACACACA"); // ALT 6,10
         assert_eq!(cols[6], "PASS");
         assert_eq!(cols[7], "PERIOD=2");
-        assert_eq!(cols[8], "GT:GQ:REPCN");
-        assert_eq!(cols[9], "0/0:40:8,8");
-        assert_eq!(cols[10], "1/2:30:6,10");
+        assert_eq!(cols[8], "GT:GQ:REPCN:DP:AD");
+        // DP = usable depth (100); AD sums the deconvolved support into REF/ALT slots:
+        // hom-ref → all reads on REF (100,0,0); the 6/10 het → 50 on each ALT (0,50,50).
+        assert_eq!(cols[9], "0/0:40:8,8:100:100,0,0");
+        assert_eq!(cols[10], "1/2:30:6,10:100:0,50,50");
     }
 
     #[test]
@@ -503,7 +545,8 @@ mod tests {
         assert_eq!(cols[3], "GCACACACACACACACA"); // REF = anchor + (CA)x8
         assert_eq!(cols[4], "G"); // ALT = anchor only (the deletion) — NOT empty
         assert!(!cols[4].is_empty(), "ALT must never be an empty field");
-        assert_eq!(cols[9], "0/1:30:8,0");
+        // DP = spanning reads (seq_counts 50+50=100); allele_support unset → AD prints `.`.
+        assert_eq!(cols[9], "0/1:30:8,0:100:.");
     }
 
     #[test]
@@ -558,7 +601,7 @@ mod tests {
         assert_eq!(cols[5], "0.0"); // QUAL clamped to zero is printed numerically (Mi14)
         assert_eq!(cols[4], "."); // no ALT
         assert_eq!(cols[6], "lowDepth");
-        assert_eq!(cols[9], "./.:.:.");
+        assert_eq!(cols[9], "./.:.:.:.:.");
     }
 
     // ── E2: FP control + output semantics ──
