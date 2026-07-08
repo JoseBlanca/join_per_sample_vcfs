@@ -30,6 +30,19 @@ pub(crate) struct FpControlCfg {
     pub(crate) qual_cap: f64,
     /// Mean `F` above which the cohort gets an apparent-`F_IS` warning.
     pub(crate) f_is_warn_threshold: f64,
+    /// Cohort-recurrence rescue (spec `ssr_cohort_recurrence_aware_gates.md` §6.1). When on,
+    /// an imbalanced het is spared the no-call if its minority allele is corroborated across
+    /// the cohort — carried by ≥[`Self::min_corroboration`] *other* plants as a homozygote or
+    /// a balanced het. Off by default → byte-identical; enabled to benchmark the recovered
+    /// recall against the silver-standard false-positive rate before flipping the default.
+    pub(crate) cohort_corroboration: bool,
+    /// Minimum homozygous/balanced-het carriers of an allele elsewhere in the cohort before an
+    /// imbalanced het carrying it is spared the no-call.
+    pub(crate) min_corroboration: u32,
+    /// Minor-allele read fraction at or above which a het counts as *balanced* — a clean
+    /// carrier for corroboration (systematic stutter is always below this, so it cannot
+    /// manufacture corroboration).
+    pub(crate) corroboration_balance: f64,
 }
 
 impl FpControlCfg {
@@ -39,6 +52,9 @@ impl FpControlCfg {
             no_call_gq: 15,
             qual_cap: 200.0,
             f_is_warn_threshold: 0.50,
+            cohort_corroboration: false,
+            min_corroboration: 2,
+            corroboration_balance: 0.40,
         }
     }
 }
@@ -163,10 +179,70 @@ fn allele_balance(call: &SampleCall) -> f64 {
     support[0].min(support[1]) / total
 }
 
+/// Per-candidate-allele **cohort corroboration**: how many present plants carry each allele
+/// as a *clean, non-stutter* call — homozygous for it, or a balanced heterozygote (minor
+/// fraction ≥ `corroboration_balance`). Indexed by candidate-allele index (the same indices
+/// `SampleCall::allele_indices` uses); the vector is sized to the largest index seen.
+///
+/// This is the recurrence signal the §6.1 rescue reads. It counts *only* homozygous or
+/// balanced carriers on purpose: systematic per-chemistry slippage only ever shows as a
+/// lopsided minority shoulder, so it can never present as a homozygous-alt or balanced-het
+/// carrier — a stutter allele's count stays zero and the gate keeps rejecting it. An
+/// imbalanced het (the call the rescue is deciding) is itself below the balance bar, so it
+/// never contributes to the counts, and no self-exclusion is needed.
+fn cohort_corroboration_counts(call: &LocusCall, cfg: &FpControlCfg) -> Vec<u32> {
+    let n_alleles = call
+        .calls
+        .iter()
+        .flat_map(|c| c.allele_indices.iter().copied())
+        .max()
+        .map_or(0, |m| m + 1);
+    let mut counts = vec![0u32; n_alleles];
+    for sample_call in &call.calls {
+        if sample_call.allele_indices.len() < 2 {
+            continue; // no-call or haploid: not a corroborating diploid carrier
+        }
+        let (i, j) = (sample_call.allele_indices[0], sample_call.allele_indices[1]);
+        if i == j {
+            counts[i] += 1; // homozygous carrier
+        } else if allele_balance(sample_call) >= cfg.corroboration_balance {
+            counts[i] += 1; // balanced het corroborates both alleles
+            counts[j] += 1;
+        }
+    }
+    counts
+}
+
+/// The candidate-allele index of a het's **minority** allele — the one with the least
+/// deconvolved read support, which is the allele the imbalance makes suspect.
+fn minority_allele(sample_call: &SampleCall) -> Option<usize> {
+    if sample_call.allele_indices.len() < 2 || sample_call.allele_support.len() < 2 {
+        return None;
+    }
+    let min_slot = if sample_call.allele_support[0] <= sample_call.allele_support[1] {
+        0
+    } else {
+        1
+    };
+    Some(sample_call.allele_indices[min_slot])
+}
+
 /// Apply the allele-balance FP defence in place: scale down an imbalanced het's GQ
 /// and convert sub-threshold calls to no-calls. Reads only each call's own
 /// [`SampleCall::allele_support`], so it needs neither the locus reads nor the read model.
+///
+/// With [`FpControlCfg::cohort_corroboration`] on, an imbalanced het is **spared** — left
+/// untouched, GQ and all — when its minority allele is corroborated across the cohort (spec
+/// §6.1): a shallow lopsided split is far more likely a real-but-under-sequenced het than a
+/// stutter artifact when the same allele stands on its own feet in other plants. Off (the
+/// default) this is byte-identical to the per-plant-only defence.
 pub(crate) fn apply_fp_control(call: &mut LocusCall, cfg: &FpControlCfg) {
+    // Corroboration is read once, before any no-call mutates the calls it counts.
+    let corroboration = if cfg.cohort_corroboration {
+        cohort_corroboration_counts(call, cfg)
+    } else {
+        Vec::new()
+    };
     for sample_call in call.calls.iter_mut() {
         if sample_call.allele_indices.is_empty() {
             continue; // already a no-call
@@ -183,6 +259,15 @@ pub(crate) fn apply_fp_control(call: &mut LocusCall, cfg: &FpControlCfg) {
         );
         let balance = allele_balance(sample_call);
         if balance < cfg.min_allele_balance {
+            // Cohort-recurrence rescue: keep the het untouched when its minority allele is
+            // corroborated by ≥`min_corroboration` clean carriers elsewhere (spec §6.1).
+            if cfg.cohort_corroboration
+                && minority_allele(sample_call).is_some_and(|a| {
+                    corroboration.get(a).copied().unwrap_or(0) >= cfg.min_corroboration
+                })
+            {
+                continue;
+            }
             // A depth-inflated false het: scale GQ by how far below the floor it is.
             let scale = (balance / cfg.min_allele_balance).clamp(0.0, 1.0);
             sample_call.gq = (sample_call.gq as f64 * scale).round() as u8;
@@ -684,6 +769,79 @@ mod tests {
             "imbalanced het → no-call"
         );
         assert_eq!(call.calls[1].gq, 40, "balanced het keeps its GQ");
+    }
+
+    #[test]
+    fn cohort_corroboration_spares_an_imbalanced_het_whose_minority_allele_recurs() {
+        // The 6/10 het is lopsided (minority = allele 2), so the per-plant defence would
+        // no-call it — but two other plants are homozygous for allele 2, so it is a real
+        // under-sequenced het, not stutter. The §6.1 rescue keeps it untouched.
+        let hom_alt = || SampleCall {
+            allele_indices: vec![2, 2],
+            genotype_units: vec![10, 10],
+            posterior: 0.99,
+            gq: 40,
+            allele_support: smallvec![60.0, 60.0],
+        };
+        let make = || LocusCall {
+            calls: vec![
+                het_call(40, 0.99, smallvec![190.0, 10.0]), // imbalanced, minority = allele 2
+                hom_alt(),
+                hom_alt(),
+            ],
+            pi: vec![0.2, 0.2, 0.6],
+            posterior_hom: vec![0.0, 0.99, 0.99],
+            admit: Admission::Pass,
+        };
+        // Default (rescue off): the imbalanced het is no-called, as before.
+        let mut off = make();
+        apply_fp_control(&mut off, &FpControlCfg::dev_default());
+        assert!(
+            off.calls[0].allele_indices.is_empty(),
+            "rescue off → imbalanced het still no-called"
+        );
+        // Rescue on: allele 2 is corroborated by the two homozygotes, so the het survives.
+        let mut on = make();
+        apply_fp_control(
+            &mut on,
+            &FpControlCfg {
+                cohort_corroboration: true,
+                ..FpControlCfg::dev_default()
+            },
+        );
+        assert_eq!(
+            on.calls[0].allele_indices,
+            vec![1, 2],
+            "rescue on → corroborated het is spared"
+        );
+        assert_eq!(on.calls[0].gq, 40, "spared het keeps its GQ untouched");
+    }
+
+    #[test]
+    fn cohort_corroboration_still_no_calls_an_uncorroborated_imbalanced_het() {
+        // The minority allele appears nowhere else as a clean (homozygous/balanced) carrier —
+        // only as another lopsided shoulder, which is exactly the systematic-stutter case. The
+        // rescue must NOT fire, so precision is preserved.
+        let mut call = LocusCall {
+            calls: vec![
+                het_call(40, 0.99, smallvec![190.0, 10.0]),
+                het_call(40, 0.99, smallvec![190.0, 10.0]),
+            ],
+            pi: vec![0.5, 0.4, 0.1],
+            posterior_hom: vec![0.0, 0.0],
+            admit: Admission::Pass,
+        };
+        apply_fp_control(
+            &mut call,
+            &FpControlCfg {
+                cohort_corroboration: true,
+                ..FpControlCfg::dev_default()
+            },
+        );
+        assert!(
+            call.calls[0].allele_indices.is_empty(),
+            "uncorroborated (stutter-shaped) imbalanced het is still no-called"
+        );
     }
 
     #[test]

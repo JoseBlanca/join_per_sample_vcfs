@@ -218,7 +218,20 @@ pub(crate) fn run(config: &SsrCallConfig) -> Result<(), SsrCallError> {
     let outer_cfg = OuterCfg::dev_default();
     let cluster_cfg = ClusterCfg::dev_default();
     let g0_cfg = G0FitCfg::dev_default();
-    let fp_cfg = FpControlCfg::dev_default();
+    // Experimental knob (spec `ssr_cohort_recurrence_aware_gates.md` §6.1):
+    // `PVC_SSR_COHORT_FP_CONTROL=1` spares an imbalanced het the allele-balance
+    // no-call when its minority allele is corroborated across the cohort. Off by
+    // default → byte-identical; enabled to benchmark the recovered recall against
+    // the silver-standard false-positive rate before flipping the default. Mirrors
+    // the `PVC_SSR_MARGINALIZED_PRIOR` knob.
+    let fp_cfg = FpControlCfg {
+        cohort_corroboration: std::env::var("PVC_SSR_COHORT_FP_CONTROL").is_ok_and(|v| v == "1"),
+        min_corroboration: std::env::var("PVC_SSR_FP_MIN_CORROBORATION")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(FpControlCfg::dev_default().min_corroboration),
+        ..FpControlCfg::dev_default()
+    };
 
     // ── Pass 1: header table + bounded burn-in subset ──
     let merger = CohortMerger::open(&config.catalog, &config.psp_files)?;
