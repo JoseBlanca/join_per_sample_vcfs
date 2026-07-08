@@ -347,6 +347,25 @@ fn log_sum_exp(xs: &[f64]) -> f64 {
     max + xs.iter().map(|x| (x - max).exp()).sum::<f64>().ln()
 }
 
+/// Cohort marginal read log-likelihoods for the per-locus **emission** model choice
+/// (spec `ssr_cohort_recurrence_aware_gates.md`, model-selection). Computed at the settled
+/// read model so the emission decision reuses exactly the likelihoods that produced the calls.
+///
+/// - [`Self::ln_marginal`] — Σ over present samples of `log Σ_G P(G | π̂, F) P(reads | G)`, the
+///   maximised marginal likelihood under the **polymorphic** candidate model (the alt alleles
+///   segregate; genotypes integrated out, frequency `π̂` fit by the EM).
+/// - [`Self::ln_monomorphic`] — Σ of `P(reads | hom aa)` for the single fixed allele `a` that
+///   best explains the cohort (no segregating alt; stutter alone accounts for off-length reads).
+///
+/// A BIC / likelihood-ratio emission gate compares the two: the extra allele must earn its
+/// parameter cost before the locus is emitted, which rejects a systematic stutter shoulder
+/// (it barely lifts the likelihood) while keeping a real segregating allele (it lifts it a lot).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct EmissionEvidence {
+    pub(crate) ln_marginal: f64,
+    pub(crate) ln_monomorphic: f64,
+}
+
 /// Genotype one locus on the supplied parameters.
 ///
 /// PLOIDY CONTRACT: v1 is diploid-only and **panics** on `ploidy != 2`. This is a
@@ -376,6 +395,7 @@ pub(crate) fn run_locus_em(
         &params.level_seed,
         &HipstrModel,
     )
+    .0
 }
 
 /// Genotype one locus with an explicit per-sample inbreeding `F` and per-group level
@@ -395,18 +415,25 @@ pub(crate) fn run_locus_em_with<M: ReadLikelihoodModel>(
     f_per_present: &[f64],
     level_per_group: &[StutterLevel],
     model: &M,
-) -> LocusCall {
+) -> (LocusCall, EmissionEvidence) {
     assert_eq!(ploidy, 2, "C4 EM is diploid-only (v1)");
     let n_present = locus.samples.len();
 
-    // A no-call locus still reports REF + the no-call samples.
+    // A no-call locus still reports REF + the no-call samples; no emission evidence (a
+    // filtered locus is emitted on its FILTER, not on the model choice).
     if candidates.admit != Admission::Pass {
-        return LocusCall {
-            calls: vec![SampleCall::no_call(); n_present],
-            pi: seed.pi0.clone(),
-            posterior_hom: vec![0.0; n_present],
-            admit: candidates.admit,
-        };
+        return (
+            LocusCall {
+                calls: vec![SampleCall::no_call(); n_present],
+                pi: seed.pi0.clone(),
+                posterior_hom: vec![0.0; n_present],
+                admit: candidates.admit,
+            },
+            EmissionEvidence {
+                ln_marginal: 0.0,
+                ln_monomorphic: 0.0,
+            },
+        );
     }
 
     let period = rungs.period();
@@ -520,11 +547,54 @@ pub(crate) fn run_locus_em_with<M: ReadLikelihoodModel>(
         &mut scratch,
     );
 
-    LocusCall {
-        calls,
-        pi,
-        posterior_hom,
-        admit: candidates.admit,
+    // Emission evidence for the model-selection gate, from the settled `data_ll` + `pi`.
+    let evidence = emission_evidence(&data_ll, &genotypes, &pi, f_per_present, k);
+
+    (
+        LocusCall {
+            calls,
+            pi,
+            posterior_hom,
+            admit: candidates.admit,
+        },
+        evidence,
+    )
+}
+
+/// Compute the [`EmissionEvidence`] (polymorphic marginal vs best monomorphic) from the settled
+/// per-sample per-genotype data log-likelihoods `data_ll`, the fit frequency `pi`, and per-sample
+/// `F`. Uses the plug-in HWE genotype prior (`genotype_prior`) — the emission choice is a
+/// separate axis from which genotype prior the calls used.
+fn emission_evidence(
+    data_ll: &[Vec<f64>],
+    genotypes: &[Genotype],
+    pi: &[f64],
+    f_per_present: &[f64],
+    k: usize,
+) -> EmissionEvidence {
+    // Polymorphic model: marginal likelihood integrating genotypes under the fit frequency.
+    let mut ln_marginal = 0.0;
+    for (sample_ll, &f) in data_ll.iter().zip(f_per_present) {
+        let log_joint: Vec<f64> = genotypes
+            .iter()
+            .zip(sample_ll)
+            .map(|(g, ll)| genotype_prior(*g, pi, f).ln() + ll)
+            .collect();
+        ln_marginal += log_sum_exp(&log_joint);
+    }
+    // Monomorphic model: every sample homozygous for the single best-fitting allele.
+    let mut ln_monomorphic = f64::NEG_INFINITY;
+    for a in 0..k {
+        if let Some(gi) = genotypes.iter().position(|g| g.i == a && g.j == a) {
+            let s: f64 = data_ll.iter().map(|sll| sll[gi]).sum();
+            if s > ln_monomorphic {
+                ln_monomorphic = s;
+            }
+        }
+    }
+    EmissionEvidence {
+        ln_marginal,
+        ln_monomorphic,
     }
 }
 
@@ -1242,6 +1312,43 @@ mod tests {
         // index/unwrap on a first genotype, no empty-sum division).
         let logs = marginalized_genotype_log_priors(&[], 2, &[0.6, 0.4], 0.5);
         assert!(logs.is_empty());
+    }
+
+    #[test]
+    fn emission_evidence_separates_monomorphic_from_polymorphic() {
+        // Two candidate alleles; genotype data-likelihoods are built order-independently so the
+        // test does not depend on the genotype enumeration order.
+        let genotypes = enumerate_diploid_genotypes(2); // (0,0),(0,1),(1,1)
+        let pi = [0.5, 0.5];
+        let f = [0.0, 0.0];
+        let ll = |want_i: usize, want_j: usize| -> Vec<f64> {
+            genotypes
+                .iter()
+                .map(|g| {
+                    if g.i == want_i && g.j == want_j {
+                        0.0
+                    } else {
+                        -20.0
+                    }
+                })
+                .collect()
+        };
+        // Monomorphic: both plants strongly hom-ref → the extra allele earns nothing, so the
+        // polymorphic marginal cannot beat the best single-allele model (BIC delta small/negative).
+        let mono = vec![ll(0, 0), ll(0, 0)];
+        let e = emission_evidence(&mono, &genotypes, &pi, &f, 2);
+        assert!(
+            2.0 * (e.ln_marginal - e.ln_monomorphic) < 5.0,
+            "monomorphic locus should not favour the polymorphic model"
+        );
+        // Polymorphic: the allele segregates (one plant hom-ref, one hom-alt) → the marginal
+        // sits far above the best single-allele model (large positive BIC delta).
+        let poly = vec![ll(0, 0), ll(1, 1)];
+        let e = emission_evidence(&poly, &genotypes, &pi, &f, 2);
+        assert!(
+            2.0 * (e.ln_marginal - e.ln_monomorphic) > 10.0,
+            "a segregating allele should favour the polymorphic model"
+        );
     }
 
     /// Params for a single low-stutter sample group matching the clean sim chemistry.

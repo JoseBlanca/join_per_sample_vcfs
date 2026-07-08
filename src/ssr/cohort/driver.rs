@@ -224,12 +224,21 @@ pub(crate) fn run(config: &SsrCallConfig) -> Result<(), SsrCallError> {
     // default → byte-identical; enabled to benchmark the recovered recall against
     // the silver-standard false-positive rate before flipping the default. Mirrors
     // the `PVC_SSR_MARGINALIZED_PRIOR` knob.
+    // Model-selection emission (spec, monomorphic-vs-polymorphic): `PVC_SSR_BIC_EMIT=1`
+    // replaces emit-iff-variable + FP-control with a BIC test on the cohort marginal read
+    // likelihood; `PVC_SSR_BIC_MARGIN` adds an extra margin (precision↑/recall↓). Off by
+    // default → byte-identical. Mirrors the `PVC_SSR_MARGINALIZED_PRIOR` knob.
     let fp_cfg = FpControlCfg {
         cohort_corroboration: std::env::var("PVC_SSR_COHORT_FP_CONTROL").is_ok_and(|v| v == "1"),
         min_corroboration: std::env::var("PVC_SSR_FP_MIN_CORROBORATION")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(FpControlCfg::dev_default().min_corroboration),
+        bic_emit: std::env::var("PVC_SSR_BIC_EMIT").is_ok_and(|v| v == "1"),
+        bic_margin: std::env::var("PVC_SSR_BIC_MARGIN")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.0),
         ..FpControlCfg::dev_default()
     };
 
@@ -531,7 +540,7 @@ fn genotype_locus(
         .iter()
         .map(|&g| frozen.f_per_sample[g as usize])
         .collect();
-    let mut call = run_locus_em_with(
+    let (mut call, em_ev) = run_locus_em_with(
         locus,
         &rungs,
         &candidates,
@@ -543,29 +552,62 @@ fn genotype_locus(
         &frozen.level_per_group,
         &HipstrModel,
     );
-    // Observe variability *before* FP-control so a drop caused by FP-control is
-    // distinguishable from one the EM produced on its own (read-only; does not affect emit).
-    let variable_before_fp = is_variable(&call, &candidates);
-    apply_fp_control(&mut call, fp_cfg);
-    let variable_after_fp = is_variable(&call, &candidates);
-
-    // Classify the fate. `ref` is seeded unconditionally, so `n_alt` counts non-ref candidates.
+    // `ref` is seeded unconditionally, so `n_alt` counts non-ref candidates.
     let n_alt = candidates.alleles.len().saturating_sub(1);
     let reflen = candidates
         .alleles
         .get(candidates.ref_idx)
         .map_or(0, |a| a.len());
-    let kind = if candidates.admit != Admission::Pass {
-        FateKind::Filtered
-    } else if variable_after_fp {
-        FateKind::EmittedVariable
-    } else if n_alt == 0 {
-        FateKind::DropNoAltCandidate
-    } else if !variable_before_fp {
-        FateKind::DropEmHomRef
+
+    // Emission decision + fate. Two modes:
+    //   * default — per-plant allele-balance FP-control, then emit-iff-variable.
+    //   * BIC (`PVC_SSR_BIC_EMIT`) — model selection on the cohort's marginal read likelihood:
+    //     the polymorphic model must beat the monomorphic one by BIC before the locus is
+    //     emitted (spec, model-selection). FP-control is not run — the model choice replaces
+    //     it. A locus is still only emitted with a variant genotype, so BIC never writes a
+    //     monomorphic row; and a variant the EM produced but BIC rejects (a stutter shoulder)
+    //     is dropped.
+    let drop;
+    let kind;
+    if fp_cfg.bic_emit {
+        let variable = is_variable(&call, &candidates);
+        let n_samples = locus.present.len().max(2) as f64;
+        let delta = 2.0 * (em_ev.ln_marginal - em_ev.ln_monomorphic);
+        let penalty = n_alt as f64 * n_samples.ln() + 2.0 * fp_cfg.bic_margin;
+        let polymorphic = delta > penalty;
+        if candidates.admit != Admission::Pass {
+            drop = false;
+            kind = FateKind::Filtered;
+        } else if variable && polymorphic {
+            drop = false;
+            kind = FateKind::EmittedVariable;
+        } else {
+            drop = true;
+            kind = if variable {
+                FateKind::DropFpControl // BIC rejected a variant the EM produced (stutter)
+            } else {
+                FateKind::DropEmHomRef
+            };
+        }
     } else {
-        FateKind::DropFpControl
-    };
+        // Observe variability *before* FP-control so a drop caused by FP-control is
+        // distinguishable from one the EM produced on its own (read-only; does not affect emit).
+        let variable_before_fp = is_variable(&call, &candidates);
+        apply_fp_control(&mut call, fp_cfg);
+        let variable_after_fp = is_variable(&call, &candidates);
+        kind = if candidates.admit != Admission::Pass {
+            FateKind::Filtered
+        } else if variable_after_fp {
+            FateKind::EmittedVariable
+        } else if n_alt == 0 {
+            FateKind::DropNoAltCandidate
+        } else if !variable_before_fp {
+            FateKind::DropEmHomRef
+        } else {
+            FateKind::DropFpControl
+        };
+        drop = candidates.admit == Admission::Pass && !variable_after_fp;
+    }
     let fate = LocusFate {
         chrom_id: locus.locus.chrom_id,
         pos: u64::from(locus.locus.start) + 1,
@@ -574,9 +616,7 @@ fn genotype_locus(
         admit: candidates.admit,
         kind,
     };
-
-    // PASS + monomorphic → drop; PASS + variable or any filtered verdict → emit.
-    if candidates.admit == Admission::Pass && !variable_after_fp {
+    if drop {
         return (None, fate);
     }
     let qual = site_qual(&call, &candidates, fp_cfg);
@@ -1454,7 +1494,8 @@ mod tests {
                 &f_present,
                 &frozen.level_per_group,
                 &HipstrModel,
-            );
+            )
+            .0;
             apply_fp_control(&mut call, &fp_cfg);
             accumulate_allele_slips(&locus, &candidates, &call, &frozen.chemistry, &mut acc);
         }

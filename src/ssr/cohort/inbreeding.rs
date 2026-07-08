@@ -247,6 +247,7 @@ pub(crate) fn run_cohort_em(
                     &level_per_group,
                     &HipstrModel,
                 )
+                .0
             })
             .collect();
 

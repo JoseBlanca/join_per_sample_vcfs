@@ -43,6 +43,14 @@ pub(crate) struct FpControlCfg {
     /// carrier for corroboration (systematic stutter is always below this, so it cannot
     /// manufacture corroboration).
     pub(crate) corroboration_balance: f64,
+    /// **Model-selection emission** (spec, monomorphic-vs-polymorphic). When on, the emit
+    /// decision is a BIC test on the cohort's marginal read likelihood (`EmissionEvidence`)
+    /// instead of emit-iff-variable + FP-control; the polymorphic model must beat the
+    /// monomorphic one to emit. Off by default → byte-identical.
+    pub(crate) bic_emit: bool,
+    /// Extra BIC margin (in half-units of 2·Δlog-likelihood) the polymorphic model must clear
+    /// beyond the parameter penalty — raises precision at the cost of recall. 0 = plain BIC.
+    pub(crate) bic_margin: f64,
 }
 
 impl FpControlCfg {
@@ -55,6 +63,8 @@ impl FpControlCfg {
             cohort_corroboration: false,
             min_corroboration: 2,
             corroboration_balance: 0.40,
+            bic_emit: false,
+            bic_margin: 0.0,
         }
     }
 }

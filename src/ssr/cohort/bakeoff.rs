@@ -259,7 +259,8 @@ pub(crate) fn run_bakeoff_with<M: ReadLikelihoodModel>(
             &f_present,
             &params.level_seed,
             model,
-        );
+        )
+        .0;
         metrics.scoring_wall += started.elapsed();
 
         for (k, &global) in locus.present.iter().enumerate() {
