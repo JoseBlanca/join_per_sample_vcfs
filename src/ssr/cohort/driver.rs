@@ -212,8 +212,7 @@ pub(crate) fn run(config: &SsrCallConfig) -> Result<(), SsrCallError> {
     // priors against HipSTR before deciding whether to make it the default. Mirrors
     // the SNP engine's `PVC_*` env knobs. Remove once the default is settled.
     let em_cfg = EmCfg {
-        marginalized_prior: std::env::var("PVC_SSR_MARGINALIZED_PRIOR")
-            .is_ok_and(|v| v == "1"),
+        marginalized_prior: std::env::var("PVC_SSR_MARGINALIZED_PRIOR").is_ok_and(|v| v == "1"),
         ..EmCfg::dev_default()
     };
     let outer_cfg = OuterCfg::dev_default();
@@ -281,6 +280,18 @@ pub(crate) fn run(config: &SsrCallConfig) -> Result<(), SsrCallError> {
     } else {
         config.queue_depth
     };
+
+    // Diagnostic sidecar: `PVC_SSR_FATE_TSV=<path>` records, for every catalog locus in the
+    // genotyping sweep, why it did or did not reach the VCF (emitted / filtered / one of the
+    // three silent monomorphic-PASS drop mechanisms). Off by default → VCF byte-identical.
+    let mut fate_out: Option<BufWriter<File>> = match std::env::var("PVC_SSR_FATE_TSV") {
+        Ok(path) if !path.is_empty() => {
+            let mut w = BufWriter::new(File::create(&path)?);
+            writeln!(w, "#chrom\tpos\treflen\tn_alt\tadmit\tfate")?;
+            Some(w)
+        }
+        _ => None,
+    };
     pool.install(|| -> Result<(), SsrCallError> {
         write_vcf_header(&mut out, &chromosomes, &sample_names, &warnings)?;
         let mut chunk: Vec<CohortLocus> = Vec::with_capacity(chunk_size);
@@ -297,6 +308,7 @@ pub(crate) fn run(config: &SsrCallConfig) -> Result<(), SsrCallError> {
                     &fp_cfg,
                     n_samples,
                     &mut out,
+                    fate_out.as_mut(),
                 )?;
                 chunk.clear();
             }
@@ -312,9 +324,13 @@ pub(crate) fn run(config: &SsrCallConfig) -> Result<(), SsrCallError> {
                 &fp_cfg,
                 n_samples,
                 &mut out,
+                fate_out.as_mut(),
             )?;
         }
         out.flush()?;
+        if let Some(fate_out) = fate_out.as_mut() {
+            fate_out.flush()?;
+        }
         Ok(())
     })
 }
@@ -395,9 +411,84 @@ fn collect_burn_in_subset<R: Read + Seek, C: Read>(
     Ok(subset)
 }
 
+/// Why a locus did (or did not) reach the VCF — the per-locus emission fate, tallied only
+/// when the `PVC_SSR_FATE_TSV` diagnostic is on. It splits the *silent* monomorphic-PASS
+/// drop (which leaves no VCF trace) into the three mechanisms that can turn a real length
+/// variant into an our-monomorphic call: the ALT was never nominated as a candidate; the
+/// EM collapsed every sample to hom-ref; or FP-control no-called the lone ALT carrier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FateKind {
+    /// PASS and polymorphic → a VCF row is written.
+    EmittedVariable,
+    /// A non-PASS admission verdict (`lowDepth`/`notPeriodic`/`tooManyAlleles`) → a
+    /// filtered VCF row is written.
+    Filtered,
+    /// PASS + monomorphic, and the candidate set held no non-reference allele at all — the
+    /// slip/variant tract was never promoted to a candidate (candidate nomination / §5.2).
+    DropNoAltCandidate,
+    /// PASS + monomorphic, a non-ref candidate existed, but the EM called every sample
+    /// hom-ref (the length variant was out-voted by the stutter model).
+    DropEmHomRef,
+    /// PASS + monomorphic, the EM produced a non-ref call, but FP-control (allele-balance
+    /// / `no_call_gq`) no-called the ALT carrier(s), leaving the site monomorphic.
+    DropFpControl,
+}
+
+impl FateKind {
+    fn label(self) -> &'static str {
+        match self {
+            FateKind::EmittedVariable => "emitted_variable",
+            FateKind::Filtered => "filtered",
+            FateKind::DropNoAltCandidate => "drop_no_alt_candidate",
+            FateKind::DropEmHomRef => "drop_em_hom_ref",
+            FateKind::DropFpControl => "drop_fp_control",
+        }
+    }
+}
+
+/// One per-locus fate record for the `PVC_SSR_FATE_TSV` diagnostic sidecar.
+#[derive(Debug, Clone, Copy)]
+struct LocusFate {
+    chrom_id: u32,
+    /// 1-based tract-start POS (matches the emitted VCF POS for interior loci; the rare
+    /// flankless-anchor −1 shift is not replicated — irrelevant for the drop set).
+    pos: u64,
+    reflen: usize,
+    n_alt: usize,
+    admit: Admission,
+    kind: FateKind,
+}
+
+impl LocusFate {
+    fn admit_text(&self) -> &'static str {
+        match self.admit {
+            Admission::Pass => "PASS",
+            Admission::NotPeriodic => "notPeriodic",
+            Admission::TooManyAlleles => "tooManyAlleles",
+            Admission::LowDepth => "lowDepth",
+        }
+    }
+
+    /// TSV row: `chrom  pos  reflen  n_alt  admit  fate` (chrom name resolved by caller).
+    fn write_row<W: Write>(&self, out: &mut W, chrom: &str) -> std::io::Result<()> {
+        writeln!(
+            out,
+            "{chrom}\t{}\t{}\t{}\t{}\t{}",
+            self.pos,
+            self.reflen,
+            self.n_alt,
+            self.admit_text(),
+            self.kind.label(),
+        )
+    }
+}
+
 /// Genotype one streamed locus on the frozen parameters and format its VCF line, applying
 /// the emit policy (arch §6): a filtered locus is emitted with its reason; a PASS locus is
-/// emitted iff it is variable; a monomorphic PASS locus is dropped (`None`).
+/// emitted iff it is variable; a monomorphic PASS locus is dropped (`None`). Alongside the
+/// (optional) VCF line it always returns a [`LocusFate`] classifying what happened — a
+/// read-only observation that does not affect the emitted line (byte-identity preserved);
+/// it is only serialised when the `PVC_SSR_FATE_TSV` diagnostic is on.
 // The frozen params + the four dev-config structs are threaded explicitly (not bundled) so
 // the per-locus call stays a pure function of its inputs — the byte-identity contract. Arg
 // count is intentional.
@@ -411,7 +502,7 @@ fn genotype_locus(
     em_cfg: &EmCfg,
     fp_cfg: &FpControlCfg,
     n_samples: usize,
-) -> Option<String> {
+) -> (Option<String>, LocusFate) {
     let rungs = build_rungs(locus, rung_cfg);
     let candidates = assemble_candidates(locus, &rungs, PLOIDY, cand_cfg);
     let seed = seed_locus(
@@ -439,11 +530,41 @@ fn genotype_locus(
         &frozen.level_per_group,
         &HipstrModel,
     );
+    // Observe variability *before* FP-control so a drop caused by FP-control is
+    // distinguishable from one the EM produced on its own (read-only; does not affect emit).
+    let variable_before_fp = is_variable(&call, &candidates);
     apply_fp_control(&mut call, fp_cfg);
+    let variable_after_fp = is_variable(&call, &candidates);
+
+    // Classify the fate. `ref` is seeded unconditionally, so `n_alt` counts non-ref candidates.
+    let n_alt = candidates.alleles.len().saturating_sub(1);
+    let reflen = candidates
+        .alleles
+        .get(candidates.ref_idx)
+        .map_or(0, |a| a.len());
+    let kind = if candidates.admit != Admission::Pass {
+        FateKind::Filtered
+    } else if variable_after_fp {
+        FateKind::EmittedVariable
+    } else if n_alt == 0 {
+        FateKind::DropNoAltCandidate
+    } else if !variable_before_fp {
+        FateKind::DropEmHomRef
+    } else {
+        FateKind::DropFpControl
+    };
+    let fate = LocusFate {
+        chrom_id: locus.locus.chrom_id,
+        pos: u64::from(locus.locus.start) + 1,
+        reflen,
+        n_alt,
+        admit: candidates.admit,
+        kind,
+    };
 
     // PASS + monomorphic → drop; PASS + variable or any filtered verdict → emit.
-    if candidates.admit == Admission::Pass && !is_variable(&call, &candidates) {
-        return None;
+    if candidates.admit == Admission::Pass && !variable_after_fp {
+        return (None, fate);
     }
     let qual = site_qual(&call, &candidates, fp_cfg);
     // PANIC-FREE: every emitted locus carries a chrom_id the merger resolved from the
@@ -462,14 +583,17 @@ fn genotype_locus(
                 chrom_names.len(),
             )
         });
-    Some(format_vcf_record(
-        chrom,
-        locus,
-        &candidates,
-        &call,
-        qual,
-        n_samples,
-    ))
+    (
+        Some(format_vcf_record(
+            chrom,
+            locus,
+            &candidates,
+            &call,
+            qual,
+            n_samples,
+        )),
+        fate,
+    )
 }
 
 /// Genotype a chunk of loci in parallel, then write the emitted records in catalog order
@@ -481,7 +605,7 @@ fn genotype_locus(
 // each per-locus genotyping call stays a pure function of its inputs — the byte-identity
 // contract. Arg count is intentional.
 #[allow(clippy::too_many_arguments)]
-fn write_genotyped_chunk<W: Write>(
+fn write_genotyped_chunk<W: Write, F: Write>(
     chunk: &[CohortLocus],
     chrom_names: &[String],
     frozen: &FrozenParams,
@@ -491,8 +615,9 @@ fn write_genotyped_chunk<W: Write>(
     fp_cfg: &FpControlCfg,
     n_samples: usize,
     out: &mut W,
+    fate_out: Option<&mut F>,
 ) -> Result<(), SsrCallError> {
-    let lines: Vec<Option<String>> = chunk
+    let results: Vec<(Option<String>, LocusFate)> = chunk
         .par_iter()
         .map(|locus| {
             genotype_locus(
@@ -507,8 +632,19 @@ fn write_genotyped_chunk<W: Write>(
             )
         })
         .collect();
-    for line in lines.into_iter().flatten() {
-        writeln!(out, "{line}")?;
+    for (line, _) in &results {
+        if let Some(line) = line {
+            writeln!(out, "{line}")?;
+        }
+    }
+    // Diagnostic sidecar (PVC_SSR_FATE_TSV): one fate row per locus, in catalog order.
+    if let Some(fate_out) = fate_out {
+        for (_, fate) in &results {
+            let chrom = chrom_names
+                .get(fate.chrom_id as usize)
+                .map_or("?", String::as_str);
+            fate.write_row(fate_out, chrom)?;
+        }
     }
     Ok(())
 }
