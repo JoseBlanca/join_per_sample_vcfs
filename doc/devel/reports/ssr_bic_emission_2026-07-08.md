@@ -32,11 +32,14 @@ on the identical silver-standard core.
   - `ln_monomorphic` — Σ of `P(reads | hom aa)` for the single fixed allele that
     best explains the cohort.
 - In `genotype_locus` ([driver.rs](../../../src/ssr/cohort/driver.rs)), when
-  `PVC_SSR_BIC_EMIT=1`: emit iff `2·(ln_marginal − ln_monomorphic) > n_alt·ln(N)
+  `PVC_SSR_EMIT_MODEL=bic` (was `PVC_SSR_BIC_EMIT=1` before the emission models were
+  unified behind one selector; see [freebayes spec](../specs/ssr_freebayes_marginal_emission.md)):
+  emit iff `2·(ln_marginal − ln_monomorphic) > n_alt·ln(N)
   + 2·margin` (BIC, `N` = present plants), and only with a variant genotype so no
   monomorphic row is ever written. FP-control is **not** run — the model choice
-  replaces it. `PVC_SSR_BIC_MARGIN` trades precision for recall. Default off →
-  **byte-identical** (verified by `diff`). 243 `ssr::cohort` tests pass, plus a
+  replaces it. `PVC_SSR_BIC_MARGIN` trades precision for recall. Default
+  (`PVC_SSR_EMIT_MODEL=heuristic`) → **byte-identical** (verified by `diff`). 243
+  `ssr::cohort` tests pass, plus a
   unit test that `EmissionEvidence` separates a monomorphic from a segregating locus.
 
 ## Benchmark (silver-standard confident core: 561 true100 / 8850 false100)
@@ -83,8 +86,10 @@ scored on this same core with `silver_standard.py`.
 ## Reproduce
 
 ```
-# BIC emission on (reuses existing .ssr.psp); sweep the margin
-PVC_SSR_MARGINALIZED_PRIOR=1 PVC_SSR_BIC_EMIT=1 PVC_SSR_BIC_MARGIN=10 \
+# BIC emission on (reuses existing .ssr.psp); sweep the margin. The emission model is
+# now selected by PVC_SSR_EMIT_MODEL = heuristic (default) | bic | freebayes; orthogonal
+# to PVC_SSR_MARGINALIZED_PRIOR (which shapes the EM genotypes every model consumes).
+PVC_SSR_MARGINALIZED_PRIOR=1 PVC_SSR_EMIT_MODEL=bic PVC_SSR_BIC_MARGIN=10 \
   pop_var_caller ssr-call <psp>/*.ssr.psp --catalog <cat> --output out.vcf
 # score on the confident core
 uv run --no-project benchmarks/ssr_tomato1/scripts/silver_standard.py --score out.vcf

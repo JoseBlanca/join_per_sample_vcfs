@@ -20,8 +20,10 @@ use std::path::PathBuf;
 use rayon::prelude::*;
 
 use crate::psp::header::ParsedChromosome;
-use crate::ssr::cohort::candidate_set::{Admission, CandidateCfg, assemble_candidates};
-use crate::ssr::cohort::em::{EmCfg, run_locus_em_with};
+use crate::ssr::cohort::candidate_set::{
+    Admission, CandidateCfg, CandidateSet, assemble_candidates,
+};
+use crate::ssr::cohort::em::{EmCfg, EmissionEvidence, EmitModel, LocusCall, run_locus_em_with};
 use crate::ssr::cohort::em_init::seed_locus;
 use crate::ssr::cohort::inbreeding::{OuterCfg, run_cohort_em};
 use crate::ssr::cohort::merge::{CohortMerger, SsrMergeError};
@@ -100,6 +102,10 @@ pub(crate) enum SsrCallError {
     /// Building the burn-in thread pool failed.
     #[error("building the ssr-call thread pool")]
     ThreadPool(#[from] rayon::ThreadPoolBuildError),
+    /// `PVC_SSR_EMIT_MODEL` was set to an unrecognised value. Fail loud rather than
+    /// silently run the default model in a benchmark (the no-silent-fallback invariant).
+    #[error("PVC_SSR_EMIT_MODEL={value:?} is not one of: heuristic, bic, freebayes")]
+    InvalidEmitModel { value: String },
 }
 
 /// Assemble the frozen [`ParamSet`] the genotyping EM consumes from the pre-pass
@@ -205,6 +211,21 @@ struct FrozenParams {
 pub(crate) fn run(config: &SsrCallConfig) -> Result<(), SsrCallError> {
     let rung_cfg = RungCfg::dev_default();
     let cand_cfg = CandidateCfg::dev_default();
+    // ── Emission model selector: `PVC_SSR_EMIT_MODEL` = heuristic (default) | bic | freebayes.
+    // ONE knob picks the per-locus emit decision; all three consume the same EM `data_ll`,
+    // so only the decision differs, never the reads. Default `heuristic` → byte-identical.
+    // Orthogonal to `PVC_SSR_MARGINALIZED_PRIOR` (below), which shapes the EM genotypes/π
+    // every model consumes — so MARG combines with any emission model. Unknown values fail
+    // loud (no silent fallback in a benchmark).
+    let emit_model = match std::env::var("PVC_SSR_EMIT_MODEL") {
+        Err(_) => EmitModel::Heuristic,
+        Ok(v) => match v.as_str() {
+            "" | "heuristic" => EmitModel::Heuristic,
+            "bic" => EmitModel::Bic,
+            "freebayes" => EmitModel::Freebayes,
+            _ => return Err(SsrCallError::InvalidEmitModel { value: v }),
+        },
+    };
     // Experimental knob (Phase 3.5 benchmark): `PVC_SSR_MARGINALIZED_PRIOR=1`
     // swaps the plug-in HWE genotype prior for the marginalized+leave-one-out
     // Dirichlet-multinomial prior (seeded by the same mode-centred `G₀`). Off by
@@ -213,6 +234,13 @@ pub(crate) fn run(config: &SsrCallConfig) -> Result<(), SsrCallError> {
     // the SNP engine's `PVC_*` env knobs. Remove once the default is settled.
     let em_cfg = EmCfg {
         marginalized_prior: std::env::var("PVC_SSR_MARGINALIZED_PRIOR").is_ok_and(|v| v == "1"),
+        emit_model,
+        // `PVC_SSR_FREEBAYES_THETA`: SFS `θ` for the freebayes marginal (default 0.01);
+        // read regardless of model but only used when `emit_model == Freebayes`.
+        sfs_theta: std::env::var("PVC_SSR_FREEBAYES_THETA")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| EmCfg::dev_default().sfs_theta),
         ..EmCfg::dev_default()
     };
     let outer_cfg = OuterCfg::dev_default();
@@ -224,18 +252,21 @@ pub(crate) fn run(config: &SsrCallConfig) -> Result<(), SsrCallError> {
     // default → byte-identical; enabled to benchmark the recovered recall against
     // the silver-standard false-positive rate before flipping the default. Mirrors
     // the `PVC_SSR_MARGINALIZED_PRIOR` knob.
-    // Model-selection emission (spec, monomorphic-vs-polymorphic): `PVC_SSR_BIC_EMIT=1`
-    // replaces emit-iff-variable + FP-control with a BIC test on the cohort marginal read
-    // likelihood; `PVC_SSR_BIC_MARGIN` adds an extra margin (precision↑/recall↓). Off by
-    // default → byte-identical. Mirrors the `PVC_SSR_MARGINALIZED_PRIOR` knob.
+    //
+    // Emission precision/recall knobs (used only under the matching `PVC_SSR_EMIT_MODEL`):
+    // `PVC_SSR_BIC_MARGIN` (bic) — extra BIC margin (precision↑/recall↓);
+    // `PVC_SSR_FREEBAYES_MIN_QUAL` (freebayes) — minimum site QUAL to emit.
     let fp_cfg = FpControlCfg {
         cohort_corroboration: std::env::var("PVC_SSR_COHORT_FP_CONTROL").is_ok_and(|v| v == "1"),
         min_corroboration: std::env::var("PVC_SSR_FP_MIN_CORROBORATION")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(FpControlCfg::dev_default().min_corroboration),
-        bic_emit: std::env::var("PVC_SSR_BIC_EMIT").is_ok_and(|v| v == "1"),
         bic_margin: std::env::var("PVC_SSR_BIC_MARGIN")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.0),
+        freebayes_min_qual: std::env::var("PVC_SSR_FREEBAYES_MIN_QUAL")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(0.0),
@@ -559,55 +590,16 @@ fn genotype_locus(
         .get(candidates.ref_idx)
         .map_or(0, |a| a.len());
 
-    // Emission decision + fate. Two modes:
-    //   * default — per-plant allele-balance FP-control, then emit-iff-variable.
-    //   * BIC (`PVC_SSR_BIC_EMIT`) — model selection on the cohort's marginal read likelihood:
-    //     the polymorphic model must beat the monomorphic one by BIC before the locus is
-    //     emitted (spec, model-selection). FP-control is not run — the model choice replaces
-    //     it. A locus is still only emitted with a variant genotype, so BIC never writes a
-    //     monomorphic row; and a variant the EM produced but BIC rejects (a stutter shoulder)
-    //     is dropped.
-    let drop;
-    let kind;
-    if fp_cfg.bic_emit {
-        let variable = is_variable(&call, &candidates);
-        let n_samples = locus.present.len().max(2) as f64;
-        let delta = 2.0 * (em_ev.ln_marginal - em_ev.ln_monomorphic);
-        let penalty = n_alt as f64 * n_samples.ln() + 2.0 * fp_cfg.bic_margin;
-        let polymorphic = delta > penalty;
-        if candidates.admit != Admission::Pass {
-            drop = false;
-            kind = FateKind::Filtered;
-        } else if variable && polymorphic {
-            drop = false;
-            kind = FateKind::EmittedVariable;
-        } else {
-            drop = true;
-            kind = if variable {
-                FateKind::DropFpControl // BIC rejected a variant the EM produced (stutter)
-            } else {
-                FateKind::DropEmHomRef
-            };
-        }
-    } else {
-        // Observe variability *before* FP-control so a drop caused by FP-control is
-        // distinguishable from one the EM produced on its own (read-only; does not affect emit).
-        let variable_before_fp = is_variable(&call, &candidates);
-        apply_fp_control(&mut call, fp_cfg);
-        let variable_after_fp = is_variable(&call, &candidates);
-        kind = if candidates.admit != Admission::Pass {
-            FateKind::Filtered
-        } else if variable_after_fp {
-            FateKind::EmittedVariable
-        } else if n_alt == 0 {
-            FateKind::DropNoAltCandidate
-        } else if !variable_before_fp {
-            FateKind::DropEmHomRef
-        } else {
-            FateKind::DropFpControl
-        };
-        drop = candidates.admit == Admission::Pass && !variable_after_fp;
-    }
+    // Emission decision + fate, dispatched on `PVC_SSR_EMIT_MODEL` (one unified gate; §decide_emission).
+    let (drop, kind, qual_override) = decide_emission(
+        em_cfg.emit_model,
+        &mut call,
+        &candidates,
+        &em_ev,
+        n_alt,
+        locus.present.len(),
+        fp_cfg,
+    );
     let fate = LocusFate {
         chrom_id: locus.locus.chrom_id,
         pos: u64::from(locus.locus.start) + 1,
@@ -619,7 +611,9 @@ fn genotype_locus(
     if drop {
         return (None, fate);
     }
-    let qual = site_qual(&call, &candidates, fp_cfg);
+    // Freebayes supplies its own P(monomorphic)-derived QUAL; heuristic/bic use the shared
+    // plug-in `site_qual` (unchanged, so those paths stay byte-identical).
+    let qual = qual_override.unwrap_or_else(|| site_qual(&call, &candidates, fp_cfg));
     // PANIC-FREE: every emitted locus carries a chrom_id the merger resolved from the
     // cohort chromosome table (merge.rs hard-errors `UnknownCatalogChrom` otherwise), so
     // this indexes in range. Fail loud rather than emit a placeholder `"?"` contig — an
@@ -647,6 +641,90 @@ fn genotype_locus(
         )),
         fate,
     )
+}
+
+/// The unified per-locus emission decision, dispatched on [`EmitModel`]
+/// (`PVC_SSR_EMIT_MODEL`). Returns `(drop, fate_kind, qual_override)`:
+///
+/// - **All three models decide from the same `data_ll`-derived evidence** — the heuristic
+///   from the calls, BIC from `em_ev.ln_marginal`/`ln_monomorphic`, freebayes from
+///   `em_ev.freebayes_ln_p_mono` — so only the *decision* differs, never the reads (the
+///   fairness invariant). There is exactly one read-likelihood pass, in `run_locus_em_with`.
+/// - **A variant genotype is required to emit** in every model, so none writes a monomorphic
+///   row. A filtered (non-PASS) locus is emitted on its FILTER regardless of model.
+/// - Only the **heuristic** mutates `call` (allele-balance no-call); the model-selection paths
+///   leave the EM's MAP calls intact — the model choice *replaces* FP-control.
+/// - `qual_override` is `Some` only for freebayes (its `−10·log10 P(monomorphic)` QUAL,
+///   clamped to `qual_cap`); the others fall back to the shared `site_qual`.
+fn decide_emission(
+    model: EmitModel,
+    call: &mut LocusCall,
+    candidates: &CandidateSet,
+    em_ev: &EmissionEvidence,
+    n_alt: usize,
+    n_present: usize,
+    fp_cfg: &FpControlCfg,
+) -> (bool, FateKind, Option<f64>) {
+    // A filtered locus is emitted on its FILTER, whatever the model. Its samples are all
+    // no-call, so FP-control would be a no-op — skip it uniformly.
+    if candidates.admit != Admission::Pass {
+        return (false, FateKind::Filtered, None);
+    }
+    match model {
+        EmitModel::Heuristic => {
+            // Observe variability *before* FP-control so a drop caused by FP-control is
+            // distinguishable from one the EM produced on its own (read-only; does not affect emit).
+            let variable_before_fp = is_variable(call, candidates);
+            apply_fp_control(call, fp_cfg);
+            let variable_after_fp = is_variable(call, candidates);
+            let kind = if variable_after_fp {
+                FateKind::EmittedVariable
+            } else if n_alt == 0 {
+                FateKind::DropNoAltCandidate
+            } else if !variable_before_fp {
+                FateKind::DropEmHomRef
+            } else {
+                FateKind::DropFpControl
+            };
+            (!variable_after_fp, kind, None)
+        }
+        EmitModel::Bic => {
+            // Model selection: the polymorphic model must beat the monomorphic one by BIC.
+            let variable = is_variable(call, candidates);
+            let n = n_present.max(2) as f64;
+            let delta = 2.0 * (em_ev.ln_marginal - em_ev.ln_monomorphic);
+            let penalty = n_alt as f64 * n.ln() + 2.0 * fp_cfg.bic_margin;
+            let polymorphic = delta > penalty;
+            emit_or_drop(variable, polymorphic, None)
+        }
+        EmitModel::Freebayes => {
+            // SFS-prior marginal: emit iff the site QUAL (`−10·log10 P(monomorphic)`) clears
+            // the floor. `freebayes_ln_p_mono` is always `Some` here (computed when this model
+            // is selected); the `unwrap_or(0.0)` is a defensive `P(mono)=1` → QUAL 0 fallback.
+            let variable = is_variable(call, candidates);
+            let ln_p_mono = em_ev.freebayes_ln_p_mono.unwrap_or(0.0);
+            let qual = (-10.0 * ln_p_mono / std::f64::consts::LN_10).clamp(0.0, fp_cfg.qual_cap);
+            let polymorphic = qual >= fp_cfg.freebayes_min_qual;
+            emit_or_drop(variable, polymorphic, Some(qual))
+        }
+    }
+}
+
+/// Shared emit/drop resolution for the model-selection paths (BIC, freebayes): emit only a
+/// variant the model judges polymorphic; a variant the model rejects is a stutter drop, a
+/// non-variant is the EM's own hom-ref drop. `qual` is threaded to the caller's override.
+fn emit_or_drop(
+    variable: bool,
+    polymorphic: bool,
+    qual: Option<f64>,
+) -> (bool, FateKind, Option<f64>) {
+    if variable && polymorphic {
+        (false, FateKind::EmittedVariable, qual)
+    } else if variable {
+        (true, FateKind::DropFpControl, qual) // model rejected a variant the EM produced (stutter)
+    } else {
+        (true, FateKind::DropEmHomRef, qual)
+    }
 }
 
 /// Genotype a chunk of loci in parallel, then write the emitted records in catalog order

@@ -37,6 +37,21 @@ use crate::ssr::cohort::types::CohortLocus;
 use smallvec::{SmallVec, smallvec};
 
 /// EM controls (pinned in F2).
+/// The per-locus **emission model**, selected by `PVC_SSR_EMIT_MODEL` (default
+/// `Heuristic` → byte-identical). Orthogonal to [`EmCfg::marginalized_prior`], which
+/// shapes the EM genotypes / `π` that *every* model consumes — any emission model
+/// combines with either genotype prior (e.g. MARG + BIC, MARG + Freebayes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EmitModel {
+    /// Emit-iff-variable + allele-balance FP-control (the historical default).
+    Heuristic,
+    /// Model selection: emit iff the polymorphic model beats the monomorphic one by BIC.
+    Bic,
+    /// Freebayes-style SFS-prior marginal: emit iff `−10·log10 P(monomorphic)` clears a
+    /// QUAL floor. See [`crate::ssr::cohort::freebayes_emit`].
+    Freebayes,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct EmCfg {
     /// Maximum EM iterations.
@@ -71,6 +86,14 @@ pub(crate) struct EmCfg {
     /// until the benchmark (Phase 3.5) decides whether to flip it. See
     /// [`marginalized_genotype_log_priors`].
     pub(crate) marginalized_prior: bool,
+    /// The emission model (`PVC_SSR_EMIT_MODEL`). Default `Heuristic`. Read inside
+    /// [`run_locus_em_with`] only to decide whether to compute the freebayes SFS marginal
+    /// (the count-vector enumeration is not free); the emit/drop *decision* is dispatched
+    /// in `driver::genotype_locus`. Orthogonal to `marginalized_prior`.
+    pub(crate) emit_model: EmitModel,
+    /// Population-scaled diversity `θ` for the freebayes SFS prior (read only when
+    /// `emit_model == Freebayes`). See [`crate::ssr::cohort::freebayes_emit::SFS_THETA`].
+    pub(crate) sfs_theta: f64,
 }
 
 impl EmCfg {
@@ -86,6 +109,8 @@ impl EmCfg {
             level_shrink: 20.0,
             level_tol: 1e-3,
             marginalized_prior: false,
+            emit_model: EmitModel::Heuristic,
+            sfs_theta: crate::ssr::cohort::freebayes_emit::SFS_THETA,
         }
     }
 }
@@ -360,10 +385,17 @@ fn log_sum_exp(xs: &[f64]) -> f64 {
 /// A BIC / likelihood-ratio emission gate compares the two: the extra allele must earn its
 /// parameter cost before the locus is emitted, which rejects a systematic stutter shoulder
 /// (it barely lifts the likelihood) while keeping a real segregating allele (it lifts it a lot).
+/// The freebayes-style SFS marginal ([`Self::freebayes_ln_p_mono`]) is carried alongside the
+/// BIC pair so **both** emission models decide from the same one read-likelihood pass
+/// (`data_ll`) — only the decision differs, never the reads. It is `Some` only when
+/// `emit_model == Freebayes` (the count-vector marginal is computed on demand).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct EmissionEvidence {
     pub(crate) ln_marginal: f64,
     pub(crate) ln_monomorphic: f64,
+    /// Freebayes-style `ln P(monomorphic | data)` (≤ 0) from the SFS-prior marginal over the
+    /// same `data_ll`; `Some` only for `EmitModel::Freebayes`, `None` otherwise / filtered loci.
+    pub(crate) freebayes_ln_p_mono: Option<f64>,
 }
 
 /// Genotype one locus on the supplied parameters.
@@ -432,6 +464,7 @@ pub(crate) fn run_locus_em_with<M: ReadLikelihoodModel>(
             EmissionEvidence {
                 ln_marginal: 0.0,
                 ln_monomorphic: 0.0,
+                freebayes_ln_p_mono: None,
             },
         );
     }
@@ -547,8 +580,20 @@ pub(crate) fn run_locus_em_with<M: ReadLikelihoodModel>(
         &mut scratch,
     );
 
-    // Emission evidence for the model-selection gate, from the settled `data_ll` + `pi`.
-    let evidence = emission_evidence(&data_ll, &genotypes, &pi, f_per_present, k);
+    // Emission evidence for the model-selection gate, from the settled `data_ll` + `pi`. The
+    // BIC pair (cheap) is always computed; the freebayes SFS marginal (a count-vector
+    // enumeration) only when that model is selected — both from this one `data_ll` so the
+    // emission choice, not the reads, is all that differs between models (the fairness invariant).
+    let mut evidence = emission_evidence(&data_ll, &genotypes, &pi, f_per_present, k);
+    if cfg.emit_model == EmitModel::Freebayes {
+        evidence.freebayes_ln_p_mono = Some(crate::ssr::cohort::freebayes_emit::ln_p_monomorphic(
+            &data_ll,
+            &pi,
+            f_per_present,
+            k,
+            cfg.sfs_theta,
+        ));
+    }
 
     (
         LocusCall {
@@ -595,6 +640,7 @@ fn emission_evidence(
     EmissionEvidence {
         ln_marginal,
         ln_monomorphic,
+        freebayes_ln_p_mono: None,
     }
 }
 
