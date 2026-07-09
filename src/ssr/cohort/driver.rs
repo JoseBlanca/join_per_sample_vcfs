@@ -272,8 +272,20 @@ pub(crate) fn run(config: &SsrCallConfig) -> Result<(), SsrCallError> {
     // is no `Default` impl, adding a field forces a compile error only in `dev_default()` itself,
     // NOT at this site — so a *new* field defaults here silently. Review new fields' defaults here
     // when they land (the byte-identity contract depends on off-valued defaults).
+    // Genotype-prior probe: `PVC_SSR_MARG_SFS=1` runs the marginalized prior with a flat
+    // symmetric **Ewens `θ/k` SFS** base measure in place of the mode-centred `G₀` — the
+    // cheap per-sample graft of the freebayes emission's SFS frequency prior into
+    // *genotyping* (the finite-`k` SFS prior on `p` is exactly a symmetric `Dir(θ/k)`, so
+    // only the base measure changes; EM, leave-one-out, and read model are untouched).
+    // It implies `marginalized_prior` (it IS a marginalized-prior variant); combine
+    // `PVC_SSR_MARGINALIZED_PRIOR=1` (DM/`G₀` base) vs `PVC_SSR_MARG_SFS=1` (SFS/`θ/k`
+    // base) to compare the two frequency-prior forms. `θ` is `PVC_SSR_FREEBAYES_THETA`
+    // (shared with the freebayes emission, default 0.01). Off by default → byte-identical.
+    let marg_sfs = std::env::var("PVC_SSR_MARG_SFS").is_ok_and(|v| v == "1");
     let em_cfg = EmCfg {
-        marginalized_prior: std::env::var("PVC_SSR_MARGINALIZED_PRIOR").is_ok_and(|v| v == "1"),
+        marginalized_prior: marg_sfs
+            || std::env::var("PVC_SSR_MARGINALIZED_PRIOR").is_ok_and(|v| v == "1"),
+        sfs_base: marg_sfs,
         emit_model,
         // `PVC_SSR_FREEBAYES_THETA`: SFS `θ` for the freebayes marginal (default 0.01);
         // read regardless of model but only used when `emit_model == Freebayes`.

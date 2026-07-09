@@ -86,6 +86,20 @@ pub(crate) struct EmCfg {
     /// until the benchmark (Phase 3.5) decides whether to flip it. See
     /// [`marginalized_genotype_log_priors`].
     pub(crate) marginalized_prior: bool,
+    /// Base measure for the marginalized prior's Dirichlet frequency model, the
+    /// **genotype-prior probe** (`PVC_SSR_MARG_SFS`). `false` (default) = the
+    /// mode-centred `G₀` pseudocounts (empirical-Bayes, favours the per-locus modal
+    /// allele). `true` = a flat symmetric **Ewens `θ/k` SFS** base (`sfs_theta / k` per
+    /// allele) — the finite-`k` neutral site-frequency-spectrum prior on the population
+    /// allele frequency `p`: sparse (`Σ = θ`, so most mass on the monomorphic corners)
+    /// and allele-agnostic. Only consulted when [`Self::marginalized_prior`] is on; it
+    /// swaps ONLY the frequency model's base measure — the leave-one-out cohort update
+    /// (`leave_one_out_alpha`) and the Dirichlet-multinomial integration
+    /// (`marginalized_genotype_log_priors`) are unchanged. This is the cheap per-sample
+    /// graft of the freebayes emission's SFS frequency prior into *genotyping*: the
+    /// faithful finite-`k` SFS prior on `p` is exactly a symmetric `Dir(θ/k)`, so no new
+    /// joint machinery is needed. Off by default → byte-identical. See [`genotype_pass`].
+    pub(crate) sfs_base: bool,
     /// The emission model (`PVC_SSR_EMIT_MODEL`). Default `Heuristic`. Read inside
     /// [`run_locus_em_with`] only to decide whether to compute the freebayes SFS marginal
     /// (the count-vector enumeration is not free); the emit/drop *decision* is dispatched
@@ -129,6 +143,7 @@ impl EmCfg {
             level_shrink: 20.0,
             level_tol: 1e-3,
             marginalized_prior: false,
+            sfs_base: false,
             emit_model: EmitModel::Heuristic,
             sfs_theta: crate::ssr::cohort::freebayes_emit::SFS_THETA,
             null_from_homs: false,
@@ -1031,11 +1046,36 @@ fn final_calls_marginalized(
     (calls, posterior_hom)
 }
 
+/// Floor for a flat SFS base entry, so `Dir(θ/k)` stays a valid (`> 0`, finite)
+/// concentration even at a degenerate `θ = 0` or a huge candidate count `k`.
+/// Far below any real diversity, so it never perturbs a genuine `θ`.
+const MIN_SFS_BASE: f64 = 1e-12;
+
+/// The base measure for the marginalized prior's Dirichlet frequency model. Default =
+/// the mode-centred `G₀` pseudocounts (empirical-Bayes). Under [`EmCfg::sfs_base`]
+/// (`PVC_SSR_MARG_SFS`) swap it for a flat symmetric **Ewens `θ/k` SFS** base
+/// (`sfs_theta / k` per allele) — the finite-`k` neutral site-frequency-spectrum prior
+/// on the allele frequency (sparse, `Σ = θ`, allele-agnostic). Returns a borrow of `g0`
+/// in the default case (no allocation, byte-identical) and an owned flat vector under
+/// the toggle. This is the single line that distinguishes the DM-marginalized genotype
+/// prior from the SFS-marginalized one: only the frequency model's *base measure*
+/// changes; the leave-one-out update and the DM integration are shared.
+fn marginalized_base<'a>(g0: &'a [f64], k: usize, cfg: &EmCfg) -> std::borrow::Cow<'a, [f64]> {
+    if cfg.sfs_base {
+        let a = (cfg.sfs_theta / k as f64).max(MIN_SFS_BASE);
+        std::borrow::Cow::Owned(vec![a; k])
+    } else {
+        std::borrow::Cow::Borrowed(g0)
+    }
+}
+
 /// One genotyping pass — the π-EM to convergence plus the final per-sample calls
 /// — dispatching on [`EmCfg::marginalized_prior`]. The plug-in branch is exactly
 /// the previous `run_pi_em` + `final_calls` sequence (byte-identical at the
 /// default); the marginalized branch runs the leave-one-out Dirichlet-multinomial
-/// prior. `k` is the candidate count.
+/// prior over a base measure chosen by [`marginalized_base`] (mode-centred `G₀` by
+/// default, the flat Ewens `θ/k` SFS base under [`EmCfg::sfs_base`]). `k` is the
+/// candidate count.
 #[allow(clippy::too_many_arguments)]
 fn genotype_pass(
     data_ll: &[Vec<f64>],
@@ -1048,9 +1088,17 @@ fn genotype_pass(
     cfg: &EmCfg,
 ) -> (Vec<f64>, Vec<SampleCall>, Vec<f64>) {
     if cfg.marginalized_prior {
-        let fit = run_pi_em_marginalized(data_ll, genotypes, g0, f_per_present, k, cfg);
-        let (calls, posterior_hom) =
-            final_calls_marginalized(data_ll, genotypes, g0, &fit, f_per_present, k, cand_units);
+        let base = marginalized_base(g0, k, cfg);
+        let fit = run_pi_em_marginalized(data_ll, genotypes, &base, f_per_present, k, cfg);
+        let (calls, posterior_hom) = final_calls_marginalized(
+            data_ll,
+            genotypes,
+            &base,
+            &fit,
+            f_per_present,
+            k,
+            cand_units,
+        );
         (fit.pi, calls, posterior_hom)
     } else {
         let pi = run_pi_em(data_ll, genotypes, g0, pi0, f_per_present, cfg);
@@ -2289,6 +2337,93 @@ mod tests {
             moved,
             "leave-one-out iterations did not move the cohort expected counts"
         );
+    }
+
+    #[test]
+    fn marginalized_base_is_g0_when_off_and_flat_theta_over_k_when_on() {
+        let g0 = [1.0, 0.5, 0.25];
+        let off = EmCfg {
+            marginalized_prior: true,
+            sfs_base: false,
+            ..EmCfg::dev_default()
+        };
+        // Default: the base measure IS `G₀`, borrowed (byte-identical to the DM path).
+        assert_eq!(marginalized_base(&g0, 3, &off).as_ref(), &g0[..]);
+        // Toggle on: a flat symmetric `θ/k` base (`Σ = θ`), independent of `G₀`.
+        let on = EmCfg {
+            marginalized_prior: true,
+            sfs_base: true,
+            sfs_theta: 0.03,
+            ..EmCfg::dev_default()
+        };
+        let base = marginalized_base(&g0, 3, &on);
+        assert_eq!(base.as_ref(), &[0.01, 0.01, 0.01]); // 0.03 / 3
+        assert!(
+            (base.iter().sum::<f64>() - 0.03).abs() < 1e-12,
+            "Σ base = θ"
+        );
+    }
+
+    #[test]
+    fn sfs_base_is_more_conservative_than_g0_on_a_lone_off_modal_carrier() {
+        // One ambiguous sample leaning to the het (0,1), with NO cohort support for the
+        // off-modal allele 1 (the other three plants are firmly hom-ref). The mode-centred
+        // `G₀` still hands allele 1 a 0.5 pseudocount, so its het stays plausible; the flat
+        // sparse Ewens `θ/k` SFS base gives allele 1 only `θ/2 ≈ 0.005` and, with the
+        // leave-one-out cohort spectrum empty for it, suppresses the lone-carrier het —
+        // i.e. the SFS frequency prior is stricter on exactly the contested cells. The
+        // probe measures whether that stricter prior helps or hurts on real data.
+        let genotypes = enumerate_diploid_genotypes(2);
+        let g0_mode = [1.0, 0.5]; // modal allele 0
+        let pi0 = [0.5, 0.5];
+        let cand_units = [5u16, 6u16];
+        let f = [0.0; 4];
+        let data_ll = vec![
+            vec![0.0, 0.5, -30.0], // sample 0: leans het (0,1)
+            vec![0.0, -30.0, -60.0],
+            vec![0.0, -30.0, -60.0],
+            vec![0.0, -30.0, -60.0],
+        ];
+        let dm = EmCfg {
+            marginalized_prior: true,
+            sfs_base: false,
+            ..EmCfg::dev_default()
+        };
+        let sfs = EmCfg {
+            marginalized_prior: true,
+            sfs_base: true,
+            ..EmCfg::dev_default()
+        };
+        let (_, _, ph_dm) = genotype_pass(
+            &data_ll,
+            &genotypes,
+            &g0_mode,
+            &pi0,
+            &f,
+            2,
+            &cand_units,
+            &dm,
+        );
+        let (_, calls_sfs, ph_sfs) = genotype_pass(
+            &data_ll,
+            &genotypes,
+            &g0_mode,
+            &pi0,
+            &f,
+            2,
+            &cand_units,
+            &sfs,
+        );
+        // The stricter SFS base raises the lone carrier's posterior homozygosity: it trusts
+        // the sparse neutral prior over one plant's thin het lean.
+        assert!(
+            ph_sfs[0] > ph_dm[0] + 1e-6,
+            "SFS base should be more hom-conservative on the lone carrier: sfs {} vs dm {}",
+            ph_sfs[0],
+            ph_dm[0]
+        );
+        // All finite / well-formed calls (no NaN from the tiny concentration).
+        assert!(calls_sfs.iter().all(|c| c.posterior.is_finite()));
     }
 
     #[test]
