@@ -1,6 +1,7 @@
 # SSR calling — statistical models, the options we can turn on, and the plan to find the best combination
 
-*Status: reference + plan, 2026-07-08, branch `ssr-bic-emission` (all emission
+*Status: reference + plan, 2026-07-08 (rev. 2026-07-09 — the `MARG-SFS` genotype-prior
+probe folded in as §3.2b / §4 finding 4, null), branch `ssr-bic-emission` (all emission
 models unified behind `PVC_SSR_EMIT_MODEL`). This document has two jobs. First, it
 is a **single map** of every statistical model and tunable option now in the SSR
 caller, so we can reason about them together instead of one report at a time.
@@ -52,7 +53,8 @@ Defined once, in plain terms, because the rest of the document reuses them.
   a site carries a variant and, if so, in how many of the cohort's chromosomes. The
   neutral (Ewens) form is governed by a diversity parameter `θ`; a small `θ` puts
   most of the prior mass on the site being monomorphic and the rest on rare
-  (low-carrier-count) alleles. (Its role in emission is §3.3.)
+  (low-carrier-count) alleles. (Its role in emission is §3.3; its tested-and-rejected
+  role as a genotype-prior base measure is §3.2.)
 - **Silver standard** — a *confidently-labelled subset* of loci we treat as truth
   in the absence of a gold standard, built from the reads (§5). **Not** a truth set.
 - **Concordance** — the fraction of individual genotype calls (one plant at one
@@ -95,7 +97,8 @@ the cited section):
 - **confident-genotype gate** — in the chemistry pre-pass, which plants get to teach
   the caller its error/stutter parameters (§3.1).
 - **genotype prior** — how the genotyping EM builds each plant's prior: **plug-in**
-  (default) or **marginalized** (`MARG`) (§3.2).
+  (default) or **marginalized** (`MARG`) — plus the marginalized prior's **SFS
+  base-measure** variant (`PVC_SSR_MARG_SFS`), tested and rejected (§3.2).
 - **emission model** — how the caller decides whether to write a locus at all:
   **heuristic** (default), **BIC**, or **freebayes** (§3.3).
 - **emission null** — what the "monomorphic" hypothesis uses for its stutter:
@@ -154,6 +157,7 @@ the settled heuristic caller. Turning one on is a runtime environment variable.
 |---|---|---|---|---|
 | 3.1 | confident-genotype gate | *(pre-pass, design)* | — | chemistry purity |
 | 3.2 | genotype prior | `PVC_SSR_MARGINALIZED_PRIOR` | plug-in | genotyping |
+| 3.2b | genotype-prior base measure (SFS) | `PVC_SSR_MARG_SFS` | mode-centred `G₀` | genotyping *(tested → null, §4)* |
 | 3.3 | emission model | `PVC_SSR_EMIT_MODEL` | `heuristic` | emission |
 | 3.4 | emission null | `PVC_SSR_NULL_FROM_HOMS` | genotype-driven | emission |
 | 3.5 | per-sample no-call under a model | `PVC_SSR_KEEP_FP_CONTROL` | off | per-sample QC |
@@ -195,6 +199,20 @@ biases every shallow plant toward hom-ref, and calling them hom-ref keeps the
 frequency low. The marginalized prior escapes the trap and **re-genotypes the
 lone-carrier recurrent heterozygotes as variant** — which turns out to be exactly
 the cells the whole recall/precision tension is about (§4).
+
+*A third variant — the SFS base measure (`PVC_SSR_MARG_SFS`), tested and rejected.*
+The marginalized prior integrates each plant's genotype over the frequency `p` drawn
+from a Dirichlet whose **base measure** is the mode-centred `G₀` (§4.3). One can ask
+whether swapping that base for the **Ewens `θ/k` SFS** — the same neutral spectrum that
+gives the freebayes *emission* its edge (§3.3) — produces better *genotypes*. It does
+so cheaply: the faithful finite-`k` SFS prior on `p` *is* a symmetric `Dir(θ/k)`, so the
+graft is the existing marginalized machinery with a flat sparse `θ/k` base in place of
+`G₀` — no joint/cohort-scale structure (reusing the freebayes count-vector marginal
+literally per plant would be the memory-costly full genotyper we rejected, so we did not).
+The **null verdict** is in §4 (finding 4): at matched emission and matched false-positive
+rate the SFS base is indistinguishable from `G₀`. Kept as a documented dead end, not a
+recommended toggle. Detail:
+[`ssr_marg_sfs_genotype_prior_2026-07-09.md`](../reports/ssr_marg_sfs_genotype_prior_2026-07-09.md).
 
 ### 3.3 Emission model — `PVC_SSR_EMIT_MODEL = heuristic | bic | freebayes`
 
@@ -278,6 +296,20 @@ confident-monomorphic) and by HipSTR concordance; full numbers in
    recall. Concretely: `freebayes + MARG + KEEP` collapses recall to ~54% (the
    no-call removes exactly what MARG recovered), while `freebayes + MARG, no KEEP`
    holds ~87% recall at ~88% concordance. **You cannot bank both at 3 reads/plant.**
+4. **The SFS frequency prior does not improve *genotyping* over the marginalized DM
+   prior (§3.2b) — a null result.** Swapping the marginalized prior's base measure from
+   the mode-centred `G₀` to the flat Ewens `θ/k` SFS leaves genotypes unchanged where it
+   matters: on the freebayes frontier (QUAL swept, so a recall gap at matched FP *is* a
+   genotyping gap) DM-marg and SFS-marg are indistinguishable at every `MIN_QUAL ≥ 10`
+   (recall within 0.7 pt, FP within 0.03%); both beat plug-in, neither beats the other.
+   The one difference — the sparser SFS base is ~3× cleaner on FP at the *unfiltered*
+   point (it suppresses the lowest-confidence lone-carrier false positives) — is
+   **redundant with the `MIN_QUAL` knob**, which prunes the same loci. This confirms
+   directly what finding 1 implied: the SFS prior's value lives in **marginalizing the
+   frequency in the emit decision**, not in a better genotype frequency model — so the
+   memory-costly full freebayes *genotyper* is **definitively not worth building** (the
+   cheapest graft of its frequency model is inert). Detail:
+   [`ssr_marg_sfs_genotype_prior_2026-07-09.md`](../reports/ssr_marg_sfs_genotype_prior_2026-07-09.md).
 
 The current recommendation (two regimes, from the comparison report):
 
@@ -361,7 +393,7 @@ lone-carrier-het cells** is enough to anchor everything.
 | axis | values to test | pruned by |
 |---|---|---|
 | emission model | `freebayes`, `bic` | `heuristic` is the thing we are replacing; keep as the reference point only |
-| genotype prior | MARG on, MARG off | — |
+| genotype prior | MARG on, MARG off | the **SFS base-measure** variant (§3.2b) is silver-null (§4, finding 4) → dropped from the sweep; gold may confirm it once, but do not carry it in the matrix |
 | per-sample no-call | KEEP on, KEEP off | **MARG on + KEEP on is dead** (recall → 54%); do not test it |
 | emission null | clean-hom on, off | test on both models |
 | knob | `MIN_QUAL` / `margin` sweep | continuous — report the frontier, not points |
@@ -407,16 +439,19 @@ depth floor (§8) means it will not hand us a free precision jump.
   a deeper cohort.
 - **The clean-hom null (§3.4) and the pre-pass gate (§3.1)** interact with the
   emission choice and have not been swept in the full matrix yet — §7 folds them in.
-- **A coherent, cheap frequency prior — the `MARG-SFS` probe.** The freebayes path
-  decides the site under the SFS prior but reports the EM's genotypes under a
-  different one (§1) — a deliberate statistical incoherence. Grafting the SFS prior
-  into the genotyper (keeping the per-locus EM, *not* the memory-costly joint
-  genotyper of §7) would make the site call and the genotypes share one prior —
-  approximately coherent and memory-neutral — and, as a by-product, test whether the
-  SFS frequency prior improves *genotypes*, not just emission. A bounded, silver-scored
-  experiment behind a toggle; expect a small effect (the freebayes-vs-BIC emission
-  edge was small), and a null result usefully closes the freebayes-genotyper question
-  for good.
+- **A coherent, cheap frequency prior — the `MARG-SFS` probe (DONE, null).** The
+  freebayes path decides the site under the SFS prior but reports the EM's genotypes
+  under a different one (§1) — a deliberate statistical incoherence. We grafted the SFS
+  prior into the genotyper cheaply (the marginalized prior's base measure swapped `G₀ →
+  θ/k`, keeping the per-locus EM, *not* the memory-costly joint genotyper of §7 —
+  `PVC_SSR_MARG_SFS`, §3.2b) to test whether it improves *genotypes*, not just emission.
+  **It does not** (§4, finding 4): at matched emission and FP the SFS base is
+  indistinguishable from `G₀`. This resolves the incoherence question the pragmatic way —
+  the two priors give the same genotypes, so the incoherence is cosmetic — and **closes
+  the freebayes-genotyper question for good**: the cheapest graft of its frequency model
+  is inert, so the expensive one is not worth building. The remaining statistical
+  incoherence (site vs genotype prior) is therefore a documented non-issue, not a
+  to-do.
 - **Ploidy.** The genotyping is diploid-only today; a polyploid grating is a separate,
   documented follow-up and changes the genotype-configuration priors above.
 
