@@ -106,6 +106,42 @@ pub(crate) enum SsrCallError {
     /// silently run the default model in a benchmark (the no-silent-fallback invariant).
     #[error("PVC_SSR_EMIT_MODEL={value:?} is not one of: heuristic, bic, freebayes")]
     InvalidEmitModel { value: String },
+    /// A `null_from_homs` numeric knob was set to a value outside its valid domain. Fail loud
+    /// (the same no-silent-fallback invariant as `PVC_SSR_EMIT_MODEL`) rather than silently
+    /// pooling the wrong plants into the clean-hom stutter null and mislabelling the run.
+    #[error("{var}={value:?} is invalid: {reason}")]
+    InvalidNullKnob {
+        var: &'static str,
+        value: String,
+        reason: &'static str,
+    },
+}
+
+/// Parse an env knob that is *set* into a validated value, failing loud on unparseable or
+/// out-of-domain input — the `null_from_homs` numeric knobs' analogue of the `PVC_SSR_EMIT_MODEL`
+/// hard error. An unset var returns `default` (the only silent path). `check` returns `Err(reason)`
+/// for a parsed-but-out-of-domain value.
+fn parse_validated_env<T: std::str::FromStr>(
+    var: &'static str,
+    default: T,
+    check: impl FnOnce(&T) -> Result<(), &'static str>,
+) -> Result<T, SsrCallError> {
+    match std::env::var(var) {
+        Err(_) => Ok(default),
+        Ok(value) => {
+            let parsed: T = value.parse().map_err(|_| SsrCallError::InvalidNullKnob {
+                var,
+                value: value.clone(),
+                reason: "not parseable as the expected numeric type",
+            })?;
+            check(&parsed).map_err(|reason| SsrCallError::InvalidNullKnob {
+                var,
+                value,
+                reason,
+            })?;
+            Ok(parsed)
+        }
+    }
 }
 
 /// Assemble the frozen [`ParamSet`] the genotyping EM consumes from the pre-pass
@@ -232,6 +268,10 @@ pub(crate) fn run(config: &SsrCallConfig) -> Result<(), SsrCallError> {
     // default so `ssr-call` is byte-identical; enabled only to benchmark the two
     // priors against HipSTR before deciding whether to make it the default. Mirrors
     // the SNP engine's `PVC_*` env knobs. Remove once the default is settled.
+    // NOTE: the `..EmCfg::dev_default()` tail defaults any field not spelled here. Because there
+    // is no `Default` impl, adding a field forces a compile error only in `dev_default()` itself,
+    // NOT at this site — so a *new* field defaults here silently. Review new fields' defaults here
+    // when they land (the byte-identity contract depends on off-valued defaults).
     let em_cfg = EmCfg {
         marginalized_prior: std::env::var("PVC_SSR_MARGINALIZED_PRIOR").is_ok_and(|v| v == "1"),
         emit_model,
@@ -241,6 +281,29 @@ pub(crate) fn run(config: &SsrCallConfig) -> Result<(), SsrCallError> {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or_else(|| EmCfg::dev_default().sfs_theta),
+        // `PVC_SSR_NULL_FROM_HOMS=1`: judge emission against a per-locus stutter null learned
+        // from the clearly-hom plants (§EmCfg::null_from_homs). Feeds both BIC and freebayes.
+        // Sweep knobs `PVC_SSR_NULL_HOM_MINDEPTH` / `PVC_SSR_NULL_HOM_FRAC` are validated
+        // fail-loud (a garbage threshold would silently pool the wrong plants into the null).
+        null_from_homs: std::env::var("PVC_SSR_NULL_FROM_HOMS").is_ok_and(|v| v == "1"),
+        null_hom_min_depth: parse_validated_env(
+            "PVC_SSR_NULL_HOM_MINDEPTH",
+            EmCfg::dev_default().null_hom_min_depth,
+            |&d| {
+                (d >= 1)
+                    .then_some(())
+                    .ok_or("must be >= 1 (0 disables the depth gate)")
+            },
+        )?,
+        null_hom_frac: parse_validated_env(
+            "PVC_SSR_NULL_HOM_FRAC",
+            EmCfg::dev_default().null_hom_frac,
+            |&f: &f64| {
+                (f.is_finite() && (0.0..=1.0).contains(&f))
+                    .then_some(())
+                    .ok_or("must be a finite fraction in [0.0, 1.0]")
+            },
+        )?,
         ..EmCfg::dev_default()
     };
     let outer_cfg = OuterCfg::dev_default();
@@ -270,6 +333,11 @@ pub(crate) fn run(config: &SsrCallConfig) -> Result<(), SsrCallError> {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(0.0),
+        // `PVC_SSR_KEEP_FP_CONTROL=1`: under bic/freebayes, keep the per-sample allele-balance
+        // no-call for GT quality/concordance while the model owns the site emit decision.
+        keep_fp_control: std::env::var("PVC_SSR_KEEP_FP_CONTROL").is_ok_and(|v| v == "1"),
+        // As with `em_cfg` above: a new `FpControlCfg` field defaults here silently (no compile
+        // error at this `..dev_default()` tail) — review its default when one is added.
         ..FpControlCfg::dev_default()
     };
 
@@ -695,6 +763,11 @@ fn decide_emission(
             let delta = 2.0 * (em_ev.ln_marginal - em_ev.ln_monomorphic);
             let penalty = n_alt as f64 * n.ln() + 2.0 * fp_cfg.bic_margin;
             let polymorphic = delta > penalty;
+            // Optional per-sample GT cleanup (concordance/QC). `variable` was read *before*
+            // this, so the no-call never gates the model's site emit decision.
+            if fp_cfg.keep_fp_control {
+                apply_fp_control(call, fp_cfg);
+            }
             emit_or_drop(variable, polymorphic, None)
         }
         EmitModel::Freebayes => {
@@ -705,6 +778,10 @@ fn decide_emission(
             let ln_p_mono = em_ev.freebayes_ln_p_mono.unwrap_or(0.0);
             let qual = (-10.0 * ln_p_mono / std::f64::consts::LN_10).clamp(0.0, fp_cfg.qual_cap);
             let polymorphic = qual >= fp_cfg.freebayes_min_qual;
+            // Optional per-sample GT cleanup (concordance/QC); does not gate the site decision.
+            if fp_cfg.keep_fp_control {
+                apply_fp_control(call, fp_cfg);
+            }
             emit_or_drop(variable, polymorphic, Some(qual))
         }
     }
@@ -790,6 +867,64 @@ mod tests {
     /// `CA` repeated `units` times — one allele's tract sequence.
     fn ca(units: u16) -> Box<[u8]> {
         "CA".repeat(units as usize).into_bytes().into_boxed_slice()
+    }
+
+    /// M5 (review): under `keep_fp_control`, the site model owns the emit decision and the
+    /// per-sample allele-balance no-call only cleans the emitted genotypes — it must NOT gate
+    /// emission. A BIC-polymorphic locus whose lone carrier `apply_fp_control` would no-call
+    /// must still emit (drop == false, EmittedVariable) while that carrier's GT is no-called.
+    #[test]
+    fn keep_fp_control_cleans_genotypes_without_changing_model_emit_decision() {
+        use crate::ssr::cohort::em::SampleCall;
+        // ref=8, alt candidates 6 and 10 units → a 6/10 het is length-variable.
+        let candidates = CandidateSet {
+            alleles: vec![ca(8), ca(6), ca(10)],
+            ref_idx: 0,
+            admit: Admission::Pass,
+        };
+        // A lone lopsided het (support 190/10) — `apply_fp_control` no-calls it.
+        let imbalanced_het = || SampleCall {
+            allele_indices: vec![1, 2],
+            genotype_units: vec![6, 10],
+            posterior: 0.99,
+            gq: 40,
+            allele_support: smallvec::SmallVec::from_slice(&[190.0, 10.0]),
+        };
+        // Evidence the BIC test judges polymorphic (Δ far above the n_alt·ln(N) penalty).
+        let em_ev = EmissionEvidence {
+            ln_marginal: 10.0,
+            ln_monomorphic: 0.0,
+            freebayes_ln_p_mono: None,
+        };
+        let fp_cfg = FpControlCfg {
+            keep_fp_control: true,
+            ..FpControlCfg::dev_default()
+        };
+
+        for model in [EmitModel::Bic, EmitModel::Freebayes] {
+            let mut ev = em_ev;
+            if model == EmitModel::Freebayes {
+                // A tiny P(monomorphic) → high QUAL → polymorphic under the default 0 floor.
+                ev.freebayes_ln_p_mono = Some(-20.0);
+            }
+            let mut call = LocusCall {
+                calls: vec![imbalanced_het()],
+                pi: vec![0.34, 0.33, 0.33],
+                posterior_hom: vec![0.0],
+                admit: Admission::Pass,
+            };
+            let (drop, kind, _) =
+                decide_emission(model, &mut call, &candidates, &ev, 2, 1, &fp_cfg);
+            assert!(
+                !drop,
+                "{model:?}: site model still emits despite the per-sample no-call"
+            );
+            assert_eq!(kind, FateKind::EmittedVariable, "{model:?}");
+            assert!(
+                call.calls[0].allele_indices.is_empty(),
+                "{model:?}: the imbalanced het's GT was cleaned to a no-call"
+            );
+        }
     }
 
     /// A catalog locus on `chrom` at 0-based `start` with a `units`-unit `CA` reference

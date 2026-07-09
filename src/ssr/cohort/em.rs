@@ -94,7 +94,27 @@ pub(crate) struct EmCfg {
     /// Population-scaled diversity `θ` for the freebayes SFS prior (read only when
     /// `emit_model == Freebayes`). See [`crate::ssr::cohort::freebayes_emit::SFS_THETA`].
     pub(crate) sfs_theta: f64,
+    /// (`PVC_SSR_NULL_FROM_HOMS`): estimate the per-locus stutter (shape θ *and* rate) from the
+    /// plants that are unambiguously homozygous by a read-fraction rule — their off-modal reads
+    /// are stutter by definition, with no genotype-call ambiguity — pooled across the whole
+    /// cohort, then judge emission (**both** BIC and freebayes) against that genotype-free null,
+    /// so an alt must clear the honest stutter. The EM's genotypes/`variable` are untouched
+    /// (emission-only). Off by default → byte-identical.
+    pub(crate) null_from_homs: bool,
+    /// Min reads before a plant is eligible to be a clean-hom stutter donor for
+    /// [`Self::null_from_homs`]. Defaults to [`DEFAULT_NULL_HOM_MIN_DEPTH`].
+    pub(crate) null_hom_min_depth: u64,
+    /// Modal-length read fraction at/above which a plant counts as clean-hom for
+    /// [`Self::null_from_homs`]. Defaults to [`DEFAULT_NULL_HOM_FRAC`].
+    pub(crate) null_hom_frac: f64,
 }
+
+/// Clean-hom stutter-donor thresholds for [`EmCfg::null_from_homs`] (`attribute_clean_homs`).
+/// Mirror the silver-standard scorer (`benchmarks/ssr_tomato1/scripts/silver_standard.py`,
+/// `MIN_DEPTH` / `HOM_FRAC`) so the caller's clean-hom donor set matches the benchmark that
+/// evaluates it. Overridable per run via `PVC_SSR_NULL_HOM_MINDEPTH` / `PVC_SSR_NULL_HOM_FRAC`.
+pub(crate) const DEFAULT_NULL_HOM_MIN_DEPTH: u64 = 4;
+pub(crate) const DEFAULT_NULL_HOM_FRAC: f64 = 0.75;
 
 impl EmCfg {
     pub(crate) fn dev_default() -> Self {
@@ -111,6 +131,9 @@ impl EmCfg {
             marginalized_prior: false,
             emit_model: EmitModel::Heuristic,
             sfs_theta: crate::ssr::cohort::freebayes_emit::SFS_THETA,
+            null_from_homs: false,
+            null_hom_min_depth: DEFAULT_NULL_HOM_MIN_DEPTH,
+            null_hom_frac: DEFAULT_NULL_HOM_FRAC,
         }
     }
 }
@@ -582,12 +605,47 @@ pub(crate) fn run_locus_em_with<M: ReadLikelihoodModel>(
 
     // Emission evidence for the model-selection gate, from the settled `data_ll` + `pi`. The
     // BIC pair (cheap) is always computed; the freebayes SFS marginal (a count-vector
-    // enumeration) only when that model is selected — both from this one `data_ll` so the
-    // emission choice, not the reads, is all that differs between models (the fairness invariant).
-    let mut evidence = emission_evidence(&data_ll, &genotypes, &pi, f_per_present, k);
+    // enumeration) only when that model is selected — both from one `data_ll` so the emission
+    // choice, not the reads, is all that differs between models (the fairness invariant).
+    //
+    // `null_from_homs`: judge emission against a genotype-free per-locus stutter null learned
+    // from the clearly-hom plants. Re-estimate θ + rate from their pooled off-modal reads
+    // (shrunk toward the frozen group prior when the clean-hom pool is thin), recompute the read
+    // likelihoods under that honest null, and derive the emission evidence — the marginal *and*
+    // the monomorphic term — from it, so an alt must clear the real stutter. The EM's genotypes
+    // are untouched, so `variable`/GTs/recall-of-candidates are unchanged (emission-only).
+    let data_ll_clean_hom_null = if cfg.null_from_homs {
+        let clean_hom_fit = attribute_clean_homs(
+            locus,
+            period,
+            params,
+            level_per_group,
+            cfg.null_hom_min_depth,
+            cfg.null_hom_frac,
+        );
+        let clean_hom_theta =
+            refine_theta_locus(&clean_hom_fit.profile, &seed.theta0, cfg.theta_shrink);
+        let clean_hom_level_multiplier = refit_level_multiplier(&clean_hom_fit, cfg.level_shrink);
+        Some(compute_data_ll(
+            &locus_model,
+            params,
+            level_per_group,
+            &clean_hom_theta,
+            clean_hom_level_multiplier,
+            cfg.lambda,
+            model,
+            &mut scratch,
+        ))
+    } else {
+        None
+    };
+    // Borrow (no clone) the honest-null matrix when the toggle is on, else the settled
+    // genotyping one — with the toggle off this is exactly `&data_ll` (byte-identical).
+    let data_ll_emit: &[Vec<f64>] = data_ll_clean_hom_null.as_deref().unwrap_or(&data_ll);
+    let mut evidence = emission_evidence(data_ll_emit, &genotypes, &pi, f_per_present, k);
     if cfg.emit_model == EmitModel::Freebayes {
         evidence.freebayes_ln_p_mono = Some(crate::ssr::cohort::freebayes_emit::ln_p_monomorphic(
-            &data_ll,
+            data_ll_emit,
             &pi,
             f_per_present,
             k,
@@ -1018,6 +1076,64 @@ struct LocusSlipFit {
     /// Reads expected to slip under the *group* level at their parent length → the level
     /// denominator (I2): the multiplier is `observed / expected`.
     expected_slipped: f64,
+}
+
+/// IDEA B: pool the stutter sufficient statistics from the plants that are *unambiguously
+/// homozygous* by a read-fraction rule (≥ `min_depth` reads, ≥ `hom_frac` of them at one
+/// length), keyed to each donor's own modal length. Their off-modal reads are stutter by
+/// definition — no genotype call, no allele-ambiguity, and no circularity with the caller we
+/// are trying to improve. Pooling across the whole cohort makes the estimate robust even at
+/// ~3 reads/plant. Ambiguous plants (thin or heterozygous-looking) contribute nothing.
+/// Same [`LocusSlipFit`] shape as [`attribute_locus`], so the same `refine_theta_locus` /
+/// `refit_level_multiplier` M-steps consume it. Determinism: integer slip counts + a fixed
+/// per-locus sample/observation order → thread-invariant.
+fn attribute_clean_homs(
+    locus: &CohortLocus,
+    period: usize,
+    params: &ParamSet,
+    level_per_group: &[StutterLevel],
+    min_depth: u64,
+    hom_frac: f64,
+) -> LocusSlipFit {
+    let mut fit = LocusSlipFit::default();
+    for k_present in 0..locus.samples.len() {
+        let seq_counts = &locus.samples[k_present].seq_counts;
+        // Length histogram (few distinct lengths → linear merge, no map alloc).
+        let mut len_counts: SmallVec<[(usize, u64); 8]> = SmallVec::new();
+        let mut total: u64 = 0;
+        for (obs, count) in seq_counts {
+            let c = *count as u64;
+            total += c;
+            match len_counts.iter_mut().find(|(l, _)| *l == obs.len()) {
+                Some((_, acc)) => *acc += c,
+                None => len_counts.push((obs.len(), c)),
+            }
+        }
+        if total < min_depth {
+            continue;
+        }
+        let (modal_len, modal_count) = len_counts
+            .iter()
+            .copied()
+            .max_by_key(|(_, c)| *c)
+            .unwrap_or((0, 0));
+        if (modal_count as f64) < hom_frac * total as f64 {
+            continue; // not clean-hom → ambiguous, excluded
+        }
+        let modal_units = (modal_len / period) as i32;
+        let (_eps, level) = sample_chemistry(locus, k_present, params, level_per_group);
+        let parent_level = (level.baseline + level.slope * modal_units as f64).clamp(0.0, 1.0);
+        for (obs, count) in seq_counts {
+            let delta = (obs.len() / period) as i32 - modal_units;
+            let c = *count as u64;
+            if delta != 0 {
+                fit.profile.add_slip(delta, c);
+                fit.slipped += c;
+            }
+            fit.expected_slipped += parent_level * c as f64;
+        }
+    }
+    fit
 }
 
 /// Attribute the locus's reads to their nearest called allele and accumulate the slip
@@ -1486,6 +1602,49 @@ mod tests {
         )
     }
 
+    /// M3 (review): `null_from_homs` is emission-only. It substitutes a clean-hom stutter null
+    /// into the emission evidence but must leave the genotyping `calls`/`pi` untouched (they are
+    /// computed from the genotyping `data_ll`, which the toggle never recomputes).
+    #[test]
+    fn null_from_homs_leaves_genotypes_unchanged() {
+        let cohort = crate::ssr::cohort::sim::simulate(&checkpoint_spec());
+        let locus = cohort.merger().next().unwrap().expect("one locus").1;
+        let rungs = build_rungs(&locus, &RungCfg::dev_default());
+        let candidates = assemble_candidates(&locus, &rungs, 2, &CandidateCfg::dev_default());
+        let params = clean_params(locus.present.len());
+        let seed = seed_locus(&locus, &rungs, &candidates, &params, 2, 3);
+        let f_per_present = vec![0.0; locus.present.len()];
+
+        let run = |cfg: &EmCfg| {
+            run_locus_em_with(
+                &locus,
+                &rungs,
+                &candidates,
+                &params,
+                &seed,
+                2,
+                cfg,
+                &f_per_present,
+                &params.level_seed,
+                &HipstrModel,
+            )
+        };
+        let off = EmCfg::dev_default();
+        let on = EmCfg {
+            null_from_homs: true,
+            ..EmCfg::dev_default()
+        };
+        let (call_off, _) = run(&off);
+        let (call_on, _) = run(&on);
+
+        // Genotypes and frequencies are byte-identical; only the emission evidence may move.
+        assert_eq!(
+            call_off.calls, call_on.calls,
+            "null_from_homs must not change GTs"
+        );
+        assert_eq!(call_off.pi, call_on.pi, "null_from_homs must not change π");
+    }
+
     #[test]
     fn checkpoint_1_called_genotypes_match_truth_at_high_depth() {
         let cohort = crate::ssr::cohort::sim::simulate(&checkpoint_spec());
@@ -1686,6 +1845,119 @@ mod tests {
         assert_eq!(fit.profile.up.iter().sum::<u64>(), 0);
         assert_eq!(fit.slipped, 0);
         assert_eq!(fit.expected_slipped, 0.0);
+    }
+
+    // ── `attribute_clean_homs` (the `null_from_homs` clean-hom stutter donor pool) ──
+
+    /// Build a one-sample CA locus (ref 8 units) with the given per-length read counts.
+    fn clean_hom_locus(seq_counts: Vec<(Box<[u8]>, u32)>) -> CohortLocus {
+        use crate::ssr::cohort::types::{LocusId, SampleEvidence, SsrQc};
+        let mut locus = CohortLocus::new(
+            LocusId {
+                chrom_id: 0,
+                start: 0,
+                end: 16,
+            },
+            Motif::new(b"CA").unwrap(),
+            Box::from(b"GGGG".as_slice()),
+            ca(8),
+        );
+        locus.push(
+            0,
+            SampleEvidence {
+                seq_counts,
+                qc: SsrQc::default(),
+            },
+        );
+        locus
+    }
+
+    #[test]
+    fn attribute_clean_homs_bins_off_modal_reads_as_slips() {
+        // modal length = 8 units (100/112 ≈ 0.89 ≥ 0.75); 7 → Δ=−1, 9 → Δ=+1, 6 → Δ=−2.
+        let locus = clean_hom_locus(vec![(ca(6), 3), (ca(7), 5), (ca(8), 100), (ca(9), 4)]);
+        let params = clean_params(1);
+        let fit = attribute_clean_homs(&locus, 2, &params, &params.level_seed, 4, 0.75);
+        assert_eq!(fit.profile.down[0], 5, "Δ=−1");
+        assert_eq!(fit.profile.up[0], 4, "Δ=+1");
+        assert_eq!(fit.profile.down[1], 3, "Δ=−2");
+        assert_eq!(fit.slipped, 12);
+        // `expected_slipped` sums the group level over *every* read (112) in a fixed order —
+        // pinning it guards the float sum against a reordering that would break thread-identity.
+        // level = baseline 0.05 + slope 0.0 · 8 = 0.05 ⇒ 0.05 · 112 = 5.6.
+        assert!((fit.expected_slipped - 5.6).abs() < 1e-9);
+    }
+
+    #[test]
+    fn attribute_clean_homs_excludes_a_plant_below_hom_frac() {
+        // 50/50 het: modal fraction 0.5 < 0.75 → excluded; the true second allele's reads must
+        // NOT be counted as stutter (the circularity `attribute_clean_homs` exists to avoid).
+        let locus = clean_hom_locus(vec![(ca(8), 6), (ca(10), 6)]);
+        let params = clean_params(1);
+        let fit = attribute_clean_homs(&locus, 2, &params, &params.level_seed, 4, 0.75);
+        assert_eq!(fit.slipped, 0);
+        assert_eq!(fit.profile.up.iter().sum::<u64>(), 0);
+        assert_eq!(fit.profile.down.iter().sum::<u64>(), 0);
+        assert_eq!(fit.expected_slipped, 0.0);
+    }
+
+    #[test]
+    fn attribute_clean_homs_excludes_a_plant_below_min_depth() {
+        // total 3 < min_depth 4 → excluded (guards the `total < min_depth` gate boundary).
+        let locus = clean_hom_locus(vec![(ca(8), 2), (ca(7), 1)]);
+        let params = clean_params(1);
+        let fit = attribute_clean_homs(&locus, 2, &params, &params.level_seed, 4, 0.75);
+        assert_eq!(fit.slipped, 0);
+        assert_eq!(fit.expected_slipped, 0.0);
+    }
+
+    #[test]
+    fn attribute_clean_homs_empty_pool_round_trips_to_the_prior() {
+        // Every donor filtered (too thin) ⇒ empty fit ⇒ `refine_theta_locus` returns the prior
+        // and `refit_level_multiplier` returns 1.0 — i.e. the toggle is a safe no-op with no
+        // clean-hom evidence.
+        let locus = clean_hom_locus(vec![(ca(8), 1)]);
+        let params = clean_params(1);
+        let fit = attribute_clean_homs(&locus, 2, &params, &params.level_seed, 4, 0.75);
+        assert_eq!(fit.slipped, 0);
+        assert_eq!(fit.expected_slipped, 0.0);
+        let prior = StutterShape {
+            up_rate: 1.0,
+            down_rate: 2.0,
+            decay: 0.1,
+        };
+        assert_eq!(refine_theta_locus(&fit.profile, &prior, 50.0), prior);
+        assert_eq!(refit_level_multiplier(&fit, 20.0), 1.0);
+    }
+
+    #[test]
+    fn attribute_clean_homs_tie_break_is_deterministic() {
+        // Two lengths tied for modal (5 each); `max_by_key` returns the LAST maximal element
+        // (10 units), so the 8-unit reads slip to Δ=−2. `hom_frac = 0.5` admits the tie.
+        let locus = clean_hom_locus(vec![(ca(8), 5), (ca(10), 5)]);
+        let params = clean_params(1);
+        let fit = attribute_clean_homs(&locus, 2, &params, &params.level_seed, 4, 0.5);
+        assert_eq!(
+            fit.profile.down[1], 5,
+            "8-unit reads slip off the last-tied modal 10"
+        );
+        assert_eq!(fit.slipped, 5);
+    }
+
+    #[test]
+    fn attribute_clean_homs_counts_far_slip_in_slipped_but_not_profile() {
+        // A read |Δ| = 12 units > MAX_SLIP (10): `add_slip` drops it from the shape profile, but
+        // `slipped` still counts it — the same divergence `attribute_locus` has.
+        let locus = clean_hom_locus(vec![(ca(8), 20), (ca(20), 3)]);
+        let params = clean_params(1);
+        let fit = attribute_clean_homs(&locus, 2, &params, &params.level_seed, 4, 0.75);
+        assert_eq!(fit.slipped, 3, "far read counts toward slipped");
+        assert_eq!(
+            fit.profile.up.iter().sum::<u64>(),
+            0,
+            "but is dropped from the profile"
+        );
+        assert_eq!(fit.profile.down.iter().sum::<u64>(), 0);
     }
 
     #[test]

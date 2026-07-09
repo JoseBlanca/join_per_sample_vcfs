@@ -51,6 +51,12 @@ pub(crate) struct FpControlCfg {
     /// — the precision/recall knob for `EmitModel::Freebayes` (`PVC_SSR_FREEBAYES_MIN_QUAL`),
     /// the analogue of `bic_margin`. Read only under that model.
     pub(crate) freebayes_min_qual: f64,
+    /// Under the model-selection emission paths (BIC / freebayes), still run the per-sample
+    /// allele-balance no-call ([`apply_fp_control`]) on the emitted row's genotypes for
+    /// per-sample GT quality / HipSTR concordance — but *without* letting it gate the site
+    /// emit decision (the model owns that). Off by default → the model paths stay
+    /// GT-untouched. `PVC_SSR_KEEP_FP_CONTROL`.
+    pub(crate) keep_fp_control: bool,
 }
 
 impl FpControlCfg {
@@ -65,6 +71,7 @@ impl FpControlCfg {
             corroboration_balance: 0.40,
             bic_margin: 0.0,
             freebayes_min_qual: 0.0,
+            keep_fp_control: false,
         }
     }
 }
