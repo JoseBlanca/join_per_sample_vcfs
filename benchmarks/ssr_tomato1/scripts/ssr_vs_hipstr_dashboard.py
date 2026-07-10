@@ -101,7 +101,8 @@ def _(mo, pairs):
             "`hipstr/cohort.str.vcf.gz` found. Run the benchmark first._"
         )
     else:
-        _default = "results_ssr15k" if "results_ssr15k" in pairs else next(iter(pairs))
+        _preferred = ("results_rerun_20260708", "results_ssr15k")
+        _default = next((p for p in _preferred if p in pairs), next(iter(pairs)))
         run_sel = mo.ui.dropdown(
             options=list(pairs.keys()), value=_default, label="benchmark run"
         )
