@@ -1,11 +1,11 @@
 # ng — common types and step interfaces
 
 *Status: architecture draft (2026-07-10), companion to
-[`../specs/ng_proposal.md`](../specs/ng_proposal.md). This doc defines the **shared
+[`../spec/ng_proposal.md`](../spec/ng_proposal.md). This doc defines the **shared
 vocabulary** (domain newtypes and the data that flows between steps) and the **step
 traits** that let one implementation of a step be swapped for another and measured
 end-to-end. It is a starting point to iterate on, not a frozen API. Naming follows
-[`ai/skills/rust-code-review/code_review/naming.md`](../../../ai/skills/rust-code-review/code_review/naming.md):
+[`ai/skills/rust-code-review/code_review/naming.md`](../../../../ai/skills/rust-code-review/code_review/naming.md):
 domain nouns for types, verbs for functions, **newtypes for domain scalars**,
 `str` in prose ↔ `ssr` in code.*
 
@@ -26,9 +26,12 @@ impl, hold the rest fixed, measure the whole pipeline against gold/silver/synthe
    behind the same signature.
 
 Two traits already exist and this design builds on them, not around them:
-`ReadLikelihoodModel` ([`src/ssr/cohort/read_model/`](../../../src/ssr/cohort/read_model/))
-is step 7 for STR; `GenotypeEmModel` ([`src/genotype_em/`](../../../src/genotype_em/))
-is step 9. The ng work generalises the rest to the same shape.
+`ReadLikelihoodModel` ([`src/ssr/cohort/read_model/`](../../../../src/ssr/cohort/read_model/))
+is step 7 for STR; `GenotypeEmModel`
+([`src/var_calling/posterior_engine.rs`](../../../../src/var_calling/posterior_engine.rs))
+is step 9. The ng work generalises the rest to the same shape. (The crate-level
+`src/genotype_em/` hoist for that trait is still pending — it lives in
+`posterior_engine.rs` today.)
 
 ---
 
@@ -45,8 +48,8 @@ same-primitive quantities is that **the compiler refuses to mix them**.
 pub struct ContigId(pub u32);       // index into the contig table
 pub struct Position(pub u64);       // 0-based reference position
 pub struct RefInterval { pub contig: ContigId, pub start: Position, pub end: Position } // half-open
-pub struct Motif(Box<[u8]>);        // the repeat unit, phase-faithful (STR)
-pub struct Period(pub u8);          // motif length in bp, the repeat period (STR)
+pub struct SsrMotif(Box<[u8]>);     // the repeat unit, phase-faithful (STR)
+pub struct SsrPeriod(pub u8);       // motif length in bp, the repeat period (STR)
 ```
 
 ### Lengths & deltas — the unit distinction that bit us
@@ -55,16 +58,19 @@ Base pairs and repeat units are **different quantities**; conflating them is the
 representation bug of spec §2. Give them different types.
 
 ```rust
-pub struct Bp(pub u32);             // a length in base pairs (allele/tract/flank/read)
-pub struct RepeatUnits(pub u16);    // a tract length in whole repeat units (STR)
-pub struct BpDelta(pub i32);        // signed length change in base pairs
-pub struct UnitDelta(pub i32);      // signed length change in whole repeat units (STR)
+pub struct Bp(pub u32);             // a length in base pairs (allele/tract/flank/read) — generic
+pub struct BpDelta(pub i32);        // signed length change in base pairs — generic
+pub struct SsrRepeatUnits(pub u16); // a tract length in whole repeat units (STR)
+pub struct SsrUnitDelta(pub i32);   // signed length change in whole repeat units (STR)
 ```
 
-`BpDelta` ↔ `UnitDelta` conversion is **only** valid with a `Period` in hand, so it
-lives on `Period` (`period.units_of(bp_delta) -> Option<UnitDelta>`, `None` when the
-bp change is not a whole-unit multiple). That one method is the choke point the
-benchmark bug slipped through when it was implicit.
+`Bp` / `BpDelta` stay **unprefixed**: base pairs are the generic length currency both
+the SNP/indel and STR paths speak. Only the *repeat-unit* quantities are STR-specific,
+so only they carry `Ssr`. The `BpDelta` → `SsrUnitDelta` conversion is thus exactly the
+generic→STR bridge, and it is **only** valid with an `SsrPeriod` in hand, so it lives on
+`SsrPeriod` (`period.units_of(bp_delta) -> Option<SsrUnitDelta>`, `None` when the bp
+change is not a whole-unit multiple). That one method is the choke point the benchmark
+bug slipped through when it was implicit.
 
 ### Depth, counts, identity
 
@@ -122,17 +128,17 @@ pub struct PreparedRead {
 }
 
 /// The router's verdict for a locus (spec step 3). This is what makes STR-awareness
-/// a *type*, not a convention: only `Str` carries a motif/period/borders.
+/// a *type*, not a convention: only `Ssr` carries a motif/period/borders.
 pub enum LocusKind {
     Generic(RefInterval),
-    Str(StrLocus),
+    Ssr(SsrLocus),
 }
-pub struct StrLocus {
+pub struct SsrLocus {
     pub id: LocusId,
     pub span: RefInterval,           // the tract, without flanks
-    pub motif: Motif,
-    pub period: Period,
-    pub ref_units: RepeatUnits,
+    pub motif: SsrMotif,
+    pub period: SsrPeriod,
+    pub ref_units: SsrRepeatUnits,
 }
 
 /// The candidate allele set at a locus (step 6). REF is always present at `ref_idx`.
