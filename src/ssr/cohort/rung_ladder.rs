@@ -115,7 +115,11 @@ pub(crate) struct RungCfg {
     pub(crate) prominence: u32,
     /// A resolved allele must recur as a *clear peak* in at least this many samples
     /// (the cohort-recurrence guard against a stutter artifact masquerading as an
-    /// allele). Counts the sample itself.
+    /// allele). Counts the sample itself. The driver **clamps this to the cohort size**
+    /// (`min(2, n_samples)`) so a single-sample run degrades gracefully: with no cohort
+    /// to corroborate against, the allele need only be a clear peak in that one sample,
+    /// and the `min_depth` / `prominence` / het-BIC gates carry the confidence instead.
+    /// Multi-sample runs (`n_samples ≥ 2`) are unaffected — it stays 2.
     pub(crate) recurrence_k: u32,
     /// A **length-separated** confident het must have its two alleles at least this
     /// many repeat units apart to be a clean seed: closer than this, the alleles' stutter

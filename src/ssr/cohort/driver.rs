@@ -245,7 +245,7 @@ struct FrozenParams {
 /// Run `ssr-call`: burn-in over a bounded subset to freeze the pooled parameters, then a
 /// streaming genotyping sweep over every locus → VCF at `config.output` (arch §2/§4/§6).
 pub(crate) fn run(config: &SsrCallConfig) -> Result<(), SsrCallError> {
-    let rung_cfg = RungCfg::dev_default();
+    let mut rung_cfg = RungCfg::dev_default();
     let cand_cfg = CandidateCfg::dev_default();
     // ── Emission model selector: `PVC_SSR_EMIT_MODEL` = heuristic (default) | bic | freebayes.
     // ONE knob picks the per-locus emit decision; all three consume the same EM `data_ll`,
@@ -361,6 +361,11 @@ pub(crate) fn run(config: &SsrCallConfig) -> Result<(), SsrCallError> {
     let n_samples = sample_names.len();
     check_unique_sample_names(&sample_names)?;
     check_vcf_safe_names(&chromosomes, &sample_names)?;
+    // Degrade the cohort-recurrence guard to the cohort size: a single-sample run has
+    // nothing to corroborate against, so require the allele to be a clear peak in that
+    // one sample (k=1) rather than dying with "no confident genotype in the pre-pass".
+    // For n_samples ≥ 2 this is a no-op (stays 2 → multi-sample byte-identical).
+    rung_cfg.recurrence_k = rung_cfg.recurrence_k.min(n_samples.max(1) as u32);
     let subset = collect_burn_in_subset(merger)?;
 
     // Estimate chemistry and freeze `F` + the per-group level on the requested thread
@@ -1067,6 +1072,36 @@ mod tests {
             units.sort_unstable();
             assert_eq!(units, vec![6, 10], "het miscalled: {col}");
         }
+    }
+
+    #[test]
+    fn run_calls_a_single_sample_cohort_via_recurrence_degradation() {
+        // A one-sample "cohort" cannot corroborate an allele across samples, so the
+        // fixed recurrence_k=2 guard would reject every genotype and the pre-pass would
+        // abort with `UnresolvedSamples`. The driver degrades recurrence_k to the cohort
+        // size (=1 here), so a clear, deep homozygote resolves on its own depth +
+        // prominence and the variant locus is called. (Regression for single-sample
+        // graceful degradation — see rung_ladder::RungCfg::recurrence_k.)
+        let dir = tempfile::TempDir::new().unwrap();
+        // One locus, ref 8 units; the lone sample is a clean hom at 10 units (a variant).
+        let config = write_cohort(dir.path(), &[(40, 8)], &[("solo", vec![vec![10]])]);
+
+        run(&config).unwrap(); // before the fix: Err(UnresolvedSamples { samples: [0] })
+        let vcf = std::fs::read_to_string(&config.output).unwrap();
+        let records: Vec<&str> = vcf.lines().filter(|l| !l.starts_with('#')).collect();
+        assert_eq!(
+            records.len(),
+            1,
+            "the single-sample variant locus should emit\n{vcf}"
+        );
+        let cols: Vec<&str> = records[0].split('\t').collect();
+        assert_eq!(cols.len(), 9 + 1, "one sample column\n{}", records[0]);
+        assert_ne!(cols[4], ".", "should carry an ALT allele: {}", records[0]);
+        let repcn = cols[9].split(':').nth(2).unwrap();
+        assert!(
+            repcn.split(',').all(|s| s == "10"),
+            "single-sample hom should be 10/10, got REPCN {repcn}"
+        );
     }
 
     #[test]
