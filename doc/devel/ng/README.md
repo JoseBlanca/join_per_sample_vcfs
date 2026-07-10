@@ -11,6 +11,8 @@ by document kind:
   plug into).
   - [`ng_step_interfaces.md`](arch/ng_step_interfaces.md) — the common domain
     newtypes and one swappable trait per pipeline step.
+  - [`module_layout.md`](arch/module_layout.md) — the `src/ng/` module tree: one
+    folder per step (trait + impls + tests together), shared vocabulary, `bench/`.
 - **`impl_plan/`** — step-by-step implementation plans (populated as work starts).
 
 This mirrors the repo-wide `doc/devel/{specs,architecture,implementation_plans}`
