@@ -52,6 +52,15 @@ benchmarks/giab/*
 !benchmarks/giab/src/
 !benchmarks/giab/README.md
 
+# GIAB HG002 STR coverage benchmark: track the runner/analysis scripts + README,
+# keep the heavy local data out (BAMs, catalog .cat, truth/regions, .psp/.vcf
+# results, HipSTR logs, eval_table.tsv — gigabytes, built locally from the scripts).
+benchmarks/ssr_hg002/*
+!benchmarks/ssr_hg002/src/
+!benchmarks/ssr_hg002/scripts/
+!benchmarks/ssr_hg002/README.txt
+benchmarks/ssr_hg002/scripts/__marimo__/
+
 # tomato2 hidden-paralog-filter study: track the scripts + the region definition,
 # keep the heavy/derivable data out (CRAMs, .psp, windowed coverage, VCF/parquet
 # results — gigabytes, all built locally from the scripts).
