@@ -47,9 +47,9 @@ same-primitive quantities is that **the compiler refuses to mix them**.
 ```rust
 pub struct ContigId(pub u32);       // index into the contig table
 pub struct Position(pub u64);       // 0-based reference position
-pub struct RefInterval { pub contig: ContigId, pub start: Position, pub end: Position } // half-open
+pub struct GenomeRegion { pub contig: ContigId, pub start: Position, pub end: Position } // half-open
 pub struct SsrMotif(Box<[u8]>);     // the repeat unit, phase-faithful (STR)
-pub struct SsrPeriod(pub u8);       // motif length in bp, the repeat period (STR)
+pub struct SsrPeriod(u8);           // motif length in bp, the repeat period (STR); >= 1, validated
 ```
 
 ### Lengths & deltas — the unit distinction that bit us
@@ -77,6 +77,7 @@ bug slipped through when it was implicit.
 ```rust
 pub struct ReadDepth(pub u32);      // reads at a locus for one sample
 pub struct AlleleObsCount(pub u32); // reads supporting one allele
+pub struct ReadWeight(pub f64);     // a read's likelihood weight (>= 0): pooling count or partial fraction
 pub struct SampleId(pub u32);       pub struct SampleGroupId(pub u32);
 pub struct LocusId(pub u64);        pub struct AlleleId(pub u16);   // index within a locus' candidate set
 ```
@@ -85,7 +86,7 @@ pub struct LocusId(pub u64);        pub struct AlleleId(pub u16);   // index wit
 
 ```rust
 pub struct LogProb(pub f64);        // natural-log probability; the internal currency
-pub struct Phred(pub f32);          // -10 log10 p, for I/O (QUAL, GQ)
+pub struct Phred(f32);              // -10 log10 p, for I/O (QUAL, GQ); >= 0, validated
 pub struct BaseQual(pub u8);        pub struct MapQual(pub u8);
 ```
 
@@ -93,13 +94,38 @@ pub struct BaseQual(pub u8);        pub struct MapQual(pub u8);
 types stops the classic "added a Phred to a ln-prob" error. Conversions are named
 functions (`Phred::from_log_prob`, `LogProb::ln`), never `as`.
 
-### Population genetics
+### Population genetics — constrained, so validated
 
 ```rust
-pub struct AlleleFreq(pub f64);     // in [0,1]
-pub struct InbreedingF(pub f64);    // Wright's F_IS, in [0,1)
-pub struct Theta(pub f64);          // Watterson/Ewens diversity for the SFS prior
+pub struct AlleleFreq(f64);         // in [0, 1]   — private field, checked constructor
+pub struct InbreedingF(f64);        // Wright's F_IS, in [0, 1)
+pub struct Theta(f64);              // Watterson/Ewens diversity, > 0
+
+impl AlleleFreq {
+    /// The only constructor — enforces the [0, 1] invariant, so every use site can
+    /// trust it. `InbreedingF`, `Theta`, `SsrPeriod` (>= 1), `Phred` (>= 0) follow suit.
+    pub fn try_new(p: f64) -> Result<Self, DomainError> {
+        (0.0..=1.0).contains(&p).then_some(Self(p)).ok_or(DomainError::AlleleFreq(p))
+    }
+    pub fn get(self) -> f64 { self.0 }
+}
 ```
+
+**Validation on constrained newtypes.** Types with a domain range (`AlleleFreq`
+[0,1], `InbreedingF` [0,1), `Theta` > 0, `SsrPeriod` ≥ 1, `Phred` ≥ 0) **hide their
+field and construct through a checked constructor**, so an illegal value is
+*unrepresentable* rather than merely discouraged. Policy by the value's source:
+
+- **Untrusted input** (a parsed VCF / catalog field, a CLI arg): `try_new -> Result`
+  and fail loudly — never silently coerce.
+- **Internally computed** (an EM frequency, an estimator's `F`): the value is in range
+  *by construction*, so a `new` that `debug_assert!`s the bound and clamps only a
+  float-epsilon overrun (an EM yielding `1.0000001` → `1.0`) is fine — but a *gross*
+  out-of-range value stays a loud bug, never a silent clamp. (The existing code already
+  clamps `F` to a `0.99` ceiling; the type is where that intent should live.)
+
+Unconstrained newtypes (`Bp`, `ReadDepth`, the ids, `BpDelta`) keep `pub` fields —
+there is no invariant to protect, so a checked constructor would be ceremony.
 
 > **Ergonomics.** Wrappers cost a `.get()` at arithmetic sites; for the few types with
 > heavy arithmetic (`LogProb`, `BpDelta`) implement the needed operators so hot code
@@ -116,54 +142,70 @@ These are the payloads passed step→step; every step impl consumes and produces
 /// One sample's evidence at one locus — the per-locus, per-sample unit.
 pub struct LocusEvidence<'a> {
     pub sample: SampleId,
-    pub reads: &'a [PreparedRead],   // output of step 2
+    pub reads: &'a [LocusRead],   // output of step 2
     pub depth: ReadDepth,
 }
 
 /// A read after step 2 (realigned / delimited). The STR path stores the observed
 /// tract bytes; the generic path stores the aligned span.
-pub struct PreparedRead {
+pub struct LocusRead {
     pub map_qual: MapQual,
     pub observed: Observation,       // enum: generic aligned allele, or an STR tract
+    pub weight: ReadWeight,          // scales this read's likelihood: 1.0 normally; a
+                                     // pooling count (>=1); or a partial-observation
+                                     // fraction (<1) — the freebayes lever we mean to test
 }
 
 /// The router's verdict for a locus (spec step 3). This is what makes STR-awareness
 /// a *type*, not a convention: only `Ssr` carries a motif/period/borders.
 pub enum LocusKind {
-    Generic(RefInterval),
+    Generic(GenomeRegion),
     Ssr(SsrLocus),
 }
 pub struct SsrLocus {
     pub id: LocusId,
-    pub span: RefInterval,           // the tract, without flanks
+    pub span: GenomeRegion,           // the tract, without flanks
     pub motif: SsrMotif,
     pub period: SsrPeriod,
     pub ref_units: SsrRepeatUnits,
 }
 
 /// The candidate allele set at a locus (step 6). REF is always present at `ref_idx`.
-pub struct CandidateSet {
+pub struct AlleleCandidates {
     pub alleles: Vec<Allele>,        // sequence-resolved
     pub ref_idx: AlleleId,
     pub admit: Admission,            // enum { Ok, LowDepth, NotPeriodic, TooManyAlleles }
 }
 
+/// One individual's genotype: a multiset of allele-ids of size = ploidy (order-free,
+/// repeats allowed). The field is PRIVATE so ploidy is not baked into the surface —
+/// diploid is simply `len() == 2`. A polyploid impl changes only the constructor and
+/// this type; the traits that consume `Genotype` never see the difference.
+pub struct Genotype(Box<[AlleleId]>);   // sorted; len() == ploidy
+impl Genotype {
+    pub fn alleles(&self) -> &[AlleleId] { &self.0 }
+    pub fn ploidy(&self) -> u8 { self.0.len() as u8 }
+    pub fn is_homozygous(&self) -> bool { self.0.iter().all(|a| *a == self.0[0]) }
+}
+
 /// Per-sample genotype log-likelihoods at a locus (step 7 → step 9). The single
 /// read-level quantity every prior/posterior/emission model consumes (spec's `Lg`).
 pub struct GenotypeLikelihoods {
-    pub genotypes: Vec<Genotype>,    // the enumerated diploid genotypes over the candidates
+    pub genotypes: Vec<Genotype>,    // the enumerated genotypes over the candidates (diploid v1)
     pub log_lik: Vec<LogProb>,       // parallel to `genotypes`, per sample handled by caller
 }
 
 /// A called genotype for one sample at one locus.
 pub struct GenotypeCall {
-    pub genotype: Genotype,          // allele-id pair (diploid v1)
+    pub genotype: Genotype,          // opaque multiset; diploid v1
     pub quality: Phred,              // GQ
 }
 
-/// The frozen output of the parameter pre-pass (spec step 4) — the "first caller's"
-/// legacy, consumed by steps 7/8. Every field is an *input*, never re-fit downstream.
-pub struct FrozenParams {
+/// The caller's model parameters — per-group error + stutter, sample-group
+/// assignment, per-sample F, contamination. Estimated once by the pre-pass (spec
+/// step 4, the "first caller") and held fixed: consumed as *inputs* by steps 7-9,
+/// never re-fit downstream.
+pub struct ModelParams {
     pub error_by_group: Vec<PerBaseError>,     // ε per sample-group
     pub stutter_by_group: Vec<StutterModel>,   // STR
     pub group_of_sample: Vec<SampleGroupId>,
@@ -186,7 +228,7 @@ are less about competing algorithms are sketched briefly; the algorithmic hot-sp
 pub trait ReadPrep {
     /// Realign/delimit one read against the reference window (STR impls also take the
     /// tract so gaps can be tract-aware). Returns None if the read is unusable here.
-    fn prepare(&self, read: &MappedRead, window: &RefWindow) -> Option<PreparedRead>;
+    fn prepare_read(&self, read: &MappedRead, window: &RefWindow) -> Option<LocusRead>;
 }
 ```
 *Impls to bench:* trust-mapper+left-align (freebayes-style), local reassembly
@@ -196,39 +238,65 @@ pub trait ReadPrep {
 ```rust
 pub trait LocusRouter {
     /// Classify a reference region: is it an STR (with motif/period/borders) or generic?
-    fn route(&self, window: &RefWindow) -> LocusKind;
+    fn route_locus(&self, window: &RefWindow) -> LocusKind;
 }
 pub trait LocusSource {
     /// Enumerate the candidate loci to genotype — a catalog iterator, or active regions.
-    fn loci(&self) -> impl Iterator<Item = RefInterval>;
+    fn loci(&self) -> impl Iterator<Item = GenomeRegion>;
 }
 ```
 *Impls to bench:* fixed STR catalog (ours), active-region detection (GATK), the
 catalog+discovery hybrid (spec §step-3). Keeping `LocusSource` and `LocusRouter`
 separate lets a data-driven source feed the same reference-based router.
 
-### Step 4 — the rough caller and the parameter estimator (the "two callers")
+### Step 4 — the rough caller, the per-sample summary, and the cohort estimator
+
+Two levels, mirroring the production `.psp` engine: per-sample estimation runs in
+Stage 1 and lands in the `.psp`; a **cohort-gather** step then computes the panel-level
+parameters before calling. (That cohort-gather step was missing from the earlier step
+list — see the note below.)
+
 ```rust
-pub trait RoughCaller {
-    /// A cheap first-pass genotype that must NOT depend on the parameters being
-    /// estimated (spec: it uses a crude base-quality ε̂, not the fitted ε). Returns
-    /// only *confident* calls — the subset allowed to teach the parameters.
-    fn call_confident(&self, evidence: &LocusEvidence) -> Option<ConfidentGenotype>;
+pub trait Caller {
+    /// Call one sample's genotype at one locus. The pre-pass drives a cheap
+    /// implementation that must NOT depend on the parameters being estimated — it uses
+    /// a crude base-quality ε̂, not the fitted ε. `None` where it makes no call; the call
+    /// carries its own quality, so "confident" is a property of the call, not a return type.
+    fn call(&self, evidence: &LocusEvidence) -> Option<GenotypeCall>;
 }
-pub trait ParameterEstimator {
-    /// Freeze the nuisance parameters from the rough caller's confident genotypes.
-    fn estimate(&self, confident: &[ConfidentGenotype]) -> FrozenParams;
+
+/// Per sample (Stage 1). From this sample's confident rough calls, compute the
+/// per-INDIVIDUAL parameters (e.g. its inbreeding `F`) and the sufficient statistics the
+/// cohort step will need. In production this is written into the `.psp` after the genomic
+/// blocks — the sample's summary section.
+pub trait SampleSummarizer {
+    fn summarize(&self, confident: &[ConfidentGenotype]) -> SampleSummary;
+}
+
+/// Once, cohort-wide, before calling — THE STEP WE HAD MISSED. Gather every sample's
+/// summary and estimate the parameters that need the whole panel: sample-groups,
+/// per-group chemistry (error/stutter), the SFS `Theta`, contamination. Assembles the
+/// final `ModelParams`, folding in each sample's `F` from its summary.
+pub trait CohortEstimator {
+    fn estimate(&self, summaries: &[SampleSummary]) -> ModelParams;
 }
 ```
-*Contract:* `RoughCaller` is the confident-subset gate (our het-margin / STR
-1-vs-2 BIC test); `estimate` never sees a non-confident call. `F` is per-sample,
-chemistry is pooled per group (spec §4 considerations).
+*Contract.* **(1) Per sample:** a cheap concrete `Caller` — a `RoughHetCaller` (SNP) or
+the STR 1-vs-2 BIC gate — makes confident rough calls, and `SampleSummarizer` turns them
+into the per-individual params (`F`) + sufficient stats, frozen into the `.psp`. **(2)
+Cohort-wide, once:** `CohortEstimator` gathers all summaries and estimates the panel-level
+params (sample-groups, per-group chemistry, SFS `Theta`) into the final `ModelParams`.
+Only confident calls teach the parameters; **"Rough" is the concrete struct's quality,
+not the trait's.** Splitting at exactly these two levels is what lets the interface follow
+the two-phase engine (per-sample → `.psp` → cohort gather) instead of assuming the whole
+panel is in memory at once. `SampleSummary` here is the ng counterpart of the existing
+`.psp` `SampleSummary` section.
 
 ### Step 6 — candidate allele generation
 ```rust
 pub trait CandidateGenerator {
-    fn candidates(&self, evidence: &[LocusEvidence], locus: &LocusKind,
-                  params: &FrozenParams) -> CandidateSet;
+    fn generate_candidates(&self, evidence: &[LocusEvidence], locus: &LocusKind,
+                           params: &ModelParams) -> AlleleCandidates;
 }
 ```
 *Impls to bench:* assembly haplotypes, the repeat-length rung ladder, observed
@@ -238,8 +306,8 @@ sequences + iterative stutter/flank discovery.
 ```rust
 pub trait ReadLikelihood {
     /// P(read | allele), in log space, given the frozen error/stutter model.
-    fn read_log_lik(&self, read: &PreparedRead, allele: &Allele,
-                    params: &FrozenParams) -> LogProb;
+    fn read_log_lik(&self, read: &LocusRead, allele: &Allele,
+                    params: &ModelParams) -> LogProb;
 }
 ```
 Contamination enters here as a mixture over the source distribution (spec's choice),
@@ -284,7 +352,7 @@ freebayes-marginal.
 ### Steps 12–13 — representation and quality
 ```rust
 pub trait AlleleRepresentation {   // step 12 — repeat-unit vs anchor-indel; routed by LocusKind
-    fn to_vcf(&self, call: &GenotypeCall, cand: &CandidateSet, locus: &LocusKind) -> VcfAlleles;
+    fn to_vcf(&self, call: &GenotypeCall, cand: &AlleleCandidates, locus: &LocusKind) -> VcfAlleles;
 }
 pub trait QualityModel {           // step 13
     fn genotype_quality(&self, call: &GenotypeCall, inference: &LocusInference) -> Phred;
@@ -304,8 +372,9 @@ field, holds the rest, and re-measures.
 pub struct CallerRecipe {
     pub read_prep:    Box<dyn ReadPrep>,
     pub router:       Box<dyn LocusRouter>,
-    pub rough_caller: Box<dyn RoughCaller>,
-    pub estimator:    Box<dyn ParameterEstimator>,
+    pub rough_caller: Box<dyn Caller>,
+    pub summarizer:   Box<dyn SampleSummarizer>,   // per-sample -> .psp
+    pub cohort_estimator: Box<dyn CohortEstimator>, // cohort gather -> ModelParams
     pub candidates:   Box<dyn CandidateGenerator>,
     pub likelihood:   Box<dyn ReadLikelihood>,
     pub prior:        Box<dyn GenotypePrior>,
@@ -324,20 +393,61 @@ generation + HipSTR stutter likelihood + our cohort prior" is one `CallerRecipe`
 
 ---
 
-## 5. Open questions for the interfaces
+## 5. Design decisions (resolved during review; add new open items here with `OPEN:`)
 
-- **Cohort vs per-locus granularity.** `GenotypeModel::infer` takes a locus' worth of
-  per-sample likelihoods; the cohort prior needs cross-sample frequency. Decide whether
-  the frequency estimate is threaded in (`&[AlleleFreq]` computed by an outer EM) or
-  the model owns the whole cohort at a locus. The single-phase ng makes the latter
-  cheap; the port-back to `.psp` streaming may force the former.
-- **Where the parameter pre-pass sits.** `RoughCaller` + `ParameterEstimator` produce
-  `FrozenParams` once per run; in the two-phase engine the rough caller is split
-  (SNP per-sample, STR cohort burn-in). The interface should not bake in *where* it
-  runs, only that its output is frozen before steps 7–9.
-- **`Genotype` beyond diploid.** The types say diploid (allele-id pair). Ploidy is a
-  documented follow-up; `Genotype` should be an opaque multiset behind an accessor so
-  a polyploid impl doesn't ripple through every trait.
-- **Read pooling / partial observations** (HipSTR / freebayes) change `LocusEvidence`
-  from `&[PreparedRead]` to weighted/unique reads. Decide if that is a `PreparedRead`
-  weight field now or a later refinement.
+- **Cohort vs per-locus granularity — decided: thread the frequency in.**
+  `GenotypeModel::infer` takes a locus' worth of per-sample likelihoods *plus* the
+  cohort allele frequency as an **input** (`&[AlleleFreq]`, computed by a shared outer
+  loop), rather than owning the whole cohort at the locus and estimating the frequency
+  itself. Owning the cohort is cheaper in the single-phase lab, but threading the
+  frequency keeps the *same* trait working under the `.psp` streaming engine (which
+  can't hold every sample at once) — so the winner ports back without a redesign.
+  Frequency estimation becomes its own small shared step.
+- **Where the parameter pre-pass sits — decided: two explicit levels (follow production).**
+  Per sample (Stage 1), the rough `Caller` + `SampleSummarizer` compute the
+  per-individual params (`F`) and write them into the `.psp` after the genomic blocks;
+  then a **cohort-gather** step (`CohortEstimator`) reads every sample's summary and
+  estimates the panel-level params (sample-groups, per-group chemistry, SFS `Theta`)
+  into the final `ModelParams`, before calling. The cohort-gather step was **missing
+  from the earlier step list** — it must also be added to the spec's step map (§1) and
+  its "what we missed" list.
+- **`Genotype` beyond diploid — decided: ploidy-agnostic type now, diploid impl.**
+  `Genotype` is an **opaque multiset** of allele-ids (private field, reached via
+  `alleles()` / `ploidy()` / `is_homozygous()`), so ploidy is not baked into its
+  surface — diploid is just `len() == 2`. v1 does the diploid math, but a future
+  polyploid impl changes only the constructor and this type, not the traits that
+  consume it. (Polyploidy is common in plants, so this preparation is worth the tiny
+  cost up front.)
+- **Read pooling / partial observations — decided: add the weight now.** `LocusRead`
+  carries a `weight: ReadWeight` (1.0 normally), which serves both a HipSTR-style
+  pooling count (>= 1) and a **freebayes-style partial-observation fraction (< 1)**.
+  We add it up front because partial observations are a **modeling lever we intend to
+  test**, not just the pooling perf optimization; simple likelihood impls treat weight
+  as 1.0 and never notice.
+
+---
+
+## 6. Existing-types reconciliation
+
+The names above are the **target** clean vocabulary. Several already exist in the code
+under a different name — or, worse, under the *same* name for a *different* concept — so
+when ng lands these are **consolidation points**, not new types to invent alongside the
+old. Verify against the code when implementing; mappings marked `≈` are approximate and
+were not freshly re-read.
+
+| ng name | existing code | action |
+|---|---|---|
+| `GenomeRegion` | `Region` ([regions.rs](../../../../src/regions.rs)), `ContigInterval` ([bam/alignment_input.rs](../../../../src/bam/alignment_input.rs)) | consolidate the coordinate-span types into one |
+| `RefWindow` | ≈ `RefSpan` ([var_calling/types.rs](../../../../src/var_calling/types.rs)) | the sequence-carrying span |
+| `MappedRead` | `MappedRead` ([bam/alignment_input.rs](../../../../src/bam/alignment_input.rs)) | reuse as-is (the step-2 input) |
+| `LocusRead` | — (new) | **distinct** from `PreparedRead` ([pileup/walker/](../../../../src/pileup/walker/)), which is a *different* concept (a decoded walker read) — do **not** reuse that name |
+| `AlleleCandidates` | `CandidateSet` ([ssr/cohort/candidate_set.rs](../../../../src/ssr/cohort/candidate_set.rs)) | rename |
+| `SampleSummary` | ≈ the `.psp` `SampleSummary` ([sample_summary/](../../../../src/sample_summary/)) | reuse / align |
+| `ModelParams` | ≈ the SSR chemistry param set ([ssr/cohort/param_estimation.rs](../../../../src/ssr/cohort/param_estimation.rs)) + per-individual `F` | assemble from both levels |
+| `Genotype` | ≈ SNP/STR genotype reprs | replace with the ploidy-agnostic multiset |
+| `ReadLikelihoodModel` | ([ssr/cohort/read_model/](../../../../src/ssr/cohort/read_model/)) | **exists** — build on it (step 7) |
+| `GenotypeEmModel` | ([var_calling/posterior_engine.rs](../../../../src/var_calling/posterior_engine.rs)) | **exists** — build on it (step 9; the crate-level `genotype_em/` hoist is still pending) |
+
+The lesson from this review: the codebase already has ~5 genomic-span types and ~5
+read types, so the real risk when implementing ng is creating a *sixth* of each rather
+than converging. This table is the convergence map.

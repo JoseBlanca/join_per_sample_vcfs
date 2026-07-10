@@ -75,7 +75,12 @@ accuracy lives. The additions:
   on — so we are really building **two callers**, a rough one to learn the parameters
   and the real one that uses them (our SNP rough-het caller and STR confident-genotype
   gate both do this, for both paths). The 10-step core silently assumed these
-  constants already existed.
+  constants already existed. And the estimation is itself **two levels** — per-sample
+  (per-individual params like `F`, frozen into the `.psp`) and then a distinct
+  **cohort-gather** step that reads every sample's summary to estimate the panel-level
+  params (sample-groups, per-group chemistry, the SFS `θ`). That cohort-gather step was
+  the most-missed of all — it is a real pipeline stage between the per-sample artefacts
+  and the cohort caller.
 - **Phasing** — physical / read-backed (GATK), or SNP-based coupling of the STR
   allele to the read's haplotype (HipSTR). Neither our list nor our caller has it.
 - **Uncertainty & emission mode** — confidence intervals and expansion
@@ -97,12 +102,19 @@ accuracy lives. The additions:
    *router*: it decides whether a locus goes down the generic small-indel path or
    the STR-specialist path. **A general caller with no router runs every locus
    generic** — freebayes' whole world.
-4. **Rough genotyping → parameter pre-pass ("the two callers").** A cheap *rough*
-   caller runs first; its **confident genotypes** are the substrate from which the
-   nuisance parameters are estimated and frozen — base-quality recalibration; the
-   error/stutter model (per-locus or per-genome); insert-size, coverage, and GC
-   profiles; inbreeding `F`; sample-group / chemistry clusters; the contamination
-   fraction — before the *real* caller runs. We build two callers, not one.
+4. **Rough genotyping → parameter pre-pass, at *two levels* ("the two callers").** A
+   cheap *rough* caller runs first; its **confident genotypes** are the substrate for
+   the frozen parameters. The estimation happens at two levels, mirroring production:
+   - **4a. Per sample.** From that sample's confident calls, estimate the params
+     computable from *one individual* — chiefly its inbreeding `F` — plus the
+     sufficient statistics the cohort step needs, and freeze them into the sample's
+     artefact (in our `.psp`, after the genomic blocks).
+   - **4b. Cohort-gather** *(the step the earlier list missed)*. Once, before calling:
+     read *every* sample's summary and estimate the params that need the **whole
+     panel** — sample-groups, per-group chemistry (error/stutter), the SFS `θ`,
+     contamination — assembling the frozen parameter set the real caller consumes.
+
+   We build two callers, not one.
 
 **Per-locus core:**
 
@@ -291,6 +303,12 @@ genotypes to estimate parameters).
   in **Stage-1 (per-sample → `.psp`)**, the STR one in a **Stage-2 cohort burn-in**.
   `F` is per-individual (fits the per-sample model); the chemistry is pooled (needs
   the cohort).
+- **The pre-pass is two levels, and the cohort-gather is a distinct step** (the one we
+  had missed). Per-sample estimation (per-individual `F` + sufficient stats) writes into
+  the `.psp`; then a **cohort-gather** reads every sample's summary and estimates the
+  panel-level params (sample-groups, per-group chemistry, SFS `θ`). The interfaces model
+  this as `SampleSummarizer` (per sample) + `CohortEstimator` (the gather) —
+  [`../arch/ng_step_interfaces.md`](../arch/ng_step_interfaces.md) §4.
 - **For ng (§3): "single-phase" drops the `.psp` per-sample/cohort split, NOT the
   rough→real bootstrap.** The bootstrap is a within-run two-pass, orthogonal to the
   `.psp` architecture — ng keeps it.
