@@ -63,18 +63,18 @@ oracle. `MappedRead` / `ContigList` are reused as-is.
 
 ### Milestone A — skeleton + `RefSeq` traits + `InMemoryRefSeq`
 
-**A1. Scaffold + `types.rs` seed.**  ☐
+**A1. Scaffold + `types.rs` seed.**  ✅
 `src/ng/mod.rs` (declarations + re-exports, minimal) and `pub mod ng;` in `lib.rs`. `types.rs`
 seeded with **only** what `ref_seq` needs: `ContigId` (unconstrained newtype) and `RefSeqError`
 (`#[non_exhaustive]`). Nouns/errors only, no logic. *Source:* ng_step_interfaces §1; ref_seq.md
 §The trait.
 
-**A2. The traits.**  ☐
+**A2. The traits.**  ✅
 `RefSeq` (universal canonical `fetch_into` + owned `fetch`) and `RawRefSeq: RefSeq` (`fetch_raw`)
 in `ref_seq.rs`. Definitions + docs only. *Source:* ref_seq.md §The trait. *Note:* capabilities
 are separate traits by decision — no silent no-ops.
 
-**A3. `InMemoryRefSeq` + tests.**  ☐
+**A3. `InMemoryRefSeq` + tests.**  ✅
 The synthetic impl (`Vec<Vec<u8>>` by `chrom_id`), implementing `RefSeq` + `RawRefSeq`. Unit
 tests: canonical fetch folds to `{A,C,G,T,N}`, raw returns stored bytes, bounds / start-0 error
 paths. *Source:* ref_seq.md §Implementations.

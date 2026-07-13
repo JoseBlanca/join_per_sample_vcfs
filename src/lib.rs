@@ -20,6 +20,7 @@ pub mod baq;
 pub mod fasta;
 pub mod genetics;
 pub mod iter_ext;
+pub mod ng;
 pub(crate) mod norm_seqs;
 pub mod paralog;
 pub mod pileup;

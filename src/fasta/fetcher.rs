@@ -1208,7 +1208,7 @@ impl ManualEvictChromRefFetcher {
 /// stray whitespace bytes that survived the newline filter) maps
 /// to `N`.
 #[inline]
-fn canonicalise(b: u8) -> u8 {
+pub(crate) fn canonicalise(b: u8) -> u8 {
     match b.to_ascii_uppercase() {
         b'A' | b'C' | b'G' | b'T' => b.to_ascii_uppercase(),
         _ => b'N',
