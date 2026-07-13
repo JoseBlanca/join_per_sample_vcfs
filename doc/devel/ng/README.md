@@ -7,6 +7,11 @@ by document kind:
 - **`spec/`** — proposals and design specs (what to build and why).
   - [`ng_proposal.md`](spec/ng_proposal.md) — the plan: the step-decomposed caller
     taxonomy, the benchmark strategy, and the single-phase lab.
+  - [`read_filtering.md`](spec/read_filtering.md) — step 1 (the whole-read keep/drop
+    prelude) + the ng foundations it settles (skeleton, `types.rs` seed, conventions).
+  - [`ref_seq.md`](spec/ref_seq.md) — the `RefSeq` reference-sequence accessor
+    (foundational infra: resident + streaming + in-memory impls). Read filtering #8 and
+    the pileup depend on it.
 - **`arch/`** — architecture (the shared types and the interfaces implementations
   plug into).
   - [`ng_step_interfaces.md`](arch/ng_step_interfaces.md) — the common domain

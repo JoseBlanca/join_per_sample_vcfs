@@ -101,7 +101,10 @@ accuracy lives. The additions:
    or the STR **catalog/panel router** (motif / period / borders). This is the
    *router*: it decides whether a locus goes down the generic small-indel path or
    the STR-specialist path. **A general caller with no router runs every locus
-   generic** — freebayes' whole world.
+   generic** — freebayes' whole world. In ng this is the head of the **locus stream**
+   (see *The locus stream* below): it segments the genome into STR and non-STR
+   stretches; STR stretches become loci directly, non-STR stretches are split into
+   loci by the pileup.
 4. **Rough genotyping → parameter pre-pass, at *two levels* ("the two callers").** A
    cheap *rough* caller runs first; its **confident genotypes** are the substrate for
    the frozen parameters. The estimation happens at two levels, mirroring production:
@@ -157,6 +160,52 @@ router — the striking exception being GATK's **DRAGstr**, which grafts the cha
 (STR-context indel prior + STR-modulated PairHMM gap penalties) onto an otherwise
 general assembly caller. Note the symmetry: **normalisation appears twice** (step 2
 generic, step 12 STR) — the same job on each branch the router selects.
+
+### The locus stream — ng's concrete spine (SNP / indel / STR at one level)
+
+The 13 steps above are the field's *analytical* taxonomy — a frame for comparing
+five callers. ng's *architecture* threads them onto a single spine, and the spine's
+whole job is to keep **SNP, indel, and STR first-class at the same level**: one
+uniform pipeline, measured against the same gold/silver standards, with the router
+as the *only* principled fork. ng is **not** "STR-first" as a design.
+
+The spine is a **stream generator of loci**:
+
+```
+genome
+  ─▶ segment into STR / non-STR stretches                   (step 3, reference-based)
+       • an STR stretch is blessed as a locus, 1:1           → reference-defined locus
+       • a non-STR stretch is walked by the pileup, which
+         splits it into loci and gathers each one's reads    → data-defined loci
+  ─▶ one stream of loci, each carrying its LocusEvidence
+  ─▶ consumed uniformly by the per-locus core (steps 6–9)    → a variant, or discarded
+```
+
+Three things this makes explicit:
+
+- **Two loci-minting mechanisms, one downstream contract.** Downstream of the stream,
+  nothing knows or cares whether a locus came from the catalog or from the pileup — it
+  sees a `LocusKind` carrying `LocusEvidence`. That uniformity *is* "the three markers
+  at one level": SNP and indel are not separate branches, they are both outcomes of
+  *generic* loci; the marker type is a property of the emitted variant, not a parallel
+  pipeline. The router is the single fork, and everything after the stream is shared.
+- **The split is reference-defined vs data-defined.** An STR locus is defined from the
+  *reference* (the catalog finds tandem structure with no reads), so it can be minted
+  before a single read is examined — which is exactly why "segment first, pileup only
+  the non-STR" is a legal ordering. A non-STR locus is defined from the *data*: the
+  pileup must read the admitted reads to discover where the variation sits. (The
+  data-driven STR discovery weighed in step 3's detail below would make STR loci
+  *partly* data-defined too — and that is precisely what would break this clean
+  ordering. Committing to reference-defined STR loci for now is what keeps the stream
+  simple.)
+- **The pileup is first-class infrastructure, not glue.** Once a stretch is ruled
+  non-STR, the genome-walking pileup — active read set, CIGAR decomposition, per-base
+  adaptor masking and mate-overlap reconciliation, per-locus emission — is a real
+  algorithm and gets its own module (it *is* our production `pileup/walker/`, the reuse
+  target). And *what counts as a non-STR locus* — a single position, an active-region
+  window, a haplotype window grown to a fixpoint — is itself a swappable axis the lab
+  will bake off, so "define the locus/window" and "gather its evidence" stay
+  conceptually separable even where an implementation fuses them.
 
 **Analyse each step, but measure end-to-end.** The steps are coupled (priors,
 likelihood, and posterior are entangled; a missing candidate is unrecoverable), so
@@ -489,15 +538,6 @@ step is where scaling is re-added.**
 **Success gate (so ng cannot become an endless side-quest).** On the standards (§2),
 does ng's per-step quality match or beat the current caller, telling us *which
 implementation to port back*? A spike that cannot answer that is a distraction.
-
-**Where to start.**
-
-- **STR first** — the smallest surface, the freshest insight (the freebayes surprise),
-  and the sharpest single-sample-vs-cohort tension.
-- **First probe: candidate generation + realignment (step 2/6).** Local reassembly /
-  haplotype candidate generation (freebayes / GATK-style) versus our catalog-anchored
-  per-locus evidence — the leading hypothesis for freebayes' detection edge, cleanly
-  testable in isolation on synthetic data.
 
 ---
 

@@ -46,8 +46,8 @@ same-primitive quantities is that **the compiler refuses to mix them**.
 
 ```rust
 pub struct ContigId(pub u32);       // index into the contig table
-pub struct Position(pub u64);       // 0-based reference position
-pub struct GenomeRegion { pub contig: ContigId, pub start: Position, pub end: Position } // half-open
+pub struct Position(pub u64);       // 1-based reference position (matches VCF/SAM/IGV and the production engine)
+pub struct GenomeRegion { pub contig: ContigId, pub start: Position, pub end: Position } // 1-based inclusive [start, end]
 pub struct SsrMotif(Box<[u8]>);     // the repeat unit, phase-faithful (STR)
 pub struct SsrPeriod(u8);           // motif length in bp, the repeat period (STR); >= 1, validated
 ```
@@ -139,10 +139,16 @@ there is no invariant to protect, so a checked constructor would be ceremony.
 These are the payloads passed step→step; every step impl consumes and produces them.
 
 ```rust
-/// One sample's evidence at one locus — the per-locus, per-sample unit.
+/// One sample's evidence at one locus — the per-locus, per-sample unit, and the
+/// currency of the **locus stream** (spec §1, *The locus stream*). A locus enters the
+/// stream from one of two mints, but downstream steps consume this type identically —
+/// that uniformity is what keeps SNP / indel / STR at one level:
+///   • an **STR** locus is reference-defined (the catalog blesses a tract 1:1);
+///   • a **generic** locus is data-defined (the `pileup/` module walks a non-STR
+///     stretch, splits it into loci, and gathers each one's reads).
 pub struct LocusEvidence<'a> {
     pub sample: SampleId,
-    pub reads: &'a [LocusRead],   // output of step 2
+    pub reads: &'a [LocusRead],   // step-2 prepared reads (STR path) / pileup output (generic)
     pub depth: ReadDepth,
 }
 
@@ -248,6 +254,22 @@ pub trait LocusSource {
 *Impls to bench:* fixed STR catalog (ours), active-region detection (GATK), the
 catalog+discovery hybrid (spec §step-3). Keeping `LocusSource` and `LocusRouter`
 separate lets a data-driven source feed the same reference-based router.
+
+**Step 3 is the head of the locus stream** (spec §1, *The locus stream*). It segments
+the genome into STR / non-STR stretches; from there **two mints feed one stream** of
+`LocusKind`-carrying `LocusEvidence`:
+
+- an **STR** stretch is blessed as a locus 1:1 — reference-defined, minted before any
+  read is read;
+- a **non-STR** stretch is handed to the **`pileup/`** module, which walks it, splits it
+  into loci, and gathers each one's evidence — data-defined.
+
+`pileup/` is **not** a step trait here: it is infrastructure (the reused
+`pileup/walker/`), the generic-path counterpart of the STR read-class/gather, and it has
+no bake-off surface of its own. What *is* still swappable inside it — the non-STR
+locus/window definition (single position vs active-region vs haplotype-fixpoint) — is the
+`LocusSource`/active-region axis above. See `module_layout.md` (*The locus stream*) for
+the open subsume-or-compose question.
 
 ### Step 4 — the rough caller, the per-sample summary, and the cohort estimator
 
@@ -395,6 +417,27 @@ generation + HipSTR stutter likelihood + our cohort prior" is one `CallerRecipe`
 
 ## 5. Design decisions (resolved during review; add new open items here with `OPEN:`)
 
+- **The pipeline spine is a locus stream, marker-agnostic — decided.** SNP, indel, and
+  STR sit at one level: step 3 segments the genome into STR / non-STR stretches, an STR
+  stretch is a locus 1:1 (reference-defined), a non-STR stretch is split into loci and
+  evidenced by the `pileup/` module (data-defined), and both feed one uniform stream of
+  `LocusEvidence` that the per-locus core consumes identically. The router is the *only*
+  principled fork; SNP and indel are both generic loci, not separate branches. `pileup/`
+  is first-class infrastructure (the reused `pileup/walker/`), not a step trait — see the
+  step-3 note above and `module_layout.md`. ng is **not** "STR-first" as a design; that
+  phrase is only about experiment ordering (spec §3). `OPEN:` whether `pileup/` subsumes
+  the generic path's step-2/window traits or is built from them.
+- **Reference access is one trait, `RefSeq`, with both access patterns — decided.**
+  A single `RefSeq` trait ([`../spec/ref_seq.md`](../spec/ref_seq.md)) consolidates
+  production's `ChromRefFetcher` + `MultiChromRefFetcher`, with three impls (resident,
+  streaming, in-memory-synthetic) reusing the `src/fasta` fetcher machinery. ng carries
+  **both** the whole-contig-resident and the streaming/sub-range patterns (memory *and*
+  speed, and a clean port-back), and matches production's raw-vs-canonical byte split so
+  the ported filters behave identically. It is foundational infra (`ref_seq.rs`), not a
+  step. **Coordinate base — decided: ng is 1-based** (matching production, VCF/SAM/IGV,
+  and cutting conversion seams): `Position` is 1-based, `GenomeRegion` 1-based inclusive
+  (§1), and `RefSeq` fetches by `(chrom_id, start_1based, length)`. Only BED input
+  converts, at the boundary, as production already does.
 - **Cohort vs per-locus granularity — decided: thread the frequency in.**
   `GenotypeModel::infer` takes a locus' worth of per-sample likelihoods *plus* the
   cohort allele frequency as an **input** (`&[AlleleFreq]`, computed by a shared outer
@@ -439,6 +482,7 @@ were not freshly re-read.
 |---|---|---|
 | `GenomeRegion` | `Region` ([regions.rs](../../../../src/regions.rs)), `ContigInterval` ([bam/alignment_input.rs](../../../../src/bam/alignment_input.rs)) | consolidate the coordinate-span types into one |
 | `RefWindow` | ≈ `RefSpan` ([var_calling/types.rs](../../../../src/var_calling/types.rs)) | the sequence-carrying span |
+| `RefSeq` + `RawRefSeq` (traits) | `ChromRefFetcher` + `MultiChromRefFetcher` + `RepositoryRefFetcher` + `StreamingChromRefFetcher` + `ManualEvictChromRefFetcher` ([fasta/fetcher.rs](../../../../src/fasta/fetcher.rs)) | **consolidate** into `RefSeq` (universal canonical fetch) + the `RawRefSeq` capability + an inherent `evict_before` (no silent no-ops); reuse the fetcher impls behind them. Spec: [`../spec/ref_seq.md`](../spec/ref_seq.md) |
 | `MappedRead` | `MappedRead` ([bam/alignment_input.rs](../../../../src/bam/alignment_input.rs)) | reuse as-is (the step-2 input) |
 | `LocusRead` | — (new) | **distinct** from `PreparedRead` ([pileup/walker/](../../../../src/pileup/walker/)), which is a *different* concept (a decoded walker read) — do **not** reuse that name |
 | `AlleleCandidates` | `CandidateSet` ([ssr/cohort/candidate_set.rs](../../../../src/ssr/cohort/candidate_set.rs)) | rename |
