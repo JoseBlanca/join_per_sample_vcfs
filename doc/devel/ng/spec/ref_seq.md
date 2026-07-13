@@ -174,13 +174,16 @@ pub trait RefSeq {
         -> Result<Vec<u8>, RefSeqError> { /* default: fetch_into a fresh Vec */ }
 }
 
-/// Raw, un-canonicalised bytes (borrowed) — the left-align / mismatch-fraction path (#8).
-/// A capability of impls that keep bytes resident (`ResidentRefSeq`, `InMemoryRefSeq`);
-/// the windowed impl simply does NOT implement it, so "no raw here" is a **compile-time**
-/// fact, not a runtime `Err`. Read filtering #8 binds `R: RawRefSeq`.
+/// Raw, un-canonicalised bytes — the left-align / mismatch-fraction path (#8). Written
+/// into the caller's `dst` (like `fetch_into`), NOT returned as a borrowed slice: a
+/// file-backed impl loads its contig lazily, so a borrowed return would force `&mut self`
+/// (a resident cache); writing into `dst` keeps the whole trait `&self` (Decision 4). A
+/// capability of impls that can serve raw bytes (`ResidentRefSeq`, `InMemoryRefSeq`); the
+/// windowed impl (canonical-only buffer) does NOT implement it, so "no raw here" is a
+/// **compile-time** fact, not a runtime `Err`. Read filtering #8 binds `R: RawRefSeq`.
 pub trait RawRefSeq: RefSeq {
-    fn fetch_raw(&self, chrom_id: ContigId, start_1based: u32, length: u32)
-        -> Result<&[u8], RefSeqError>;
+    fn fetch_raw_into(&self, chrom_id: ContigId, start_1based: u32, length: u32,
+                      dst: &mut Vec<u8>) -> Result<(), RefSeqError>;
 }
 ```
 
@@ -194,11 +197,17 @@ Two contracts to nail in the doc, both lifted from production:
   `OutOfPattern` variant in case a strict auto-slide impl is ever added.)
 - **Build once, one resident contig, clear on transition.** See the caching section.
 
-**On `&self` vs `&mut self`.** The trait is uniformly `&self`, so a resident impl stays
-shareable read-only (the property production's rayon workers rely on, and the port-back
-wants). The windowed impl's `fetch_into` still mutates its buffer, so it uses interior
-mutability (a `RefCell`, as production's streaming reader does) to keep `&self`; its
-`evict_before` is an inherent `&mut self` method. Nothing forces `&mut self` into the trait.
+**On `&self` — the whole fetch surface is `&self`.** Because both `fetch_into` and
+`fetch_raw_into` write into the caller's `dst` (rather than returning a borrowed slice), no
+impl needs `&mut self` or a resident cache to serve a fetch — `ResidentRefSeq` is stateless
+per call (get the contig from the repository → copy the window into `dst`), so it stays
+`Send + Sync` and shareable read-only. The one interior-mutability point is the **windowed**
+impl: its `fetch_into` extends a sliding buffer, so it uses a `RefCell` to keep
+`fetch_into(&self)`, and its `evict_before` is an inherent `&mut self` method. Nothing
+forces `&mut self` into the trait. *(This resolved a design question surfaced during
+implementation: the earlier borrowed-`&[u8]` `fetch_raw` sketch was not implementable for
+the lazily-loaded resident impl — a borrow cannot escape a `RefCell`. Option C, write into
+`dst`, was chosen.)*
 
 `RefSeqError` is `#[non_exhaustive]`, mirroring production's `ChromRefFetchError`:
 out-of-bounds, invalid start (0), the reserved monotonic-contract violation, and I/O. (No
@@ -218,17 +227,18 @@ them — no silent no-ops.
 pub struct ResidentRefSeq {
     repository: fasta::Repository,   // reuse: noodles whole-contig cache (Arc<Sequence>)
     contigs: ContigList,             // chrom_id -> name
-    raw_contig: RefCell<Option<(ContigId, Arc<Sequence>)>>,  // last contig, for borrowed raw
 }
-impl RefSeq    for ResidentRefSeq { /* fetch_into: slice the resident contig + canonicalise */ }
-impl RawRefSeq for ResidentRefSeq { /* fetch_raw: borrow the resident bytes, no folding */ }
+// Stateless per call (both fetch paths copy into the caller's dst) — no cache field.
+impl RefSeq    for ResidentRefSeq { /* fetch_into: get contig, slice, canonicalise into dst */ }
+impl RawRefSeq for ResidentRefSeq { /* fetch_raw_into: get contig, slice, copy verbatim into dst */ }
 impl ResidentRefSeq {
+    pub fn new(repository, contigs) -> Self;
     pub fn clear(&self);             // drop the resident contig at a contig transition (--regions fix)
 }
 ```
 Random access anywhere in the resident contig; `Send + Sync` (shareable read-only).
 Bounded by `clear()` at contig transitions. **The raw-capable impl**, so read filtering #8
-uses it. Reuse target: `RepositoryRefFetcher` + `RawContigRefCache`.
+uses it. Reuse target: `RepositoryRefFetcher` (canonical) + `RawContigRefCache` (raw).
 
 ### `WindowedRefSeq` — sub-range buffer, caller-evictable (canonical only)
 
@@ -255,7 +265,7 @@ worker; `!Sync` via `RefCell` — fine, ng is single-thread). Reuse target:
 ```rust
 pub struct InMemoryRefSeq { contigs: Vec<Vec<u8>> }   // indexed by chrom_id; hand-built bases
 impl RefSeq    for InMemoryRefSeq { /* fetch_into: slice + canonicalise */ }
-impl RawRefSeq for InMemoryRefSeq { /* fetch_raw: slice the stored bytes */ }
+impl RawRefSeq for InMemoryRefSeq { /* fetch_raw_into: copy stored bytes into dst */ }
 impl InMemoryRefSeq { pub fn from_contigs(contigs: Vec<Vec<u8>>) -> Self; }
 ```
 Holds everything (no eviction, no `clear` needed); random access; raw-capable. Lets the
@@ -263,7 +273,7 @@ mismatch filter (#8) and the pileup be unit-tested with **no FASTA on disk**.
 
 ### Capability matrix
 
-| impl | canonical `fetch` (`RefSeq`) | `fetch_raw` (`RawRefSeq`) | random access | `evict_before` | `clear()` | thread |
+| impl | canonical `fetch` (`RefSeq`) | `fetch_raw_into` (`RawRefSeq`) | random access | `evict_before` | `clear()` | thread |
 |---|---|---|---|---|---|---|
 | `ResidentRefSeq` | ✓ | ✓ | whole contig | — | ✓ (contig transition) | `Send + Sync` |
 | `WindowedRefSeq` | ✓ | — (not impl'd) | within window | ✓ (inherent) | — (rebuild on chrom change) | `Send` |

@@ -84,17 +84,17 @@ paths. *Source:* ref_seq.md §Implementations.
 
 ### Milestone B — `ResidentRefSeq` (whole-contig, real FASTA, reuse)
 
-**B1. Canonical resident fetch + `clear`.**  ☐
+**B1. Canonical resident fetch + `clear`.**  ✅
 `ResidentRefSeq` wrapping `fasta::Repository` + `ContigList` (reuse `build_fasta_repository`);
 `fetch_into` / `fetch` slice the resident contig and reuse `canonicalise`; `clear()` drops the
 resident contig at a contig transition. *Depends:* A2. *Source:* ref_seq.md §Implementations +
 Reuse map; the `--regions` caching rule.
 
-**B2. `RawRefSeq` for `ResidentRefSeq`.**  ☐
+**B2. `RawRefSeq` for `ResidentRefSeq`.**  ✅
 Borrowed raw bytes (the `RawContigRefCache` model — a cached `Arc<Sequence>` reachable via
 `&self`). *Source:* ref_seq.md Decision 4.
 
-**B3. Tests — byte-parity with production.**  ☐
+**B3. Tests — byte-parity with production.**  ✅
 Against a small FASTA fixture, sweep `(chrom_id, start, length)` windows and assert
 `ResidentRefSeq` canonical bytes match `RepositoryRefFetcher` and raw bytes match
 `RawContigRefCache`. Also assert agreement with `InMemoryRefSeq` on a hand-built reference.

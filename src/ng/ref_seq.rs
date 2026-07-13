@@ -3,18 +3,28 @@
 //! filtering. Design spec: `doc/devel/ng/spec/ref_seq.md`.
 //!
 //! [`RefSeq`] is the **universal** surface: canonical `{A,C,G,T,N}` fetch, which every
-//! implementation provides. Capabilities only some impls have live on the impls that
-//! have them — never as trait methods that silently do nothing on the rest: raw bytes
-//! are the [`RawRefSeq`] sub-trait; buffer eviction is an inherent method on the windowed
-//! impl (a later milestone). This file holds the traits, the error type, and the
-//! synthetic [`InMemoryRefSeq`]; the file-backed impls (`ResidentRefSeq`,
-//! `WindowedRefSeq`) land in later milestones.
+//! implementation provides. Raw bytes are the [`RawRefSeq`] sub-trait; buffer eviction is
+//! an inherent method on the windowed impl (a later milestone). Both fetch surfaces write
+//! into a caller-owned buffer (`&self`, alloc-free when the buffer is reused) rather than
+//! returning a borrowed slice — that keeps every impl `&self`-shareable and avoids the
+//! lazy-load/borrow-escape problem the file-backed impls would otherwise hit.
 //!
-//! Canonicalisation reuses the production [`crate::fasta::fetcher::canonicalise`], so
-//! canonical bytes are byte-identical to the production fetchers by construction.
+//! This file holds the traits, the error type, the synthetic [`InMemoryRefSeq`], and the
+//! FASTA-backed [`ResidentRefSeq`]; the streaming `WindowedRefSeq` lands in a later
+//! milestone. Canonicalisation reuses the production
+//! [`crate::fasta::fetcher::canonicalise`], so canonical bytes are byte-identical to the
+//! production fetchers by construction.
+//!
+//! `noodles`' FASTA crate is referred to by its full name `noodles_fasta` here (only the
+//! `Repository` type is named); `crate::fasta` is our own module. Keeping the two spelled
+//! differently avoids the "same token, two crates" ambiguity.
 
+use crate::fasta::ContigList;
 use crate::fasta::fetcher::canonicalise;
 use crate::ng::types::ContigId;
+use noodles_fasta::Repository;
+use std::io;
+use std::ops::Range;
 
 /// Errors from a reference fetch. `#[non_exhaustive]` so matchers must accept future
 /// variants; the shape mirrors the production `fasta::fetcher::ChromRefFetchError`.
@@ -32,15 +42,18 @@ pub enum RefSeqError {
     /// `start_1based` was 0 — the 1-based coordinate contract was violated.
     #[error("start_1based must be >= 1")]
     InvalidStart,
-    /// No contig with this id exists in the reference.
+    /// No contig with this id exists in the reference contig table.
     #[error("unknown {0:?}")]
     UnknownContig(ContigId),
-    /// Underlying reference I/O failure (file-backed impls only).
-    #[error("reference I/O failure on {contig:?}: {source}")]
+    /// A reference read failed: either a genuine FASTA I/O error, or a contig that is in
+    /// the table but absent from the FASTA repository. Both fold into one variant to
+    /// mirror the production `ChromRefFetchError::Io` (kept for port-back parity); the
+    /// `source` distinguishes them (a synthesised `NotFound` for the missing-contig case).
+    #[error("reference read failed on {contig:?}")]
     Io {
         contig: ContigId,
         #[source]
-        source: std::io::Error,
+        source: io::Error,
     },
     // NOTE: a strict monotonic-forward (auto-slide) fetcher would add an `OutOfPattern`
     // variant here (cf. production `ChromRefFetchError`). ng's windowed impl is
@@ -48,10 +61,38 @@ pub enum RefSeqError {
     // `#[non_exhaustive]` keeps adding it later non-breaking. (ref_seq.md, Decision 6.)
 }
 
+/// Validate a 1-based `[start_1based, start_1based + length)` request against a contig of
+/// `contig_len` bytes, returning the 0-based [`Range`] to slice. The single home for the
+/// coordinate/bounds contract, shared by every impl so they cannot drift. The caller must
+/// have already established that `contig` exists and that `start_1based >= 1`.
+fn validate_window(
+    contig: ContigId,
+    contig_len: usize,
+    start_1based: u32,
+    length: u32,
+) -> Result<Range<usize>, RefSeqError> {
+    debug_assert!(
+        start_1based >= 1,
+        "caller must reject start_1based == 0 first"
+    );
+    let start0 = (start_1based - 1) as usize;
+    // `checked_add` guards a 32-bit `usize`, where `start0 + length` could wrap and slip
+    // past the bounds check into a slice-index panic; on 64-bit it never fails.
+    match start0.checked_add(length as usize) {
+        Some(end0) if end0 <= contig_len => Ok(start0..end0),
+        _ => Err(RefSeqError::OutOfBounds {
+            contig,
+            contig_length: u32::try_from(contig_len).unwrap_or(u32::MAX),
+            start: start_1based,
+            end: start_1based.saturating_add(length),
+        }),
+    }
+}
+
 /// Access to reference-genome bases by (contig, 1-based range). The universal surface
-/// every implementation provides: canonical `{A,C,G,T,N}` fetch. Raw bytes and buffer
-/// eviction are capabilities on the impls that support them ([`RawRefSeq`]; the windowed
-/// impl's inherent `evict_before`), not methods here — see the module docs.
+/// every implementation provides: canonical `{A,C,G,T,N}` fetch. Raw bytes are the
+/// [`RawRefSeq`] capability; buffer eviction is the windowed impl's inherent
+/// `evict_before` — neither is a method here.
 ///
 /// Coordinates are bare `u32` (1-based `start_1based`, `length`) rather than newtypes, to
 /// match the production `MultiChromRefFetcher::fetch` signature so a winning impl ports
@@ -59,7 +100,7 @@ pub enum RefSeqError {
 pub trait RefSeq {
     /// Write the canonical `{A,C,G,T,N}` bases for the `length` bases starting at 1-based
     /// `start_1based` on `contig` into `dst`. On success, `dst`'s previous contents are
-    /// **replaced**; on error `dst` is left unchanged. The allocation-free hot path.
+    /// **replaced**; on error `dst` is left unchanged. Alloc-free when `dst` is reused.
     fn fetch_into(
         &self,
         contig: ContigId,
@@ -68,9 +109,7 @@ pub trait RefSeq {
         dst: &mut Vec<u8>,
     ) -> Result<(), RefSeqError>;
 
-    /// Owned convenience over [`Self::fetch_into`]. Canonical fetch returns owned bytes
-    /// because canonicalisation produces fresh bytes; the raw read ([`RawRefSeq`]) can
-    /// borrow instead.
+    /// Owned convenience over [`Self::fetch_into`].
     fn fetch(
         &self,
         contig: ContigId,
@@ -79,25 +118,33 @@ pub trait RefSeq {
     ) -> Result<Vec<u8>, RefSeqError> {
         // Start empty rather than `with_capacity(length)`: `length` is caller-controlled
         // and only validated inside `fetch_into`, so reserving up front would let an
-        // invalid (huge) request allocate before it is rejected. `fetch_into` grows the
-        // buffer only after the range is validated.
+        // invalid (huge) request allocate before it is rejected.
         let mut out = Vec::new();
         self.fetch_into(contig, start_1based, length, &mut out)?;
         Ok(out)
     }
 }
 
-/// Raw, un-canonicalised reference bytes (borrowed) — the left-alignment /
-/// mismatch-fraction path. A capability of impls that keep bytes resident; an impl whose
-/// buffer is already canonicalised simply does not implement it, so "no raw here" is a
-/// compile-time fact rather than a runtime error.
+/// Raw, un-canonicalised reference bytes — the left-alignment / mismatch-fraction path,
+/// which needs the verbatim reference bytes (no `{A,C,G,T,N}` folding). A capability of
+/// impls that can serve raw bytes; an impl whose only representation is already
+/// canonicalised simply does not implement it, so "no raw here" is a compile-time fact
+/// rather than a runtime error.
+///
+/// Like [`RefSeq::fetch_into`], raw bytes are **written into the caller's `dst`** (`&self`,
+/// alloc-free when reused) rather than returned as a borrowed slice: a file-backed impl
+/// loads its contig lazily, and a borrowed return would force `&mut self` (a resident
+/// cache) — the copy into `dst` keeps the whole trait `&self`. (ref_seq.md, Decision 4.)
 pub trait RawRefSeq: RefSeq {
-    fn fetch_raw(
+    /// Write the raw bytes for the window into `dst` (replacing its contents on success;
+    /// `dst` unchanged on error).
+    fn fetch_raw_into(
         &self,
         contig: ContigId,
         start_1based: u32,
         length: u32,
-    ) -> Result<&[u8], RefSeqError>;
+        dst: &mut Vec<u8>,
+    ) -> Result<(), RefSeqError>;
 }
 
 /// A synthetic, fully in-memory reference: each contig's bytes held directly, indexed by
@@ -116,9 +163,7 @@ impl InMemoryRefSeq {
     }
 
     /// Resolve a `(contig, start_1based, length)` request to the raw stored slice, or the
-    /// matching [`RefSeqError`]. The single place the coordinate/bounds contract is
-    /// enforced; both `fetch_into` (which canonicalises the result) and `fetch_raw`
-    /// (which returns it as-is) go through it.
+    /// matching [`RefSeqError`]. Both fetch paths go through it.
     fn resolve_range(
         &self,
         contig: ContigId,
@@ -132,21 +177,8 @@ impl InMemoryRefSeq {
             .contigs
             .get(contig.get() as usize)
             .ok_or(RefSeqError::UnknownContig(contig))?;
-        let start0 = (start_1based - 1) as usize;
-        // `checked_add` guards a 32-bit `usize`, where `start0 + length` could wrap and
-        // slip past the bounds check into a slice-index panic; on 64-bit it never fails.
-        let end0 = match start0.checked_add(length as usize) {
-            Some(end0) if end0 <= bytes.len() => end0,
-            _ => {
-                return Err(RefSeqError::OutOfBounds {
-                    contig,
-                    contig_length: bytes.len() as u32,
-                    start: start_1based,
-                    end: start_1based.saturating_add(length),
-                });
-            }
-        };
-        Ok(&bytes[start0..end0])
+        let range = validate_window(contig, bytes.len(), start_1based, length)?;
+        Ok(&bytes[range])
     }
 }
 
@@ -166,49 +198,164 @@ impl RefSeq for InMemoryRefSeq {
 }
 
 impl RawRefSeq for InMemoryRefSeq {
-    fn fetch_raw(
+    fn fetch_raw_into(
         &self,
         contig: ContigId,
         start_1based: u32,
         length: u32,
-    ) -> Result<&[u8], RefSeqError> {
-        self.resolve_range(contig, start_1based, length)
+        dst: &mut Vec<u8>,
+    ) -> Result<(), RefSeqError> {
+        let raw = self.resolve_range(contig, start_1based, length)?;
+        dst.clear();
+        dst.extend_from_slice(raw);
+        Ok(())
+    }
+}
+
+/// A FASTA-backed reference over a shared noodles [`Repository`] (the whole-contig cache
+/// the production CRAM/pileup path already uses). Stateless per call: each fetch pulls the
+/// contig's resident `Arc<Sequence>` from the repository, slices the window, and copies it
+/// into the caller's `dst` — so the impl is `&self` and holds no per-fetch state (a clean
+/// [`RefSeq`] + [`RawRefSeq`] pair). Mirrors the production `RepositoryRefFetcher`
+/// (canonical) + `RawContigRefCache` (raw). One contig is resident at a time;
+/// [`Self::clear`] drops it at a contig transition (the `--regions` memory discipline).
+pub struct ResidentRefSeq {
+    repository: Repository,
+    contigs: ContigList,
+}
+
+impl ResidentRefSeq {
+    /// Build over a shared repository and its contig table. The `repository` is an
+    /// `Arc`-backed handle (cheap clone); pass the same instance the reader uses so the
+    /// resident contigs are shared. `contigs` maps [`ContigId`] → contig name.
+    pub fn new(repository: Repository, contigs: ContigList) -> Self {
+        Self {
+            repository,
+            contigs,
+        }
+    }
+
+    /// Drop the resident contig(s) from the underlying repository cache — call at a contig
+    /// transition to keep at most one contig resident (the `--regions` memory rule). A
+    /// subsequent fetch transparently reloads.
+    pub fn clear(&self) {
+        self.repository.clear();
+    }
+
+    /// Pull the contig's resident bytes, validate the window, and hand the raw slice to
+    /// `consume` while the `Arc<Sequence>` is alive (the slice cannot escape the `Arc`, so
+    /// both fetch paths consume it in place — one canonicalising, one copying verbatim).
+    fn with_window<R>(
+        &self,
+        contig: ContigId,
+        start_1based: u32,
+        length: u32,
+        consume: impl FnOnce(&[u8]) -> R,
+    ) -> Result<R, RefSeqError> {
+        if start_1based == 0 {
+            return Err(RefSeqError::InvalidStart);
+        }
+        let entry = self
+            .contigs
+            .entries
+            .get(contig.get() as usize)
+            .ok_or(RefSeqError::UnknownContig(contig))?;
+        let seq = match self.repository.get(entry.name.as_bytes()) {
+            Some(Ok(seq)) => seq,
+            Some(Err(source)) => return Err(RefSeqError::Io { contig, source }),
+            None => {
+                return Err(RefSeqError::Io {
+                    contig,
+                    source: io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("contig {} not in FASTA repository", entry.name),
+                    ),
+                });
+            }
+        };
+        // Arc<Sequence> -> &Sequence -> &[u8] (the resident bytes, verbatim).
+        let raw: &[u8] = AsRef::<[u8]>::as_ref(seq.as_ref());
+        let range = validate_window(contig, raw.len(), start_1based, length)?;
+        Ok(consume(&raw[range]))
+    }
+}
+
+impl RefSeq for ResidentRefSeq {
+    fn fetch_into(
+        &self,
+        contig: ContigId,
+        start_1based: u32,
+        length: u32,
+        dst: &mut Vec<u8>,
+    ) -> Result<(), RefSeqError> {
+        self.with_window(contig, start_1based, length, |raw| {
+            dst.clear();
+            dst.extend(raw.iter().copied().map(canonicalise));
+        })
+    }
+}
+
+impl RawRefSeq for ResidentRefSeq {
+    fn fetch_raw_into(
+        &self,
+        contig: ContigId,
+        start_1based: u32,
+        length: u32,
+        dst: &mut Vec<u8>,
+    ) -> Result<(), RefSeqError> {
+        self.with_window(contig, start_1based, length, |raw| {
+            dst.clear();
+            dst.extend_from_slice(raw);
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fasta::ContigEntry;
+    use crate::fasta::MultiChromRefFetcher;
+    use crate::fasta::fetcher::RepositoryRefFetcher;
+    use crate::pileup::per_sample::read_processor::RawContigRefCache;
+    use std::io::Write;
+    use std::path::PathBuf;
+
+    // ----- InMemoryRefSeq -------------------------------------------------
 
     /// contig 0 mixes case, an ambiguity code, a gap, and a stray byte to exercise
     /// canonicalisation; contig 1 is a clean `ACGT` for coordinate tests.
-    fn reference() -> InMemoryRefSeq {
+    fn in_memory() -> InMemoryRefSeq {
         InMemoryRefSeq::from_contigs(vec![b"acgtNR-x".to_vec(), b"ACGT".to_vec()])
+    }
+
+    /// Convenience: raw bytes as an owned Vec (the trait writes into a caller buffer).
+    fn raw(r: &impl RawRefSeq, contig: ContigId, start: u32, len: u32) -> Vec<u8> {
+        let mut dst = Vec::new();
+        r.fetch_raw_into(contig, start, len, &mut dst).unwrap();
+        dst
     }
 
     #[test]
     fn fetch_canonical_uppercases_acgt_and_folds_the_rest_to_n() {
-        let r = reference();
-        // acgt -> ACGT; N stays N; R, -, x all fold to N.
+        let r = in_memory();
         assert_eq!(r.fetch(ContigId(0), 1, 8).unwrap(), b"ACGTNNNN");
     }
 
     #[test]
     fn canonicalise_folds_rna_uracil_to_n() {
-        // `U`/`u` are named in canonicalise's contract; pin that they fold to N.
         let r = InMemoryRefSeq::from_contigs(vec![b"UuAa".to_vec()]);
         assert_eq!(r.fetch(ContigId(0), 1, 4).unwrap(), b"NNAA");
     }
 
     #[test]
     fn fetch_raw_returns_stored_bytes_verbatim() {
-        let r = reference();
-        assert_eq!(r.fetch_raw(ContigId(0), 1, 8).unwrap(), b"acgtNR-x");
+        let r = in_memory();
+        assert_eq!(raw(&r, ContigId(0), 1, 8), b"acgtNR-x");
     }
 
     #[test]
     fn fetch_into_replaces_dst_contents() {
-        let r = reference();
+        let r = in_memory();
         let mut dst = b"stale-contents".to_vec();
         r.fetch_into(ContigId(1), 1, 4, &mut dst).unwrap();
         assert_eq!(dst, b"ACGT");
@@ -216,16 +363,15 @@ mod tests {
 
     #[test]
     fn fetch_into_leaves_dst_unchanged_on_error() {
-        let r = reference();
+        let r = in_memory();
         let mut dst = b"KEEP".to_vec();
-        // An overrunning request errors from resolve_range before dst.clear() runs.
         assert!(r.fetch_into(ContigId(1), 1, 99, &mut dst).is_err());
         assert_eq!(dst, b"KEEP");
     }
 
     #[test]
     fn fetch_matches_fetch_into() {
-        let r = reference();
+        let r = in_memory();
         let owned = r.fetch(ContigId(0), 2, 3).unwrap();
         let mut dst = Vec::new();
         r.fetch_into(ContigId(0), 2, 3, &mut dst).unwrap();
@@ -234,25 +380,22 @@ mod tests {
 
     #[test]
     fn sub_range_fetch_is_1_based() {
-        let r = reference();
-        // positions 2..=4 (1-based) of "ACGT" are "CGT".
+        let r = in_memory();
         assert_eq!(r.fetch(ContigId(1), 2, 3).unwrap(), b"CGT");
-        assert_eq!(r.fetch_raw(ContigId(1), 2, 3).unwrap(), b"CGT");
+        assert_eq!(raw(&r, ContigId(1), 2, 3), b"CGT");
     }
 
     #[test]
     fn fetch_last_base_of_contig_returns_tail() {
-        let r = reference();
-        // start at the last base (1-based 4 of "ACGT"), length 1.
+        let r = in_memory();
         assert_eq!(r.fetch(ContigId(1), 4, 1).unwrap(), b"T");
-        assert_eq!(r.fetch_raw(ContigId(1), 4, 1).unwrap(), b"T");
+        assert_eq!(raw(&r, ContigId(1), 4, 1), b"T");
     }
 
     #[test]
     fn zero_length_fetch_is_empty_not_error() {
-        let r = reference();
+        let r = in_memory();
         assert_eq!(r.fetch(ContigId(1), 1, 0).unwrap(), b"");
-        // even at the one-past-the-end boundary (start = length + 1).
         assert_eq!(r.fetch(ContigId(1), 5, 0).unwrap(), b"");
     }
 
@@ -271,7 +414,7 @@ mod tests {
 
     #[test]
     fn start_zero_is_invalid_start() {
-        let r = reference();
+        let r = in_memory();
         assert!(matches!(
             r.fetch(ContigId(1), 0, 1),
             Err(RefSeqError::InvalidStart)
@@ -280,7 +423,7 @@ mod tests {
 
     #[test]
     fn unknown_contig_id_is_reported() {
-        let r = reference();
+        let r = in_memory();
         assert!(matches!(
             r.fetch(ContigId(9), 1, 1),
             Err(RefSeqError::UnknownContig(ContigId(9)))
@@ -289,8 +432,7 @@ mod tests {
 
     #[test]
     fn window_past_contig_end_is_out_of_bounds() {
-        let r = reference();
-        // "ACGT" has length 4; 6 bases from position 1 overruns.
+        let r = in_memory();
         match r.fetch(ContigId(1), 1, 6) {
             Err(RefSeqError::OutOfBounds {
                 contig,
@@ -309,22 +451,220 @@ mod tests {
 
     #[test]
     fn one_base_past_the_end_is_out_of_bounds_but_exact_fit_succeeds() {
-        let r = reference();
-        // "ACGT" is length 4: length 5 from pos 1 overruns by exactly one...
+        let r = in_memory();
         assert!(matches!(
             r.fetch(ContigId(1), 1, 5),
             Err(RefSeqError::OutOfBounds { .. })
         ));
-        // ...while the exact-fit neighbour (length 4) is fine.
         assert_eq!(r.fetch(ContigId(1), 1, 4).unwrap(), b"ACGT");
     }
 
     #[test]
     fn raw_and_canonical_differ_only_by_folding() {
-        let r = reference();
-        let raw = r.fetch_raw(ContigId(0), 1, 8).unwrap().to_vec();
+        let r = in_memory();
+        let raw_bytes = raw(&r, ContigId(0), 1, 8);
         let canon = r.fetch(ContigId(0), 1, 8).unwrap();
-        let expect: Vec<u8> = raw.iter().copied().map(canonicalise).collect();
+        let expect: Vec<u8> = raw_bytes.iter().copied().map(canonicalise).collect();
         assert_eq!(canon, expect);
+    }
+
+    // ----- ResidentRefSeq -------------------------------------------------
+
+    /// Write a multi-contig, single-line-per-contig FASTA + `.fai` to a tempdir and return
+    /// the guard, the path, and the matching `ContigList` (mirrors the production
+    /// `fetcher.rs` test fixtures). Bytes must be FASTA-legal (letters/IUPAC/`N`); the
+    /// contig strings here exercise soft-masking + ambiguity-code canonicalisation.
+    fn build_fasta(contigs: &[(&str, &[u8])]) -> (tempfile::TempDir, PathBuf, ContigList) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fasta_path = dir.path().join("ref.fa");
+        let fai_path = dir.path().join("ref.fa.fai");
+        let mut fa = std::fs::File::create(&fasta_path).expect("create fasta");
+        let mut fai_txt = String::new();
+        let mut offset = 0usize;
+        let mut entries = Vec::new();
+        for (name, bases) in contigs {
+            let header = format!(">{name}\n");
+            fa.write_all(header.as_bytes()).expect("hdr");
+            fa.write_all(bases).expect("seq");
+            fa.write_all(b"\n").expect("nl");
+            let seq_offset = offset + header.len();
+            // name\tlength\toffset\tline_bases\tline_width
+            fai_txt.push_str(&format!(
+                "{name}\t{len}\t{seq_offset}\t{len}\t{width}\n",
+                len = bases.len(),
+                width = bases.len() + 1,
+            ));
+            offset = seq_offset + bases.len() + 1;
+            entries.push(ContigEntry {
+                name: (*name).to_string(),
+                length: bases.len() as u64,
+                md5: None,
+            });
+        }
+        std::fs::write(&fai_path, fai_txt).expect("write fai");
+        (dir, fasta_path, ContigList { entries })
+    }
+
+    fn repository_for(fasta_path: &std::path::Path) -> Repository {
+        let indexed = noodles_fasta::io::indexed_reader::Builder::default()
+            .build_from_path(fasta_path)
+            .expect("indexed fasta");
+        let adapter = noodles_fasta::repository::adapters::IndexedReader::new(indexed);
+        Repository::new(adapter)
+    }
+
+    /// Fixture: chr0 exercises soft-masking + IUPAC folding; chr1 is clean.
+    const FASTA_CONTIGS: &[(&str, &[u8])] = &[("chr0", b"acgtNRYK"), ("chr1", b"ACGTACGT")];
+
+    fn resident() -> (tempfile::TempDir, ResidentRefSeq, ContigList) {
+        let (dir, path, contigs) = build_fasta(FASTA_CONTIGS);
+        let resident = ResidentRefSeq::new(repository_for(&path), contigs.clone());
+        (dir, resident, contigs)
+    }
+
+    #[test]
+    fn resident_canonical_matches_production_repository_fetcher() {
+        let (_dir, path, contigs) = build_fasta(FASTA_CONTIGS);
+        let resident = ResidentRefSeq::new(repository_for(&path), contigs.clone());
+        let production = RepositoryRefFetcher::new(repository_for(&path), contigs);
+
+        for (chrom_id, (_name, bases)) in FASTA_CONTIGS.iter().enumerate() {
+            let len = bases.len() as u32;
+            for start in 1..=len {
+                for length in 0..=(len - start + 1) {
+                    let ours = resident
+                        .fetch(ContigId(chrom_id as u32), start, length)
+                        .unwrap();
+                    let prod =
+                        MultiChromRefFetcher::fetch(&production, chrom_id as u32, start, length)
+                            .expect("production fetch");
+                    assert_eq!(
+                        ours, prod,
+                        "canonical mismatch chrom {chrom_id} start {start} len {length}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn resident_raw_matches_production_raw_cache() {
+        let (_dir, path, contigs) = build_fasta(FASTA_CONTIGS);
+        let resident = ResidentRefSeq::new(repository_for(&path), contigs.clone());
+        let mut production = RawContigRefCache::new(repository_for(&path), contigs);
+
+        for (chrom_id, (_name, bases)) in FASTA_CONTIGS.iter().enumerate() {
+            let len = bases.len() as u32;
+            for start in 1..=len {
+                for length in 1..=(len - start + 1) {
+                    let ours = raw(&resident, ContigId(chrom_id as u32), start, length);
+                    let prod = production
+                        .fetch_raw_slice(chrom_id, start as u64, length)
+                        .expect("production raw slice");
+                    assert_eq!(
+                        ours.as_slice(),
+                        prod,
+                        "raw mismatch chrom {chrom_id} start {start} len {length}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn resident_agrees_with_in_memory_on_canonical_and_raw() {
+        let (_dir, resident, _contigs) = resident();
+        let in_mem =
+            InMemoryRefSeq::from_contigs(FASTA_CONTIGS.iter().map(|(_, b)| b.to_vec()).collect());
+
+        for (chrom_id, (_name, bases)) in FASTA_CONTIGS.iter().enumerate() {
+            let id = ContigId(chrom_id as u32);
+            let len = bases.len() as u32;
+            for start in 1..=len {
+                for length in 1..=(len - start + 1) {
+                    assert_eq!(
+                        resident.fetch(id, start, length).unwrap(),
+                        in_mem.fetch(id, start, length).unwrap(),
+                        "canonical chrom {chrom_id} start {start} len {length}"
+                    );
+                    assert_eq!(
+                        raw(&resident, id, start, length),
+                        raw(&in_mem, id, start, length),
+                        "raw chrom {chrom_id} start {start} len {length}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn resident_raw_is_verbatim_fasta_bytes() {
+        let (_dir, resident, _contigs) = resident();
+        assert_eq!(raw(&resident, ContigId(0), 1, 8), b"acgtNRYK");
+        assert_eq!(resident.fetch(ContigId(0), 1, 8).unwrap(), b"ACGTNNNN");
+    }
+
+    #[test]
+    fn resident_fetch_into_replaces_stale_dst_contents() {
+        let (_dir, resident, _contigs) = resident();
+        let mut dst = b"stale".to_vec();
+        resident.fetch_into(ContigId(1), 1, 4, &mut dst).unwrap();
+        assert_eq!(dst, b"ACGT");
+    }
+
+    #[test]
+    fn resident_leaves_dst_unchanged_on_error() {
+        let (_dir, resident, _contigs) = resident();
+        let mut dst = b"KEEP".to_vec();
+        assert!(resident.fetch_into(ContigId(1), 1, 99, &mut dst).is_err());
+        assert_eq!(dst, b"KEEP");
+        let mut raw_dst = b"KEEP-RAW".to_vec();
+        assert!(
+            resident
+                .fetch_raw_into(ContigId(1), 1, 99, &mut raw_dst)
+                .is_err()
+        );
+        assert_eq!(raw_dst, b"KEEP-RAW");
+    }
+
+    #[test]
+    fn resident_error_cases() {
+        let (_dir, path, mut contigs) = build_fasta(FASTA_CONTIGS);
+        // Add a contig present in the table but absent from the FASTA -> Io on fetch.
+        contigs.entries.push(ContigEntry {
+            name: "chrGhost".to_string(),
+            length: 4,
+            md5: None,
+        });
+        let resident = ResidentRefSeq::new(repository_for(&path), contigs);
+
+        assert!(matches!(
+            resident.fetch(ContigId(0), 0, 1),
+            Err(RefSeqError::InvalidStart)
+        ));
+        assert!(matches!(
+            resident.fetch(ContigId(9), 1, 1),
+            Err(RefSeqError::UnknownContig(ContigId(9)))
+        ));
+        assert!(matches!(
+            resident.fetch(ContigId(2), 1, 1),
+            Err(RefSeqError::Io {
+                contig: ContigId(2),
+                ..
+            })
+        ));
+        assert!(matches!(
+            resident.fetch(ContigId(1), 1, 99),
+            Err(RefSeqError::OutOfBounds { .. })
+        ));
+    }
+
+    #[test]
+    fn resident_clear_reloads_transparently() {
+        let (_dir, resident, _contigs) = resident();
+        let before = resident.fetch(ContigId(0), 1, 8).unwrap();
+        resident.clear();
+        let after = resident.fetch(ContigId(0), 1, 8).unwrap();
+        assert_eq!(before, after);
     }
 }

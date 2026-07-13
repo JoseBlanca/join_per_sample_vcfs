@@ -6,5 +6,5 @@
 pub mod ref_seq;
 pub mod types;
 
-pub use ref_seq::{InMemoryRefSeq, RawRefSeq, RefSeq, RefSeqError};
+pub use ref_seq::{InMemoryRefSeq, RawRefSeq, RefSeq, RefSeqError, ResidentRefSeq};
 pub use types::ContigId;

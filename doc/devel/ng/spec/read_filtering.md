@@ -1,6 +1,7 @@
 # ng step 1 — read filtering (and the ng foundations)
 
-*Status: design spec (2026-07-10; renamed admission → filtering 2026-07-11). First
+*Status: design spec (2026-07-10; renamed admission → filtering 2026-07-11; pre-decode
+gate folded into the filter via the `RawRecord` seam 2026-07-13). First
 spec under [`ng_proposal.md`](ng_proposal.md); companion to the arch docs
 [`../arch/ng_step_interfaces.md`](../arch/ng_step_interfaces.md) (shared types +
 step traits) and [`../arch/module_layout.md`](../arch/module_layout.md) (the
@@ -26,15 +27,15 @@ filtering (§3, §7).
 
 ## 1. What read filtering *is* — and what it is not
 
-Read filtering is the **whole-read keep/drop prelude**. It takes the reads decoded
-from one sample's alignment file (BAM/CRAM) and yields the subset worth carrying
-forward, plus a tally of what was dropped and why. Three properties fix its scope:
+Read filtering is the **whole-read keep/drop prelude**. It takes the reads of
+one sample's alignment file (BAM/CRAM) and yields the subset worth carrying
+forward, plus a tally of what was dropped and why. It gates the cheap flag/MAPQ tests
+before decode and decodes only the survivors (§5). Three properties fix its scope:
 
 - **Per-read.** Every decision is about one read in isolation: its flags, its
   mapping quality, its length, its per-base mismatches against the reference. No
   decision needs another read, a pair, or a locus.
-- **Locus-independent.** Filtering runs *before* the caller knows which loci it will
-  genotype (step 3, the router). A read is kept or dropped for the whole run, not per
+- **Locus-independent.** A read is kept or dropped for the whole run, not per
   candidate site.
 - **Content-preserving.** Filtering **selects** reads; it never rewrites them. A kept
   read's bytes, CIGAR, and qualities are exactly what was decoded. Every
@@ -43,8 +44,7 @@ forward, plus a tally of what was dropped and why. Three properties fix its scop
 
 That last property draws the one boundary line worth stating explicitly, because the
 step map in `ng_proposal.md` §1 lists "overlapping-mate quality reconciliation" under
-step 1, yet in the production code that work is **per-base and pairwise** and happens
-far downstream, at pileup-walker time. See §6.
+step 1, yet in the production code that work is **per-base and pairwise** and happens downstream.
 
 **Read filtering does *not*:**
 
@@ -59,7 +59,7 @@ Its output is simply *the reads that earned their place in the pipeline.*
 
 ---
 
-## 2. The ng foundations settled here
+## 2. The ng foundations this first step establishes
 
 ### 2.1 Module structure
 
@@ -173,28 +173,32 @@ reuses the former and supplies its own driver.
 | adaptor boundary (annotation) | `compute_adaptor_boundary(...)` → stored on `MappedRead.adaptor_boundary` | carried through, not applied (§6) |
 | the read itself | `MappedRead` | **reuse as-is** — it is the step-2 input (`ng_step_interfaces.md` §6) |
 
-The one predicate ng does **not** call directly is `classify_pre_decode`: it takes a
-noodles `RecordBuf` (a not-yet-decoded record), because in production the flag and MAPQ
-tests run *before* decoding to save work. ng operates on already-decoded `MappedRead`s
-(the lab decodes everything; it is not chasing that optimisation), so it re-expresses
-the same six flag/MAPQ tests over `MappedRead.flag` and `MappedRead.mapq` — a handful
-of bit-tests reusing the same `FLAG_*` constants and `DEFAULT_MIN_MAPQ`. Same logic,
-same constants, different input type.
+The one predicate handled specially is `classify_pre_decode`: it takes a noodles
+`RecordBuf` (a not-yet-decoded record) because in production the flag and MAPQ tests run
+*before* decoding to save work. ng keeps that optimisation but **relocates it from the
+reader into read filtering** (§3, §5): the filter consumes *undecoded* records through the
+`RawRecord` seam, applies filters #1–#6 to the record's flag and MAPQ, decodes only the
+survivors, and applies #7–#9 to the resulting `MappedRead`. Where the predicate is already
+record-shaped it is reused directly; where a test reads the decoded read it is re-expressed
+over `MappedRead.flag`/`MappedRead.mapq` — the same `FLAG_*` constants and `DEFAULT_MIN_MAPQ`
+throughout. Same logic, same constants; the decode boundary just falls mid-cascade (§3).
 
 **Where the filter config lives — a deliberate choice.** In production the flag/MAPQ
 gate is applied by the reader (via its `AlignmentMergedReaderConfig`), so a read may
 arrive already filtered by a policy set elsewhere. ng instead makes read filtering own
 its **entire** policy in one visible `ReadFilterConfig` and applies the full cascade
-itself: the reader is asked only to *decode* reads, not to filter them. Filtering being
-a real, inspectable step — the whole point of the decomposition — means its policy must
-be in one place, not inherited from a hidden reader default.
+itself: the reader is asked only to *hand over records and decode them on demand* (§5),
+never to filter them. This is exactly what lets the pre-decode flag/MAPQ gate live *in the
+filter* without re-splitting the policy — the records arrive raw, and the filter, not the
+reader, decides which to drop and which to decode. Filtering being a real, inspectable
+step — the whole point of the decomposition — means its policy must be in one place, not
+inherited from a hidden reader default.
 
-> **Boy-scout note.** Two decisions are left open to *improve if it helps readability*,
-> not frozen: (a) whether kept reads deserve a distinct type (`FilteredRead`) rather
-> than a bare `MappedRead` (§4), and (b) exactly how much to reuse the old predicates
-> versus tidy them as we lift them into ng. The spec records the leaning; the
-> implementation is free to leave the code a little better than it found it where a
-> clear win appears, and to write that down when it does.
+> **Boy-scout note.** The kept-read type is now settled — bare `MappedRead`, no
+> `FilteredRead` wrapper (§4, §7). One decision is left open to *improve if it helps
+> readability*, not frozen: exactly how much to reuse the old predicates versus tidy them
+> as we lift them into ng. The implementation is free to leave the code a little better
+> than it found it where a clear win appears, and to write that down when it does.
 
 ### 2.6 The test and bench shape
 
@@ -203,7 +207,7 @@ be in one place, not inherited from a hidden reader default.
   is kept; one below is dropped) and the cascade order. The existing `alignment_input`
   tests are the template and, for the ported predicates, the behaviour to match.
 - **One fixture-driven integration test** — filter the reads of a small known BAM/CRAM
-  and assert the resulting `ReadFilterStats` (§4) matches hand-counted expectations.
+  and assert the resulting `ReadFilterCounts` (§4) matches hand-counted expectations.
   This is the regression anchor for the port.
 - **`bench/` is deferred for this step, on purpose.** The lab's `bench/` module scores
   *competing* implementations against gold/silver/synthetic standards
@@ -235,6 +239,16 @@ order-independent.
 | 8 | **high mismatch fraction** ⚠ | the read's fraction of quality-clearing mismatches against the reference exceeds the threshold — a defence against contamination, adaptor runthrough, and chimeric tails the aligner placed anyway. **Reference-dependent — pending the reference-accessor spec** | `Some(0.10)` | `DEFAULT_MAX_READ_MISMATCH_FRACTION` | `max_read_mismatch_fraction` |
 | 9 | **bad CIGAR** | the alignment is ill-formed: an adjacent insertion/deletion pair, or a deletion at a read boundary — signals the aligner was genuinely confused | on | — | none (always applied) |
 
+**The decode boundary sits between #6 and #7.** Filters #1–#6 read only the record's flag
+and MAPQ — both available *before* the sequence, qualities, and CIGAR are decoded; #7–#9
+need the decoded read (its length, its bases against the reference, its CIGAR). Because the
+cascade is already hit-rate-ordered, this split is free: read filtering gates #1–#6 on the
+undecoded record and decodes only the survivors (§5), so a read dropped for a flag or low
+MAPQ never pays decode cost. This is the ng home of production's `classify_pre_decode`
+optimisation — relocated from the reader into the filter, which is what keeps the whole
+policy and the whole drop-tally in one place (§2.5). It is **result-preserving**: same reads
+dropped, same attribution, byte-identical output — a pure work-saving reordering.
+
 **Supplementary / secondary / unmapped have no toggle** — this matches the production
 policy and its rationale (`AlignmentMergedReaderConfig`'s "why no
 `drop_secondary`/`drop_supplementary` toggles" note): admitting either would silently
@@ -249,9 +263,10 @@ reference bases regardless, the shared accessor is defined in [`ref_seq.md`](ref
 Filter #8 therefore:
 
 - **stays in read filtering**, taking a `&impl RawRefSeq` threaded into `ReadFilter::new`;
-- reads **raw** (un-canonicalised) bytes via `RawRefSeq::fetch_raw`, matching production's
-  `RawContigRefCache` → `read_exceeds_mismatch_fraction` path exactly, so the ported
-  filter behaves identically (the point of matching the old byte convention);
+- reads **raw** (un-canonicalised) bytes via `RawRefSeq::fetch_raw_into` (writing into a
+  reused buffer), matching production's `RawContigRefCache` →
+  `read_exceeds_mismatch_fraction` path, so the ported filter behaves identically (the
+  point of matching the old byte convention);
 - turns off cleanly when `max_read_mismatch_fraction` is `None`, in which case no
   reference access happens at all.
 
@@ -290,15 +305,16 @@ pub struct ReadFilterConfig {
 /// fired (the first one, per the hit-rate order) for the tally.
 pub enum FilterVerdict {
     Keep,
-    Drop(DropReason),   // enum: Duplicate | LowMapq | Supplementary | Secondary |
-                        //       Unmapped | QcFail | TooShort | HighMismatch | BadCigar
+    Drop(DropReason),   // enum: Duplicate | LowMapq | Supplementary | Secondary | Unmapped |
+                        //       QcFail | TooShort | HighMismatchFraction | BadCigar
+                        //       (variant names line up 1:1 with the ReadFilterCounts fields)
 }
 
 /// A per-sample tally of the filtering pass — one counter per drop reason, plus the
 /// kept count. The ng port of `FilterCounts`. Surfacing every drop is the "no silent
 /// caps" discipline: a read that vanished must be accounted for. It is a **running**
 /// tally (§5): readable at any point, final once the input is exhausted.
-pub struct ReadFilterStats {
+pub struct ReadFilterCounts {
     pub kept: u64,
     pub duplicate: u64,
     pub low_mapq: u64,
@@ -312,74 +328,134 @@ pub struct ReadFilterStats {
 }
 ```
 
-**No new *read* type.** A kept read is a `MappedRead`, unchanged — filtering selects, it
-does not transform (§1). `MappedRead` is already the documented input to step 2
+**No new *read* type.** A kept read is a `MappedRead`, unchanged (§1).
+The *input*, by contrast, is an undecoded record the source fills into a reused buffer,
+viewed through the `RawRecord` seam (§5) and decoded only on the survivors; the kept
+*output* stays a bare `MappedRead`. `MappedRead` is already the documented input to step 2
 (`prepare_read(&self, read: &MappedRead, …)` in `ng_step_interfaces.md` §3), so making
-filtering yield `MappedRead` keeps the two steps composable with no adapter. *(Boy-scout
-open item: if a typestate `FilteredRead(MappedRead)` wrapper buys enough "you cannot
-skip filtering" safety to be worth the ceremony, add it when that value is demonstrated
-— see §2.5. The leaning is to keep the bare `MappedRead`.)*
+filtering yield `MappedRead` keeps the two steps composable with no adapter. *(Settled: no
+`FilteredRead(MappedRead)` typestate wrapper — the per-read copy is not worth the "cannot
+skip filtering" compile-time guarantee, which the test suite already secures cheaply. See
+§7.)*
 
 ---
 
-## 5. The public surface — a filtering iterator that carries its stats
+## 5. The public surface — a kept-read iterator fed by a record source
 
-Read filtering is exposed as an **iterator adapter**: construct a `ReadFilter` from the
-input read iterator and the config, then iterate it to pull the reads that pass. It
-holds the running `ReadFilterStats` as reads flow through. Lazy and streaming — no
-upfront `Vec` — so it drops straight into the locus-stream spine (`ng_proposal.md` §1)
-as its first stage.
+Read filtering is exposed as an **iterator of kept reads** (`Iterator<Item = MappedRead>`),
+driven by a **record source** it reads into a single reused buffer. It gates the cheap
+flag/MAPQ filters on each undecoded record and decodes only the survivors (§3), holding the
+running `ReadFilterCounts` as reads flow through. Lazy and streaming — no upfront `Vec` — so
+it drops straight into the locus-stream spine (`ng_proposal.md` §1) as its first stage.
+
+**Why a source, not an `Iterator` of records.** A standard `Iterator`'s `Item` is owned with
+no lifetime tie to `&mut self`, so an `Iterator<Item = RawRecord>` would force a fresh
+`RecordBuf` per read — no buffer reuse (the lending-iterator problem). Modelling the input as
+a source that *fills* a reused buffer keeps one `RecordBuf` alive for the whole pass; the
+*output* stays a clean `Iterator<Item = MappedRead>`, so nothing downstream notices.
 
 ```rust
-/// Filters one sample's decoded reads, lazily. `next()` pulls from the input, applies
-/// the §3 cascade to each read, tallies every drop, and returns the first read that
-/// passes (or `None` when the input is exhausted).
+/// A borrowed view of one alignment record — the seam that lets the flag/MAPQ cascade run
+/// *before* decode. Phase one exposes the cheap fields filters #1–#6 need without touching
+/// the packed sequence/qualities; `decode` is the expensive phase (base/quality decode +
+/// adaptor-boundary annotation → `MappedRead`), run only on survivors. It borrows `&self`,
+/// not `self`, so the underlying buffer stays reusable for the next read.
+pub trait RawRecord {
+    fn flag(&self) -> Flags;         // SAM bitfield — same type `MappedRead.flag` carries; filters #1, #3–#6
+    fn mapq(&self) -> MapQual;       // SAM MAPQ (unavailable 0xFF → 0); filter #2
+    fn decode(&self) -> MappedRead;  // expensive phase (#7–#9 read the result); copies what MappedRead keeps
+}
+
+/// The filter's input: fills a caller-owned buffer with the next record, reusing its
+/// allocations. Replaces `Iterator<Item = RawRecord>` precisely to get that reuse (above).
+/// The production impl wraps the alignment reader; unit tests supply a trivial fake (§2.6).
+pub trait RecordSource {
+    type Record: RawRecord + Default;   // the reused buffer type (production: a noodles RecordBuf view)
+    /// Fill `buf` with the next record, reusing its buffers. `Ok(true)` = filled,
+    /// `Ok(false)` = end of input; `Err` is fatal to the run (see the contract below).
+    fn read_next(&mut self, buf: &mut Self::Record) -> io::Result<bool>;
+}
+
+/// Filters one sample's reads, lazily. `next()` reads the next record into its reused
+/// buffer, runs the pre-decode cascade (#1–#6) on its flag/MAPQ, decodes only if it
+/// survives, runs the decode-dependent cascade (#7–#9) on the resulting `MappedRead`,
+/// tallies every drop, and returns the first read that passes (or `None` at end of input).
+/// A read dropped on a flag or low MAPQ builds no `MappedRead` at all (§3).
 ///
-/// `stats()` is a RUNNING tally: readable at any point — peek mid-stream to watch how
+/// `counts()` is a RUNNING tally: readable at any point — peek mid-stream to watch how
 /// filtering is going — and complete once the iterator is exhausted. Reaching the final
 /// totals is the caller's responsibility (iterate to the end); nothing forces full
 /// consumption.
-pub struct ReadFilter<I, R /*: I: Iterator<Item = MappedRead>, R: RawRefSeq */> {
-    reads: I,
+pub struct ReadFilter<S: RecordSource, R /*: R: RawRefSeq */> {
+    source: S,
+    buf: S::Record,               // the single record buffer reused across every read
     reference: R,                 // RawRefSeq — raw bytes for filter #8; see §3 + ref_seq.md
     config: ReadFilterConfig,
-    stats: ReadFilterStats,
+    counts: ReadFilterCounts,
 }
 
-impl<I: Iterator<Item = MappedRead>, R: RawRefSeq> Iterator for ReadFilter<I, R> {
+impl<S: RecordSource, R: RawRefSeq> Iterator for ReadFilter<S, R> {
     type Item = MappedRead;
-    fn next(&mut self) -> Option<MappedRead> { /* pull → cascade → tally → first Keep */ }
+    fn next(&mut self) -> Option<MappedRead> {
+        // read_next into self.buf (reuse) → pre-decode cascade → tally & continue on Drop
+        //   → self.buf.decode() → post-decode cascade → tally → first Keep
+        // (an Err from read_next or from #8 aborts the run — fatal, see the contract)
+    }
 }
 
-impl<I, R> ReadFilter<I, R> {
-    pub fn new(reads: I, reference: R, config: ReadFilterConfig) -> Self { /* … */ }
+impl<S: RecordSource, R> ReadFilter<S, R> {
+    pub fn new(source: S, reference: R, config: ReadFilterConfig) -> Self { /* buf = Default */ }
     /// The running tally — current counts, final once iteration is exhausted.
-    pub fn stats(&self) -> &ReadFilterStats { &self.stats }
+    pub fn counts(&self) -> &ReadFilterCounts { &self.counts }
 }
 ```
 
-Usage — iterate by `&mut` so the filter (and its stats) outlives the loop:
+Usage — iterate by `&mut` so the filter (and its counts) outlives the loop:
 
 ```rust
-let mut filter = ReadFilter::new(decoded_reads, reference, config);
-for read in &mut filter {
+let mut filter = ReadFilter::new(source, reference, config);   // source: RecordSource
+for read in &mut filter {                                      // yields MappedRead — survivors, already decoded
     // … feed the locus stream
 }
-let stats = filter.stats();   // running totals; complete here because the loop drained it
+let counts = filter.counts();   // running totals; complete here because the loop drained it
 ```
 
-The single-read decision is factored into a helper so the cascade is unit-testable in
-isolation (with the in-memory `RawRefSeq` impl standing in for a FASTA, `ref_seq.md` §2):
+The decision is factored into two helpers — split on the decode boundary (§3) — so each
+half is unit-testable in isolation (the post-decode half with the in-memory `RawRefSeq`
+impl standing in for a FASTA, `ref_seq.md` §2):
 
 ```rust
-fn verdict(read: &MappedRead, reference: &impl RawRefSeq, config: &ReadFilterConfig) -> FilterVerdict;
+/// Phase one — the flag/MAPQ cascade (#1–#6) on an undecoded record. Reference-free and
+/// decode-free: `Keep` means "decode and continue to phase two", `Drop` is the first fail.
+fn verdict_pre_decode(flag: Flags, mapq: MapQual, config: &ReadFilterConfig) -> FilterVerdict;
+
+/// Phase two — the decode-dependent cascade (#7–#9) on the decoded read. `reference` is
+/// consulted only by #8, and only when `max_read_mismatch_fraction` is `Some` (§3).
+fn verdict_post_decode(read: &MappedRead, reference: &impl RawRefSeq, config: &ReadFilterConfig) -> FilterVerdict;
 ```
 
 *Contract:* content-preserving, per-sample, lazy; every dropped read is charged to
-exactly one reason in the running stats. `reference` is consulted only by filter #8, and
-only when `max_read_mismatch_fraction` is `Some` (§3). (The `R: RawRefSeq` bound holds even
-when #8 is disabled at runtime; a caller wanting *no* reference at all would be a future
-`Option<R>` refinement — not needed now, since every real run has a reference anyway.)
+exactly one reason in the running counts, and decode runs only on reads that clear the
+pre-decode gate (#1–#6). The *output* is a bare `MappedRead` stream — the step-2 input
+(`ng_step_interfaces.md` §3) — so modelling the input as a `RecordSource` changes only the
+filter's input edge, not its output contract.
+
+One buffer is reused across the whole pass (the source fills `buf` in place); because a kept
+`MappedRead` outlives that buffer, `decode` **copies** the bytes it keeps out of it — a
+per-*kept*-read copy that reads dropped pre-decode never pay. (Reusing the buffer and moving
+its bytes into `MappedRead` are mutually exclusive: moving would drain the buffer and defeat
+reuse, so copy-on-keep is the deliberate choice — the output outliving the input forces
+copy-or-drain.)
+
+`reference` is consulted only by filter #8, and only when `max_read_mismatch_fraction` is
+`Some` (§3). A `RefSeqError` from #8 (`fetch_raw_into` returns `Result`, ref_seq.md §1) — as
+is an `Err` from `RecordSource::read_next` — is **fatal to the run, not a per-read drop**:
+the reads' contigs are validated against the reference before iteration, so an in-loop fetch
+or read error signals corrupt input or a broken invariant and aborts the pass rather than
+being swallowed. That is what keeps the surface `Item = MappedRead` — no per-item `Result`,
+no silent error bucket in `ReadFilterCounts`. (The `R: RawRefSeq` bound holds even when #8 is
+disabled at runtime; a caller wanting *no* reference at all would be a future `Option<R>`
+refinement — not needed now, since every real run has a reference anyway.)
 
 ---
 
@@ -426,18 +502,36 @@ whole-read prelude, not the per-base gatherer.
 
 ---
 
-## 7. Open questions
+## 7. Resolved decisions & open questions
 
 - **The reference-sequence accessor — resolved: `RefSeq`** ([`ref_seq.md`](ref_seq.md)),
   a dedicated spec written first because it is shared (pileup, BAQ, realignment, DUST) and
   #8 depends on it. Filter #8 stays in read filtering, takes a `&impl RawRefSeq`, and reads
   raw bytes (§3). (Coordinate base is settled: ng is uniformly **1-based**, matching
   production and VCF/SAM.)
-- **`FilteredRead` typestate?** Keep the bare `MappedRead` (current leaning), or wrap it
-  so "reached step 2 without filtering" is a compile error? Decide if/when the safety
-  proves worth the ceremony (§4, §2.5).
-- **Does the lab ever want the flag/MAPQ gate at decode time?** ng decodes everything
-  and filters after, for simplicity. If a future large-cohort ng experiment makes decode
-  cost bite, the pre-decode `classify_pre_decode` optimisation can be lifted in — but not
-  before it measurably matters.
+- **`FilteredRead` typestate — resolved: no.** Kept reads stay bare `MappedRead`s; there
+  is no `FilteredRead(MappedRead)` wrapper. Wrapping would make "reached step 2 without
+  filtering" a compile error, but that safety is not worth its cost — the wrapper is a copy
+  (or a newtype dance) on every kept read for a guarantee the test suite already gives us
+  cheaply (§2.6: the fixture-driven pass asserts the exact `ReadFilterCounts`, and the
+  cascade is unit-tested). Composability with step 2 (`prepare_read(&self, read: &MappedRead, …)`)
+  stays adapter-free (§4).
+- **Pre-decode gating — resolved: it is in the design (§3, §5).** Read filtering consumes
+  undecoded records through the `RawRecord` seam and decodes only the survivors of the
+  flag/MAPQ cascade (#1–#6), so a read dropped on a flag or low MAPQ never pays decode cost
+  — production's `classify_pre_decode` optimisation, relocated into the filter so the whole
+  policy and tally stay in one place. Because it is result-preserving (same drops, same
+  attribution, byte-identical output) it carries no correctness risk; its *magnitude* is
+  worth measuring on a real cohort, but the seam costs nothing to keep whether the saving
+  proves large or small.
+- **Reference-fetch error model — resolved: fatal, not per-read (§5).** `fetch_raw_into` is
+  fallible (`Result<_, RefSeqError>`, ref_seq.md §1), but the filter surface stays
+  `Item = MappedRead`: contigs are validated against the reference before iteration, and an
+  in-loop `RefSeqError` aborts the run (corrupt input or broken invariant) rather than being
+  swallowed into a per-read drop or poisoning every `next()` with a `Result`.
+- **Where `RawRecord` is implemented — OPEN.** The trait is ng's (§5), but its production
+  impl can either (a) be an **ng-owned adapter wrapping the noodles record** — keeping the
+  dependency ng → existing code, so production never learns about ng — or (b) be added to
+  the existing reader, coupling production to an ng trait. Leaning (a): it matches this
+  step's "reuse the predicates, supply our own driver" ethos (§2.5). Confirm before code.
 ```
