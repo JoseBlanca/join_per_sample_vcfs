@@ -160,13 +160,13 @@ spec §3.6, arch §2.2, §3 (error model).
 
 ### Milestone D — validate against `trf-mod` (parity, no production change)
 
-**D1. Capture & commit the golden catalog.**  ☐
+**D1. Capture & commit the golden catalog.**  ✅
 Run the current `trf-mod` → `postprocess` path in the container on a small tomato-reference subset
 (spec §9.5) and commit the resulting catalog TSV as a test fixture (under `tests/data/…` or the
 module's fixtures, per the `baq` pattern). Production is untouched — this only *reads* the existing
 path to snapshot the parity **oracle**. *Depends:* none (existing code). *Source:* spec §6, §9.
 
-**D2. Golden-fixture parity test — the port anchor.**  ☐
+**D2. Golden-fixture parity test — the port anchor.**  ✅
 In a test (living in `src/ssr/catalog`, where it can see `build_loci` + `TrfRecord`), run
 `find_tandem_repeats` on the D1 reference, bridge each `RepeatInterval` to the existing post-filter
 input via `TrfRecord::for_test(start, end, period as u16, score, b"")` (a **test-only** adapter —

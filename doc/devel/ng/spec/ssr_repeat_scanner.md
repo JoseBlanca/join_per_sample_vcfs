@@ -415,6 +415,16 @@ orchestrator (`catalog::run`) stops spawning `trf-mod` per contig and instead ca
   current `trf-mod`→postprocess loci for parity, so it applies **no** `max_repeat_len` cap (that
   cap is a live-caller routing feature, not catalog policy; adding it would diverge from the
   golden). The satellite cap, windowing, and region tiling are the *other* consumer's seam.
+- **The catalog must pre-filter before `build_loci` (validated finding, Milestone D).** `trf-mod`
+  hands the post-filter a *clean* candidate set (significant repeats, redundancy eliminated). The
+  raw scanner is deliberately permissive (`min_copies = 2`), so it also emits low-copy noise (in
+  aperiodic sequence) and every period-multiple of a real tract; fed straight to `build_loci` that
+  noise trips `drop_bundles` — which runs *before* the copy-number floor — and cascades the real
+  loci away. So `catalog::run` must apply, before `build_loci`, the two cleanups `trf-mod` bakes
+  in: the **per-period copy floor** and **period-multiple redundancy elimination** (`IsRedundant`).
+  This is *catalog policy* — it stays out of the use-agnostic scanner and the unchanged
+  post-filter. With it, the scanner reproduces the golden catalog at **16/16 recall** (the parity
+  test `src/ssr/catalog/scanner_parity.rs`); it is required whenever the production swap lands.
 - **The post-filter is unchanged, consuming `RepeatInterval` directly.** `postprocess::build_loci`
   currently takes `Vec<TrfRecord>` and reads only `start/end/period/score` — exactly
   `RepeatInterval`'s fields. So `TrfRecord` is **deleted** and `build_loci` (and its internal
