@@ -396,6 +396,139 @@ pub fn find_tandem_repeats(
     out
 }
 
+// ---------------------------------------------------------------------
+// The region seam (Milestone C) — repeat / satellite / unique tiling
+// ---------------------------------------------------------------------
+
+/// Tile a resident sequence into an ordered, gap-free run of [`Region`]s (spec §3.6): the
+/// coverage-merge core shared by [`RegionScanner::over_slice`] and (later) the windowed
+/// streaming path — so it is also the oracle for window-count invariance.
+///
+/// Steps: run [`find_tandem_repeats`], sort by start, union overlapping/abutting intervals
+/// into merged repeat spans (grouping their intervals), apply the [`SegmentOptions`]
+/// smoothing (`merge_gap` bridges short unique gaps, `min_repeat_len` drops short repeat
+/// blips back to unique), classify each surviving span `Repeat` vs `Satellite` by
+/// `max_repeat_len`, and emit `Unique` for every gap. The output tiles `[0, seq.len())`
+/// exactly, in order, with no two same-kind tiles adjacent.
+fn tile(
+    seq: &[u8],
+    periods: PeriodRange,
+    params: &ScanParams,
+    opts: &SegmentOptions,
+) -> Vec<Region> {
+    let n = seq.len() as u32;
+    let mut out = Vec::new();
+    if n == 0 {
+        return out;
+    }
+
+    // 1. Detect, then sort globally by start (find_tandem_repeats concatenates per-period).
+    let mut intervals = find_tandem_repeats(seq, periods, params);
+    intervals.sort_by_key(|iv| (iv.start, iv.end));
+
+    // 2. Union overlapping/abutting intervals into merged repeat spans, keeping the
+    //    constituent intervals of each.
+    struct Merged {
+        start: u32,
+        end: u32,
+        intervals: Vec<RepeatInterval>,
+    }
+    let mut spans: Vec<Merged> = Vec::new();
+    for iv in intervals {
+        match spans.last_mut() {
+            Some(last) if iv.start <= last.end => {
+                last.end = last.end.max(iv.end);
+                last.intervals.push(iv);
+            }
+            _ => spans.push(Merged {
+                start: iv.start,
+                end: iv.end,
+                intervals: vec![iv],
+            }),
+        }
+    }
+
+    // 3a. Smoothing — bridge unique gaps shorter than `merge_gap` (coalesce the spans).
+    if opts.merge_gap > 0 {
+        let mut bridged: Vec<Merged> = Vec::new();
+        for span in spans {
+            match bridged.last_mut() {
+                Some(last) if span.start - last.end < opts.merge_gap => {
+                    last.end = span.end;
+                    last.intervals.extend(span.intervals);
+                }
+                _ => bridged.push(span),
+            }
+        }
+        spans = bridged;
+    }
+
+    // 3b. Smoothing — drop repeat spans shorter than `min_repeat_len` (they become unique).
+    if opts.min_repeat_len > 0 {
+        spans.retain(|s| s.end - s.start >= opts.min_repeat_len);
+    }
+
+    // 4. Emit the tiling: Unique for each gap, Repeat/Satellite for each span.
+    let mut pos = 0u32;
+    for span in spans {
+        if span.start > pos {
+            out.push(Region::Unique(RegionSpan {
+                start: pos,
+                end: span.start,
+            }));
+        }
+        let region_span = RegionSpan {
+            start: span.start,
+            end: span.end,
+        };
+        if span.end - span.start > opts.max_repeat_len {
+            out.push(Region::Satellite(region_span));
+        } else {
+            out.push(Region::Repeat(RepeatRegion {
+                span: region_span,
+                intervals: span.intervals.into_boxed_slice(),
+            }));
+        }
+        pos = span.end;
+    }
+    if pos < n {
+        out.push(Region::Unique(RegionSpan { start: pos, end: n }));
+    }
+    out
+}
+
+/// Streams a repeat/satellite/unique tiling of a reference as an iterator of [`Region`]s —
+/// the routing seam the snp/ssr caller consumes (spec §3.6). Yields `Result<Region,
+/// ScanError>`; the resident [`RegionScanner::over_slice`] path is infallible (always
+/// `Ok`), while the windowed streaming path (a later increment) surfaces a mid-scan
+/// reference-read failure as a terminal `Err`.
+pub struct RegionScanner {
+    regions: std::vec::IntoIter<Region>,
+}
+
+impl RegionScanner {
+    /// Tile a small, already-resident sequence (spec §3.6). Precomputes the whole tiling;
+    /// the windowed, memory-bounded constructor over a `ChromRefFetcher` lands separately.
+    pub fn over_slice(
+        seq: &[u8],
+        periods: PeriodRange,
+        params: &ScanParams,
+        opts: &SegmentOptions,
+    ) -> Self {
+        Self {
+            regions: tile(seq, periods, params, opts).into_iter(),
+        }
+    }
+}
+
+impl Iterator for RegionScanner {
+    type Item = Result<Region, ScanError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.regions.next().map(Ok)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -670,5 +803,169 @@ mod tests {
             got.iter().all(|r| (r.end - r.start) / 2 >= 2),
             "every emitted interval has >= min_copies copies: {got:?}"
         );
+    }
+
+    // ---- RegionScanner::over_slice (the region seam, C1) -------------------
+
+    /// A region's `(start, end, kind)` for the tiling-contract check — kind is 0 Repeat,
+    /// 1 Satellite, 2 Unique.
+    fn triple(r: &Region) -> (u32, u32, u8) {
+        match r {
+            Region::Repeat(rr) => (rr.span.start, rr.span.end, 0),
+            Region::Satellite(s) => (s.start, s.end, 1),
+            Region::Unique(s) => (s.start, s.end, 2),
+        }
+    }
+
+    fn regions_of(seq: &[u8], periods: PeriodRange, opts: &SegmentOptions) -> Vec<Region> {
+        RegionScanner::over_slice(seq, periods, &ScanParams::default(), opts)
+            .map(|r| r.unwrap())
+            .collect()
+    }
+
+    /// Every tiling is coordinate-ordered, gap-free over `[0, n)`, non-overlapping, and has
+    /// no two same-kind tiles adjacent.
+    fn assert_tiles(regions: &[Region], n: u32) {
+        let mut pos = 0u32;
+        let mut prev_kind: Option<u8> = None;
+        for r in regions {
+            let (s, e, kind) = triple(r);
+            assert_eq!(
+                s, pos,
+                "tile starts at {s}, expected {pos} (gap or overlap)"
+            );
+            assert!(e > s, "empty tile [{s}, {e})");
+            assert_ne!(Some(kind), prev_kind, "two same-kind tiles adjacent at {s}");
+            prev_kind = Some(kind);
+            pos = e;
+        }
+        assert_eq!(pos, n, "tiling must cover exactly [0, {n})");
+    }
+
+    #[test]
+    fn empty_input_yields_no_regions() {
+        assert!(regions_of(b"", p(1, 6), &SegmentOptions::default()).is_empty());
+    }
+
+    #[test]
+    fn a_lone_repeat_tiles_as_unique_repeat_unique() {
+        // Non-repetitive flanks around a clean (CAG)*8 tract.
+        let mut seq = b"TTGGA".to_vec();
+        for _ in 0..8 {
+            seq.extend_from_slice(b"CAG");
+        }
+        seq.extend_from_slice(b"GGTTA");
+        let regions = regions_of(&seq, p(3, 3), &SegmentOptions::default());
+        assert_tiles(&regions, seq.len() as u32);
+        let kinds: Vec<u8> = regions.iter().map(|r| triple(r).2).collect();
+        assert_eq!(kinds, vec![2, 0, 2], "Unique, Repeat, Unique: {regions:?}");
+        // The single Repeat covers the tract.
+        if let Region::Repeat(rr) = &regions[1] {
+            assert_eq!((rr.span.start, rr.span.end), (5, 5 + 24));
+        } else {
+            panic!("middle tile is the repeat");
+        }
+    }
+
+    #[test]
+    fn overlapping_periods_merge_into_one_repeat_carrying_all() {
+        // (AT)*10 matches at periods 2, 4 and 6 — three overlapping intervals, one Repeat.
+        let seq = b"ATATATATATATATATATAT"; // 20 bp
+        let regions = regions_of(seq, p(2, 6), &SegmentOptions::default());
+        assert_tiles(&regions, seq.len() as u32);
+        let repeats: Vec<_> = regions
+            .iter()
+            .filter_map(|r| match r {
+                Region::Repeat(rr) => Some(rr),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(repeats.len(), 1, "one merged repeat region: {regions:?}");
+        let periods: std::collections::BTreeSet<u8> =
+            repeats[0].intervals.iter().map(|iv| iv.period).collect();
+        assert!(
+            periods.contains(&2) && periods.contains(&4) && periods.contains(&6),
+            "the merged region carries all overlapping periods: {:?}",
+            repeats[0].intervals
+        );
+    }
+
+    #[test]
+    fn a_repeat_over_the_cap_is_a_satellite() {
+        // The same (CAG)*8 = 24 bp tract, but with a 10 bp satellite cap → Satellite.
+        let mut seq = b"TTGGA".to_vec();
+        for _ in 0..8 {
+            seq.extend_from_slice(b"CAG");
+        }
+        seq.extend_from_slice(b"GGTTA");
+        let opts = SegmentOptions {
+            max_repeat_len: 10,
+            ..SegmentOptions::default()
+        };
+        let regions = regions_of(&seq, p(3, 3), &opts);
+        assert_tiles(&regions, seq.len() as u32);
+        assert_eq!(
+            regions.iter().map(|r| triple(r).2).collect::<Vec<_>>(),
+            vec![2, 1, 2],
+            "Unique, Satellite, Unique: {regions:?}"
+        );
+    }
+
+    #[test]
+    fn merge_gap_bridges_two_nearby_repeats() {
+        // Two (CAG)*5 tracts separated by a 12 bp non-repetitive gap → two intervals.
+        let mut seq = Vec::new();
+        for _ in 0..5 {
+            seq.extend_from_slice(b"CAG");
+        }
+        seq.extend_from_slice(b"TGACGTTGACGT"); // 12 bp gap the finder won't bridge
+        for _ in 0..5 {
+            seq.extend_from_slice(b"CAG");
+        }
+        // Off: two separate Repeats, a Unique gap between them.
+        let off = regions_of(&seq, p(3, 3), &SegmentOptions::default());
+        let repeats_off = off.iter().filter(|r| triple(r).2 == 0).count();
+        assert_eq!(repeats_off, 2, "without merge_gap, two repeats: {off:?}");
+        assert_tiles(&off, seq.len() as u32);
+        // On: a merge_gap wider than the 12 bp gap coalesces them into one Repeat.
+        let opts = SegmentOptions {
+            merge_gap: 20,
+            ..SegmentOptions::default()
+        };
+        let on = regions_of(&seq, p(3, 3), &opts);
+        assert_eq!(
+            on.iter().filter(|r| triple(r).2 == 0).count(),
+            1,
+            "with merge_gap, one bridged repeat: {on:?}"
+        );
+        assert_tiles(&on, seq.len() as u32);
+    }
+
+    #[test]
+    fn min_repeat_len_reclassifies_a_short_blip_as_unique() {
+        // An isolated (CAG)*3 = 9 bp tract, flanked.
+        let mut seq = b"TTGGA".to_vec();
+        for _ in 0..3 {
+            seq.extend_from_slice(b"CAG");
+        }
+        seq.extend_from_slice(b"GGTTA");
+        // Off: the 9 bp tract is a Repeat.
+        let off = regions_of(&seq, p(3, 3), &SegmentOptions::default());
+        assert!(
+            off.iter().any(|r| triple(r).2 == 0),
+            "a repeat is present: {off:?}"
+        );
+        // On: min_repeat_len = 20 drops it → the whole contig is one Unique tile.
+        let opts = SegmentOptions {
+            min_repeat_len: 20,
+            ..SegmentOptions::default()
+        };
+        let on = regions_of(&seq, p(3, 3), &opts);
+        assert_eq!(
+            on.iter().map(|r| triple(r).2).collect::<Vec<_>>(),
+            vec![2],
+            "the short repeat is reclassified unique, gaps merged: {on:?}"
+        );
+        assert_tiles(&on, seq.len() as u32);
     }
 }

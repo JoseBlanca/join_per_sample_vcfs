@@ -135,7 +135,7 @@ a period-2 tract that also matches at p = 4/6 (all emitted — no period de-dup)
 
 ### Milestone C — the region seam
 
-**C1. Coverage merge → `Region` tiling over a resident slice.**  ☐
+**C1. Coverage merge → `Region` tiling over a resident slice.**  ✅
 `RegionScanner::over_slice(seq, periods, params, opts)` and the `Iterator<Item = Result<Region,
 ScanError>>` impl for the resident case: run `find_tandem_repeats`, sort intervals by start, sweep
 to union overlapping/abutting intervals into merged spans, classify each `Repeat` vs `Satellite`
