@@ -135,18 +135,18 @@ added at the owner's request — a sibling `RecordSource`, no change to the seam
 
 ### Milestone D — the `ReadFilter` iterator (end-to-end)
 
-**D1. `ReadFilter` + `new`.**  ☐
+**D1. `ReadFilter` + `new`.**  ✅
 The struct (owns `source`, the reused `buf`, `reference`, `config`, `counts`) and
 `new(...) -> Result<Self, RefSeqError>`: validates every source-header contig resolves in the
 reference (fail-fast), seeds `buf = Default`. *Depends:* B, C. *Source:* spec §5, arch §3.
 
-**D2. `Iterator::next` + `counts`.**  ☐
+**D2. `Iterator::next` + `counts`.**  ✅
 `read_next` into the reused `buf` → `verdict_pre_decode` → on survival `buf.decode()` →
 `verdict_post_decode` → tally every drop → yield first `Keep`; an `Err` from `read_next` or #8
 aborts the run (fatal, no per-item `Result`). `counts()` exposes the running tally. *Source:*
 spec §5.
 
-**D3. Fixture-driven integration test — the port anchor.**  ☐
+**D3. Fixture-driven integration test — the port anchor.**  ✅
 Filter the reads of a small known **BAM** (and, since the CRAM source now exists, a CRAM too)
 and assert the exact `ReadFilterCounts` against hand-counted expectations. Add a buffer-reuse
 assertion (one `RecordBuf` across the pass) and a header/reference-mismatch case that fails in

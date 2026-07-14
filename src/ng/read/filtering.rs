@@ -13,9 +13,10 @@
 //! `DEFAULT_*` constants, and its `RecordBuf → MappedRead` decode path as-is,
 //! and supplies only its own driver and config.
 //!
-//! Milestones A (the step-1-local types) and B (the two-phase `verdict_*`
-//! cascade) have landed; the record-source seam (C) and the `ReadFilter`
-//! iterator (D) follow.
+//! The whole step is here: the step-1-local types, the two-phase `verdict_*`
+//! cascade, the `RawRecord`/`RecordSource` seam with the noodles BAM/CRAM
+//! adapters, and the `ReadFilter` iterator that drives them into a stream of
+//! kept reads with a running drop tally.
 
 use crate::bam::alignment_input::{
     DEFAULT_MAX_READ_MISMATCH_FRACTION, DEFAULT_MIN_MAPQ, DEFAULT_MIN_READ_LENGTH,
@@ -123,6 +124,26 @@ pub struct ReadFilterCounts {
     pub bad_cigar: u64,
 }
 
+impl ReadFilterCounts {
+    /// Tally one drop against its counter. The exhaustive `match` is the guard for
+    /// the documented `DropReason` ↔ `ReadFilterCounts` 1:1 mapping: adding a
+    /// `DropReason` variant without a counter here is a compile error, so the two
+    /// cannot silently desync (mirrors production `FilterCounts::record_drop`).
+    fn record_drop(&mut self, reason: DropReason) {
+        match reason {
+            DropReason::Duplicate => self.duplicate += 1,
+            DropReason::LowMapq => self.low_mapq += 1,
+            DropReason::Supplementary => self.supplementary += 1,
+            DropReason::Secondary => self.secondary += 1,
+            DropReason::Unmapped => self.unmapped += 1,
+            DropReason::QcFail => self.qc_fail += 1,
+            DropReason::TooShort => self.too_short += 1,
+            DropReason::HighMismatchFraction => self.high_mismatch_fraction += 1,
+            DropReason::BadCigar => self.bad_cigar += 1,
+        }
+    }
+}
+
 /// Phase one of the cascade — the flag/MAPQ filters (#1–#6), decided on an
 /// undecoded record's `flag` and `mapq` alone. Reference-free and decode-free:
 /// `Keep` means "decode and continue to phase two", `Drop` is charged to the
@@ -134,8 +155,6 @@ pub struct ReadFilterCounts {
 /// `MapQual(0)` by the record source (Milestone C), so a non-zero `min_mapq`
 /// drops it — matching production. `flag` is the raw SAM bitfield
 /// (`MappedRead.flag`), tested against the reused `FLAG_*` constants.
-// Wired into the `ReadFilter` iterator in Milestone D; unit-tested standalone here.
-#[cfg_attr(not(test), allow(dead_code))]
 fn verdict_pre_decode(flag: u16, mapq: MapQual, config: &ReadFilterConfig) -> FilterVerdict {
     // 1. Duplicate — a PCR/optical copy of another molecule (toggle).
     if config.drop_duplicate && (flag & FLAG_DUPLICATE) != 0 {
@@ -195,8 +214,6 @@ fn verdict_pre_decode(flag: u16, mapq: MapQual, config: &ReadFilterConfig) -> Fi
 /// out-of-bounds fetch signals a malformed record — and the fatal model treats
 /// it, like a truncated file, as corrupt input to fail loudly on rather than
 /// filter around (spec §7).
-// Wired into the `ReadFilter` iterator in Milestone D; unit-tested standalone here.
-#[cfg_attr(not(test), allow(dead_code))]
 fn verdict_post_decode(
     read: &MappedRead,
     reference: &impl RawRefSeq,
@@ -288,10 +305,15 @@ pub trait RawRecord {
 /// input; an `Err` is **fatal to the run**.
 pub trait RecordSource {
     /// The reused buffer type — a [`RawRecord`] the source refills in place. The
-    /// `Default` bound is load-bearing: the [`ReadFilter`] iterator (Milestone D)
-    /// seeds *one* buffer with `Default::default()` and hands the same `&mut` to
+    /// `Default` bound is load-bearing: the [`ReadFilter`] iterator seeds *one*
+    /// buffer with `Default::default()` and hands the same `&mut` to
     /// [`Self::read_next`] on every read, so the whole pass allocates one record.
     type Record: RawRecord + Default;
+    /// The alignment file's SAM header. Its `@SQ` list defines the contigs the
+    /// reads may reference; [`ReadFilter::new`] validates that every one resolves
+    /// in the reference up front, so an in-loop reference error later means
+    /// genuinely corrupt input rather than a mismatched reference.
+    fn header(&self) -> &sam::Header;
     /// Fill `buf` with the next record, reusing its allocations. `Ok(true)` =
     /// filled; `Ok(false)` = end of input, after which `buf` holds an unspecified
     /// (stale) record the caller must not read; `Err` is fatal to the run.
@@ -370,6 +392,10 @@ impl<R> BamRecordSource<R> {
 
 impl<R: io::Read> RecordSource for BamRecordSource<R> {
     type Record = NoodlesRawRecord;
+
+    fn header(&self) -> &sam::Header {
+        &self.header
+    }
 
     fn read_next(&mut self, buf: &mut NoodlesRawRecord) -> io::Result<bool> {
         // Stamp the file tag before the read; the reader refills `buf.record` in
@@ -480,6 +506,10 @@ impl<R: io::Read> CramRecordSource<R> {
 impl<R: io::Read> RecordSource for CramRecordSource<R> {
     type Record = NoodlesRawRecord;
 
+    fn header(&self) -> &sam::Header {
+        &self.header
+    }
+
     fn read_next(&mut self, buf: &mut NoodlesRawRecord) -> io::Result<bool> {
         buf.source_file_index = self.source_file_index;
         loop {
@@ -497,6 +527,181 @@ impl<R: io::Read> RecordSource for CramRecordSource<R> {
                     self.exhausted = true;
                     return Ok(false);
                 }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// The ReadFilter iterator (the driver)
+// ---------------------------------------------------------------------
+
+/// A fatal, run-level error from a [`ReadFilter`] pass. Filtering's per-read
+/// surface is `Item = MappedRead` (no per-item `Result`), so a genuinely fatal
+/// condition — a failed record read, a failed decode, or a reference-fetch
+/// failure — stops the iteration (`next()` returns `None`) and is surfaced once,
+/// at the end, by [`ReadFilter::finish`]. It is never folded into a per-read
+/// drop or a silent EOF.
+#[derive(Debug, thiserror::Error)]
+pub enum ReadFilterError {
+    /// The record source failed to read the next record (e.g. a truncated file).
+    #[error("reading the next alignment record failed")]
+    Source(#[source] io::Error),
+    /// A record that cleared the pre-decode gate failed to decode — a corrupt
+    /// record (the unmapped flag clear yet no position).
+    #[error("decoding an alignment record failed")]
+    Decode(#[source] io::Error),
+    /// Filter #8's reference fetch failed. `ReadFilter::new` validates contigs up
+    /// front, so this signals corrupt input or a read past a contig end.
+    #[error("reference access failed during filtering")]
+    Reference(#[source] RefSeqError),
+}
+
+/// Filters one sample's reads, lazily, as an `Iterator<Item = MappedRead>`. Each
+/// `next()` reads the next record into the single reused buffer, runs the
+/// pre-decode cascade (#1–#6) on its flag/MAPQ, decodes only on survival, runs
+/// the decode-dependent cascade (#7, #9, #8), tallies every drop, and returns the
+/// first read that passes (or `None` at end of input). A read dropped pre-decode
+/// builds no `MappedRead` at all.
+///
+/// `counts()` is a **running** tally, readable at any point and final once the
+/// iterator is exhausted.
+///
+/// **Fatal errors and `finish`.** Because the item is a bare `MappedRead` (no
+/// per-item `Result`, by design — spec §5), a fatal condition ([`ReadFilterError`])
+/// stops the iteration by returning `None`, which is otherwise indistinguishable
+/// from a clean end of input. **The caller must call [`Self::finish`] after
+/// iterating** to tell the two apart — a bare `for read in filter {}` that drops
+/// the filter would hide a fatal abort. A `Drop` guard debug-asserts against that
+/// misuse, so it is caught in every test/dev run; the real pipeline consumer
+/// drives the filter and calls `finish`.
+pub struct ReadFilter<S: RecordSource, R> {
+    source: S,
+    /// The single record buffer reused across every read.
+    record_buf: S::Record,
+    /// Raw reference bytes for filter #8; see `ref_seq.md`.
+    reference: R,
+    config: ReadFilterConfig,
+    counts: ReadFilterCounts,
+    /// Reused scratch for #8's reference fetch (touched only when #8 runs).
+    ref_buf: Vec<u8>,
+    /// Latches the first fatal error; once set, `next()` yields `None` forever,
+    /// and `finish` reports it. Cleared by `finish` so a clean drop is quiet.
+    fatal_error: Option<ReadFilterError>,
+}
+
+impl<S: RecordSource, R: RawRefSeq> ReadFilter<S, R> {
+    /// Fail-fast setup: validate that every contig in the source header's `@SQ`
+    /// list resolves in the reference, then seed the reused record buffer. A
+    /// header/reference mismatch is surfaced here (`Err`) rather than mid-stream,
+    /// which is what lets an in-loop reference error be treated as fatal-corrupt
+    /// (spec §5).
+    pub fn new(source: S, reference: R, config: ReadFilterConfig) -> Result<Self, RefSeqError> {
+        // A read's `ref_id` indexes the `@SQ` list (ContigId(i) = the i-th `@SQ`),
+        // so validating those indices covers every contig a read can reference. A
+        // zero-length fetch at position 1 resolves iff the contig exists.
+        let contig_count = source.header().reference_sequences().len();
+        let mut probe = Vec::new();
+        for i in 0..contig_count {
+            // PANIC-FREE: a `@SQ` list long enough to overflow `u32` is not
+            // representable by any real alignment file (`ref_id` is a 32-bit
+            // field); the index fits by construction.
+            let contig = ContigId(u32::try_from(i).expect("contig index fits u32"));
+            reference.fetch_into(contig, 1, 0, &mut probe)?;
+        }
+        Ok(Self {
+            source,
+            record_buf: S::Record::default(),
+            reference,
+            config,
+            counts: ReadFilterCounts::default(),
+            ref_buf: Vec::new(),
+            fatal_error: None,
+        })
+    }
+
+    /// The running tally — current counts, final once iteration is exhausted.
+    pub fn counts(&self) -> &ReadFilterCounts {
+        &self.counts
+    }
+
+    /// Consume the filter after iterating, returning the final counts on a clean
+    /// pass or the fatal error that stopped it. `#[must_use]`: the fatal-error
+    /// surface is only seen if the caller checks it.
+    #[must_use = "a fatal filtering error is only observed by inspecting the result"]
+    pub fn finish(mut self) -> Result<ReadFilterCounts, ReadFilterError> {
+        // Take the error (marking it observed, so the `Drop` guard stays quiet)
+        // and move the counts out via `mem::take` (a `Drop` type cannot be
+        // destructured by-value).
+        match self.fatal_error.take() {
+            Some(error) => Err(error),
+            None => Ok(std::mem::take(&mut self.counts)),
+        }
+    }
+
+    /// Latch a fatal error and stop the iteration. Shared by the three fatal arms
+    /// of `next()`.
+    fn fail(&mut self, error: ReadFilterError) -> Option<MappedRead> {
+        self.fatal_error = Some(error);
+        None
+    }
+}
+
+impl<S: RecordSource, R> Drop for ReadFilter<S, R> {
+    fn drop(&mut self) {
+        // A latched fatal error must be observed via `finish()`; iterating in a
+        // bare `for` loop and dropping the filter would hide it (a fatal abort
+        // then looks like a clean end of input). Catch that misuse in debug/test
+        // builds; skip while already unwinding another panic.
+        debug_assert!(
+            self.fatal_error.is_none() || std::thread::panicking(),
+            "ReadFilter dropped with an unobserved fatal error — consume it with finish()"
+        );
+    }
+}
+
+impl<S: RecordSource, R: RawRefSeq> Iterator for ReadFilter<S, R> {
+    type Item = MappedRead;
+
+    fn next(&mut self) -> Option<MappedRead> {
+        // Once a fatal error is latched, stay stopped.
+        if self.fatal_error.is_some() {
+            return None;
+        }
+        loop {
+            match self.source.read_next(&mut self.record_buf) {
+                Ok(true) => {}
+                Ok(false) => return None, // clean end of input
+                Err(error) => return self.fail(ReadFilterError::Source(error)),
+            }
+
+            // Phase one — flag/MAPQ, before decode. Exhaustive so a future
+            // `FilterVerdict` variant cannot silently fall through to decode.
+            match verdict_pre_decode(self.record_buf.flag(), self.record_buf.mapq(), &self.config) {
+                FilterVerdict::Keep => {}
+                FilterVerdict::Drop(reason) => {
+                    self.counts.record_drop(reason);
+                    continue;
+                }
+            }
+
+            // Decode only the pre-decode survivors.
+            let read = match self.record_buf.decode() {
+                Ok(read) => read,
+                Err(error) => return self.fail(ReadFilterError::Decode(error)),
+            };
+
+            // Phase two — length / CIGAR / mismatch, on the decoded read.
+            match verdict_post_decode(&read, &self.reference, &self.config, &mut self.ref_buf) {
+                Ok(FilterVerdict::Keep) => {
+                    self.counts.kept += 1;
+                    return Some(read);
+                }
+                Ok(FilterVerdict::Drop(reason)) => {
+                    self.counts.record_drop(reason);
+                    continue;
+                }
+                Err(error) => return self.fail(ReadFilterError::Reference(error)),
             }
         }
     }
@@ -910,15 +1115,19 @@ mod tests {
 
     /// A trivial in-memory `RawRecord`: it carries a whole `MappedRead` and reads
     /// its `flag`/`mapq` back off it, so the cascade can be driven with no BAM.
+    /// `decode_fails` makes `decode` return an error (to exercise the fatal
+    /// decode-error path).
     #[derive(Clone)]
     struct FakeRecord {
         read: MappedRead,
+        decode_fails: bool,
     }
 
     impl Default for FakeRecord {
         fn default() -> Self {
             Self {
                 read: mapped(b"", &[], Vec::new()),
+                decode_fails: false,
             }
         }
     }
@@ -931,20 +1140,39 @@ mod tests {
             MapQual(self.read.mapq)
         }
         fn decode(&self) -> io::Result<MappedRead> {
+            if self.decode_fails {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "fake decode failure",
+                ));
+            }
             Ok(self.read.clone())
         }
     }
 
     /// A `RecordSource` yielding a fixed slice of `FakeRecord`s, refilling the
     /// caller's buffer each call.
-    #[derive(Default)]
     struct FakeSource {
         records: Vec<FakeRecord>,
+        header: sam::Header,
         next_index: usize,
+    }
+
+    impl FakeSource {
+        fn new(records: Vec<FakeRecord>, header: sam::Header) -> Self {
+            Self {
+                records,
+                header,
+                next_index: 0,
+            }
+        }
     }
 
     impl RecordSource for FakeSource {
         type Record = FakeRecord;
+        fn header(&self) -> &sam::Header {
+            &self.header
+        }
         fn read_next(&mut self, buf: &mut FakeRecord) -> io::Result<bool> {
             match self.records.get(self.next_index) {
                 Some(record) => {
@@ -963,7 +1191,10 @@ mod tests {
         let mut read = mapped(&vec![b'A'; 30], &vec![30u8; 30], vec![CigarOp::Match(30)]);
         read.flag = flag;
         read.mapq = mapq;
-        FakeRecord { read }
+        FakeRecord {
+            read,
+            decode_fails: false,
+        }
     }
 
     #[test]
@@ -972,10 +1203,10 @@ mod tests {
         // decode survivors → post-decode, over the fake source.
         let reference = poly_a_ref(30);
         let cfg = ReadFilterConfig::default();
-        let mut source = FakeSource {
-            records: vec![fake(FLAG_DUPLICATE, 60), fake(FLAG_PAIRED, 60)],
-            next_index: 0,
-        };
+        let mut source = FakeSource::new(
+            vec![fake(FLAG_DUPLICATE, 60), fake(FLAG_PAIRED, 60)],
+            one_contig_header(),
+        );
         let mut buf = FakeRecord::default();
         let mut ref_buf = Vec::new();
 
@@ -1024,14 +1255,19 @@ mod tests {
             .build()
     }
 
-    fn one_contig_header() -> sam::Header {
+    /// A header with a single `chr1` reference sequence of the given length.
+    fn contig_header(length: usize) -> sam::Header {
         sam::Header::builder()
             .set_header(Default::default())
             .add_reference_sequence(
                 "chr1",
-                Map::<ReferenceSequence>::new(NonZero::new(100usize).unwrap()),
+                Map::<ReferenceSequence>::new(NonZero::new(length).unwrap()),
             )
             .build()
+    }
+
+    fn one_contig_header() -> sam::Header {
+        contig_header(100)
     }
 
     /// Encode a header + records to an in-memory BAM (BGZF), returning the bytes.
@@ -1307,5 +1543,292 @@ mod tests {
             actual, expected,
             "identical to noodles' own record iterator, in order"
         );
+    }
+
+    // ----- the ReadFilter iterator (D) ------------------------------------
+
+    /// A read whose CIGAR is `Deletion(2), Match(seq.len())` (a boundary deletion
+    /// → bad CIGAR), long enough to clear `min_read_length` so #9 — not #7 —
+    /// fires. `seq` lets a test also make it high-mismatch (fails #8) to check the
+    /// #9-before-#8 attribution.
+    fn boundary_deletion_record(start: usize, seq: &[u8]) -> RecordBuf {
+        RecordBuf::builder()
+            .set_name("bad")
+            .set_reference_sequence_id(0usize)
+            .set_flags(Flags::from(FLAG_PAIRED))
+            .set_mapping_quality(MappingQuality::new(60).unwrap())
+            .set_alignment_start(Position::try_from(start).unwrap())
+            .set_cigar(
+                [Op::new(Kind::Deletion, 2), Op::new(Kind::Match, seq.len())]
+                    .into_iter()
+                    .collect(),
+            )
+            .set_sequence(Sequence::from(seq.to_vec()))
+            .set_quality_scores(QualityScores::from(vec![30u8; seq.len()]))
+            .build()
+    }
+
+    /// The fixture: two kept reads plus one read per *mapped* drop reason (#1–#4,
+    /// #6–#9), all on a single all-`A` contig. The #5 unmapped drop is covered
+    /// separately (`read_filter_charges_an_unmapped_read_end_to_end`): a realistic
+    /// unmapped read has MAPQ 0 and is charged to #2 first, and a fake MAPQ does
+    /// not survive a CRAM round-trip. Returns the records and the
+    /// `ReadFilterCounts` a correct pass must produce; the counts are asserted, not
+    /// read order.
+    fn drop_fixture() -> (Vec<RecordBuf>, ReadFilterCounts) {
+        let clean = |name: &str, start: usize| {
+            record_with_seq(
+                name,
+                start,
+                60,
+                Flags::from(FLAG_PAIRED),
+                b"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            )
+        };
+        let records = vec![
+            clean("kept1", 10), // kept
+            clean("kept2", 20), // kept
+            record_with_seq(
+                "dup",
+                30,
+                60,
+                Flags::from(FLAG_PAIRED | FLAG_DUPLICATE),
+                b"AAAAAAAAAA",
+            ), // #1
+            record_with_seq("lowmapq", 40, 5, Flags::from(FLAG_PAIRED), b"AAAAAAAAAA"), // #2 (mapq 5 < 20)
+            record_with_seq(
+                "supp",
+                50,
+                60,
+                Flags::from(FLAG_PAIRED | FLAG_SUPPLEMENTARY),
+                b"AAAAAAAAAA",
+            ), // #3
+            record_with_seq(
+                "sec",
+                60,
+                60,
+                Flags::from(FLAG_PAIRED | FLAG_SECONDARY),
+                b"AAAAAAAAAA",
+            ), // #4
+            record_with_seq(
+                "qcfail",
+                70,
+                60,
+                Flags::from(FLAG_PAIRED | FLAG_QC_FAIL),
+                b"AAAAAAAAAA",
+            ), // #6
+            record_with_seq("tooshort", 80, 60, Flags::from(FLAG_PAIRED), b"AAAAA"), // #7 (len 5 < 30)
+            // #8: 5 non-reference bases out of 30 = 16.7% > 10%.
+            record_with_seq(
+                "highmismatch",
+                90,
+                60,
+                Flags::from(FLAG_PAIRED),
+                b"CCCCCAAAAAAAAAAAAAAAAAAAAAAAAA",
+            ),
+            // #9 bad CIGAR — AND high-mismatch (5 `C`s). Because it fails both #9
+            // and #8, the exact counts below discriminate the ng #9-before-#8
+            // order: it must land in `bad_cigar` (not `high_mismatch_fraction`).
+            boundary_deletion_record(120, b"CCCCCAAAAAAAAAAAAAAAAAAAAAAAAA"), // #9
+        ];
+        let expected = ReadFilterCounts {
+            kept: 2,
+            duplicate: 1,
+            low_mapq: 1,
+            supplementary: 1,
+            secondary: 1,
+            unmapped: 0,
+            qc_fail: 1,
+            too_short: 1,
+            high_mismatch_fraction: 1,
+            bad_cigar: 1,
+        };
+        (records, expected)
+    }
+
+    /// The `@SQ`-length-200 all-`A` reference the drop fixture filters against.
+    fn fixture_reference() -> InMemoryRefSeq {
+        InMemoryRefSeq::from_contigs(vec![vec![b'A'; 200]])
+    }
+
+    #[test]
+    fn read_filter_bam_fixture_matches_hand_counted_drops() {
+        let (records, expected) = drop_fixture();
+        let header = one_contig_200_header();
+        let bytes = in_memory_bam(&header, &records);
+
+        let mut reader = bam::io::Reader::new(&bytes[..]);
+        let read_header = reader.read_header().unwrap();
+        let source = BamRecordSource::new(reader, read_header, 0);
+        let mut filter =
+            ReadFilter::new(source, fixture_reference(), ReadFilterConfig::default()).unwrap();
+
+        let kept: Vec<MappedRead> = (&mut filter).collect();
+        assert_eq!(kept.len(), 2, "exactly the two clean reads survive");
+        assert_eq!(*filter.counts(), expected);
+        // Clean pass → finish returns the final counts, no fatal error.
+        assert_eq!(filter.finish().unwrap(), expected);
+    }
+
+    #[test]
+    fn read_filter_cram_fixture_matches_hand_counted_drops() {
+        use crate::bam::alignment_input::build_fasta_repository;
+        use crate::pileup::per_sample::cram_files::{
+            ContigSpec, HeaderOverrides, build_cram, build_fasta,
+        };
+
+        let (records, expected) = drop_fixture();
+        let contigs = vec![ContigSpec {
+            name: "chr1".into(),
+            length: 200,
+        }];
+        let (_fasta_dir, fasta_path) = build_fasta(&contigs).unwrap();
+        let (_cram_dir, cram_path) =
+            build_cram(&fasta_path, &contigs, &HeaderOverrides::default(), &records).unwrap();
+        let repository = build_fasta_repository(&fasta_path).unwrap();
+
+        let mut reader = cram::io::Reader::new(std::fs::File::open(&cram_path).unwrap());
+        let header = reader.read_header().unwrap();
+        let source = CramRecordSource::new(reader, header, repository, 0);
+        let mut filter =
+            ReadFilter::new(source, fixture_reference(), ReadFilterConfig::default()).unwrap();
+
+        let kept: Vec<MappedRead> = (&mut filter).collect();
+        assert_eq!(kept.len(), 2);
+        assert_eq!(filter.finish().unwrap(), expected);
+    }
+
+    #[test]
+    fn read_filter_new_rejects_a_contig_missing_from_the_reference() {
+        // Header declares two contigs; the reference has only one.
+        let header = sam::Header::builder()
+            .set_header(Default::default())
+            .add_reference_sequence(
+                "chr1",
+                Map::<ReferenceSequence>::new(NonZero::new(100usize).unwrap()),
+            )
+            .add_reference_sequence(
+                "chr2",
+                Map::<ReferenceSequence>::new(NonZero::new(100usize).unwrap()),
+            )
+            .build();
+        let source = FakeSource::new(Vec::new(), header);
+        let result = ReadFilter::new(source, poly_a_ref(100), ReadFilterConfig::default());
+        assert!(matches!(
+            result,
+            Err(RefSeqError::UnknownContig(ContigId(1)))
+        ));
+    }
+
+    /// A `RecordSource` whose `read_next` always fails — to drive the fatal path.
+    struct ErroringSource {
+        header: sam::Header,
+    }
+
+    impl RecordSource for ErroringSource {
+        type Record = FakeRecord;
+        fn header(&self) -> &sam::Header {
+            &self.header
+        }
+        fn read_next(&mut self, _buf: &mut FakeRecord) -> io::Result<bool> {
+            Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated"))
+        }
+    }
+
+    #[test]
+    fn read_filter_source_read_error_is_fatal() {
+        let source = ErroringSource {
+            header: one_contig_header(),
+        };
+        let mut filter =
+            ReadFilter::new(source, poly_a_ref(100), ReadFilterConfig::default()).unwrap();
+        // The read error stops iteration immediately …
+        assert!((&mut filter).next().is_none());
+        // … and it stays stopped (the fatal error is latched).
+        assert!((&mut filter).next().is_none());
+        assert!(matches!(filter.finish(), Err(ReadFilterError::Source(_))));
+    }
+
+    #[test]
+    fn read_filter_decode_error_is_fatal() {
+        // A record that clears the pre-decode gate but fails to decode.
+        let mut record = fake(FLAG_PAIRED, 60);
+        record.decode_fails = true;
+        let source = FakeSource::new(vec![record], one_contig_header());
+        let mut filter =
+            ReadFilter::new(source, poly_a_ref(100), ReadFilterConfig::default()).unwrap();
+        assert!((&mut filter).next().is_none());
+        assert!(matches!(filter.finish(), Err(ReadFilterError::Decode(_))));
+    }
+
+    #[test]
+    fn read_filter_reference_error_mid_stream_is_fatal() {
+        // A read whose #8 reference window runs past the (short) contig end. The
+        // contig resolves in `new` (a zero-length probe), so this fails only
+        // in-loop → fatal Reference error.
+        let read = mapped(&vec![b'A'; 50], &vec![30u8; 50], vec![CigarOp::Match(50)]);
+        let source = FakeSource::new(
+            vec![FakeRecord {
+                read,
+                decode_fails: false,
+            }],
+            one_contig_header(),
+        );
+        // contig length 10 < the read's 50-base reference span.
+        let mut filter =
+            ReadFilter::new(source, poly_a_ref(10), ReadFilterConfig::default()).unwrap();
+        assert!((&mut filter).next().is_none());
+        assert!(matches!(
+            filter.finish(),
+            Err(ReadFilterError::Reference(RefSeqError::OutOfBounds { .. }))
+        ));
+    }
+
+    #[test]
+    fn read_filter_charges_an_unmapped_read_end_to_end() {
+        // The #5 counter the BAM/CRAM fixture omits: an unmapped read that clears
+        // #2 (MAPQ 60) is charged to `unmapped` through the full iterator.
+        let unmapped = fake(FLAG_PAIRED | FLAG_UNMAPPED, 60);
+        let clean = fake(FLAG_PAIRED, 60);
+        let source = FakeSource::new(vec![unmapped, clean], one_contig_header());
+        let mut filter =
+            ReadFilter::new(source, poly_a_ref(30), ReadFilterConfig::default()).unwrap();
+        let kept: Vec<MappedRead> = (&mut filter).collect();
+        assert_eq!(kept.len(), 1, "only the clean read survives");
+        assert_eq!(filter.counts().unmapped, 1);
+        assert_eq!(filter.counts().kept, 1);
+    }
+
+    #[test]
+    fn read_filter_over_an_empty_source_yields_nothing_and_zero_counts() {
+        let source = FakeSource::new(Vec::new(), one_contig_header());
+        let mut filter =
+            ReadFilter::new(source, poly_a_ref(30), ReadFilterConfig::default()).unwrap();
+        assert!((&mut filter).next().is_none());
+        assert_eq!(filter.finish().unwrap(), ReadFilterCounts::default());
+    }
+
+    #[test]
+    fn read_filter_counts_is_a_running_tally_before_exhaustion() {
+        // A duplicate (dropped) then a clean read (kept): the first `next()`
+        // returns the kept read, and `counts()` already reflects both.
+        let source = FakeSource::new(
+            vec![
+                fake(FLAG_PAIRED | FLAG_DUPLICATE, 60),
+                fake(FLAG_PAIRED, 60),
+            ],
+            one_contig_header(),
+        );
+        let mut filter =
+            ReadFilter::new(source, poly_a_ref(30), ReadFilterConfig::default()).unwrap();
+        assert!((&mut filter).next().is_some());
+        assert_eq!(filter.counts().duplicate, 1);
+        assert_eq!(filter.counts().kept, 1);
+        assert!((&mut filter).next().is_none());
+        assert_eq!(filter.finish().unwrap().kept, 1);
+    }
+
+    fn one_contig_200_header() -> sam::Header {
+        contig_header(200)
     }
 }

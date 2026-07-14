@@ -15,3 +15,8 @@
 //! `doc/devel/ng/spec/read_filtering.md` §2.1.
 
 pub mod filtering;
+
+pub use filtering::{
+    BamRecordSource, CramRecordSource, NoodlesRawRecord, RawRecord, ReadFilter, ReadFilterConfig,
+    ReadFilterCounts, ReadFilterError, RecordSource,
+};
