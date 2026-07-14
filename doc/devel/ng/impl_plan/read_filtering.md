@@ -116,21 +116,22 @@ arch §3, spec §5. **Deviation (recorded):** `decode` returns `io::Result<Mappe
 spec's illustrative infallible `MappedRead` — the reused `record_buf_to_mapped_read` is
 fallible, and a decode failure is fatal like the #8 fetch (spec §7).
 
-**C2. The ng-owned noodles adapter.**  ✅
+**C2. The ng-owned noodles adapters (BAM + CRAM).**  ✅
 `NoodlesRawRecord` wraps a noodles `RecordBuf`: `flag`/`mapq` are cheap field reads,
 `decode(&self)` runs the existing `RecordBuf → MappedRead` path (reusing
 `compute_adaptor_boundary` via `record_buf_to_mapped_read`, whose visibility was lifted
-`pub(super)`→`pub(crate)`); `BamRecordSource<R>` fills the reused buffer via noodles
-`read_record_buf`. ng-owned — the dependency points ng → existing code (spec §7, decision a).
-**Scope (recorded):** **BAM only.** CRAM does not fit the one-record-into-a-reused-buffer shape
-(noodles decodes CRAM at *container* granularity into owned `Vec<RecordBuf>` and consults a
-reference at decode time), so a **CRAM `RecordSource` is deferred to a later step** as a sibling
-impl (a container buffer yielding owned records). This is a scope decision surfaced at
-Checkpoint C, not a design change to the seam.
+`pub(super)`→`pub(crate)`). Two `RecordSource` impls: **`BamRecordSource<R>`** fills the reused
+buffer in place via noodles `read_record_buf`; **`CramRecordSource<R>`** buffers one CRAM
+*container*'s decoded records (CRAM decodes at container granularity into owned records and
+consults a reference at decode time) and yields them one per read, refilling across containers,
+passing its own `fasta::Repository` to the slice decoder. Both ng-owned — the dependency points
+ng → existing code (spec §7, decision a). *(CRAM was initially deferred at Checkpoint C, then
+added at the owner's request — a sibling `RecordSource`, no change to the seam.)*
 
 > **Checkpoint C:** records flow through the seam; the fake source unit-tests it with no BAM;
-> the noodles BAM adapter reads flag/MAPQ pre-decode and decodes survivors (in-memory-BAM
-> round-trip test). Pause for review.
+> the BAM adapter reads flag/MAPQ pre-decode and decodes survivors (in-memory-BAM round-trip);
+> the CRAM adapter matches noodles' own record iterator across multiple containers. Pause for
+> review.
 
 ### Milestone D — the `ReadFilter` iterator (end-to-end)
 
@@ -146,8 +147,8 @@ aborts the run (fatal, no per-item `Result`). `counts()` exposes the running tal
 spec §5.
 
 **D3. Fixture-driven integration test — the port anchor.**  ☐
-Filter the reads of a small known **BAM** (CRAM deferred with the CRAM `RecordSource`, C2) and
-assert the exact `ReadFilterCounts` against hand-counted expectations. Add a buffer-reuse
+Filter the reads of a small known **BAM** (and, since the CRAM source now exists, a CRAM too)
+and assert the exact `ReadFilterCounts` against hand-counted expectations. Add a buffer-reuse
 assertion (one `RecordBuf` across the pass) and a header/reference-mismatch case that fails in
 `new`. **Note (from B):** hand-count against the **#7→#9→#8** order — per-bucket
 `bad_cigar`/`high_mismatch_fraction` differ from production for both-failing reads by the

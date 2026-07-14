@@ -26,6 +26,8 @@ use crate::bam::alignment_input::{
 use crate::ng::ref_seq::{RawRefSeq, RefSeqError};
 use crate::ng::types::{BaseQual, Bp, ContigId, MapQual, MismatchFraction};
 use noodles_bam as bam;
+use noodles_cram as cram;
+use noodles_fasta as fasta;
 use noodles_sam as sam;
 use noodles_sam::alignment::RecordBuf;
 use std::io;
@@ -344,13 +346,10 @@ impl RawRecord for NoodlesRawRecord {
 /// D) decide, which is what keeps the whole filtering policy in one place
 /// (spec §2.5).
 ///
-/// **BAM only for now** — a deliberate, recorded scoping of Milestone C. CRAM
-/// does not fit this one-record-into-a-reused-buffer shape: noodles decodes CRAM
-/// at *container* granularity into owned `Vec<RecordBuf>` and consults a
-/// reference `Repository` at decode time (unlike BAM's `read_record_buf`, which
-/// is self-contained). A CRAM `RecordSource` is therefore a separate sibling
-/// impl (a container buffer that yields owned records) for a later step; see the
-/// read-filtering plan's Milestone C note. Milestone D's fixture is BAM.
+/// BAM-specific because it leans on BAM's self-contained one-record-at-a-time
+/// `read_record_buf`. CRAM does not fit that shape (it decodes at *container*
+/// granularity into owned records and consults a reference at decode time), so it
+/// has its own sibling source, [`CramRecordSource`], below.
 pub struct BamRecordSource<R> {
     reader: bam::io::Reader<R>,
     /// BAM record decode ignores the header, but `read_record_buf` requires it.
@@ -378,6 +377,128 @@ impl<R: io::Read> RecordSource for BamRecordSource<R> {
         buf.source_file_index = self.source_file_index;
         let bytes_read = self.reader.read_record_buf(&self.header, &mut buf.record)?;
         Ok(bytes_read != 0)
+    }
+}
+
+/// A [`RecordSource`] over a noodles CRAM reader. Unlike BAM's one-record-at-a-time
+/// `read_record_buf`, CRAM is decoded at *container* granularity — a container
+/// holds one or more slices whose records are decoded together against the
+/// reference — so this source decodes one container into an owned buffer of
+/// records and yields them one per [`RecordSource::read_next`], decoding the next
+/// container when that buffer drains. `read_next` therefore *moves* an
+/// already-decoded [`RecordBuf`] into the caller's buffer rather than refilling
+/// it in place (the container buffer's allocations are what get reused across
+/// containers). Still **unfiltered**: it hands over every record.
+///
+/// `reference_sequence_repository` is the FASTA reference CRAM slice decoding
+/// consults; it must cover the contigs the CRAM references. This source drives
+/// `read_container` + slice decode directly and passes this repository to the
+/// slice decoder, so — unlike the reader's inherent `records()`/`query()` methods,
+/// which this source does not use — a `cram::io::Reader` built *without* a
+/// repository works fine here.
+pub struct CramRecordSource<R> {
+    reader: cram::io::Reader<R>,
+    header: sam::Header,
+    reference_sequence_repository: fasta::Repository,
+    source_file_index: usize,
+    /// The reused container buffer — its allocations are recycled across reads.
+    container: cram::io::reader::Container,
+    /// The current container's decoded records, yielded one per read.
+    buffered_records: std::vec::IntoIter<RecordBuf>,
+    /// Set once end of input is reached. noodles' `read_container` is not
+    /// idempotent past the CRAM EOF marker (a second call reads past the end and
+    /// errors), so this latch makes `read_next` return `Ok(false)` idempotently
+    /// after the first EOF — matching the BAM source's behaviour.
+    exhausted: bool,
+}
+
+/// Outcome of decoding one CRAM container into the record buffer.
+enum ContainerRefill {
+    /// A container was decoded; its records are now buffered.
+    Decoded,
+    /// No container left — end of input.
+    EndOfInput,
+}
+
+impl<R> CramRecordSource<R> {
+    /// Wrap an already-opened CRAM reader whose header has already been read.
+    /// `reference_sequence_repository` is the FASTA reference used to decode CRAM
+    /// slices; it must cover the CRAM's contigs. This repository is authoritative:
+    /// the source decodes slices with it directly and never consults any
+    /// repository baked into `reader` (the reader's own copy, if any, is used only
+    /// by its inherent `records()`/`query()` methods, which this source bypasses).
+    pub fn new(
+        reader: cram::io::Reader<R>,
+        header: sam::Header,
+        reference_sequence_repository: fasta::Repository,
+        source_file_index: usize,
+    ) -> Self {
+        Self {
+            reader,
+            header,
+            reference_sequence_repository,
+            source_file_index,
+            container: cram::io::reader::Container::default(),
+            buffered_records: Vec::new().into_iter(),
+            exhausted: false,
+        }
+    }
+}
+
+impl<R: io::Read> CramRecordSource<R> {
+    /// Decode the next container's records into `self.buffered_records`. This
+    /// mirrors noodles' own internal `Records::read_container_records`, but passes
+    /// our own repository clone — the reader's copy is private, and only the slice
+    /// decoder needs it (we pass it explicitly).
+    fn refill_from_next_container(&mut self) -> io::Result<ContainerRefill> {
+        if self.reader.read_container(&mut self.container)? == 0 {
+            return Ok(ContainerRefill::EndOfInput);
+        }
+        let compression_header = self.container.compression_header()?;
+        let mut records: Vec<RecordBuf> = Vec::new();
+        for slice in self.container.slices() {
+            let slice = slice?;
+            // The decoded block data and the borrowed `Record`s live only within
+            // this loop body; converting to owned `RecordBuf` here keeps the
+            // buffered result independent of those borrows.
+            let (core_data_src, external_data_srcs) = slice.decode_blocks()?;
+            for record in slice.records(
+                self.reference_sequence_repository.clone(),
+                &self.header,
+                &compression_header,
+                &core_data_src,
+                &external_data_srcs,
+            )? {
+                records.push(RecordBuf::try_from_alignment_record(&self.header, &record)?);
+            }
+        }
+        self.buffered_records = records.into_iter();
+        Ok(ContainerRefill::Decoded)
+    }
+}
+
+impl<R: io::Read> RecordSource for CramRecordSource<R> {
+    type Record = NoodlesRawRecord;
+
+    fn read_next(&mut self, buf: &mut NoodlesRawRecord) -> io::Result<bool> {
+        buf.source_file_index = self.source_file_index;
+        loop {
+            if let Some(record) = self.buffered_records.next() {
+                buf.record = record;
+                return Ok(true);
+            }
+            if self.exhausted {
+                return Ok(false);
+            }
+            // Buffer drained → decode the next container (or latch end of input).
+            match self.refill_from_next_container()? {
+                ContainerRefill::Decoded => {}
+                ContainerRefill::EndOfInput => {
+                    self.exhausted = true;
+                    return Ok(false);
+                }
+            }
+        }
     }
 }
 
@@ -1042,5 +1163,149 @@ mod tests {
         assert_eq!(short.seq.len(), 10, "no stale tail from the 40-base record");
         assert_eq!(short.pos, 60);
         assert_eq!(short.mapq, 30);
+    }
+
+    /// A mapped record with an explicit sequence (so a test can put a
+    /// non-reference base in it and check the reconstructed bytes).
+    fn record_with_seq(qname: &str, start: usize, mapq: u8, flags: Flags, seq: &[u8]) -> RecordBuf {
+        RecordBuf::builder()
+            .set_name(qname)
+            .set_reference_sequence_id(0usize)
+            .set_flags(flags)
+            .set_mapping_quality(MappingQuality::new(mapq).expect("mapq in range"))
+            .set_alignment_start(Position::try_from(start).unwrap())
+            .set_cigar([Op::new(Kind::Match, seq.len())].into_iter().collect())
+            .set_sequence(Sequence::from(seq.to_vec()))
+            .set_quality_scores(QualityScores::from(vec![30u8; seq.len()]))
+            .build()
+    }
+
+    #[test]
+    fn cram_record_source_reads_flag_mapq_and_decodes_through_a_real_cram() {
+        use crate::bam::alignment_input::build_fasta_repository;
+        use crate::pileup::per_sample::cram_files::{
+            ContigSpec, HeaderOverrides, build_cram, build_fasta,
+        };
+
+        let contigs = vec![ContigSpec {
+            name: "chr1".into(),
+            length: 100,
+        }];
+        let (_fasta_dir, fasta_path) = build_fasta(&contigs).unwrap();
+        // The reference is all 'A'. Record 1 carries non-reference bases (`C`,
+        // `G`), so CRAM must store and decode back substitution features —
+        // exercising reference-diff reconstruction, not just a length.
+        let r1_seq = b"AACAAAAAAG";
+        let records = [
+            record_with_seq("r1", 10, 60, Flags::from(FLAG_PAIRED), r1_seq),
+            record_with_seq(
+                "r2",
+                40,
+                40,
+                Flags::from(FLAG_PAIRED | FLAG_DUPLICATE),
+                b"AAAAA",
+            ),
+        ];
+        let (_cram_dir, cram_path) =
+            build_cram(&fasta_path, &contigs, &HeaderOverrides::default(), &records).unwrap();
+        let repository = build_fasta_repository(&fasta_path).unwrap();
+
+        let file = std::fs::File::open(&cram_path).unwrap();
+        let mut reader = cram::io::Reader::new(file);
+        let header = reader.read_header().unwrap();
+        let mut source = CramRecordSource::new(reader, header, repository, 5);
+        let mut buf = NoodlesRawRecord::default();
+
+        // Record 1 — pre-decode reads through the container-buffered source, then decode.
+        assert!(source.read_next(&mut buf).unwrap());
+        assert_eq!(buf.flag(), FLAG_PAIRED);
+        assert_eq!(buf.mapq(), MapQual(60));
+        let read = buf.decode().unwrap();
+        assert_eq!(read.pos, 10);
+        assert_eq!(
+            read.seq, r1_seq,
+            "the non-reference bases decode back exactly"
+        );
+        assert_eq!(read.source_file_index, 5);
+
+        // Record 2.
+        assert!(source.read_next(&mut buf).unwrap());
+        assert_eq!(buf.flag(), FLAG_PAIRED | FLAG_DUPLICATE);
+        assert_eq!(buf.mapq(), MapQual(40));
+
+        // End of input (buffer drained + no further container).
+        assert!(!source.read_next(&mut buf).unwrap());
+
+        // `_fasta_dir`/`_cram_dir` keep the tempdirs alive through the read above.
+    }
+
+    #[test]
+    fn cram_record_source_matches_noodles_records_across_multiple_containers() {
+        use crate::bam::alignment_input::build_fasta_repository;
+        use crate::pileup::per_sample::cram_files::{
+            ContigSpec, HeaderOverrides, build_cram, build_fasta,
+        };
+
+        // noodles packs 10240 records per CRAM container, so > 10240 records force
+        // at least two containers — exercising the drain-and-refill loop that is
+        // the whole reason CramRecordSource differs from BamRecordSource.
+        let record_count = 10_241usize;
+        let contigs = vec![ContigSpec {
+            name: "chr1".into(),
+            length: 200,
+        }];
+        let (_fasta_dir, fasta_path) = build_fasta(&contigs).unwrap();
+        // Coordinate-sorted (non-decreasing positions), all within the contig.
+        let records: Vec<RecordBuf> = (0..record_count)
+            .map(|i| {
+                let start = 1 + i / 100; // 1..=103, monotonic; footprint <= 113
+                record_with_seq(
+                    &format!("r{i}"),
+                    start,
+                    40,
+                    Flags::from(FLAG_PAIRED),
+                    b"AAAAAAAAAA",
+                )
+            })
+            .collect();
+        let (_cram_dir, cram_path) =
+            build_cram(&fasta_path, &contigs, &HeaderOverrides::default(), &records).unwrap();
+        let repository = build_fasta_repository(&fasta_path).unwrap();
+
+        // Ground truth: noodles' own whole-file record iterator (reader built WITH
+        // the repository, which its inherent `records()` requires).
+        let expected: Vec<RecordBuf> = {
+            let mut reader = cram::io::reader::Builder::default()
+                .set_reference_sequence_repository(repository.clone())
+                .build_from_path(&cram_path)
+                .unwrap();
+            let header = reader.read_header().unwrap();
+            reader
+                .records(&header)
+                .collect::<io::Result<Vec<_>>>()
+                .unwrap()
+        };
+
+        // Ours: a plain reader (no baked-in repository), repo passed explicitly.
+        let mut reader = cram::io::Reader::new(std::fs::File::open(&cram_path).unwrap());
+        let header = reader.read_header().unwrap();
+        let mut source = CramRecordSource::new(reader, header, repository, 0);
+        let mut buf = NoodlesRawRecord::default();
+        let mut actual: Vec<RecordBuf> = Vec::new();
+        while source.read_next(&mut buf).unwrap() {
+            actual.push(buf.record.clone());
+        }
+        // Post-EOF is idempotently Ok(false).
+        assert!(!source.read_next(&mut buf).unwrap());
+
+        assert_eq!(
+            actual.len(),
+            record_count,
+            "every record across both containers is yielded"
+        );
+        assert_eq!(
+            actual, expected,
+            "identical to noodles' own record iterator, in order"
+        );
     }
 }
