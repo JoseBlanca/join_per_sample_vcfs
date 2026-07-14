@@ -797,7 +797,10 @@ pub(super) enum FilterBucket {
 // Per-record conversion
 // ---------------------------------------------------------------------
 
-pub(super) fn record_buf_to_mapped_read(
+// `pub(crate)` (widened from `pub(super)`) so the ng read-filtering adapter
+// (`crate::ng::read::filtering`) can reuse this decode path — the ng → existing
+// code dependency the read-filtering spec §7 (decision a) calls for.
+pub(crate) fn record_buf_to_mapped_read(
     rb: &sam::alignment::RecordBuf,
     source_file_index: usize,
 ) -> io::Result<MappedRead> {

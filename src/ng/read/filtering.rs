@@ -21,9 +21,14 @@ use crate::bam::alignment_input::{
     DEFAULT_MAX_READ_MISMATCH_FRACTION, DEFAULT_MIN_MAPQ, DEFAULT_MIN_READ_LENGTH,
     DEFAULT_MISMATCH_BQ_FLOOR, FLAG_DUPLICATE, FLAG_QC_FAIL, FLAG_SECONDARY, FLAG_SUPPLEMENTARY,
     FLAG_UNMAPPED, MappedRead, cigar_is_bad, cigar_ref_span, read_exceeds_mismatch_fraction,
+    record_buf_to_mapped_read,
 };
 use crate::ng::ref_seq::{RawRefSeq, RefSeqError};
 use crate::ng::types::{BaseQual, Bp, ContigId, MapQual, MismatchFraction};
+use noodles_bam as bam;
+use noodles_sam as sam;
+use noodles_sam::alignment::RecordBuf;
+use std::io;
 
 /// The filtering policy: which filters are active and their thresholds. Minimal
 /// by design — one field per active filter, no dormant levers (downsampling,
@@ -241,6 +246,139 @@ fn verdict_post_decode(
     }
 
     Ok(FilterVerdict::Keep)
+}
+
+// ---------------------------------------------------------------------
+// The record-source seam (input edge)
+// ---------------------------------------------------------------------
+
+/// A borrowed view of one alignment record — the seam that lets the flag/MAPQ
+/// cascade (#1–#6) run *before* the record is decoded. [`Self::flag`] and
+/// [`Self::mapq`] are cheap field reads on the still-packed record; [`Self::decode`]
+/// is the expensive phase (base/quality decode + adaptor-boundary annotation →
+/// [`MappedRead`]), run only on the reads that clear the pre-decode gate. It
+/// borrows `&self`, not `self`, so the underlying buffer stays reusable for the
+/// next read.
+pub trait RawRecord {
+    /// The SAM flag bitfield — the same `u16` [`MappedRead::flag`] carries; read
+    /// by filters #1, #3–#6.
+    fn flag(&self) -> u16;
+    /// The SAM mapping quality; filter #2. "Unavailable" (SAM `0xFF`) resolves to
+    /// [`MapQual`]`(0)`, matching production, so any non-zero minimum drops it.
+    fn mapq(&self) -> MapQual;
+    /// Decode the record into an owned [`MappedRead`] (filters #7–#9 read the
+    /// result). Fallible because the reused decode path
+    /// ([`record_buf_to_mapped_read`]) is: a record reaching here has passed the
+    /// pre-decode cascade (so it is mapped), but a corrupt record — the unmapped
+    /// flag clear yet no position — surfaces here as an `Err` that, like the #8
+    /// fetch and `RecordSource::read_next`, is **fatal to the run** rather than a
+    /// per-read drop or a panic (spec §7). (The spec's illustrative signature
+    /// showed this infallible; it is fallible in practice because the reused
+    /// production decoder is.)
+    fn decode(&self) -> io::Result<MappedRead>;
+}
+
+/// The filter's input: fills a caller-owned buffer with the next record, reusing
+/// its allocations. Modelled as a source that *fills* a buffer rather than an
+/// `Iterator<Item = RawRecord>` precisely so one buffer survives the whole pass
+/// (a std iterator's owned `Item` cannot borrow a reused buffer — the
+/// lending-iterator problem, spec §5). `Ok(true)` = filled, `Ok(false)` = end of
+/// input; an `Err` is **fatal to the run**.
+pub trait RecordSource {
+    /// The reused buffer type — a [`RawRecord`] the source refills in place. The
+    /// `Default` bound is load-bearing: the [`ReadFilter`] iterator (Milestone D)
+    /// seeds *one* buffer with `Default::default()` and hands the same `&mut` to
+    /// [`Self::read_next`] on every read, so the whole pass allocates one record.
+    type Record: RawRecord + Default;
+    /// Fill `buf` with the next record, reusing its allocations. `Ok(true)` =
+    /// filled; `Ok(false)` = end of input, after which `buf` holds an unspecified
+    /// (stale) record the caller must not read; `Err` is fatal to the run.
+    fn read_next(&mut self, buf: &mut Self::Record) -> io::Result<bool>;
+}
+
+/// An ng-owned adapter viewing a noodles [`RecordBuf`] as a [`RawRecord`]. The
+/// production `RecordSource` refills the inner `record` in place;
+/// [`RawRecord::flag`]/[`RawRecord::mapq`] are cheap field reads on the undecoded
+/// record, and [`RawRecord::decode`] runs the reused
+/// [`record_buf_to_mapped_read`] path (which itself reuses
+/// `compute_adaptor_boundary`). `source_file_index` is the per-file tag stamped
+/// onto the decoded [`MappedRead`]; the source sets it before each read.
+///
+/// ng-owned by design (spec §7, decision a): the dependency points ng → existing
+/// code, so production never learns about ng.
+///
+/// Both fields are `pub(crate)` internal state, not a caller-set surface:
+/// `source_file_index` is (re)stamped by the source on every [`RecordSource::read_next`],
+/// and `record` is refilled in place — a caller-written value would just be
+/// overwritten. No `Clone`: the whole point is to reuse one buffer, and cloning
+/// would deep-copy the `RecordBuf` it exists to avoid copying.
+#[derive(Debug, Default)]
+pub struct NoodlesRawRecord {
+    /// The reused undecoded record buffer.
+    pub(crate) record: RecordBuf,
+    /// The 0-based index of the file this record came from (stamped onto the
+    /// decoded [`MappedRead`]).
+    pub(crate) source_file_index: usize,
+}
+
+impl RawRecord for NoodlesRawRecord {
+    fn flag(&self) -> u16 {
+        self.record.flags().bits()
+    }
+
+    fn mapq(&self) -> MapQual {
+        // `map(u8::from).unwrap_or(0)`: SAM `0xFF` (unavailable) decodes to `None`
+        // → treated as MAPQ 0, matching production `classify_pre_decode`.
+        MapQual(self.record.mapping_quality().map(u8::from).unwrap_or(0))
+    }
+
+    fn decode(&self) -> io::Result<MappedRead> {
+        record_buf_to_mapped_read(&self.record, self.source_file_index)
+    }
+}
+
+/// A [`RecordSource`] over a noodles BAM reader. `read_next` reads the next record
+/// into the reused buffer via noodles' `read_record_buf` (true buffer reuse — no
+/// per-read allocation), returning `Ok(false)` at end of input. It is
+/// **unfiltered**: it hands over every record and lets [`ReadFilter`] (Milestone
+/// D) decide, which is what keeps the whole filtering policy in one place
+/// (spec §2.5).
+///
+/// **BAM only for now** — a deliberate, recorded scoping of Milestone C. CRAM
+/// does not fit this one-record-into-a-reused-buffer shape: noodles decodes CRAM
+/// at *container* granularity into owned `Vec<RecordBuf>` and consults a
+/// reference `Repository` at decode time (unlike BAM's `read_record_buf`, which
+/// is self-contained). A CRAM `RecordSource` is therefore a separate sibling
+/// impl (a container buffer that yields owned records) for a later step; see the
+/// read-filtering plan's Milestone C note. Milestone D's fixture is BAM.
+pub struct BamRecordSource<R> {
+    reader: bam::io::Reader<R>,
+    /// BAM record decode ignores the header, but `read_record_buf` requires it.
+    header: sam::Header,
+    source_file_index: usize,
+}
+
+impl<R> BamRecordSource<R> {
+    /// Wrap an already-opened BAM reader whose header has already been read.
+    pub fn new(reader: bam::io::Reader<R>, header: sam::Header, source_file_index: usize) -> Self {
+        Self {
+            reader,
+            header,
+            source_file_index,
+        }
+    }
+}
+
+impl<R: io::Read> RecordSource for BamRecordSource<R> {
+    type Record = NoodlesRawRecord;
+
+    fn read_next(&mut self, buf: &mut NoodlesRawRecord) -> io::Result<bool> {
+        // Stamp the file tag before the read; the reader refills `buf.record` in
+        // place (reusing its allocations).
+        buf.source_file_index = self.source_file_index;
+        let bytes_read = self.reader.read_record_buf(&self.header, &mut buf.record)?;
+        Ok(bytes_read != 0)
+    }
 }
 
 #[cfg(test)]
@@ -635,5 +773,274 @@ mod tests {
             post(&read, &reference, &post_config(Some(0.0))),
             FilterVerdict::Keep
         );
+    }
+
+    // ----- the record-source seam (C) -------------------------------------
+
+    use noodles_core::Position;
+    use noodles_sam::alignment::io::Write as _;
+    use noodles_sam::alignment::record::cigar::Op;
+    use noodles_sam::alignment::record::cigar::op::Kind;
+    use noodles_sam::alignment::record::{Flags, MappingQuality};
+    use noodles_sam::alignment::record_buf::{QualityScores, Sequence};
+    use noodles_sam::header::record::value::Map;
+    use noodles_sam::header::record::value::map::ReferenceSequence;
+    use std::num::NonZero;
+
+    /// A trivial in-memory `RawRecord`: it carries a whole `MappedRead` and reads
+    /// its `flag`/`mapq` back off it, so the cascade can be driven with no BAM.
+    #[derive(Clone)]
+    struct FakeRecord {
+        read: MappedRead,
+    }
+
+    impl Default for FakeRecord {
+        fn default() -> Self {
+            Self {
+                read: mapped(b"", &[], Vec::new()),
+            }
+        }
+    }
+
+    impl RawRecord for FakeRecord {
+        fn flag(&self) -> u16 {
+            self.read.flag
+        }
+        fn mapq(&self) -> MapQual {
+            MapQual(self.read.mapq)
+        }
+        fn decode(&self) -> io::Result<MappedRead> {
+            Ok(self.read.clone())
+        }
+    }
+
+    /// A `RecordSource` yielding a fixed slice of `FakeRecord`s, refilling the
+    /// caller's buffer each call.
+    #[derive(Default)]
+    struct FakeSource {
+        records: Vec<FakeRecord>,
+        next_index: usize,
+    }
+
+    impl RecordSource for FakeSource {
+        type Record = FakeRecord;
+        fn read_next(&mut self, buf: &mut FakeRecord) -> io::Result<bool> {
+            match self.records.get(self.next_index) {
+                Some(record) => {
+                    *buf = record.clone();
+                    self.next_index += 1;
+                    Ok(true)
+                }
+                None => Ok(false),
+            }
+        }
+    }
+
+    /// A 30 bp all-`A` mapped read carrying the given flag/MAPQ — long enough to
+    /// clear the default `min_read_length`, and matching a poly-A reference.
+    fn fake(flag: u16, mapq: u8) -> FakeRecord {
+        let mut read = mapped(&vec![b'A'; 30], &vec![30u8; 30], vec![CigarOp::Match(30)]);
+        read.flag = flag;
+        read.mapq = mapq;
+        FakeRecord { read }
+    }
+
+    #[test]
+    fn fake_source_drives_the_seam() {
+        // Mimic what the Milestone-D iterator will do: read_next → pre-decode →
+        // decode survivors → post-decode, over the fake source.
+        let reference = poly_a_ref(30);
+        let cfg = ReadFilterConfig::default();
+        let mut source = FakeSource {
+            records: vec![fake(FLAG_DUPLICATE, 60), fake(FLAG_PAIRED, 60)],
+            next_index: 0,
+        };
+        let mut buf = FakeRecord::default();
+        let mut ref_buf = Vec::new();
+
+        // Record 1 — duplicate: dropped pre-decode, never decoded.
+        assert!(source.read_next(&mut buf).unwrap());
+        assert_eq!(buf.flag(), FLAG_DUPLICATE);
+        assert_eq!(buf.mapq(), MapQual(60));
+        assert_eq!(
+            verdict_pre_decode(buf.flag(), buf.mapq(), &cfg),
+            FilterVerdict::Drop(DropReason::Duplicate)
+        );
+
+        // Record 2 — clean: pre-decode keep → decode → post-decode keep.
+        assert!(source.read_next(&mut buf).unwrap());
+        assert_eq!(
+            verdict_pre_decode(buf.flag(), buf.mapq(), &cfg),
+            FilterVerdict::Keep
+        );
+        let read = buf.decode().unwrap();
+        assert_eq!(
+            verdict_post_decode(&read, &reference, &cfg, &mut ref_buf).unwrap(),
+            FilterVerdict::Keep
+        );
+
+        // End of input.
+        assert!(!source.read_next(&mut buf).unwrap());
+    }
+
+    fn bam_record(
+        qname: &str,
+        ref_id: usize,
+        start: usize,
+        len: usize,
+        mapq: u8,
+        flags: Flags,
+    ) -> RecordBuf {
+        RecordBuf::builder()
+            .set_name(qname)
+            .set_reference_sequence_id(ref_id)
+            .set_flags(flags)
+            .set_mapping_quality(MappingQuality::new(mapq).expect("mapq in range"))
+            .set_alignment_start(Position::try_from(start).unwrap())
+            .set_cigar([Op::new(Kind::Match, len)].into_iter().collect())
+            .set_sequence(Sequence::from(vec![b'A'; len]))
+            .set_quality_scores(QualityScores::from(vec![30u8; len]))
+            .build()
+    }
+
+    fn one_contig_header() -> sam::Header {
+        sam::Header::builder()
+            .set_header(Default::default())
+            .add_reference_sequence(
+                "chr1",
+                Map::<ReferenceSequence>::new(NonZero::new(100usize).unwrap()),
+            )
+            .build()
+    }
+
+    /// Encode a header + records to an in-memory BAM (BGZF), returning the bytes.
+    fn in_memory_bam(header: &sam::Header, records: &[RecordBuf]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        // Scope the writer so its `&mut bytes` borrow (held live by its `Drop`)
+        // is released before `bytes` is returned.
+        {
+            let mut writer = bam::io::Writer::new(&mut bytes);
+            writer.write_header(header).expect("write header");
+            for record in records {
+                writer
+                    .write_alignment_record(header, record)
+                    .expect("write record");
+            }
+            writer.try_finish().expect("finish bam");
+        }
+        bytes
+    }
+
+    #[test]
+    fn noodles_raw_record_reads_flag_mapq_and_decodes() {
+        let record = bam_record("r1", 0, 5, 4, 42, Flags::from(FLAG_DUPLICATE));
+        let raw = NoodlesRawRecord {
+            record,
+            source_file_index: 7,
+        };
+        // Cheap pre-decode reads.
+        assert_eq!(raw.flag(), FLAG_DUPLICATE);
+        assert_eq!(raw.mapq(), MapQual(42));
+        // Decode produces the MappedRead the cascade's phase two consumes.
+        let read = raw.decode().unwrap();
+        assert_eq!(read.ref_id, 0);
+        assert_eq!(read.pos, 5);
+        assert_eq!(read.mapq, 42);
+        assert_eq!(read.seq, b"AAAA");
+        assert_eq!(read.source_file_index, 7);
+    }
+
+    #[test]
+    fn noodles_raw_record_maps_unavailable_mapq_to_zero() {
+        // A record with no mapping quality (SAM 0xFF) → MapQual(0).
+        let record = RecordBuf::builder()
+            .set_reference_sequence_id(0)
+            .set_flags(Flags::from(FLAG_PAIRED))
+            .set_alignment_start(Position::try_from(1usize).unwrap())
+            .set_cigar([Op::new(Kind::Match, 4)].into_iter().collect())
+            .set_sequence(Sequence::from(b"ACGT".to_vec()))
+            .set_quality_scores(QualityScores::from(vec![30u8; 4]))
+            .build();
+        let raw = NoodlesRawRecord {
+            record,
+            source_file_index: 0,
+        };
+        assert_eq!(raw.mapq(), MapQual(0));
+    }
+
+    #[test]
+    fn noodles_raw_record_decode_errors_on_a_record_with_no_position() {
+        // A default record has no reference_sequence_id / alignment_start, so the
+        // reused decoder fails — the Err a corrupt record would surface (fatal).
+        let raw = NoodlesRawRecord::default();
+        let err = raw.decode().expect_err("missing position must fail decode");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn bam_record_source_reads_flag_mapq_and_decodes_through_a_real_bam() {
+        let header = one_contig_header();
+        let records = [
+            bam_record("r1", 0, 10, 30, 60, Flags::from(FLAG_PAIRED)),
+            bam_record(
+                "r2",
+                0,
+                20,
+                30,
+                40,
+                Flags::from(FLAG_PAIRED | FLAG_DUPLICATE),
+            ),
+        ];
+        let bytes = in_memory_bam(&header, &records);
+
+        let mut reader = bam::io::Reader::new(&bytes[..]);
+        let read_header = reader.read_header().expect("read header");
+        let mut source = BamRecordSource::new(reader, read_header, 3);
+
+        let mut buf = NoodlesRawRecord::default();
+
+        // Record 1 — pre-decode reads, then decode.
+        assert!(source.read_next(&mut buf).unwrap());
+        assert_eq!(buf.flag(), FLAG_PAIRED);
+        assert_eq!(buf.mapq(), MapQual(60));
+        let read = buf.decode().unwrap();
+        assert_eq!(read.pos, 10);
+        assert_eq!(read.seq.len(), 30);
+        assert_eq!(read.source_file_index, 3);
+
+        // Record 2 — the reused buffer is refilled in place.
+        assert!(source.read_next(&mut buf).unwrap());
+        assert_eq!(buf.flag(), FLAG_PAIRED | FLAG_DUPLICATE);
+        assert_eq!(buf.mapq(), MapQual(40));
+
+        // End of input.
+        assert!(!source.read_next(&mut buf).unwrap());
+    }
+
+    #[test]
+    fn bam_record_source_reuses_the_buffer_without_leaking_a_prior_record() {
+        // A long record then a short one, both decoded through the SAME reused
+        // buffer: if `read_record_buf` did not fully overwrite the buffer, the
+        // 40-base record's tail would leak into the 10-base one.
+        let header = one_contig_header();
+        let records = [
+            bam_record("long", 0, 10, 40, 60, Flags::from(FLAG_PAIRED)),
+            bam_record("short", 0, 60, 10, 30, Flags::from(FLAG_PAIRED)),
+        ];
+        let bytes = in_memory_bam(&header, &records);
+
+        let mut reader = bam::io::Reader::new(&bytes[..]);
+        let read_header = reader.read_header().expect("read header");
+        let mut source = BamRecordSource::new(reader, read_header, 0);
+        let mut buf = NoodlesRawRecord::default();
+
+        assert!(source.read_next(&mut buf).unwrap());
+        assert_eq!(buf.decode().unwrap().seq.len(), 40);
+
+        assert!(source.read_next(&mut buf).unwrap());
+        let short = buf.decode().unwrap();
+        assert_eq!(short.seq.len(), 10, "no stale tail from the 40-base record");
+        assert_eq!(short.pos, 60);
+        assert_eq!(short.mapq, 30);
     }
 }

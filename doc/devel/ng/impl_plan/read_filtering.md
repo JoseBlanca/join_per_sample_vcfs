@@ -108,20 +108,29 @@ shapes. *Source:* spec §3, arch §3.
 
 ### Milestone C — the `RecordSource` / `RawRecord` seam
 
-**C1. The traits + a test fake.**  ☐
+**C1. The traits + a test fake.**  ✅
 `RawRecord` (`flag`, `mapq`, `decode(&self)`) and `RecordSource` (`read_next(&mut buf)`,
 reused buffer) in `filtering.rs`. A trivial in-memory fake `RawRecord` and a fake
 `RecordSource` yielding a fixed slice — enough to drive the cascade without a BAM. *Source:*
-arch §3, spec §5.
+arch §3, spec §5. **Deviation (recorded):** `decode` returns `io::Result<MappedRead>`, not the
+spec's illustrative infallible `MappedRead` — the reused `record_buf_to_mapped_read` is
+fallible, and a decode failure is fatal like the #8 fetch (spec §7).
 
-**C2. The ng-owned noodles adapter.**  ☐
-An adapter wrapping a noodles `RecordBuf`: `flag`/`mapq` are cheap field reads, `decode(&self)`
-runs the existing `RecordBuf → MappedRead` path (reusing `compute_adaptor_boundary`); a
-`RecordSource` adapter over the alignment reader fills the reused buffer. ng-owned — the
-dependency points ng → existing code (spec §7, decision a). *Source:* spec §2.5 reuse map.
+**C2. The ng-owned noodles adapter.**  ✅
+`NoodlesRawRecord` wraps a noodles `RecordBuf`: `flag`/`mapq` are cheap field reads,
+`decode(&self)` runs the existing `RecordBuf → MappedRead` path (reusing
+`compute_adaptor_boundary` via `record_buf_to_mapped_read`, whose visibility was lifted
+`pub(super)`→`pub(crate)`); `BamRecordSource<R>` fills the reused buffer via noodles
+`read_record_buf`. ng-owned — the dependency points ng → existing code (spec §7, decision a).
+**Scope (recorded):** **BAM only.** CRAM does not fit the one-record-into-a-reused-buffer shape
+(noodles decodes CRAM at *container* granularity into owned `Vec<RecordBuf>` and consults a
+reference at decode time), so a **CRAM `RecordSource` is deferred to a later step** as a sibling
+impl (a container buffer yielding owned records). This is a scope decision surfaced at
+Checkpoint C, not a design change to the seam.
 
 > **Checkpoint C:** records flow through the seam; the fake source unit-tests it with no BAM;
-> the noodles adapter compiles and reads flag/MAPQ pre-decode. Pause for review.
+> the noodles BAM adapter reads flag/MAPQ pre-decode and decodes survivors (in-memory-BAM
+> round-trip test). Pause for review.
 
 ### Milestone D — the `ReadFilter` iterator (end-to-end)
 
@@ -137,15 +146,17 @@ aborts the run (fatal, no per-item `Result`). `counts()` exposes the running tal
 spec §5.
 
 **D3. Fixture-driven integration test — the port anchor.**  ☐
-Filter the reads of a small known BAM/CRAM and assert the exact `ReadFilterCounts` against
-hand-counted expectations **and** against the production filters run over the same fixture
-(drop-parity). Add a buffer-reuse assertion (one `RecordBuf` across the pass) and a
-header/reference-mismatch case that fails in `new`. *Source:* spec §2.6, arch §Test & bench
-shape.
+Filter the reads of a small known **BAM** (CRAM deferred with the CRAM `RecordSource`, C2) and
+assert the exact `ReadFilterCounts` against hand-counted expectations. Add a buffer-reuse
+assertion (one `RecordBuf` across the pass) and a header/reference-mismatch case that fails in
+`new`. **Note (from B):** hand-count against the **#7→#9→#8** order — per-bucket
+`bad_cigar`/`high_mismatch_fraction` differ from production for both-failing reads by the
+settled reorder, so *drop-parity vs the production filters is per-bucket-order-adjusted*, not
+byte-identical. Also enforce the `DropReason`↔`ReadFilterCounts` 1:1 mapping (exhaustive
+`match` at the tally site) — carried from A/B. *Source:* spec §2.6, arch §Test & bench shape.
 
-> **Checkpoint D:** read filtering runs end-to-end on a real BAM/CRAM; counts match the
-> hand-count and are drop-identical to the production filters on the fixture. **Step 1 is
-> complete.** Pause for review.
+> **Checkpoint D:** read filtering runs end-to-end on a real BAM; counts match the hand-count.
+> **Step 1 is complete** (CRAM `RecordSource` is a tracked follow-up). Pause for review.
 
 ---
 
