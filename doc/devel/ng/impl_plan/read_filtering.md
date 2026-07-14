@@ -89,14 +89,14 @@ fields), `ReadFilterCounts`. No logic. Test: `Default` reproduces the production
 
 ### Milestone B — the two-phase cascade (the decision, pure)
 
-**B1. `verdict_pre_decode` (#1–#6).**  ☐
+**B1. `verdict_pre_decode` (#1–#6).**  ✅
 The flag/MAPQ bit-tests over the reused `FLAG_*` constants and `min_mapq`, in hit-rate order,
 charging a read to the first filter it fails; reference-free and decode-free. Unit tests: each
 filter's boundary (mapq exactly at `min_mapq` kept, one below dropped; each flag bit), the
 `drop_qc_fail` / `drop_duplicate` toggles, and attribution order when several would fire.
 *Source:* spec §3, §5.
 
-**B2. `verdict_post_decode` (#7–#9).**  ☐
+**B2. `verdict_post_decode` (#7–#9).**  ✅
 Too-short (`min_read_length` on decoded length), high-mismatch (call
 `read_exceeds_mismatch_fraction` gated on `&impl RawRefSeq` + `mismatch_bq_floor`), bad-CIGAR
 (call `cigar_is_bad`). Unit tests use `InMemoryRefSeq` as the reference; cover #8 on and off
