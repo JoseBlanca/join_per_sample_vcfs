@@ -21,9 +21,10 @@
 //! period-shifted copy; grow runs of matches) and our own code — **not** from the
 //! AGPL-v3 `TRF-mod` source, which was not read.
 //!
-//! Build status (incremental, per the impl plan): **Milestone A — types + scaffold.**
-//! The interval finder (Milestone B) and the `RegionScanner` region seam (Milestone C)
-//! land as later increments; this file currently carries only the type vocabulary.
+//! Build status (incremental, per the impl plan): **Milestones A–B done** — the type
+//! vocabulary and the `find_tandem_repeats` interval finder (lag-`p` scoring + a
+//! Ruzzo–Tompa maximal-scoring-segment pass). The `RegionScanner` region seam
+//! (Milestone C) lands as a later increment.
 //!
 //! Visibility note: types are `pub` (matching the sibling ng modules, e.g. `types.rs`),
 //! not the arch doc's illustrative `pub(crate)` — the ng convention exposes its module
@@ -256,6 +257,145 @@ pub enum ScanError {
     },
 }
 
+// ---------------------------------------------------------------------
+// The interval finder (Milestone B) — lag-p scoring + Ruzzo–Tompa
+// ---------------------------------------------------------------------
+
+/// Canonicalise an ACGT base to an uppercase byte, or `None` for any non-ACGT byte.
+/// A tandem-repeat match requires **both** compared bases to canonicalise equal (so an
+/// `N == N` never matches — the two `None`s are not equal by this function's use).
+#[inline]
+fn canonical_base(b: u8) -> Option<u8> {
+    match b {
+        b'A' | b'a' => Some(b'A'),
+        b'C' | b'c' => Some(b'C'),
+        b'G' | b'g' => Some(b'G'),
+        b'T' | b't' => Some(b'T'),
+        _ => None,
+    }
+}
+
+/// One open segment in the Ruzzo–Tompa working stack: `l`/`r` are the cumulative score
+/// strictly before the segment and through its end (so the segment's own score is
+/// `r - l`); `start`/`end` are inclusive indices into the score sequence.
+struct RtSeg {
+    l: i64,
+    r: i64,
+    start: usize,
+    end: usize,
+}
+
+/// Find every **maximal scoring subsequence** of a score sequence (Ruzzo & Tompa 1999),
+/// calling `emit(start, end, score)` once per segment — `start`/`end` inclusive indices
+/// into the input, `score = r - l > 0`. Segments are emitted in ascending `start` order.
+///
+/// A maximal scoring subsequence is a contiguous run of positive total that cannot be
+/// extended or trimmed without lowering its score; substitutions and short interruptions
+/// stay inside one segment as long as the surrounding score outweighs them (spec §3.4).
+///
+/// Runs online: when a new positive element finds **no** stacked segment with a smaller
+/// `l` (Ruzzo–Tompa "rule 2"), every stacked segment is provably unabsorbable by any
+/// future element — a later absorption chain hits the new element's `l` floor and stops —
+/// so the stack is flushed and reset. On the sparse-positive signal this scanner produces
+/// the working stack therefore stays small (≈ open segments, not O(n)); the emitted set is
+/// identical to offline Ruzzo–Tompa (pinned by a brute-force property test).
+fn maximal_scoring_subsequences(
+    scores: impl Iterator<Item = i64>,
+    mut emit: impl FnMut(usize, usize, i64),
+) {
+    let mut stack: Vec<RtSeg> = Vec::new();
+    let mut total: i64 = 0;
+    for (i, s) in scores.enumerate() {
+        let l = total;
+        total += s;
+        let r = total;
+        if s <= 0 {
+            continue; // non-positive scores never start a segment; they advance the total
+        }
+        let mut cur = RtSeg {
+            l,
+            r,
+            start: i,
+            end: i,
+        };
+        loop {
+            // The rightmost stacked segment whose `l` is smaller than `cur.l`.
+            match stack.iter().rposition(|seg| seg.l < cur.l) {
+                None => {
+                    // Rule 2: no left-smaller segment → flush the (unabsorbable) stack.
+                    for seg in stack.drain(..) {
+                        emit(seg.start, seg.end, seg.r - seg.l);
+                    }
+                    break;
+                }
+                Some(j) => {
+                    if stack[j].r >= cur.r {
+                        break; // Rule 3: `cur` stays a separate segment to the right.
+                    }
+                    // Rule 4: `cur` absorbs `stack[j..]` — extend its left edge and re-search.
+                    cur.l = stack[j].l;
+                    cur.start = stack[j].start;
+                    stack.truncate(j);
+                }
+            }
+        }
+        stack.push(cur);
+    }
+    for seg in stack.drain(..) {
+        emit(seg.start, seg.end, seg.r - seg.l);
+    }
+}
+
+/// Find every tandem-repeat interval in `seq` whose period lies in `periods` (arch §2.1).
+///
+/// For each period `p` it scores position `j` (`j >= p`) `+match_reward` when `seq[j]`
+/// and `seq[j-p]` canonicalise to the same ACGT base and `-mismatch_penalty` otherwise
+/// (a non-ACGT base never matches), takes every Ruzzo–Tompa maximal scoring segment, maps
+/// it to the 0-based half-open tract it certifies, and emits it when its implied copy
+/// count clears `params.min_copies`. Pure and total over arbitrary bytes; deterministic.
+///
+/// Returns raw, possibly-overlapping intervals — one region can match at several periods,
+/// and the finder does **not** de-duplicate periods or resolve overlaps; that is a
+/// consumer's job (spec §1, §3.5). Per-period results are start-sorted; across periods
+/// they are concatenated (period-ascending).
+pub fn find_tandem_repeats(
+    seq: &[u8],
+    periods: PeriodRange,
+    params: &ScanParams,
+) -> Vec<RepeatInterval> {
+    let mut out = Vec::new();
+    let n = seq.len();
+    for period in periods.min()..=periods.max() {
+        let p = period as usize;
+        if p >= n {
+            continue; // no position has a partner `p` bases back
+        }
+        // Score index `k` (0-based over `p..n`) corresponds to position `j = k + p`.
+        let scores = (p..n).map(
+            |j| match (canonical_base(seq[j]), canonical_base(seq[j - p])) {
+                (Some(a), Some(b)) if a == b => i64::from(params.match_reward),
+                _ => -i64::from(params.mismatch_penalty),
+            },
+        );
+        maximal_scoring_subsequences(scores, |k0, k1, score| {
+            // Segment [k0, k1] → tract [k0, k1 + p + 1): the earliest base involved is
+            // `j0 - p = k0`, the latest is `j1 = k1 + p`, so the exclusive end is `k1+p+1`.
+            let tract_start = k0 as u32;
+            let tract_end = (k1 + p + 1) as u32;
+            let copies = (tract_end - tract_start) / u32::from(period);
+            if copies >= params.min_copies {
+                out.push(RepeatInterval {
+                    start: tract_start,
+                    end: tract_end,
+                    period,
+                    score: i32::try_from(score).unwrap_or(i32::MAX),
+                });
+            }
+        });
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -318,5 +458,217 @@ mod tests {
         assert_eq!(o.window_bp, 100_000);
         assert_eq!(o.merge_gap, 0);
         assert_eq!(o.min_repeat_len, 0);
+    }
+
+    // ---- Ruzzo–Tompa vs a brute-force oracle -------------------------------
+
+    /// Collect `maximal_scoring_subsequences` into a start-sorted `(start, end, score)`
+    /// vector for comparison.
+    fn rt_segments(scores: &[i64]) -> Vec<(usize, usize, i64)> {
+        let mut out = Vec::new();
+        maximal_scoring_subsequences(scores.iter().copied(), |a, b, s| out.push((a, b, s)));
+        out.sort_unstable();
+        out
+    }
+
+    /// Brute-force all maximal scoring subsequences straight from the Ruzzo–Tompa
+    /// definition (O(n⁴), for small test inputs only — the independent oracle). An
+    /// inclusive range `[i, j]` qualifies iff: (1) its score is positive; (2) every
+    /// *proper* sub-range scores strictly less (so it is internally optimal); and (3) it
+    /// is not properly contained in another range satisfying (1)+(2) (so it is maximal).
+    fn brute_segments(scores: &[i64]) -> Vec<(usize, usize, i64)> {
+        let n = scores.len();
+        let mut pre = vec![0i64; n + 1];
+        for i in 0..n {
+            pre[i + 1] = pre[i] + scores[i];
+        }
+        let score = |i: usize, j: usize| pre[j + 1] - pre[i]; // inclusive [i, j]
+
+        // Candidates: positive score, every proper sub-range strictly smaller.
+        let mut cands: Vec<(usize, usize, i64)> = Vec::new();
+        for i in 0..n {
+            for j in i..n {
+                let sc = score(i, j);
+                if sc <= 0 {
+                    continue;
+                }
+                let internally_optimal =
+                    (i..=j).all(|i2| (i2..=j).all(|j2| (i2, j2) == (i, j) || score(i2, j2) < sc));
+                if internally_optimal {
+                    cands.push((i, j, sc));
+                }
+            }
+        }
+
+        // Keep only those not properly contained in another candidate (maximality).
+        let mut res: Vec<(usize, usize, i64)> = cands
+            .iter()
+            .copied()
+            .filter(|&(i, j, _)| {
+                !cands
+                    .iter()
+                    .any(|&(a, b, _)| a <= i && j <= b && (a, b) != (i, j))
+            })
+            .collect();
+        res.sort_unstable();
+        res
+    }
+
+    #[test]
+    fn ruzzo_tompa_matches_brute_force_on_crafted_cases() {
+        let cases: &[&[i64]] = &[
+            &[],
+            &[-7, -7, -7],
+            &[2, 2, 2, 2],
+            &[2, -7, 2],  // two singletons — the interruption is too costly to bridge
+            &[2, -3, 2],  // one merged segment — the dip is bridged
+            &[5, -10, 8], // dip below the left L → two segments
+            &[5, -3, 8],  // dip stays above → one segment
+            &[2, 2, -7, 2, 2],
+            &[-7, 2, 2, -7, 2, -7, 2, 2, -7],
+            &[1, 1, 1, -2, 1, 1, 1, -10, 5, 5],
+        ];
+        for case in cases {
+            assert_eq!(rt_segments(case), brute_segments(case), "case {case:?}");
+        }
+    }
+
+    #[test]
+    fn ruzzo_tompa_matches_brute_force_on_pseudo_random() {
+        // Deterministic LCG over ±-style scores; no rand dependency.
+        let mut state: u64 = 0x9E3779B97F4A7C15;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as u32
+        };
+        for _ in 0..400 {
+            let len = (next() % 24) as usize;
+            let scores: Vec<i64> = (0..len)
+                .map(|_| if next() % 4 == 0 { 2 } else { -7 }) // 25% match-like
+                .collect();
+            assert_eq!(
+                rt_segments(&scores),
+                brute_segments(&scores),
+                "scores {scores:?}"
+            );
+        }
+    }
+
+    // ---- find_tandem_repeats ----------------------------------------------
+
+    fn p(min: u8, max: u8) -> PeriodRange {
+        PeriodRange::new(min, max).unwrap()
+    }
+
+    /// A clean (CAG)*8 tract detected at period 3 as one exact interval.
+    #[test]
+    fn finds_a_clean_perfect_tract() {
+        let seq = b"CAGCAGCAGCAGCAGCAGCAGCAG"; // 8 copies, 24 bp
+        let got = find_tandem_repeats(seq, p(3, 3), &ScanParams::default());
+        assert_eq!(
+            got,
+            vec![RepeatInterval {
+                start: 0,
+                end: 24,
+                period: 3,
+                score: 2 * (24 - 3), // match_reward × matches
+            }]
+        );
+    }
+
+    /// A single substitution inside a tract keeps it **one** interval (spec §3.4).
+    #[test]
+    fn a_substitution_keeps_one_interval() {
+        // (CAG)*5, then one base flipped, then (CAG)*5.
+        let mut seq = Vec::new();
+        for _ in 0..5 {
+            seq.extend_from_slice(b"CAG");
+        }
+        seq.extend_from_slice(b"CAT"); // the interrupting copy (G→T)
+        for _ in 0..5 {
+            seq.extend_from_slice(b"CAG");
+        }
+        let got = find_tandem_repeats(&seq, p(3, 3), &ScanParams::default());
+        let period3: Vec<_> = got.iter().filter(|r| r.period == 3).collect();
+        assert_eq!(
+            period3.len(),
+            1,
+            "one span across the substitution: {got:?}"
+        );
+        assert_eq!(period3[0].start, 0);
+        assert_eq!(period3[0].end, seq.len() as u32);
+    }
+
+    /// A single indel (a bounded mismatch burst) also keeps the tract **one** interval —
+    /// the lag-p comparison is local, so downstream copies resume in phase (spec §3.4).
+    #[test]
+    fn a_single_indel_keeps_one_interval() {
+        // (CAG)*6, one inserted base, (CAG)*6 — phase shifts but the burst is bounded.
+        let mut seq = Vec::new();
+        for _ in 0..6 {
+            seq.extend_from_slice(b"CAG");
+        }
+        seq.push(b'T'); // a 1 bp insertion
+        for _ in 0..6 {
+            seq.extend_from_slice(b"CAG");
+        }
+        let got = find_tandem_repeats(&seq, p(3, 3), &ScanParams::default());
+        let period3: Vec<_> = got.iter().filter(|r| r.period == 3).collect();
+        assert_eq!(
+            period3.len(),
+            1,
+            "the single indel is a bounded burst, not a split: {got:?}"
+        );
+        assert_eq!(period3[0].start, 0);
+        assert_eq!(period3[0].end, seq.len() as u32);
+    }
+
+    /// A run of `N` yields nothing — `N == N` is not a match (spec §3.5).
+    #[test]
+    fn an_n_run_emits_nothing() {
+        let seq = b"NNNNNNNNNNNNNNNNNNNN";
+        assert!(find_tandem_repeats(seq, p(1, 6), &ScanParams::default()).is_empty());
+    }
+
+    /// A soft-masked (lowercase) tract is still found — comparison is case-insensitive.
+    #[test]
+    fn a_soft_masked_tract_is_found() {
+        let seq = b"cagcagcagcagcagcagcagcag"; // lowercase (CAG)*8
+        let got = find_tandem_repeats(seq, p(3, 3), &ScanParams::default());
+        assert_eq!(got.len(), 1);
+        assert_eq!((got[0].start, got[0].end, got[0].period), (0, 24, 3));
+    }
+
+    /// An (AT)*n tract matches at period 2 **and** its multiples 4 and 6 — all emitted;
+    /// the finder does not de-duplicate periods (spec §3.5).
+    #[test]
+    fn multiples_of_the_fundamental_period_are_all_emitted() {
+        let seq = b"ATATATATATATATATATAT"; // (AT)*10, 20 bp
+        let got = find_tandem_repeats(seq, p(2, 6), &ScanParams::default());
+        let periods: std::collections::BTreeSet<u8> = got.iter().map(|r| r.period).collect();
+        assert!(
+            periods.contains(&2),
+            "fundamental period 2 present: {got:?}"
+        );
+        assert!(periods.contains(&4), "multiple period 4 present: {got:?}");
+        assert!(periods.contains(&6), "multiple period 6 present: {got:?}");
+        assert!(
+            !periods.contains(&3) && !periods.contains(&5),
+            "no match at non-divisor periods 3/5: {got:?}"
+        );
+    }
+
+    /// The `min_copies` floor drops sub-threshold segments (e.g. a lone coincidental match).
+    #[test]
+    fn the_min_copies_floor_drops_short_segments() {
+        // One coincidental period-2 match embedded in non-repetitive sequence.
+        let seq = b"ACGTACAGTCTGAC";
+        let got = find_tandem_repeats(seq, p(2, 2), &ScanParams::default());
+        assert!(
+            got.iter().all(|r| (r.end - r.start) / 2 >= 2),
+            "every emitted interval has >= min_copies copies: {got:?}"
+        );
     }
 }

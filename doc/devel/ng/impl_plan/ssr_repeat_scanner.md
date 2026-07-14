@@ -113,14 +113,14 @@ arch §1.2–§1.3, §2.2.
 
 ### Milestone B — the interval finder (the algorithmic heart, pure)
 
-**B1. Scoring signal + Ruzzo–Tompa maximal segments.**  ☐
+**B1. Scoring signal + Ruzzo–Tompa maximal segments.**  ✅
 The per-period lag-*p* score walk (`+match_reward` on a case-insensitive ACGT match to `seq[j-p]`,
 else `-mismatch_penalty`; non-ACGT never matches) and the O(n) Ruzzo–Tompa maximal-scoring-segment
 pass over it, as an internal helper returning `[j0, j1]` segments for one period. Unit tests on the
 helper: a clean tract yields one segment at the exact bounds; an `N`-run yields none. *Source:*
 spec §3.1–§3.2, §3.5, arch §2.1.
 
-**B2. `find_tandem_repeats` — emission over the period range.**  ☐
+**B2. `find_tandem_repeats` — emission over the period range.**  ✅
 Loop periods `min..=max`, map each segment to `RepeatInterval { start: j0-p, end: j1+1, period: p,
 score }`, apply the `min_copies` emission floor, concatenate. Unit tests (consumer-agnostic, spec
 §9): clean `(CAG)k` (exact `start/end/period/score`); a substitution-interrupted tract (**one**
