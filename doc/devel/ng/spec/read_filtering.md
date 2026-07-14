@@ -2,13 +2,17 @@
 
 *Status: design spec (2026-07-10; renamed admission → filtering 2026-07-11; pre-decode
 gate folded into the filter via the `RawRecord` seam, input modelled as a reused-buffer
-`RecordSource` rather than an iterator of records, 2026-07-13). First
+`RecordSource` rather than an iterator of records, 2026-07-13; **implemented 2026-07-14** —
+step 1 built A–D, with two owner-approved revisions to this spec noted inline: the
+post-decode cascade runs cheapest-first `#7 → #9 → #8` (§3), and the iterator item is
+`Result<MappedRead, ReadFilterError>` rather than a bare `MappedRead` so a fatal error
+cannot be silently lost (§5, §7)). First
 spec under [`ng_proposal.md`](ng_proposal.md); its code-facing companion is
 [`../arch/read_filtering.md`](../arch/read_filtering.md) (this step's types & interfaces,
 distilled), which sits under the shared arch docs
 [`../arch/ng_step_interfaces.md`](../arch/ng_step_interfaces.md) (shared types +
 step traits) and [`../arch/module_layout.md`](../arch/module_layout.md) (the
-`src/ng/` tree). **No code yet** — this settles the design.*
+`src/ng/` tree).*
 
 *Naming follows the project convention: **STR** in prose, `ssr` in code
 identifiers (`str` is a Rust primitive). Read filtering is generic — it has no
@@ -345,17 +349,29 @@ skip filtering" compile-time guarantee, which the test suite already secures che
 
 ## 5. The public surface — a kept-read iterator fed by a record source
 
-Read filtering is exposed as an **iterator of kept reads** (`Iterator<Item = MappedRead>`),
-driven by a **record source** it reads into a single reused buffer. It gates the cheap
-flag/MAPQ filters on each undecoded record and decodes only the survivors (§3), holding the
-running `ReadFilterCounts` as reads flow through. Lazy and streaming — no upfront `Vec` — so
-it drops straight into the locus-stream spine (`ng_proposal.md` §1) as its first stage.
+Read filtering is exposed as an **iterator of kept reads**
+(`Iterator<Item = Result<MappedRead, ReadFilterError>>`), driven by a **record source** it
+reads into a single reused buffer. It gates the cheap flag/MAPQ filters on each undecoded
+record and decodes only the survivors (§3), holding the running `ReadFilterCounts` as reads
+flow through. Lazy and streaming — no upfront `Vec` — so it drops straight into the
+locus-stream spine (`ng_proposal.md` §1) as its first stage.
+
+> **Revised 2026-07-14 — the item is a `Result`.** This spec originally made the item a bare
+> `MappedRead`, surfacing a fatal error out-of-band. The implementation review showed that
+> hides silent data loss: `next()` returns `None` for *both* a clean end of input and a fatal
+> abort, so a caller that iterates and doesn't separately check would silently drop reads on a
+> mid-run failure — contradicting the "account for every read" discipline (§4). The item is now
+> `Result<MappedRead, ReadFilterError>`: a fatal condition yields `Some(Err(_))` once, then
+> `None`, so `let read = read?;` makes it un-ignorable. This matches the noodles readers this
+> sits on (`records()` is `Item = io::Result<_>`). The rest of this section reflects the
+> revision.
 
 **Why a source, not an `Iterator` of records.** A standard `Iterator`'s `Item` is owned with
 no lifetime tie to `&mut self`, so an `Iterator<Item = RawRecord>` would force a fresh
 `RecordBuf` per read — no buffer reuse (the lending-iterator problem). Modelling the input as
 a source that *fills* a reused buffer keeps one `RecordBuf` alive for the whole pass; the
-*output* stays a clean `Iterator<Item = MappedRead>`, so nothing downstream notices.
+*output* is a clean `Iterator<Item = Result<MappedRead, _>>`, so nothing downstream changes
+its shape.
 
 ```rust
 /// A borrowed view of one alignment record — the seam that lets the flag/MAPQ cascade run
@@ -379,48 +395,56 @@ pub trait RecordSource {
     fn read_next(&mut self, buf: &mut Self::Record) -> io::Result<bool>;
 }
 
+/// A fatal, run-level error, yielded *in the item stream* so it cannot be mistaken for a
+/// clean end of input. `read_next` failure, `decode` failure, and a filter-#8 reference
+/// fetch failure each map to one variant.
+pub enum ReadFilterError { Source(io::Error), Decode(io::Error), Reference(RefSeqError) }
+
 /// Filters one sample's reads, lazily. `next()` reads the next record into its reused
 /// buffer, runs the pre-decode cascade (#1–#6) on its flag/MAPQ, decodes only if it
-/// survives, runs the decode-dependent cascade (#7–#9) on the resulting `MappedRead`,
-/// tallies every drop, and returns the first read that passes (or `None` at end of input).
-/// A read dropped on a flag or low MAPQ builds no `MappedRead` at all (§3).
+/// survives, runs the decode-dependent cascade (#7, #9, #8) on the resulting `MappedRead`,
+/// tallies every drop, and returns the first read that passes as `Ok(read)` (or `None` at
+/// end of input). A read dropped on a flag or low MAPQ builds no `MappedRead` at all (§3). A
+/// fatal condition yields `Some(Err(_))` once and then `None` (the iterator is fused).
 ///
 /// `counts()` is a RUNNING tally: readable at any point — peek mid-stream to watch how
-/// filtering is going — and complete once the iterator is exhausted. Reaching the final
-/// totals is the caller's responsibility (iterate to the end); nothing forces full
-/// consumption.
+/// filtering is going — and complete once the iterator is exhausted.
 pub struct ReadFilter<S: RecordSource, R /*: R: RawRefSeq */> {
     source: S,
-    buf: S::Record,               // the single record buffer reused across every read
+    record_buf: S::Record,        // the single record buffer reused across every read
     reference: R,                 // RawRefSeq — raw bytes for filter #8; see §3 + ref_seq.md
     config: ReadFilterConfig,
     counts: ReadFilterCounts,
+    ref_buf: Vec<u8>,             // reused scratch for #8's reference fetch
+    done: bool,                   // fuse: set on clean EOF or after a fatal error is yielded
 }
 
 impl<S: RecordSource, R: RawRefSeq> Iterator for ReadFilter<S, R> {
-    type Item = MappedRead;
-    fn next(&mut self) -> Option<MappedRead> {
-        // read_next into self.buf (reuse) → pre-decode cascade → tally & continue on Drop
-        //   → self.buf.decode() → post-decode cascade → tally → first Keep
-        // (an Err from read_next or from #8 aborts the run — fatal, see the contract)
+    type Item = Result<MappedRead, ReadFilterError>;
+    fn next(&mut self) -> Option<Self::Item> {
+        // read_next into self.record_buf (reuse) → pre-decode cascade → tally & continue on
+        //   Drop → self.record_buf.decode() → post-decode cascade → tally → first Keep as Ok
+        // (an Err from read_next, decode, or #8 is yielded once as Some(Err(_)), then None)
     }
 }
 
 impl<S: RecordSource, R: RawRefSeq> ReadFilter<S, R> {
     /// Fail-fast setup: validates that every contig in the source's header resolves in the
-    /// reference, then seeds `buf` to `Default`. A header/reference mismatch is a setup
-    /// error, surfaced here rather than mid-stream.
+    /// reference, then seeds the record buffer to `Default`. A header/reference mismatch is a
+    /// setup error, surfaced here rather than mid-stream.
     pub fn new(source: S, reference: R, config: ReadFilterConfig) -> Result<Self, RefSeqError> { /* … */ }
     /// The running tally — current counts, final once iteration is exhausted.
     pub fn counts(&self) -> &ReadFilterCounts { &self.counts }
 }
 ```
 
-Usage — iterate by `&mut` so the filter (and its counts) outlives the loop:
+Usage — iterate by `&mut` so the filter (and its counts) outlives the loop; `?` on each item
+surfaces a fatal error:
 
 ```rust
 let mut filter = ReadFilter::new(source, reference, config)?;  // validates header vs reference
-for read in &mut filter {                                      // yields MappedRead — survivors, already decoded
+for read in &mut filter {                                      // Item = Result<MappedRead, _>
+    let read = read?;                                          // fatal error → propagated, not lost
     // … feed the locus stream
 }
 let counts = filter.counts();   // running totals; complete here because the loop drained it
@@ -455,14 +479,15 @@ copy-or-drain.)
 
 `reference` is consulted only by filter #8, and only when `max_read_mismatch_fraction` is
 `Some` (§3). A `RefSeqError` from #8 (`fetch_raw_into` returns `Result`, ref_seq.md §1) — as
-is an `Err` from `RecordSource::read_next` — is **fatal to the run, not a per-read drop**:
-`ReadFilter::new` validates up front — returning `Result` — that every contig in the
-source's header resolves in the reference, so any in-loop fetch or read error signals
-genuinely corrupt input (e.g. a truncated file) or a broken invariant, and aborts the pass
-rather than being swallowed. That is what keeps the surface `Item = MappedRead` — no per-item `Result`,
-no silent error bucket in `ReadFilterCounts`. (The `R: RawRefSeq` bound holds even when #8 is
-disabled at runtime; a caller wanting *no* reference at all would be a future `Option<R>`
-refinement — not needed now, since every real run has a reference anyway.)
+is an `Err` from `RecordSource::read_next` or `RawRecord::decode` — is **fatal to the run, not
+a per-read drop**: `ReadFilter::new` validates up front — returning `Result` — that every
+contig in the source's header resolves in the reference, so any in-loop fetch, read, or decode
+error signals genuinely corrupt input (e.g. a truncated file) or a broken invariant. It is
+**yielded once as the iterator's item** (`Some(Err(_))`, then `None`) rather than swallowed —
+so it is un-ignorable (`read?`) and never a silent EOF, while still carrying no error bucket in
+`ReadFilterCounts` (§4). (The `R: RawRefSeq` bound holds even when #8 is disabled at runtime; a
+caller wanting *no* reference at all would be a future `Option<R>` refinement — not needed now,
+since every real run has a reference anyway.)
 
 ---
 
@@ -542,18 +567,24 @@ whole-read prelude, not the per-base gatherer.
   attribution, byte-identical output) it carries no correctness risk; its *magnitude* is
   worth measuring on a real cohort, but the seam costs nothing to keep whether the saving
   proves large or small.
-- **Reference-fetch error model — resolved: fatal, not per-read (§5).** `fetch_raw_into` is
-  fallible (`Result<_, RefSeqError>`, ref_seq.md §1), but the filter surface stays
-  `Item = MappedRead`: contigs are validated against the reference before iteration, and an
-  in-loop `RefSeqError` aborts the run (corrupt input or broken invariant) rather than being
-  swallowed into a per-read drop or poisoning every `next()` with a `Result`.
+- **Reference-fetch error model — resolved: fatal, delivered in-stream (§5; revised
+  2026-07-14).** `fetch_raw_into` is fallible (`Result<_, RefSeqError>`, ref_seq.md §1), as is
+  `read_next` and `decode`. Contigs are validated against the reference before iteration, so an
+  in-loop error signals corrupt input or a broken invariant and is **fatal to the run**. It is
+  surfaced as the iterator's item (`Some(Err(ReadFilterError))` once, then `None`), *not*
+  swallowed into a per-read drop or a silent EOF. **This revises the original decision** to keep
+  `Item = MappedRead` and surface the error out-of-band: the review showed that let a fatal
+  abort masquerade as clean EOF (silent read loss) unless the caller separately checked, so the
+  error moved into the item stream where `?` makes it un-ignorable. `ReadFilterCounts` still has
+  no error bucket.
 - **Input shape — resolved: a record source, not an iterator of records (§5).** The filter
   takes a `RecordSource` that fills one reused `RecordBuf`, rather than an
   `Iterator<Item = RawRecord>` — a std `Iterator`'s owned `Item` cannot borrow a reused
   buffer (the lending-iterator problem), so it would force a fresh record per read. The
-  output stays a clean `Iterator<Item = MappedRead>`. Trade recorded in §5: because a kept
-  `MappedRead` outlives the buffer, `decode` copies the bytes it keeps (per-kept-read),
-  while reads dropped pre-decode cost no allocation and no copy.
+  *output* is an `Iterator<Item = Result<MappedRead, ReadFilterError>>` (the error moved into
+  the stream, above). Trade recorded in §5: because a kept `MappedRead` outlives the buffer,
+  `decode` copies the bytes it keeps (per-kept-read), while reads dropped pre-decode cost no
+  allocation and no copy.
 - **Where `RecordSource`/`RawRecord` are implemented — resolved: (a) an ng-owned adapter.**
   The traits are ng's (§5); their production impl is an **ng-owned adapter wrapping the
   noodles reader/record**, keeping the dependency ng → existing code so production never

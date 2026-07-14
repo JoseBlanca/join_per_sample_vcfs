@@ -123,21 +123,29 @@ pub trait RecordSource {
     fn read_next(&mut self, buf: &mut Self::Record) -> io::Result<bool>;   // Ok(false) = EOF; Err is fatal
 }
 
+/// A fatal, run-level error, yielded in the item stream (not out-of-band).
+pub enum ReadFilterError { Source(io::Error), Decode(io::Error), Reference(RefSeqError) }
+
 /// A lazy iterator of kept reads, carrying its running counts. One RecordBuf is reused
 /// across the whole pass; `next()` reads a record, runs #1–#6 on flag/MAPQ, decodes only on
-/// survival, runs #7–#9, tallies every drop, and yields the first Keep.
+/// survival, runs #7/#9/#8, tallies every drop, and yields the first Keep as `Ok(read)`.
 pub struct ReadFilter<S: RecordSource, R /* : RawRefSeq */> {
     source: S,
-    buf: S::Record,               // the single reused record buffer
+    record_buf: S::Record,        // the single reused record buffer
     reference: R,                 // RawRefSeq — raw bytes for #8 (ref_seq.md)
     config: ReadFilterConfig,
     counts: ReadFilterCounts,
+    ref_buf: Vec<u8>,             // reused scratch for #8's reference fetch
+    done: bool,                   // fuse: set on clean EOF or after a fatal error is yielded
 }
 
+// Item is a Result (revised 2026-07-14 — see spec §5/§7): a fatal error is yielded once as
+// Some(Err(_)) then None, so `read?` makes it un-ignorable rather than a silent EOF.
 impl<S: RecordSource, R: RawRefSeq> Iterator for ReadFilter<S, R> {
-    type Item = MappedRead;       // survivors, already decoded
-    fn next(&mut self) -> Option<MappedRead>;
+    type Item = Result<MappedRead, ReadFilterError>;
+    fn next(&mut self) -> Option<Self::Item>;
 }
+impl<S: RecordSource, R: RawRefSeq> std::iter::FusedIterator for ReadFilter<S, R> {}
 
 impl<S: RecordSource, R: RawRefSeq> ReadFilter<S, R> {
     /// Fail-fast setup: validates every source-header contig resolves in the reference.
@@ -145,19 +153,23 @@ impl<S: RecordSource, R: RawRefSeq> ReadFilter<S, R> {
     pub fn counts(&self) -> &ReadFilterCounts;   // running tally; final once iteration is exhausted
 }
 
-// The decision, split on the decode boundary so each half unit-tests in isolation:
-fn verdict_pre_decode(flag: Flags, mapq: MapQual, config: &ReadFilterConfig) -> FilterVerdict;
+// The decision, split on the decode boundary so each half unit-tests in isolation. Post-decode
+// runs cheapest-first #7 → #9 → #8 (revised 2026-07-14 — spec §3); it returns a Result because
+// #8's reference fetch is fallible:
+fn verdict_pre_decode(flag: u16, mapq: MapQual, config: &ReadFilterConfig) -> FilterVerdict;
 fn verdict_post_decode(read: &MappedRead, reference: &impl RawRefSeq,
-                       config: &ReadFilterConfig) -> FilterVerdict;
+                       config: &ReadFilterConfig, ref_buf: &mut Vec<u8>)
+                       -> Result<FilterVerdict, RefSeqError>;
 ```
 
 **Contract:** content-preserving, per-sample, lazy; every dropped read charged to exactly one
 reason. Decode runs only on pre-decode survivors. One buffer is reused; because a kept
 `MappedRead` outlives it, `decode` **copies** the bytes it keeps (per-kept-read — reads
 dropped pre-decode pay neither copy nor allocation). `reference` is consulted only by #8, only
-when `max_read_mismatch_fraction` is `Some`. Any `RefSeqError` (#8) or `read_next` `Err` is
-**fatal to the run**, not a per-read drop — which keeps the surface `Item = MappedRead` (no
-per-item `Result`, no error bucket in the counts).
+when `max_read_mismatch_fraction` is `Some`. Any `RefSeqError` (#8), `read_next` `Err`, or
+`decode` `Err` is **fatal to the run**, not a per-read drop — yielded once as the item
+`Some(Err(ReadFilterError))` (then `None`), so it is un-ignorable via `?` and never a silent
+EOF, with no error bucket in the counts.
 
 ## 4. Design decisions — decided
 
@@ -174,8 +186,8 @@ Distilled from the spec; see it for the reasoning. Add new open items with `OPEN
 - **Input is a reused-buffer `RecordSource`, not an iterator of records — decided.** A std
   `Iterator`'s owned `Item` can't borrow a reused buffer (the lending-iterator problem), so an
   `Iterator<Item = RawRecord>` would force a fresh `RecordBuf` per read. A source that fills
-  one buffer keeps reuse; the *output* stays `Iterator<Item = MappedRead>` so nothing
-  downstream changes (spec §5).
+  one buffer keeps reuse; the *output* is `Iterator<Item = Result<MappedRead, ReadFilterError>>`
+  (see the error-model decision below) (spec §5).
 - **`decode(&self)`, copy-on-keep — decided.** The output outlives the reused input buffer, so
   `decode` copies the bytes `MappedRead` keeps. Reuse-buffer and move-out-of-buffer are
   mutually exclusive (moving drains the buffer, defeating reuse); copy-on-keep is the
@@ -184,10 +196,14 @@ Distilled from the spec; see it for the reasoning. Add new open items with `OPEN
   would make "reached step 2 unfiltered" a compile error, but that per-read cost is not worth
   a guarantee the test suite already secures cheaply; composability with step 2's
   `prepare_read(&MappedRead, …)` stays adapter-free (spec §4, §7).
-- **Error model is fatal / run-level — decided.** `ReadFilter::new` validates the source
-  header against the reference up front (returns `Result`); in-loop fetch/read errors abort
-  the run rather than degrade to a per-read drop or poison every `next()` with a `Result`
-  (spec §5, §7).
+- **Error model is fatal / run-level, delivered in-stream — decided (revised 2026-07-14).**
+  `ReadFilter::new` validates the source header against the reference up front (returns
+  `Result`); an in-loop fetch/read/decode error is **fatal** and yielded as the iterator's item
+  (`Some(Err(ReadFilterError))` once, then `None` — the iterator is fused), never degraded to a
+  per-read drop or a silent EOF. *Originally* the item was a bare `MappedRead` with the error
+  surfaced out-of-band; the review showed that let a fatal abort look like clean EOF (silent
+  read loss) unless the caller separately checked, so the error moved into the item where `?`
+  makes it un-ignorable — the same shape as the noodles readers this sits on (spec §5, §7).
 - **`RecordSource`/`RawRecord` impl = ng-owned adapter — decided.** The traits are ng's; the
   production impl is an ng-owned adapter wrapping the noodles reader/record, so the dependency
   points ng → existing code and production never learns about ng. Rejected: adding the impl to

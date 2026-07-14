@@ -536,11 +536,11 @@ impl<R: io::Read> RecordSource for CramRecordSource<R> {
 // The ReadFilter iterator (the driver)
 // ---------------------------------------------------------------------
 
-/// A fatal, run-level error from a [`ReadFilter`] pass. Filtering's per-read
-/// surface is `Item = MappedRead` (no per-item `Result`), so a genuinely fatal
-/// condition — a failed record read, a failed decode, or a reference-fetch
-/// failure — stops the iteration (`next()` returns `None`) and is surfaced once,
-/// at the end, by [`ReadFilter::finish`]. It is never folded into a per-read
+/// A fatal, run-level error from a [`ReadFilter`] pass. It is yielded **in the
+/// iterator's item stream** — a fatal condition (a failed record read, a failed
+/// decode, or a reference-fetch failure) makes `next()` return `Some(Err(..))`
+/// once and then `None` — so the caller cannot mistake it for a clean end of
+/// input: `let read = read?;` propagates it. It is never folded into a per-read
 /// drop or a silent EOF.
 #[derive(Debug, thiserror::Error)]
 pub enum ReadFilterError {
@@ -557,24 +557,23 @@ pub enum ReadFilterError {
     Reference(#[source] RefSeqError),
 }
 
-/// Filters one sample's reads, lazily, as an `Iterator<Item = MappedRead>`. Each
-/// `next()` reads the next record into the single reused buffer, runs the
-/// pre-decode cascade (#1–#6) on its flag/MAPQ, decodes only on survival, runs
-/// the decode-dependent cascade (#7, #9, #8), tallies every drop, and returns the
-/// first read that passes (or `None` at end of input). A read dropped pre-decode
-/// builds no `MappedRead` at all.
+/// Filters one sample's reads, lazily, as an
+/// `Iterator<Item = Result<MappedRead, ReadFilterError>>`. Each `next()` reads
+/// the next record into the single reused buffer, runs the pre-decode cascade
+/// (#1–#6) on its flag/MAPQ, decodes only on survival, runs the decode-dependent
+/// cascade (#7, #9, #8), tallies every drop, and returns the first read that
+/// passes as `Ok(read)`. A read dropped pre-decode builds no `MappedRead` at all.
+///
+/// **The item is a `Result`** (unlike the spec's original `Item = MappedRead`,
+/// revised so a fatal error cannot be silently lost): a fatal condition yields
+/// `Some(Err(_))` once and then `None`, so `for read in &mut filter { let read =
+/// read?; … }` surfaces it with no separate bookkeeping. This matches the noodles
+/// readers this sits on (`records()` is `Item = io::Result<_>`). The iterator is
+/// fused — after a clean `None` or a fatal `Err`, further `next()`s return `None`.
 ///
 /// `counts()` is a **running** tally, readable at any point and final once the
-/// iterator is exhausted.
-///
-/// **Fatal errors and `finish`.** Because the item is a bare `MappedRead` (no
-/// per-item `Result`, by design — spec §5), a fatal condition ([`ReadFilterError`])
-/// stops the iteration by returning `None`, which is otherwise indistinguishable
-/// from a clean end of input. **The caller must call [`Self::finish`] after
-/// iterating** to tell the two apart — a bare `for read in filter {}` that drops
-/// the filter would hide a fatal abort. A `Drop` guard debug-asserts against that
-/// misuse, so it is caught in every test/dev run; the real pipeline consumer
-/// drives the filter and calls `finish`.
+/// iterator is exhausted (iterate by `&mut` so the filter — and its counts —
+/// outlives the loop).
 pub struct ReadFilter<S: RecordSource, R> {
     source: S,
     /// The single record buffer reused across every read.
@@ -585,9 +584,9 @@ pub struct ReadFilter<S: RecordSource, R> {
     counts: ReadFilterCounts,
     /// Reused scratch for #8's reference fetch (touched only when #8 runs).
     ref_buf: Vec<u8>,
-    /// Latches the first fatal error; once set, `next()` yields `None` forever,
-    /// and `finish` reports it. Cleared by `finish` so a clean drop is quiet.
-    fatal_error: Option<ReadFilterError>,
+    /// Set on clean end of input or after a fatal error is yielded; makes the
+    /// iterator fused (subsequent `next()`s return `None`).
+    done: bool,
 }
 
 impl<S: RecordSource, R: RawRefSeq> ReadFilter<S, R> {
@@ -616,7 +615,7 @@ impl<S: RecordSource, R: RawRefSeq> ReadFilter<S, R> {
             config,
             counts: ReadFilterCounts::default(),
             ref_buf: Vec::new(),
-            fatal_error: None,
+            done: false,
         })
     }
 
@@ -625,53 +624,29 @@ impl<S: RecordSource, R: RawRefSeq> ReadFilter<S, R> {
         &self.counts
     }
 
-    /// Consume the filter after iterating, returning the final counts on a clean
-    /// pass or the fatal error that stopped it. `#[must_use]`: the fatal-error
-    /// surface is only seen if the caller checks it.
-    #[must_use = "a fatal filtering error is only observed by inspecting the result"]
-    pub fn finish(mut self) -> Result<ReadFilterCounts, ReadFilterError> {
-        // Take the error (marking it observed, so the `Drop` guard stays quiet)
-        // and move the counts out via `mem::take` (a `Drop` type cannot be
-        // destructured by-value).
-        match self.fatal_error.take() {
-            Some(error) => Err(error),
-            None => Ok(std::mem::take(&mut self.counts)),
-        }
-    }
-
-    /// Latch a fatal error and stop the iteration. Shared by the three fatal arms
-    /// of `next()`.
-    fn fail(&mut self, error: ReadFilterError) -> Option<MappedRead> {
-        self.fatal_error = Some(error);
-        None
-    }
-}
-
-impl<S: RecordSource, R> Drop for ReadFilter<S, R> {
-    fn drop(&mut self) {
-        // A latched fatal error must be observed via `finish()`; iterating in a
-        // bare `for` loop and dropping the filter would hide it (a fatal abort
-        // then looks like a clean end of input). Catch that misuse in debug/test
-        // builds; skip while already unwinding another panic.
-        debug_assert!(
-            self.fatal_error.is_none() || std::thread::panicking(),
-            "ReadFilter dropped with an unobserved fatal error — consume it with finish()"
-        );
+    /// Mark the iterator finished and yield a fatal error. Shared by the three
+    /// fatal arms of `next()`.
+    fn fail(&mut self, error: ReadFilterError) -> Option<Result<MappedRead, ReadFilterError>> {
+        self.done = true;
+        Some(Err(error))
     }
 }
 
 impl<S: RecordSource, R: RawRefSeq> Iterator for ReadFilter<S, R> {
-    type Item = MappedRead;
+    type Item = Result<MappedRead, ReadFilterError>;
 
-    fn next(&mut self) -> Option<MappedRead> {
-        // Once a fatal error is latched, stay stopped.
-        if self.fatal_error.is_some() {
+    fn next(&mut self) -> Option<Self::Item> {
+        // Fused: once a clean EOF or a fatal error has been reported, stay stopped.
+        if self.done {
             return None;
         }
         loop {
             match self.source.read_next(&mut self.record_buf) {
                 Ok(true) => {}
-                Ok(false) => return None, // clean end of input
+                Ok(false) => {
+                    self.done = true;
+                    return None; // clean end of input
+                }
                 Err(error) => return self.fail(ReadFilterError::Source(error)),
             }
 
@@ -695,7 +670,7 @@ impl<S: RecordSource, R: RawRefSeq> Iterator for ReadFilter<S, R> {
             match verdict_post_decode(&read, &self.reference, &self.config, &mut self.ref_buf) {
                 Ok(FilterVerdict::Keep) => {
                     self.counts.kept += 1;
-                    return Some(read);
+                    return Some(Ok(read));
                 }
                 Ok(FilterVerdict::Drop(reason)) => {
                     self.counts.record_drop(reason);
@@ -706,6 +681,8 @@ impl<S: RecordSource, R: RawRefSeq> Iterator for ReadFilter<S, R> {
         }
     }
 }
+
+impl<S: RecordSource, R: RawRefSeq> std::iter::FusedIterator for ReadFilter<S, R> {}
 
 #[cfg(test)]
 mod tests {
@@ -1663,11 +1640,9 @@ mod tests {
         let mut filter =
             ReadFilter::new(source, fixture_reference(), ReadFilterConfig::default()).unwrap();
 
-        let kept: Vec<MappedRead> = (&mut filter).collect();
+        let kept: Vec<MappedRead> = (&mut filter).collect::<Result<_, _>>().unwrap();
         assert_eq!(kept.len(), 2, "exactly the two clean reads survive");
         assert_eq!(*filter.counts(), expected);
-        // Clean pass → finish returns the final counts, no fatal error.
-        assert_eq!(filter.finish().unwrap(), expected);
     }
 
     #[test]
@@ -1693,9 +1668,9 @@ mod tests {
         let mut filter =
             ReadFilter::new(source, fixture_reference(), ReadFilterConfig::default()).unwrap();
 
-        let kept: Vec<MappedRead> = (&mut filter).collect();
+        let kept: Vec<MappedRead> = (&mut filter).collect::<Result<_, _>>().unwrap();
         assert_eq!(kept.len(), 2);
-        assert_eq!(filter.finish().unwrap(), expected);
+        assert_eq!(*filter.counts(), expected);
     }
 
     #[test]
@@ -1742,11 +1717,13 @@ mod tests {
         };
         let mut filter =
             ReadFilter::new(source, poly_a_ref(100), ReadFilterConfig::default()).unwrap();
-        // The read error stops iteration immediately …
+        // The read error surfaces as the yielded item …
+        assert!(matches!(
+            (&mut filter).next(),
+            Some(Err(ReadFilterError::Source(_)))
+        ));
+        // … and the iterator is fused (stays stopped) afterward.
         assert!((&mut filter).next().is_none());
-        // … and it stays stopped (the fatal error is latched).
-        assert!((&mut filter).next().is_none());
-        assert!(matches!(filter.finish(), Err(ReadFilterError::Source(_))));
     }
 
     #[test]
@@ -1757,8 +1734,11 @@ mod tests {
         let source = FakeSource::new(vec![record], one_contig_header());
         let mut filter =
             ReadFilter::new(source, poly_a_ref(100), ReadFilterConfig::default()).unwrap();
+        assert!(matches!(
+            (&mut filter).next(),
+            Some(Err(ReadFilterError::Decode(_)))
+        ));
         assert!((&mut filter).next().is_none());
-        assert!(matches!(filter.finish(), Err(ReadFilterError::Decode(_))));
     }
 
     #[test]
@@ -1777,11 +1757,13 @@ mod tests {
         // contig length 10 < the read's 50-base reference span.
         let mut filter =
             ReadFilter::new(source, poly_a_ref(10), ReadFilterConfig::default()).unwrap();
-        assert!((&mut filter).next().is_none());
         assert!(matches!(
-            filter.finish(),
-            Err(ReadFilterError::Reference(RefSeqError::OutOfBounds { .. }))
+            (&mut filter).next(),
+            Some(Err(ReadFilterError::Reference(
+                RefSeqError::OutOfBounds { .. }
+            )))
         ));
+        assert!((&mut filter).next().is_none());
     }
 
     #[test]
@@ -1793,7 +1775,7 @@ mod tests {
         let source = FakeSource::new(vec![unmapped, clean], one_contig_header());
         let mut filter =
             ReadFilter::new(source, poly_a_ref(30), ReadFilterConfig::default()).unwrap();
-        let kept: Vec<MappedRead> = (&mut filter).collect();
+        let kept: Vec<MappedRead> = (&mut filter).collect::<Result<_, _>>().unwrap();
         assert_eq!(kept.len(), 1, "only the clean read survives");
         assert_eq!(filter.counts().unmapped, 1);
         assert_eq!(filter.counts().kept, 1);
@@ -1805,7 +1787,7 @@ mod tests {
         let mut filter =
             ReadFilter::new(source, poly_a_ref(30), ReadFilterConfig::default()).unwrap();
         assert!((&mut filter).next().is_none());
-        assert_eq!(filter.finish().unwrap(), ReadFilterCounts::default());
+        assert_eq!(*filter.counts(), ReadFilterCounts::default());
     }
 
     #[test]
@@ -1821,11 +1803,11 @@ mod tests {
         );
         let mut filter =
             ReadFilter::new(source, poly_a_ref(30), ReadFilterConfig::default()).unwrap();
-        assert!((&mut filter).next().is_some());
+        assert!(matches!((&mut filter).next(), Some(Ok(_))));
         assert_eq!(filter.counts().duplicate, 1);
         assert_eq!(filter.counts().kept, 1);
         assert!((&mut filter).next().is_none());
-        assert_eq!(filter.finish().unwrap().kept, 1);
+        assert_eq!(filter.counts().kept, 1);
     }
 
     fn one_contig_200_header() -> sam::Header {
