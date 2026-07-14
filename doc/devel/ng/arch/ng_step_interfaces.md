@@ -229,6 +229,16 @@ in, what comes out, what invariants hold) is the deliverable. Steps 1 and 10–1
 are less about competing algorithms are sketched briefly; the algorithmic hot-spots
 (2, 3, 4, 6, 7, 8, 9, 11) get the real interfaces.
 
+### Step 1 — read filtering
+
+Its "real interface" lives in a dedicated companion, [`read_filtering.md`](read_filtering.md)
+(spec: [`../spec/read_filtering.md`](../spec/read_filtering.md)) — not a swappable-algorithm
+step but a fixed prelude, so it gets its own doc rather than a trait sketch here. In short: a
+`RecordSource` fills one reused record buffer, a nine-filter cascade runs #1–#6 (flag/MAPQ)
+*before* decode and #7–#9 after, and a `ReadFilter` iterator yields the surviving
+`MappedRead`s while carrying a running `ReadFilterCounts`. It reuses the
+[`bam/alignment_input.rs`](../../../../src/bam/alignment_input.rs) predicates and constants.
+
 ### Step 2 — read preparation / realignment
 ```rust
 pub trait ReadPrep {

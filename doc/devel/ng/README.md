@@ -18,7 +18,13 @@ by document kind:
     newtypes and one swappable trait per pipeline step.
   - [`module_layout.md`](arch/module_layout.md) — the `src/ng/` module tree: one
     folder per step (trait + impls + tests together), shared vocabulary, `bench/`.
-- **`impl_plan/`** — step-by-step implementation plans (populated as work starts).
+  - [`read_filtering.md`](arch/read_filtering.md) — step 1's types & interfaces,
+    distilled (the code-facing companion to the spec).
+- **`impl_plan/`** — step-by-step implementation plans (build order, not new design).
+  - [`foundations.md`](impl_plan/foundations.md) — the first ng code: skeleton,
+    `types.rs` seed, and the `RefSeq` accessor (three impls).
+  - [`read_filtering.md`](impl_plan/read_filtering.md) — step 1: the `read/` module,
+    the cascade, the `RecordSource`/`RawRecord` seam, the `ReadFilter` iterator.
 
 This mirrors the repo-wide `doc/devel/{specs,architecture,implementation_plans}`
 convention but scoped to ng, so the growing set of ng docs stays together.

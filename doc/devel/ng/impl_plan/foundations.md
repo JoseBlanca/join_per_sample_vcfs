@@ -146,9 +146,9 @@ buffer is empty; clear when `pos` is past the buffer end. *Source:* ref_seq.md D
 
 ## Out of scope (next plans)
 
-- **Read filtering (step 1)** — once its spec + architecture are finalized; a separate plan.
-  (`RawRefSeq`, which #8 will consume, is fully built here — read filtering only adds its own
-  module on top.)
+- **Read filtering (step 1)** — now planned in [`read_filtering.md`](read_filtering.md) (its
+  spec + architecture are finalized). (`RawRefSeq`, which #8 consumes, is fully built here —
+  read filtering only adds its own module on top, and needs only Milestones A + B, not C.)
 - **`pileup/`** (the non-STR loci+evidence generator — `WindowedRefSeq`'s first real consumer),
   the **locus router** (step 3), and the **research probes** (candidate generation + realignment
   first — `ng_proposal.md` §3).

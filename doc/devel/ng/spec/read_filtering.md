@@ -1,8 +1,11 @@
 # ng step 1 — read filtering (and the ng foundations)
 
 *Status: design spec (2026-07-10; renamed admission → filtering 2026-07-11; pre-decode
-gate folded into the filter via the `RawRecord` seam 2026-07-13). First
-spec under [`ng_proposal.md`](ng_proposal.md); companion to the arch docs
+gate folded into the filter via the `RawRecord` seam, input modelled as a reused-buffer
+`RecordSource` rather than an iterator of records, 2026-07-13). First
+spec under [`ng_proposal.md`](ng_proposal.md); its code-facing companion is
+[`../arch/read_filtering.md`](../arch/read_filtering.md) (this step's types & interfaces,
+distilled), which sits under the shared arch docs
 [`../arch/ng_step_interfaces.md`](../arch/ng_step_interfaces.md) (shared types +
 step traits) and [`../arch/module_layout.md`](../arch/module_layout.md) (the
 `src/ng/` tree). **No code yet** — this settles the design.*
@@ -64,8 +67,8 @@ Its output is simply *the reads that earned their place in the pipeline.*
 ### 2.1 Module structure
 
 Read filtering and preparation are two stages of the same job — turning a decoded
-alignment record into locus evidence — and they share the same input type
-(`MappedRead`) and the same reference accessor.
+alignment record into locus evidence — and they share the same reference accessor; read
+filtering's output (`MappedRead`) is read preparation's input.
 
 ```
 src/ng/read/
@@ -176,9 +179,9 @@ reuses the former and supplies its own driver.
 The one predicate handled specially is `classify_pre_decode`: it takes a noodles
 `RecordBuf` (a not-yet-decoded record) because in production the flag and MAPQ tests run
 *before* decoding to save work. ng keeps that optimisation but **relocates it from the
-reader into read filtering** (§3, §5): the filter consumes *undecoded* records through the
-`RawRecord` seam, applies filters #1–#6 to the record's flag and MAPQ, decodes only the
-survivors, and applies #7–#9 to the resulting `MappedRead`. Where the predicate is already
+reader into read filtering** (§3, §5): the filter reads *undecoded* records into a reused
+buffer (the `RecordSource`/`RawRecord` seam), applies filters #1–#6 to the record's flag and
+MAPQ, decodes only the survivors, and applies #7–#9 to the resulting `MappedRead`. Where the predicate is already
 record-shaped it is reused directly; where a test reads the decoded read it is re-expressed
 over `MappedRead.flag`/`MappedRead.mapq` — the same `FLAG_*` constants and `DEFAULT_MIN_MAPQ`
 throughout. Same logic, same constants; the decode boundary just falls mid-cascade (§3).
@@ -403,8 +406,11 @@ impl<S: RecordSource, R: RawRefSeq> Iterator for ReadFilter<S, R> {
     }
 }
 
-impl<S: RecordSource, R> ReadFilter<S, R> {
-    pub fn new(source: S, reference: R, config: ReadFilterConfig) -> Self { /* buf = Default */ }
+impl<S: RecordSource, R: RawRefSeq> ReadFilter<S, R> {
+    /// Fail-fast setup: validates that every contig in the source's header resolves in the
+    /// reference, then seeds `buf` to `Default`. A header/reference mismatch is a setup
+    /// error, surfaced here rather than mid-stream.
+    pub fn new(source: S, reference: R, config: ReadFilterConfig) -> Result<Self, RefSeqError> { /* … */ }
     /// The running tally — current counts, final once iteration is exhausted.
     pub fn counts(&self) -> &ReadFilterCounts { &self.counts }
 }
@@ -413,7 +419,7 @@ impl<S: RecordSource, R> ReadFilter<S, R> {
 Usage — iterate by `&mut` so the filter (and its counts) outlives the loop:
 
 ```rust
-let mut filter = ReadFilter::new(source, reference, config);   // source: RecordSource
+let mut filter = ReadFilter::new(source, reference, config)?;  // validates header vs reference
 for read in &mut filter {                                      // yields MappedRead — survivors, already decoded
     // … feed the locus stream
 }
@@ -450,9 +456,10 @@ copy-or-drain.)
 `reference` is consulted only by filter #8, and only when `max_read_mismatch_fraction` is
 `Some` (§3). A `RefSeqError` from #8 (`fetch_raw_into` returns `Result`, ref_seq.md §1) — as
 is an `Err` from `RecordSource::read_next` — is **fatal to the run, not a per-read drop**:
-the reads' contigs are validated against the reference before iteration, so an in-loop fetch
-or read error signals corrupt input or a broken invariant and aborts the pass rather than
-being swallowed. That is what keeps the surface `Item = MappedRead` — no per-item `Result`,
+`ReadFilter::new` validates up front — returning `Result` — that every contig in the
+source's header resolves in the reference, so any in-loop fetch or read error signals
+genuinely corrupt input (e.g. a truncated file) or a broken invariant, and aborts the pass
+rather than being swallowed. That is what keeps the surface `Item = MappedRead` — no per-item `Result`,
 no silent error bucket in `ReadFilterCounts`. (The `R: RawRefSeq` bound holds even when #8 is
 disabled at runtime; a caller wanting *no* reference at all would be a future `Option<R>`
 refinement — not needed now, since every real run has a reference anyway.)
@@ -495,6 +502,16 @@ pair-HMM read preparation. Neither is a per-read filtering decision.
   sequence). They enter `ReadFilterConfig` as real knobs only when they enter the
   pipeline — not as dormant disabled fields now (§2.4).
 
+- **Output-`MappedRead` allocation reuse → locus-stream memory design, not step 1.** The
+  filter reuses one input `RecordBuf` (§5), but `decode` still builds a fresh owned
+  `MappedRead` per pre-decode survivor — the output's lifetime belongs to the *consumer*
+  (the locus window holds each read until the walk passes it), so the filter cannot reuse a
+  single output slot. Reusing those allocations needs the consumer to participate — a
+  free-list the locus stream returns spent reads to, or an arena reset per locus window —
+  which is a pipeline-wide ownership decision, not a per-read filtering one. It also buys
+  lower allocator *churn*, not a lower peak (peak is bounded by window occupancy, freed as
+  the walk advances). Deferred to the `pileup/` / locus-stream design, measure-first.
+
 This is consistent with `ng_proposal.md` §1: the step map catalogues overlap
 reconciliation under step 1 (as all five surveyed callers do), but the *locus-stream*
 subsection there places the per-base evidence work in `pileup/` — read filtering is the
@@ -516,9 +533,10 @@ whole-read prelude, not the per-base gatherer.
   cheaply (§2.6: the fixture-driven pass asserts the exact `ReadFilterCounts`, and the
   cascade is unit-tested). Composability with step 2 (`prepare_read(&self, read: &MappedRead, …)`)
   stays adapter-free (§4).
-- **Pre-decode gating — resolved: it is in the design (§3, §5).** Read filtering consumes
-  undecoded records through the `RawRecord` seam and decodes only the survivors of the
-  flag/MAPQ cascade (#1–#6), so a read dropped on a flag or low MAPQ never pays decode cost
+- **Pre-decode gating — resolved: it is in the design (§3, §5).** Read filtering reads
+  undecoded records into a reused buffer (the `RecordSource`/`RawRecord` seam) and decodes
+  only the survivors of the flag/MAPQ cascade (#1–#6), so a read dropped on a flag or low
+  MAPQ never pays decode cost
   — production's `classify_pre_decode` optimisation, relocated into the filter so the whole
   policy and tally stay in one place. Because it is result-preserving (same drops, same
   attribution, byte-identical output) it carries no correctness risk; its *magnitude* is
@@ -529,9 +547,17 @@ whole-read prelude, not the per-base gatherer.
   `Item = MappedRead`: contigs are validated against the reference before iteration, and an
   in-loop `RefSeqError` aborts the run (corrupt input or broken invariant) rather than being
   swallowed into a per-read drop or poisoning every `next()` with a `Result`.
-- **Where `RawRecord` is implemented — OPEN.** The trait is ng's (§5), but its production
-  impl can either (a) be an **ng-owned adapter wrapping the noodles record** — keeping the
-  dependency ng → existing code, so production never learns about ng — or (b) be added to
-  the existing reader, coupling production to an ng trait. Leaning (a): it matches this
-  step's "reuse the predicates, supply our own driver" ethos (§2.5). Confirm before code.
+- **Input shape — resolved: a record source, not an iterator of records (§5).** The filter
+  takes a `RecordSource` that fills one reused `RecordBuf`, rather than an
+  `Iterator<Item = RawRecord>` — a std `Iterator`'s owned `Item` cannot borrow a reused
+  buffer (the lending-iterator problem), so it would force a fresh record per read. The
+  output stays a clean `Iterator<Item = MappedRead>`. Trade recorded in §5: because a kept
+  `MappedRead` outlives the buffer, `decode` copies the bytes it keeps (per-kept-read),
+  while reads dropped pre-decode cost no allocation and no copy.
+- **Where `RecordSource`/`RawRecord` are implemented — resolved: (a) an ng-owned adapter.**
+  The traits are ng's (§5); their production impl is an **ng-owned adapter wrapping the
+  noodles reader/record**, keeping the dependency ng → existing code so production never
+  learns about ng. Rejected (b) — adding the impl to the existing reader — which would
+  couple production to an ng trait for no gain; the adapter matches this step's "reuse the
+  predicates, supply our own driver" ethos (§2.5).
 ```
