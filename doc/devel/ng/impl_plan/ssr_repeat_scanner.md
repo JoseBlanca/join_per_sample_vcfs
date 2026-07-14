@@ -89,12 +89,12 @@ spec §6–§7 and stands ready, unexecuted. The scanner is a standalone sequenc
 
 ### Milestone A — module scaffold + types (types, no logic)
 
-**A1. Scaffold `src/ng/tandem_repeat.rs`.**  ☐
+**A1. Scaffold `src/ng/tandem_repeat.rs`.**  ✅
 The file with its `#[cfg(test)]` block; wire `pub(crate) mod tandem_repeat;` into `src/ng/mod.rs`.
 One file, no folder — one algorithm, no bake-off; a shared primitive in the ng tree, not a
 pipeline step. *Source:* arch §Module home.
 
-**A2. Input types.**  ☐
+**A2. Input types.**  ✅
 `PeriodRange` (private `u8` fields, `new(min, max) -> Result<Self, PeriodRangeError>` rejecting
 `min == 0` and `min > max`, `min()`/`max()` accessors); `PeriodRangeError` (`#[non_exhaustive]`
 `thiserror`, `ZeroMin` / `MinExceedsMax`); `ScanParams` + `SegmentOptions` (plain config, visible
@@ -102,7 +102,7 @@ pipeline step. *Source:* arch §Module home.
 `PeriodRange::new` accepts `(1,6)`/`(6,6)`, rejects `(0,_)` and `(3,2)`; `Default`s match the
 named values. *Source:* spec §5, arch §1.1.
 
-**A3. Output types.**  ☐
+**A3. Output types.**  ✅
 `RepeatInterval` (`start`/`end` `u32`, `period` `u8`, `score` `i32`); `RegionSpan { start, end }`;
 `RepeatRegion { span, intervals }`; the three-kind `Region` enum; `ScanError`
 (`#[non_exhaustive]`, `Fetch { source: ChromRefFetchError }`). No logic. *Source:* spec §4, §3.6,
