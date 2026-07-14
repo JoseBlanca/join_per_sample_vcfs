@@ -425,14 +425,14 @@ mod tests {
         let q_seg = site_qual(
             &make_data_ll(k, &seg),
             &[0.5, 0.5],
-            &vec![0.82; 8],
+            &[0.82; 8],
             k,
             SFS_THETA,
         );
         let q_stut = site_qual(
             &make_data_ll(k, &stut),
             &[0.9, 0.1],
-            &vec![0.82; 8],
+            &[0.82; 8],
             k,
             SFS_THETA,
         );
@@ -479,8 +479,8 @@ mod tests {
             })
             .collect();
         let data_ll = make_data_ll(k, &per_sample);
-        let a = site_qual(&data_ll, &[0.5, 0.5], &vec![0.5; 6], k, SFS_THETA);
-        let b = site_qual(&data_ll, &[0.5, 0.5], &vec![0.5; 6], k, SFS_THETA);
+        let a = site_qual(&data_ll, &[0.5, 0.5], &[0.5; 6], k, SFS_THETA);
+        let b = site_qual(&data_ll, &[0.5, 0.5], &[0.5; 6], k, SFS_THETA);
         assert_eq!(a.to_bits(), b.to_bits());
     }
 }

@@ -914,8 +914,8 @@ mod tests {
             min_read_length: Some(Bp(30)),
             ..post_config(None) // #8 already disabled by post_config(None)
         };
-        let at = mapped(&vec![b'A'; 30], &vec![40; 30], vec![CigarOp::Match(30)]);
-        let below = mapped(&vec![b'A'; 29], &vec![40; 29], vec![CigarOp::Match(29)]);
+        let at = mapped(&[b'A'; 30], &[40; 30], vec![CigarOp::Match(30)]);
+        let below = mapped(&[b'A'; 29], &[40; 29], vec![CigarOp::Match(29)]);
         assert_eq!(post(&at, &reference, &cfg), FilterVerdict::Keep);
         assert_eq!(
             post(&below, &reference, &cfg),
@@ -1165,7 +1165,7 @@ mod tests {
     /// A 30 bp all-`A` mapped read carrying the given flag/MAPQ — long enough to
     /// clear the default `min_read_length`, and matching a poly-A reference.
     fn fake(flag: u16, mapq: u8) -> FakeRecord {
-        let mut read = mapped(&vec![b'A'; 30], &vec![30u8; 30], vec![CigarOp::Match(30)]);
+        let mut read = mapped(&[b'A'; 30], &[30u8; 30], vec![CigarOp::Match(30)]);
         read.flag = flag;
         read.mapq = mapq;
         FakeRecord {
@@ -1719,11 +1719,11 @@ mod tests {
             ReadFilter::new(source, poly_a_ref(100), ReadFilterConfig::default()).unwrap();
         // The read error surfaces as the yielded item …
         assert!(matches!(
-            (&mut filter).next(),
+            filter.next(),
             Some(Err(ReadFilterError::Source(_)))
         ));
         // … and the iterator is fused (stays stopped) afterward.
-        assert!((&mut filter).next().is_none());
+        assert!(filter.next().is_none());
     }
 
     #[test]
@@ -1735,10 +1735,10 @@ mod tests {
         let mut filter =
             ReadFilter::new(source, poly_a_ref(100), ReadFilterConfig::default()).unwrap();
         assert!(matches!(
-            (&mut filter).next(),
+            filter.next(),
             Some(Err(ReadFilterError::Decode(_)))
         ));
-        assert!((&mut filter).next().is_none());
+        assert!(filter.next().is_none());
     }
 
     #[test]
@@ -1746,7 +1746,7 @@ mod tests {
         // A read whose #8 reference window runs past the (short) contig end. The
         // contig resolves in `new` (a zero-length probe), so this fails only
         // in-loop → fatal Reference error.
-        let read = mapped(&vec![b'A'; 50], &vec![30u8; 50], vec![CigarOp::Match(50)]);
+        let read = mapped(&[b'A'; 50], &[30u8; 50], vec![CigarOp::Match(50)]);
         let source = FakeSource::new(
             vec![FakeRecord {
                 read,
@@ -1758,12 +1758,12 @@ mod tests {
         let mut filter =
             ReadFilter::new(source, poly_a_ref(10), ReadFilterConfig::default()).unwrap();
         assert!(matches!(
-            (&mut filter).next(),
+            filter.next(),
             Some(Err(ReadFilterError::Reference(
                 RefSeqError::OutOfBounds { .. }
             )))
         ));
-        assert!((&mut filter).next().is_none());
+        assert!(filter.next().is_none());
     }
 
     #[test]
@@ -1786,7 +1786,7 @@ mod tests {
         let source = FakeSource::new(Vec::new(), one_contig_header());
         let mut filter =
             ReadFilter::new(source, poly_a_ref(30), ReadFilterConfig::default()).unwrap();
-        assert!((&mut filter).next().is_none());
+        assert!(filter.next().is_none());
         assert_eq!(*filter.counts(), ReadFilterCounts::default());
     }
 
@@ -1803,10 +1803,10 @@ mod tests {
         );
         let mut filter =
             ReadFilter::new(source, poly_a_ref(30), ReadFilterConfig::default()).unwrap();
-        assert!(matches!((&mut filter).next(), Some(Ok(_))));
+        assert!(matches!(filter.next(), Some(Ok(_))));
         assert_eq!(filter.counts().duplicate, 1);
         assert_eq!(filter.counts().kept, 1);
-        assert!((&mut filter).next().is_none());
+        assert!(filter.next().is_none());
         assert_eq!(filter.counts().kept, 1);
     }
 
