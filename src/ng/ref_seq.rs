@@ -4,14 +4,14 @@
 //!
 //! [`RefSeq`] is the **universal** surface: canonical `{A,C,G,T,N}` fetch, which every
 //! implementation provides. Raw bytes are the [`RawRefSeq`] sub-trait; buffer eviction is
-//! an inherent method on the windowed impl (a later milestone). Both fetch surfaces write
+//! an inherent method on the windowed impl ([`WindowedRefSeq`]). Both fetch surfaces write
 //! into a caller-owned buffer (`&self`, alloc-free when the buffer is reused) rather than
 //! returning a borrowed slice — that keeps every impl `&self`-shareable and avoids the
 //! lazy-load/borrow-escape problem the file-backed impls would otherwise hit.
 //!
-//! This file holds the traits, the error type, the synthetic [`InMemoryRefSeq`], and the
-//! FASTA-backed [`ResidentRefSeq`]; the streaming `WindowedRefSeq` lands in a later
-//! milestone. Canonicalisation reuses the production
+//! This file holds the traits, the error type, and all three implementations: the
+//! synthetic [`InMemoryRefSeq`], the whole-contig FASTA-backed [`ResidentRefSeq`], and the
+//! streaming, caller-evictable [`WindowedRefSeq`]. Canonicalisation reuses the production
 //! [`crate::fasta::fetcher::canonicalise`], so canonical bytes are byte-identical to the
 //! production fetchers by construction.
 //!
@@ -19,12 +19,14 @@
 //! `Repository` type is named); `crate::fasta` is our own module. Keeping the two spelled
 //! differently avoids the "same token, two crates" ambiguity.
 
-use crate::fasta::ContigList;
 use crate::fasta::fetcher::canonicalise;
+use crate::fasta::{ChromRefFetchError, ContigList, ManualEvictChromRefFetcher};
 use crate::ng::types::ContigId;
 use noodles_fasta::Repository;
+use std::cell::RefCell;
 use std::io;
 use std::ops::Range;
+use std::path::PathBuf;
 
 /// Errors from a reference fetch. `#[non_exhaustive]` so matchers must accept future
 /// variants; the shape mirrors the production `fasta::fetcher::ChromRefFetchError`.
@@ -310,15 +312,110 @@ impl RawRefSeq for ResidentRefSeq {
     }
 }
 
+/// Map the single-contig fetcher's error into the ng error, tagging the contig.
+fn map_chrom_error(contig: ContigId, err: ChromRefFetchError) -> RefSeqError {
+    match err {
+        ChromRefFetchError::InvalidStart => RefSeqError::InvalidStart,
+        ChromRefFetchError::OutOfBounds {
+            chrom_length,
+            start,
+            end,
+            ..
+        } => RefSeqError::OutOfBounds {
+            contig,
+            contig_length: chrom_length,
+            start,
+            end,
+        },
+        ChromRefFetchError::Io { source, .. } => RefSeqError::Io { contig, source },
+        // `OutOfPattern` (streaming-only) and any future variant: the manual-evict fetcher
+        // never produces them, so fold defensively into Io.
+        other => RefSeqError::Io {
+            contig,
+            source: io::Error::other(other.to_string()),
+        },
+    }
+}
+
+/// A FASTA-backed reference that keeps only a **sub-range window** of the current contig
+/// resident, extending it on demand in either direction and shrinking it on the caller's
+/// command via [`Self::evict_before`] — the memory-bounded, any-access-within-the-window
+/// alternative to [`ResidentRefSeq`]'s whole-contig residency. Canonical-only (its buffer
+/// holds `{A,C,G,T,N}` bytes), so it does **not** implement [`RawRefSeq`]. It wraps the
+/// production `ManualEvictChromRefFetcher` (one per resident contig, rebuilt on a contig
+/// change), so its buffer / canonicalisation / eviction logic — and its bytes — are
+/// identical to the production streaming path. A `RefCell` keeps `fetch_into(&self)` while
+/// the inner fetcher mutates its buffer; `evict_before` is the inherent `&mut self`
+/// capability. `Send` but not `Sync` (per-worker ownership, like the production fetchers).
+pub struct WindowedRefSeq {
+    fasta_path: PathBuf,
+    contigs: ContigList,
+    current: RefCell<Option<(ContigId, ManualEvictChromRefFetcher)>>,
+}
+
+impl WindowedRefSeq {
+    /// Build over a FASTA path (its sibling `<path>.fai` is used) and the contig table. No
+    /// contig is resident until the first fetch.
+    pub fn new(fasta_path: PathBuf, contigs: ContigList) -> Self {
+        Self {
+            fasta_path,
+            contigs,
+            current: RefCell::new(None),
+        }
+    }
+
+    /// Release buffered bytes before `pos` on the currently-resident contig — the
+    /// caller-driven memory bound (production's `ManualEvictChromRefFetcher::evict_before`:
+    /// drain `[.., pos)`, keep capacity). No-op when no contig is resident. Correctness is
+    /// preserved: a later fetch of an evicted position simply re-reads it.
+    pub fn evict_before(&mut self, pos: u32) {
+        if let Some((_, fetcher)) = self.current.get_mut() {
+            fetcher.evict_before(pos);
+        }
+    }
+}
+
+impl RefSeq for WindowedRefSeq {
+    fn fetch_into(
+        &self,
+        contig: ContigId,
+        start_1based: u32,
+        length: u32,
+        dst: &mut Vec<u8>,
+    ) -> Result<(), RefSeqError> {
+        let entry = self
+            .contigs
+            .entries
+            .get(contig.get() as usize)
+            .ok_or(RefSeqError::UnknownContig(contig))?;
+        let mut current = self.current.borrow_mut();
+        let needs_rebuild = !matches!(&*current, Some((resident, _)) if *resident == contig);
+        if needs_rebuild {
+            let fetcher = ManualEvictChromRefFetcher::for_contig(&self.fasta_path, &entry.name)
+                .map_err(|e| map_chrom_error(contig, e))?;
+            *current = Some((contig, fetcher));
+        }
+        let (_, fetcher) = current.as_mut().expect("current set above");
+        // The fetcher returns canonical {A,C,G,T,N} bytes (it reuses `canonicalise` on
+        // refill), so they can be copied out verbatim — byte-identical to ResidentRefSeq.
+        let bytes = fetcher
+            .fetch(start_1based, length)
+            .map_err(|e| map_chrom_error(contig, e))?;
+        dst.clear();
+        dst.extend_from_slice(bytes);
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fasta::ContigEntry;
-    use crate::fasta::MultiChromRefFetcher;
     use crate::fasta::fetcher::RepositoryRefFetcher;
+    use crate::fasta::{
+        ChromRefFetcher, ContigEntry, MultiChromRefFetcher, StreamingChromRefFetcher,
+    };
     use crate::pileup::per_sample::read_processor::RawContigRefCache;
     use std::io::Write;
-    use std::path::PathBuf;
 
     // ----- InMemoryRefSeq -------------------------------------------------
 
@@ -666,5 +763,104 @@ mod tests {
         resident.clear();
         let after = resident.fetch(ContigId(0), 1, 8).unwrap();
         assert_eq!(before, after);
+    }
+
+    // ----- WindowedRefSeq -------------------------------------------------
+
+    fn windowed() -> (tempfile::TempDir, WindowedRefSeq) {
+        let (dir, path, contigs) = build_fasta(FASTA_CONTIGS);
+        (dir, WindowedRefSeq::new(path, contigs))
+    }
+
+    #[test]
+    fn windowed_canonical_matches_resident_across_all_windows() {
+        let (_dir, path, contigs) = build_fasta(FASTA_CONTIGS);
+        let resident = ResidentRefSeq::new(repository_for(&path), contigs.clone());
+        let windowed = WindowedRefSeq::new(path, contigs);
+        for (chrom_id, (_name, bases)) in FASTA_CONTIGS.iter().enumerate() {
+            let id = ContigId(chrom_id as u32);
+            let len = bases.len() as u32;
+            for start in 1..=len {
+                for length in 1..=(len - start + 1) {
+                    assert_eq!(
+                        windowed.fetch(id, start, length).unwrap(),
+                        resident.fetch(id, start, length).unwrap(),
+                        "chrom {chrom_id} start {start} len {length}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn windowed_matches_production_streaming_on_a_forward_walk() {
+        let (_dir, path, contigs) = build_fasta(FASTA_CONTIGS);
+        let windowed = WindowedRefSeq::new(path.clone(), contigs);
+        let streaming = StreamingChromRefFetcher::for_contig(&path, "chr1").unwrap();
+        // chr1 = ACGTACGT (len 8); walk 2-base windows forward (monotonic → streaming-legal).
+        for start in 1..=7u32 {
+            let ours = windowed.fetch(ContigId(1), start, 2).unwrap();
+            let prod = ChromRefFetcher::fetch(&streaming, start, 2).unwrap();
+            assert_eq!(ours, prod, "forward walk start {start}");
+        }
+    }
+
+    #[test]
+    fn windowed_supports_within_window_random_and_backward_access() {
+        let (_dir, windowed) = windowed();
+        // chr1 = ACGTACGT (len 8). Fetch forward, then jump backward — the manual-evict
+        // buffer allows any access within the resident range (unlike strict streaming).
+        assert_eq!(windowed.fetch(ContigId(1), 5, 4).unwrap(), b"ACGT");
+        assert_eq!(windowed.fetch(ContigId(1), 1, 3).unwrap(), b"ACG"); // backward jump
+        assert_eq!(windowed.fetch(ContigId(1), 3, 4).unwrap(), b"GTAC"); // overlaps both
+    }
+
+    #[test]
+    fn windowed_eviction_preserves_correctness() {
+        let (_dir, mut windowed) = windowed();
+        let before = windowed.fetch(ContigId(1), 1, 8).unwrap();
+        windowed.evict_before(5); // drop resident bytes before position 5
+        // Re-fetching an evicted position simply re-reads it; the bytes are unchanged.
+        assert_eq!(windowed.fetch(ContigId(1), 1, 8).unwrap(), before);
+        // evict on a fresh contig / with nothing resident is a harmless no-op.
+        assert_eq!(windowed.fetch(ContigId(0), 1, 8).unwrap(), b"ACGTNNNN");
+    }
+
+    #[test]
+    fn windowed_rebuilds_on_contig_transition() {
+        let (_dir, windowed) = windowed();
+        assert_eq!(windowed.fetch(ContigId(0), 1, 8).unwrap(), b"ACGTNNNN");
+        assert_eq!(windowed.fetch(ContigId(1), 1, 4).unwrap(), b"ACGT");
+        assert_eq!(windowed.fetch(ContigId(0), 5, 4).unwrap(), b"NNNN"); // back to chr0
+    }
+
+    #[test]
+    fn windowed_error_cases() {
+        let (_dir, path, mut contigs) = build_fasta(FASTA_CONTIGS);
+        contigs.entries.push(ContigEntry {
+            name: "chrGhost".to_string(),
+            length: 4,
+            md5: None,
+        });
+        let windowed = WindowedRefSeq::new(path, contigs);
+        assert!(matches!(
+            windowed.fetch(ContigId(0), 0, 1),
+            Err(RefSeqError::InvalidStart)
+        ));
+        assert!(matches!(
+            windowed.fetch(ContigId(9), 1, 1),
+            Err(RefSeqError::UnknownContig(ContigId(9)))
+        ));
+        assert!(matches!(
+            windowed.fetch(ContigId(2), 1, 1),
+            Err(RefSeqError::Io {
+                contig: ContigId(2),
+                ..
+            })
+        ));
+        assert!(matches!(
+            windowed.fetch(ContigId(1), 1, 99),
+            Err(RefSeqError::OutOfBounds { .. })
+        ));
     }
 }
