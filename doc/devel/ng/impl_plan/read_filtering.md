@@ -66,19 +66,19 @@ traits with a test fake **and** the ng-owned noodles adapter; the `ReadFilter` i
 
 ### Milestone A — module scaffold + vocabulary + local types (types, no logic)
 
-**A1. Scaffold the `read/` module.**  ☐
+**A1. Scaffold the `read/` module.**  ✅
 `src/ng/read/mod.rs` (declares `filtering`; the `ReadPrep` trait lands later, step 2) and an
 empty `src/ng/read/filtering.rs` with its `#[cfg(test)]` block; wire `pub mod read;` into
 `ng/mod.rs`. One file, no folder — no bake-off (module_layout 1a). *Source:* arch §Module home.
 
-**A2. Extend `types.rs` with the scalar newtypes.**  ☐
+**A2. Extend `types.rs` with the scalar newtypes.**  ✅
 `MapQual`, `BaseQual`, `Bp` (unconstrained — `pub` field, ergonomic derives, `.get()`) and
 `MismatchFraction` (constrained — private field, `try_new` in `[0,1]`); add the
 `MismatchFraction` variant to `DomainError`. Names match ng_step_interfaces §1. Unit test:
 `MismatchFraction::try_new` accepts boundary values, rejects out-of-range. *Source:* spec
 §2.2/§2.3, arch §2.1.
 
-**A3. The step-1-local types.**  ☐
+**A3. The step-1-local types.**  ✅
 In `filtering.rs`: `ReadFilterConfig` (+ `Default` = the production policy, its thresholds the
 reused `DEFAULT_*` constants), `FilterVerdict`, `DropReason` (variants 1:1 with the counts
 fields), `ReadFilterCounts`. No logic. Test: `Default` reproduces the production defaults.

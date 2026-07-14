@@ -19,6 +19,8 @@ Skills and agents are instructed to leave it untouched.
 > **Current focus.** _Maintained by skills (last-completed) and the human
 > project manager (next-task)._
 >
+> - **Last completed task (2026-07-14):** **ng step 1 read filtering — Milestone A (types + scaffold), plan-driven (implement → review → apply → commit)**
+>   Landed the type foundations for the ng read-filtering step: scaffolded `src/ng/read/`, seeded `src/ng/types.rs` with the scalar newtypes read filtering touches (`MapQual`/`BaseQual`/`Bp` unconstrained + `.get()`; `MismatchFraction` constrained via checked `try_new`) and the ng-wide `DomainError`, and defined the step-1-local `ReadFilterConfig`/`FilterVerdict`/`DropReason`/`ReadFilterCounts` (no logic). `ReadFilterConfig::default()` reproduces the production `AlignmentMergedReaderConfig` filtering subset from the reused `DEFAULT_*` constants — the port anchor. 8-category review = 0 Blocker/0 Major/4 Minor+Nits; applied 3 (+1 Nit), deferred the `DropReason`↔counts enforcement to Milestone B, disputed 2 (spec-mandated flat config + `.get()` convention). Foundations-C `WindowedRefSeq` committed first (`8ab92c7`) to give a clean read-filtering diff. Reports: [impl](doc/devel/reports/implementations/ng_read_filtering_a_2026-07-14.md), [review](doc/devel/reports/reviews/ng_read_filtering_a_2026-07-14.md), [fixes](doc/devel/reports/reviews/fixes_applied_2026-07-14.md). **Next:** Milestone B — the two-phase `verdict_*` cascade (see the ng step-1 block + the #8/#9 ordering watch-note).
 > - **Last completed task (2026-07-09):** **SSR emission null-toggles — 9-category multi-agent code review + applied fixes (branch `ssr-bic-emission`)**
 >   Reviewed the four env-gated experimental toggles on the SSR `ssr-call` emission path (`PVC_SSR_KEEP_FP_CONTROL`, `PVC_SSR_BIC_NULL_REFIT`, `PVC_SSR_NULL_FROM_HOMS`, `PVC_SSR_NULL_GENOTYPER`). **Approve-with-changes:** 0 Blocker, 12 Major, 8 Minor + Nits (review [ssr_emission_null_toggles_2026-07-09.md](doc/devel/reports/reviews/ssr_emission_null_toggles_2026-07-09.md); audit trail `tmp/review_2026-07-09_ssr-emission-null-toggles/`). All four intent claims (BIC-only refit, emit-invariant `keep_fp_control`, GT-untouched `null_from_homs`, off-path byte-identity) verified by code-tracing. Then applied the fixes ([fixes_applied_2026-07-09.md](doc/devel/reports/reviews/fixes_applied_2026-07-09.md)): per two owner decisions, **deleted** the two empirically-dead toggles (idea-A `bic_null_refit` + genotyper-B `null_in_genotyper` — superseding 7 findings) and **corrected** `null_hom_frac` 0.8→0.75 to match the silver scorer (named consts + provenance). Added **8 regression tests** (6 for `attribute_clean_homs`, `null_from_homs` GT-invariance, `keep_fp_control` emit-invariance for BIC+freebayes), **fail-loud validation** of the numeric env knobs (`InvalidNullKnob`), and `..dev_default()` silent-default caveat comments. Surviving surface = emission-only `null_from_homs` (+ two knobs) + `keep_fp_control`. Validation: in-scope fmt/clippy clean, `ssr::cohort` 250→**258 tests** pass, default VCF byte-identical, `null_from_homs` thread-deterministic (T1==T8). **Next:** merge to `main` (default byte-identical → no `.psp` regen); re-score the emission-model comparison if the exact `null_from_homs` figures are quoted (0.75 shifts them slightly).
 > - **Last completed task (2026-07-07):** **Shared genotype-EM — Phase 3.5: SSR marginalized-prior benchmark (branch `em-convergence-criterion`, merged to main)**
@@ -1092,6 +1094,36 @@ type model are settled; built in data-flow order (types → Stage 0 → Stage 1/
   - **Mi10** — promote the P2.0 diagnostic harness to an example / add a removal condition.
   - **Mi11** — shared `#[cfg(test)]` fixtures module; §8 `run_is_byte_identical_across_threads_with_a_purity_contrast`.
   - Tracked in `doc/devel/TODO.txt`: same-length paralog FP guard; D1 BIC confident-genotype gate (the low-depth/high-`F_IS` het-undercall tail); §5.2 threshold sweep; Phase-2 refit from the broad caller genotypes (the P2.0 population, where the effect is clean).
+
+---
+
+## ng — next-generation step-decomposed caller (experimental)
+
+A single-phase, in-memory research lab that decomposes SNP/indel/STR calling
+into swappable steps; winning steps port back into the production two-phase
+engine. Design: [doc/devel/ng/](doc/devel/ng/) (start with
+[spec/ng_proposal.md](doc/devel/ng/spec/ng_proposal.md)).
+
+#### Foundations — `RefSeq` reference accessor + shared vocabulary
+- **Status:** shipped (Milestones A–C on `main`)
+- **Plan:** [foundations.md](doc/devel/ng/impl_plan/foundations.md); **Spec:** [ref_seq.md](doc/devel/ng/spec/ref_seq.md)
+- **Code:** [src/ng/ref_seq.rs](src/ng/ref_seq.rs) (`RefSeq`/`RawRefSeq` traits; `InMemoryRefSeq`, `ResidentRefSeq`, `WindowedRefSeq`), [src/ng/types.rs](src/ng/types.rs) (`ContigId`), [src/ng/mod.rs](src/ng/mod.rs).
+- **Commits:** `6474d19` (A — traits + InMemoryRefSeq), `6da4030` (B — ResidentRefSeq + `fetch_raw_into`), `8ab92c7` (C — WindowedRefSeq streaming/evictable).
+- **Open:** none.
+
+#### Step 1 — read filtering
+- **Status:** implemented (Milestone A of 4; A–D plan). No review-of-record yet beyond the per-milestone loop.
+- **Plan:** [read_filtering.md](doc/devel/ng/impl_plan/read_filtering.md); **Spec:** [spec](doc/devel/ng/spec/read_filtering.md); **Arch:** [arch](doc/devel/ng/arch/read_filtering.md).
+- **Code:** [src/ng/read/filtering.rs](src/ng/read/filtering.rs) (step-1-local types), [src/ng/read/mod.rs](src/ng/read/mod.rs), [src/ng/types.rs](src/ng/types.rs) (scalar newtypes `MapQual`/`BaseQual`/`Bp`/`MismatchFraction` + `DomainError`).
+- **Impl report:** [ng_read_filtering_a_2026-07-14.md](doc/devel/reports/implementations/ng_read_filtering_a_2026-07-14.md)
+- **Latest review:** [ng_read_filtering_a_2026-07-14.md](doc/devel/reports/reviews/ng_read_filtering_a_2026-07-14.md) — Approve-with-changes (0 Blocker, 0 Major, 4 Minor + Nits).
+- **Latest fixes-applied:** [fixes_applied_2026-07-14.md](doc/devel/reports/reviews/fixes_applied_2026-07-14.md) — 3 Applied + 1 Nit Applied, 1 Deferred (Mi4), 2 Disputed.
+- **Milestone A done (types + scaffold):** `read/` module scaffold; `types.rs` scalar newtypes; `ReadFilterConfig`/`FilterVerdict`/`DropReason`/`ReadFilterCounts` (no logic). `Default` reproduces the production `AlignmentMergedReaderConfig` filtering subset (the port anchor).
+- **Open:**
+  - **Milestone B** — `verdict_pre_decode` (#1–#6) + `verdict_post_decode` (#7–#9), the two-phase cascade, unit-tested against `InMemoryRefSeq`. **Carry Mi4:** enforce the `DropReason`↔`ReadFilterCounts` 1:1 mapping with an exhaustive `match` here.
+  - **Milestone C** — `RawRecord`/`RecordSource` traits + test fake + ng-owned noodles adapter.
+  - **Milestone D** — `ReadFilter` iterator + `new` + `counts` + fixture drop-parity test (the port anchor vs the production filters).
+  - **Watch (surfaces at B/D):** production applies the post-decode filters in the order bad-CIGAR (G2) → left-align (F3) → mismatch (F1), i.e. #9 before #8 and #8 on the *left-aligned* CIGAR; the ng cascade orders #8 before #9 on the *original* CIGAR (left-alignment is deferred to `pileup/`, spec §6). Keep/drop is order-independent, but per-bucket **attribution** and the exact #8 outcome could differ — confirm against the drop-parity fixture in D and escalate if parity breaks.
 
 ---
 
