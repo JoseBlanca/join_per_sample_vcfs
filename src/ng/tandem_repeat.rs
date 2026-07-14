@@ -21,17 +21,17 @@
 //! period-shifted copy; grow runs of matches) and our own code — **not** from the
 //! AGPL-v3 `TRF-mod` source, which was not read.
 //!
-//! Build status (incremental, per the impl plan): **Milestones A–B done** — the type
-//! vocabulary and the `find_tandem_repeats` interval finder (lag-`p` scoring + a
-//! Ruzzo–Tompa maximal-scoring-segment pass). The `RegionScanner` region seam
-//! (Milestone C) lands as a later increment.
+//! Build status (incremental, per the impl plan): **Milestones A–C done** — the type
+//! vocabulary, the `find_tandem_repeats` interval finder (lag-`p` scoring + a Ruzzo–Tompa
+//! maximal-scoring-segment pass), and the `RegionScanner` region seam (coverage-merge
+//! tiling, resident via `over_slice` and windowed-streaming via `stream`).
 //!
 //! Visibility note: types are `pub` (matching the sibling ng modules, e.g. `types.rs`),
 //! not the arch doc's illustrative `pub(crate)` — the ng convention exposes its module
 //! vocabulary as reachable API, which also lets Milestone-A types be defined ahead of
 //! their Milestone-B/C consumers without tripping `dead_code`.
 
-use crate::fasta::ChromRefFetchError;
+use crate::fasta::{ChromRefFetchError, ChromRefFetcher};
 
 // ---------------------------------------------------------------------
 // Inputs — the scope and scoring knobs
@@ -293,12 +293,11 @@ struct RtSeg {
 /// extended or trimmed without lowering its score; substitutions and short interruptions
 /// stay inside one segment as long as the surrounding score outweighs them (spec §3.4).
 ///
-/// Runs online: when a new positive element finds **no** stacked segment with a smaller
-/// `l` (Ruzzo–Tompa "rule 2"), every stacked segment is provably unabsorbable by any
-/// future element — a later absorption chain hits the new element's `l` floor and stops —
-/// so the stack is flushed and reset. On the sparse-positive signal this scanner produces
-/// the working stack therefore stays small (≈ open segments, not O(n)); the emitted set is
-/// identical to offline Ruzzo–Tompa (pinned by a brute-force property test).
+/// This is the textbook offline pass: a working stack of open segments, drained at the end.
+/// Its correctness is pinned by a brute-force property test (`ruzzo_tompa_matches_brute_force`).
+/// The stack is O(number of open segments) — bounded per window on the region seam's streaming
+/// path; on a whole-contig `find_tandem_repeats` (the catalog's use) it can grow to O(n) on a
+/// pathological input, an online-finalisation optimisation deferred behind that property test.
 fn maximal_scoring_subsequences(
     scores: impl Iterator<Item = i64>,
     mut emit: impl FnMut(usize, usize, i64),
@@ -321,13 +320,7 @@ fn maximal_scoring_subsequences(
         loop {
             // The rightmost stacked segment whose `l` is smaller than `cur.l`.
             match stack.iter().rposition(|seg| seg.l < cur.l) {
-                None => {
-                    // Rule 2: no left-smaller segment → flush the (unabsorbable) stack.
-                    for seg in stack.drain(..) {
-                        emit(seg.start, seg.end, seg.r - seg.l);
-                    }
-                    break;
-                }
+                None => break, // Rule 2: no left-smaller segment → `cur` is separate.
                 Some(j) => {
                     if stack[j].r >= cur.r {
                         break; // Rule 3: `cur` stays a separate segment to the right.
@@ -400,96 +393,91 @@ pub fn find_tandem_repeats(
 // The region seam (Milestone C) — repeat / satellite / unique tiling
 // ---------------------------------------------------------------------
 
-/// Tile a resident sequence into an ordered, gap-free run of [`Region`]s (spec §3.6): the
-/// coverage-merge core shared by [`RegionScanner::over_slice`] and (later) the windowed
-/// streaming path — so it is also the oracle for window-count invariance.
-///
-/// Steps: run [`find_tandem_repeats`], sort by start, union overlapping/abutting intervals
-/// into merged repeat spans (grouping their intervals), apply the [`SegmentOptions`]
-/// smoothing (`merge_gap` bridges short unique gaps, `min_repeat_len` drops short repeat
-/// blips back to unique), classify each surviving span `Repeat` vs `Satellite` by
-/// `max_repeat_len`, and emit `Unique` for every gap. The output tiles `[0, seq.len())`
-/// exactly, in order, with no two same-kind tiles adjacent.
-fn tile(
-    seq: &[u8],
-    periods: PeriodRange,
-    params: &ScanParams,
-    opts: &SegmentOptions,
-) -> Vec<Region> {
-    let n = seq.len() as u32;
-    let mut out = Vec::new();
-    if n == 0 {
-        return out;
-    }
-
-    // 1. Detect, then sort globally by start (find_tandem_repeats concatenates per-period).
-    let mut intervals = find_tandem_repeats(seq, periods, params);
-    intervals.sort_by_key(|iv| (iv.start, iv.end));
-
-    // 2. Union overlapping/abutting intervals into merged repeat spans, keeping the
-    //    constituent intervals of each.
-    struct Merged {
-        start: u32,
-        end: u32,
-        intervals: Vec<RepeatInterval>,
-    }
-    let mut spans: Vec<Merged> = Vec::new();
-    for iv in intervals {
-        match spans.last_mut() {
-            Some(last) if iv.start <= last.end => {
-                last.end = last.end.max(iv.end);
-                last.intervals.push(iv);
-            }
-            _ => spans.push(Merged {
-                start: iv.start,
-                end: iv.end,
-                intervals: vec![iv],
-            }),
+/// A merged repeat span (the union of overlapping/abutting intervals) plus the intervals
+/// that formed it — the intermediate between raw intervals and emitted [`Region`]s.
+/// Union a bag of half-open `[start, end)` spans into disjoint, start-sorted spans. The
+/// repeat **coverage** — the positions some repeat covers — independent of which intervals
+/// produced it (so it merges identically whether fed whole-contig intervals or windowed,
+/// clipped fragments).
+fn union_spans(mut spans: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
+    spans.sort_unstable();
+    let mut out: Vec<(u32, u32)> = Vec::new();
+    for (s, e) in spans {
+        match out.last_mut() {
+            Some(last) if s <= last.1 => last.1 = last.1.max(e),
+            _ => out.push((s, e)),
         }
     }
+    out
+}
 
-    // 3a. Smoothing — bridge unique gaps shorter than `merge_gap` (coalesce the spans).
+/// Build the final region tiling of `[0, n)` from two inputs kept **deliberately separate**:
+/// the repeat `coverage` (span-level, which classifies Repeat/Satellite and fixes the
+/// boundaries) and the exact `str_intervals` (which decorate each `Repeat` with its
+/// constituents). Splitting them is what makes the windowed path invariant: coverage
+/// coalesces satellite fragments across windows, while STR intervals — always ≤
+/// `max_repeat_len`, so captured whole by one window — are attached by start.
+///
+/// Steps: union the coverage into spans, apply the [`SegmentOptions`] smoothing (`merge_gap`
+/// bridges short unique gaps, `min_repeat_len` drops short repeat blips), classify each
+/// surviving span `Repeat` vs `Satellite` by `max_repeat_len` (attaching the `str_intervals`
+/// whose start lies in a `Repeat` span), and fill every gap with `Unique`. The output tiles
+/// `[0, n)` exactly, coordinate-ordered, with no two same-kind tiles adjacent.
+fn build_regions(
+    coverage: Vec<(u32, u32)>,
+    mut str_intervals: Vec<RepeatInterval>,
+    n: u32,
+    opts: &SegmentOptions,
+) -> Vec<Region> {
+    let mut spans = union_spans(coverage);
+
+    // Smoothing — bridge unique gaps shorter than `merge_gap`.
     if opts.merge_gap > 0 {
-        let mut bridged: Vec<Merged> = Vec::new();
-        for span in spans {
+        let mut bridged: Vec<(u32, u32)> = Vec::new();
+        for (s, e) in spans {
             match bridged.last_mut() {
-                Some(last) if span.start - last.end < opts.merge_gap => {
-                    last.end = span.end;
-                    last.intervals.extend(span.intervals);
-                }
-                _ => bridged.push(span),
+                Some(last) if s - last.1 < opts.merge_gap => last.1 = e,
+                _ => bridged.push((s, e)),
             }
         }
         spans = bridged;
     }
-
-    // 3b. Smoothing — drop repeat spans shorter than `min_repeat_len` (they become unique).
+    // Smoothing — drop repeat spans shorter than `min_repeat_len` (they become unique).
     if opts.min_repeat_len > 0 {
-        spans.retain(|s| s.end - s.start >= opts.min_repeat_len);
+        spans.retain(|&(s, e)| e - s >= opts.min_repeat_len);
     }
 
-    // 4. Emit the tiling: Unique for each gap, Repeat/Satellite for each span.
+    str_intervals.sort_by_key(|iv| (iv.start, iv.end));
+    let mut iv_idx = 0usize; // a single forward cursor into the start-sorted intervals
+
+    let mut out = Vec::new();
     let mut pos = 0u32;
-    for span in spans {
-        if span.start > pos {
+    for (start, end) in spans {
+        if start > pos {
             out.push(Region::Unique(RegionSpan {
                 start: pos,
-                end: span.start,
+                end: start,
             }));
         }
-        let region_span = RegionSpan {
-            start: span.start,
-            end: span.end,
-        };
-        if span.end - span.start > opts.max_repeat_len {
+        let region_span = RegionSpan { start, end };
+        if end - start > opts.max_repeat_len {
             out.push(Region::Satellite(region_span));
         } else {
+            // Attach the intervals whose start lies in this span. Skipped intervals (in
+            // gaps, satellites, or dropped spans) are stepped over by the shared cursor.
+            while iv_idx < str_intervals.len() && str_intervals[iv_idx].start < start {
+                iv_idx += 1;
+            }
+            let lo = iv_idx;
+            while iv_idx < str_intervals.len() && str_intervals[iv_idx].start < end {
+                iv_idx += 1;
+            }
             out.push(Region::Repeat(RepeatRegion {
                 span: region_span,
-                intervals: span.intervals.into_boxed_slice(),
+                intervals: str_intervals[lo..iv_idx].to_vec().into_boxed_slice(),
             }));
         }
-        pos = span.end;
+        pos = end;
     }
     if pos < n {
         out.push(Region::Unique(RegionSpan { start: pos, end: n }));
@@ -497,18 +485,110 @@ fn tile(
     out
 }
 
+/// Tile a resident sequence into an ordered, gap-free run of [`Region`]s (spec §3.6). The
+/// **oracle** the windowed streaming path (`stream`) must reproduce (window-count invariance):
+/// its coverage is every interval's span and its STR intervals are all of them.
+fn tile(
+    seq: &[u8],
+    periods: PeriodRange,
+    params: &ScanParams,
+    opts: &SegmentOptions,
+) -> Vec<Region> {
+    let n = seq.len() as u32;
+    if n == 0 {
+        return Vec::new();
+    }
+    let intervals = find_tandem_repeats(seq, periods, params);
+    let coverage = intervals.iter().map(|iv| (iv.start, iv.end)).collect();
+    build_regions(coverage, intervals, n, opts)
+}
+
+/// A windowed scan's two outputs: the repeat **coverage** spans (`[start, end)`, span-level)
+/// and the exact STR **intervals** — kept separate on purpose (§`build_regions`).
+type WindowedScan = (Vec<(u32, u32)>, Vec<RepeatInterval>);
+
+/// Scan a whole contig in windows through a `ChromRefFetcher`, returning the repeat
+/// `coverage` and the exact STR `intervals` — memory-bounded (peak ≈ `window_bp +
+/// 2·max_repeat_len`, not the contig length; spec §3.6).
+///
+/// Each window fetches its core `[c, core_end)` plus a `max_repeat_len` margin on **each**
+/// side and runs `find_tandem_repeats` on that slice. From each found interval it derives two
+/// things, which is what makes the result window-invariant:
+///
+/// - **coverage**: the interval **clipped to the core** — so every core contributes its own
+///   repeat coverage and adjacent cores abut, letting the later union rejoin a satellite
+///   (necessarily longer than any one window's fetch) across all the windows it spans; and
+/// - **STR intervals**: the interval **kept whole, if its start is in the core** — an
+///   STR-sized (≤ `max_repeat_len`) repeat is captured in full by the `max_repeat_len`
+///   margins, so it is segmented identically to a whole-contig scan and attributed to exactly
+///   one window. (Long/satellite intervals kept this way are discarded downstream, since a
+///   Satellite span carries no intervals — so their truncation is harmless.)
+///
+/// The `max_repeat_len` margins are load-bearing: Ruzzo–Tompa segmentation is
+/// context-dependent, so a shorter margin would let a window re-segment a long repeat
+/// mid-tract and emit a spurious in-core fragment.
+fn collect_windowed(
+    fetcher: &dyn ChromRefFetcher,
+    periods: PeriodRange,
+    params: &ScanParams,
+    opts: &SegmentOptions,
+) -> Result<WindowedScan, ScanError> {
+    let contig_len = fetcher.length();
+    let window = opts.window_bp.max(1);
+    let margin = opts.max_repeat_len;
+    let mut coverage: Vec<(u32, u32)> = Vec::new();
+    let mut str_intervals: Vec<RepeatInterval> = Vec::new();
+    let mut core = 0u32;
+    while core < contig_len {
+        let core_end = core.saturating_add(window).min(contig_len);
+        let fetch_start = core.saturating_sub(margin);
+        let fetch_end = core_end.saturating_add(margin).min(contig_len);
+        // `fetch` is 1-based.
+        let bytes = fetcher
+            .fetch(fetch_start + 1, fetch_end - fetch_start)
+            .map_err(|source| ScanError::Fetch { source })?;
+        for iv in find_tandem_repeats(&bytes, periods, params) {
+            let global_start = iv.start + fetch_start;
+            let global_end = iv.end + fetch_start;
+            // Coverage: clip to the core so cores tile.
+            let cov_start = global_start.max(core);
+            let cov_end = global_end.min(core_end);
+            if cov_start < cov_end {
+                coverage.push((cov_start, cov_end));
+            }
+            // STR intervals: whole, attributed to the core that holds the start.
+            if global_start >= core && global_start < core_end {
+                str_intervals.push(RepeatInterval {
+                    start: global_start,
+                    end: global_end,
+                    period: iv.period,
+                    score: iv.score,
+                });
+            }
+        }
+        core = core_end;
+    }
+    Ok((coverage, str_intervals))
+}
+
 /// Streams a repeat/satellite/unique tiling of a reference as an iterator of [`Region`]s —
 /// the routing seam the snp/ssr caller consumes (spec §3.6). Yields `Result<Region,
-/// ScanError>`; the resident [`RegionScanner::over_slice`] path is infallible (always
-/// `Ok`), while the windowed streaming path (a later increment) surfaces a mid-scan
-/// reference-read failure as a terminal `Err`.
+/// ScanError>`.
+///
+/// Two constructors: [`over_slice`](Self::over_slice) tiles a resident sequence, and
+/// [`stream`](Self::stream) tiles a whole contig windowed through a `ChromRefFetcher`
+/// without holding it in memory. `stream` is **window-count invariant for the STR tiling** —
+/// it yields exactly the `Repeat`/`Unique` structure `over_slice` would, regardless of
+/// `window_bp`. A `Satellite` (a repeat longer than `max_repeat_len`, hence longer than a
+/// window's reach) may segment differently between the two, because its internal structure
+/// depends on global context a bounded window cannot see; that is harmless, since satellites
+/// are mask/skip regions, not genotyping targets (§`collect_windowed`).
 pub struct RegionScanner {
     regions: std::vec::IntoIter<Region>,
 }
 
 impl RegionScanner {
-    /// Tile a small, already-resident sequence (spec §3.6). Precomputes the whole tiling;
-    /// the windowed, memory-bounded constructor over a `ChromRefFetcher` lands separately.
+    /// Tile a small, already-resident sequence (spec §3.6). Infallible (yields only `Ok`).
     pub fn over_slice(
         seq: &[u8],
         periods: PeriodRange,
@@ -518,6 +598,23 @@ impl RegionScanner {
         Self {
             regions: tile(seq, periods, params, opts).into_iter(),
         }
+    }
+
+    /// Tile a whole contig windowed through `fetcher`, memory-bounded (spec §3.6). The
+    /// contig length is taken from `fetcher.length()`. A reference-read failure during the
+    /// windowed scan is surfaced here as `Err` (fail-fast), keeping iteration infallible.
+    pub fn stream(
+        fetcher: impl ChromRefFetcher,
+        periods: PeriodRange,
+        params: &ScanParams,
+        opts: &SegmentOptions,
+    ) -> Result<Self, ScanError> {
+        let contig_len = fetcher.length();
+        let (coverage, str_intervals) = collect_windowed(&fetcher, periods, params, opts)?;
+        let regions = build_regions(coverage, str_intervals, contig_len, opts);
+        Ok(Self {
+            regions: regions.into_iter(),
+        })
     }
 }
 
@@ -676,8 +773,8 @@ mod tests {
                 .wrapping_add(1442695040888963407);
             (state >> 33) as u32
         };
-        for _ in 0..400 {
-            let len = (next() % 24) as usize;
+        for _ in 0..2000 {
+            let len = (next() % 160) as usize;
             let scores: Vec<i64> = (0..len)
                 .map(|_| if next() % 4 == 0 { 2 } else { -7 }) // 25% match-like
                 .collect();
@@ -967,5 +1064,153 @@ mod tests {
             "the short repeat is reclassified unique, gaps merged: {on:?}"
         );
         assert_tiles(&on, seq.len() as u32);
+    }
+
+    // ---- RegionScanner::stream (windowed, C2) ------------------------------
+
+    /// Build a single-contig `StreamingChromRefFetcher` over `seq` via a project-local temp
+    /// FASTA + a hand-computed `.fai` (single-line record, so `offset` is the fixed 5-byte
+    /// `>chr\n` header). The returned `TempDir` must be kept alive for the file to persist.
+    fn fetcher_over(seq: &[u8]) -> (tempfile::TempDir, crate::fasta::StreamingChromRefFetcher) {
+        use std::io::Write;
+        std::fs::create_dir_all("tmp").unwrap();
+        let dir = tempfile::tempdir_in("tmp").unwrap();
+        let fa = dir.path().join("ref.fa");
+        let fai = dir.path().join("ref.fa.fai");
+        {
+            let mut f = std::fs::File::create(&fa).unwrap();
+            f.write_all(b">chr\n").unwrap();
+            f.write_all(seq).unwrap();
+            f.write_all(b"\n").unwrap();
+        }
+        {
+            let mut f = std::fs::File::create(&fai).unwrap();
+            // name  length  offset  line_bases  line_width
+            writeln!(f, "chr\t{}\t5\t{}\t{}", seq.len(), seq.len(), seq.len() + 1).unwrap();
+        }
+        let fetcher = crate::fasta::StreamingChromRefFetcher::for_contig(&fa, "chr").unwrap();
+        (dir, fetcher)
+    }
+
+    /// The mixed test contig: two flanks, a (CAG)*15 tract, a non-repetitive gap, an
+    /// (AT)*20 tract, and a trailing flank — repeats, unique, and multi-period overlap.
+    fn mixed_contig() -> Vec<u8> {
+        let mut s = b"TGCATGCA".to_vec();
+        for _ in 0..15 {
+            s.extend_from_slice(b"CAG");
+        }
+        s.extend_from_slice(b"TTGACGTACGT"); // 11 bp non-repetitive gap
+        for _ in 0..20 {
+            s.extend_from_slice(b"AT");
+        }
+        s.extend_from_slice(b"GGCCTTAACC");
+        s
+    }
+
+    fn stream_regions(seq: &[u8], periods: PeriodRange, opts: &SegmentOptions) -> Vec<Region> {
+        let (_dir, fetcher) = fetcher_over(seq);
+        RegionScanner::stream(fetcher, periods, &ScanParams::default(), opts)
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    }
+
+    /// The streamed tiling equals the resident tiling for every `window_bp` — the
+    /// boundary-halo / attribution correctness gate (spec §3.6; the analogue of the cohort
+    /// DUST split-invariance test).
+    fn assert_window_invariant(seq: &[u8], periods: PeriodRange, base: &SegmentOptions) {
+        let oracle = regions_of(seq, periods, base);
+        assert_tiles(&oracle, seq.len() as u32);
+        for wbp in [seq.len() as u32 + 5, 100, 40, 16, 7, 3] {
+            let opts = SegmentOptions {
+                window_bp: wbp.max(1),
+                ..*base
+            };
+            let streamed = stream_regions(seq, periods, &opts);
+            assert_eq!(
+                streamed, oracle,
+                "window_bp={wbp}: streamed tiling must equal the resident oracle"
+            );
+        }
+    }
+
+    /// Two isolated STRs (each ≤ `max_repeat_len`) separated by an aperiodic gap wider than
+    /// the window margin — so a small `max_repeat_len` genuinely truncates the per-window
+    /// fetch, exercising real cross-window coverage assembly (not the whole-contig-per-window
+    /// case the default cap degenerates to on a tiny contig).
+    fn spaced_str_contig() -> Vec<u8> {
+        let mut s = Vec::new();
+        let mut st: u64 = 0x1234_5678_9abc_def0;
+        let mut filler = |n: usize, out: &mut Vec<u8>| {
+            for _ in 0..n {
+                st = st
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                out.push(b"ACGT"[((st >> 40) % 4) as usize]);
+            }
+        };
+        filler(15, &mut s); // left flank
+        for _ in 0..8 {
+            s.extend_from_slice(b"CAG"); // STR 1: 24 bp
+        }
+        filler(45, &mut s); // aperiodic gap, wider than the 30 bp margin below
+        for _ in 0..10 {
+            s.extend_from_slice(b"AT"); // STR 2: 20 bp
+        }
+        filler(15, &mut s); // right flank
+        s
+    }
+
+    #[test]
+    fn stream_is_window_invariant_default() {
+        assert_window_invariant(&mixed_contig(), p(2, 6), &SegmentOptions::default());
+    }
+
+    #[test]
+    fn stream_is_window_invariant_with_smoothing() {
+        let opts = SegmentOptions {
+            merge_gap: 15, // bridges the 11 bp gap between the two tracts
+            min_repeat_len: 5,
+            ..SegmentOptions::default()
+        };
+        assert_window_invariant(&mixed_contig(), p(2, 6), &opts);
+    }
+
+    #[test]
+    fn stream_is_window_invariant_across_truncated_windows() {
+        // A 30 bp cap (hence 30 bp margins) < the contig, so small windows really truncate the
+        // fetch. Both STRs are ≤ 30 bp and the gap between them exceeds the margin, so each is
+        // captured whole by its own window and segmented identically to the resident scan.
+        let opts = SegmentOptions {
+            max_repeat_len: 30,
+            ..SegmentOptions::default()
+        };
+        assert_window_invariant(&spaced_str_contig(), p(2, 6), &opts);
+    }
+
+    #[test]
+    fn stream_detects_a_satellite_within_a_window() {
+        // A small cap makes the whole mixed contig one satellite. Windowed streaming
+        // reproduces the resident tiling when the window contains the satellite; a satellite
+        // longer than a window's reach may segment differently (context-dependent, and it is
+        // mask/skip not an analysis target — see `collect_windowed`), so this asserts the
+        // fits-in-window case only.
+        let seq = mixed_contig();
+        let opts = SegmentOptions {
+            max_repeat_len: 20,
+            ..SegmentOptions::default()
+        };
+        let oracle = regions_of(&seq, p(2, 6), &opts);
+        assert!(
+            oracle.iter().any(|r| matches!(r, Region::Satellite(_))),
+            "the capped contig is a satellite: {oracle:?}"
+        );
+        for wbp in [seq.len() as u32 + 5, seq.len() as u32, 150] {
+            let o = SegmentOptions {
+                window_bp: wbp,
+                ..opts
+            };
+            assert_eq!(stream_regions(&seq, p(2, 6), &o), oracle, "window_bp={wbp}");
+        }
     }
 }

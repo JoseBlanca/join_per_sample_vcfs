@@ -145,7 +145,7 @@ overlapping different-period intervals merge into one `Repeat` carrying both; `U
 Unique` around a lone repeat; a `> max_repeat_len` run → `Satellite`; `merge_gap`/`min_repeat_len`
 smoothing; empty input → nothing. *Depends:* B2. *Source:* spec §3.6, arch §1.3, §2.2.
 
-**C2. Windowed streaming over `ChromRefFetcher`.**  ☐
+**C2. Windowed streaming over `ChromRefFetcher`.**  ✅
 `RegionScanner::new(fetcher, contig_len, periods, params, opts)`: walk in `window_bp` cores with a
 right halo of `max_repeat_len` and a left margin of `periods.max`, run the C1 merge per window,
 emit regions whose start falls in the core (halo/attribution dedup), coalesce satellites spanning
