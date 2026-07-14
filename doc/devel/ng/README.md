@@ -9,6 +9,12 @@ by document kind:
     taxonomy, the benchmark strategy, and the single-phase lab.
   - [`read_filtering.md`](spec/read_filtering.md) — step 1 (the whole-read keep/drop
     prelude) + the ng foundations it settles (skeleton, `types.rs` seed, conventions).
+  - [`read_preparation.md`](spec/read_preparation.md) — step 2 (the per-read transform),
+    the shared discipline; two path specs:
+    [`read_preparation_generic.md`](spec/read_preparation_generic.md) (SNP/indel: left-align +
+    BAQ → `PreparedReadNg`) and
+    [`read_preparation_ssr.md`](spec/read_preparation_ssr.md) (STR: tract extraction →
+    `SsrTractObs`).
   - [`ref_seq.md`](spec/ref_seq.md) — the `RefSeq` reference-sequence accessor
     (foundational infra: resident + streaming + in-memory impls). Read filtering #8 and
     the pileup depend on it.
