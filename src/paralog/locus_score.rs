@@ -98,7 +98,6 @@ impl ParalogScore {
 /// `0.5·ln(2π)` — the constant term of a Normal log-density.
 const LN_SQRT_2PI: f64 = 0.918_938_533_204_672_7;
 
-
 /// A usable sample paired with its one-copy relative-depth SD (σ₀). Formed
 /// once in [`score_locus_for_paralogy`] after validation (coverage
 /// winsorised, `alt_reads ≤ total_reads`, σ₀ finite and `> 0`) so both
@@ -213,7 +212,8 @@ impl ParalogScorePrecompute {
             for &f in inbreeding {
                 // Wright dosage HWE: P(non-carrier) = (1−q)² + F·q(1−q), floored
                 // exactly as the old inline code did so the `.ln()` is identical.
-                let p_noncarrier = ((1.0 - q) * (1.0 - q) + f * q * (1.0 - q)).max(PROBABILITY_FLOOR);
+                let p_noncarrier =
+                    ((1.0 - q) * (1.0 - q) + f * q * (1.0 - q)).max(PROBABILITY_FLOOR);
                 carrier_probs.push((
                     p_noncarrier.ln(),
                     (1.0 - p_noncarrier).max(PROBABILITY_FLOOR).ln(),
@@ -827,5 +827,4 @@ mod tests {
         assert!((vafs[2] - 1.0 / 7.0).abs() < 1e-12);
         assert!((vafs[3] - 3.0 / 7.0).abs() < 1e-12);
     }
-
 }

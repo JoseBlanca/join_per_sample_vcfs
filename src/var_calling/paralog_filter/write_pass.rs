@@ -174,92 +174,90 @@ pub(crate) fn run_write_pass<R: Read + Send>(
     let (work_tx, work_rx) = crossbeam_channel::bounded::<(u64, PosteriorRecord)>(cap);
     let (done_tx, done_rx) = crossbeam_channel::bounded::<(u64, FormatOutcome)>(cap);
 
-    let records_dropped_paralog = std::thread::scope(
-        |scope| -> Result<u64, WritePassError> {
-            // Reader: decode + paralog cut, contiguous `order` to survivors.
-            let reader = scope.spawn(move || -> Result<u64, WritePassError> {
-                let mut order = 0u64;
-                let mut dropped = 0u64;
-                while let Some(record) = spill.next_record() {
-                    let mut record = record?;
-                    // Apply the cut to the stored LR (folded into the histogram this
-                    // `calibration` came from — so the cut matches the value it was
-                    // built from). `NaN` = unscored → never flagged → kept.
-                    let flagged = calibration.flags(record.paralog_lr);
-                    // Stamp the paralog posterior on every scored locus (drop or
-                    // keep) so emitted records carry `PARALOG_POST`; `NaN` → `None`.
-                    record.record.paralog_posterior = calibration.posterior(record.paralog_lr);
-                    if flagged && !keep_dup_artifacts {
-                        dropped += 1;
-                        continue;
-                    }
-                    if work_tx.send((order, record.record)).is_err() {
-                        break; // workers gone
-                    }
-                    order += 1;
+    let records_dropped_paralog = std::thread::scope(|scope| -> Result<u64, WritePassError> {
+        // Reader: decode + paralog cut, contiguous `order` to survivors.
+        let reader = scope.spawn(move || -> Result<u64, WritePassError> {
+            let mut order = 0u64;
+            let mut dropped = 0u64;
+            while let Some(record) = spill.next_record() {
+                let mut record = record?;
+                // Apply the cut to the stored LR (folded into the histogram this
+                // `calibration` came from — so the cut matches the value it was
+                // built from). `NaN` = unscored → never flagged → kept.
+                let flagged = calibration.flags(record.paralog_lr);
+                // Stamp the paralog posterior on every scored locus (drop or
+                // keep) so emitted records carry `PARALOG_POST`; `NaN` → `None`.
+                record.record.paralog_posterior = calibration.posterior(record.paralog_lr);
+                if flagged && !keep_dup_artifacts {
+                    dropped += 1;
+                    continue;
                 }
-                Ok(dropped)
-            });
-
-            // Format workers: filter + serialise, off the writer thread.
-            let mut worker_handles = Vec::with_capacity(n_workers);
-            for _ in 0..n_workers {
-                let work_rx = work_rx.clone();
-                let done_tx = done_tx.clone();
-                let mut formatter = writer.make_formatter();
-                worker_handles.push(scope.spawn(move || -> Result<(), WritePassError> {
-                    for (order, record) in work_rx {
-                        let outcome = formatter.process(&record).map_err(WriterError::from)?;
-                        if done_tx.send((order, outcome)).is_err() {
-                            break; // sink gone
-                        }
-                    }
-                    Ok(())
-                }));
+                if work_tx.send((order, record.record)).is_err() {
+                    break; // workers gone
+                }
+                order += 1;
             }
-            // Drop the main-thread channel handles so the channels disconnect once
-            // the reader / workers finish (else the sink loop never ends).
-            drop(work_rx);
-            drop(done_tx);
+            Ok(dropped)
+        });
 
-            // Sink (this thread): reorder by `order`, guard, commit in genomic order.
-            let mut ref_fetcher: Option<(u32, StreamingChromRefFetcher)> = None;
-            let mut pending: BTreeMap<u64, FormatOutcome> = BTreeMap::new();
-            let mut next = 0u64;
-            let sink_result = (|| -> Result<(), WritePassError> {
-                for (order, outcome) in done_rx.iter() {
-                    pending.insert(order, outcome);
-                    while let Some(outcome) = pending.remove(&next) {
-                        emit_outcome(
-                            outcome,
-                            &mut writer,
-                            &mut ref_fetcher,
-                            reference,
-                            chrom_names,
-                        )?;
-                        next += 1;
+        // Format workers: filter + serialise, off the writer thread.
+        let mut worker_handles = Vec::with_capacity(n_workers);
+        for _ in 0..n_workers {
+            let work_rx = work_rx.clone();
+            let done_tx = done_tx.clone();
+            let mut formatter = writer.make_formatter();
+            worker_handles.push(scope.spawn(move || -> Result<(), WritePassError> {
+                for (order, record) in work_rx {
+                    let outcome = formatter.process(&record).map_err(WriterError::from)?;
+                    if done_tx.send((order, outcome)).is_err() {
+                        break; // sink gone
                     }
                 }
                 Ok(())
-            })();
+            }));
+        }
+        // Drop the main-thread channel handles so the channels disconnect once
+        // the reader / workers finish (else the sink loop never ends).
+        drop(work_rx);
+        drop(done_tx);
 
-            // Join everyone; first error wins (sink → reader → workers). The scope
-            // would auto-join, but we join explicitly to surface thread errors.
-            let reader_result = reader.join().expect("write-pass reader thread panicked");
-            let mut worker_err = None;
-            for h in worker_handles {
-                if let Err(e) = h.join().expect("write-pass format worker panicked") {
-                    worker_err.get_or_insert(e);
+        // Sink (this thread): reorder by `order`, guard, commit in genomic order.
+        let mut ref_fetcher: Option<(u32, StreamingChromRefFetcher)> = None;
+        let mut pending: BTreeMap<u64, FormatOutcome> = BTreeMap::new();
+        let mut next = 0u64;
+        let sink_result = (|| -> Result<(), WritePassError> {
+            for (order, outcome) in done_rx.iter() {
+                pending.insert(order, outcome);
+                while let Some(outcome) = pending.remove(&next) {
+                    emit_outcome(
+                        outcome,
+                        &mut writer,
+                        &mut ref_fetcher,
+                        reference,
+                        chrom_names,
+                    )?;
+                    next += 1;
                 }
             }
-            sink_result?;
-            let dropped = reader_result?;
-            if let Some(e) = worker_err {
-                return Err(e);
+            Ok(())
+        })();
+
+        // Join everyone; first error wins (sink → reader → workers). The scope
+        // would auto-join, but we join explicitly to surface thread errors.
+        let reader_result = reader.join().expect("write-pass reader thread panicked");
+        let mut worker_err = None;
+        for h in worker_handles {
+            if let Err(e) = h.join().expect("write-pass format worker panicked") {
+                worker_err.get_or_insert(e);
             }
-            Ok(dropped)
-        },
-    )?;
+        }
+        sink_result?;
+        let dropped = reader_result?;
+        if let Some(e) = worker_err {
+            return Err(e);
+        }
+        Ok(dropped)
+    })?;
 
     let mut stats = writer.finish()?;
     stats.records_dropped_paralog = records_dropped_paralog;

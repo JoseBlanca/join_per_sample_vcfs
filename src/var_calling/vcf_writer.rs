@@ -96,7 +96,8 @@ impl ParallelRecordFormatter {
         if !record.is_variant_call() {
             return Ok(FormatOutcome::Drop(DropBucket::HomRef));
         }
-        if f64::from(self.formatter.final_qual(record, &mut self.cache)) < self.filters.min_qual_phred
+        if f64::from(self.formatter.final_qual(record, &mut self.cache))
+            < self.filters.min_qual_phred
         {
             return Ok(FormatOutcome::Drop(DropBucket::LowQual));
         }
