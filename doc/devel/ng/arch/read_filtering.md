@@ -14,7 +14,7 @@ the **contract** is the deliverable. See the spec for the "why" behind every dec
 
 One file, `src/ng/read/filtering.rs`, with its `#[cfg(test)]` block beside it — read
 filtering is a **fixed prelude with no bake-off**, so it is a file, not a folder
-(`module_layout.md` principle 1a). It shares the `read/` module with step 2 (`ReadPrep`),
+(`module_layout.md` principle 1a). It shares the `read/` module with step 2 (`ReadPreparer`),
 which turns filtering's output into locus evidence and keeps its swappable impls side by side
 (principle 1b). The scalar newtypes seed `src/ng/types.rs` (§2.2 below); everything else is
 step-1-local.

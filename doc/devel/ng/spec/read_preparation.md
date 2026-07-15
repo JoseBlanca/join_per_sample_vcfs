@@ -10,7 +10,7 @@ common. The two path specs:*
 - *STR: [`read_preparation_ssr.md`](read_preparation_ssr.md) — tract extraction.*
 
 *Under [`ng_proposal.md`](ng_proposal.md) (§2) and the arch docs
-[`../arch/ng_step_interfaces.md`](../arch/ng_step_interfaces.md) (the `ReadPrep` trait sketch)
+[`../arch/ng_step_interfaces.md`](../arch/ng_step_interfaces.md) (the `ReadPreparer` trait sketch)
 and [`../arch/module_layout.md`](../arch/module_layout.md) (the `read/` module). Follows
 [`read_filtering.md`](read_filtering.md) (step 1). **No code yet.** Naming: **STR** in prose,
 `ssr` in code.*
@@ -69,12 +69,12 @@ observation (`ReadObs::Sequence`) that the **tract tally + cohort likelihood con
 gatherer *is* the preparation — each takes a prepared read as input.
 
 This resolves the standing open question in `module_layout.md` (*"does `pileup/` subsume the
-generic path's step 2, or is it built from it?"*): **built from it.** `ReadPrep` is a real step;
+generic path's step 2, or is it built from it?"*): **built from it.** `ReadPreparer` is a real step;
 the pileup (generic) and the tract tally (STR) are its consumers, one step upstream of where the
 two paths converge at `LocusEvidence`.
 
 ```
-generic:  MappedRead ─prepare▶ PreparedReadNg ─▶ pileup walker ─▶ LocusEvidence
+generic:  MappedRead ─prepare▶ PreparedRead ─▶ pileup walker ─▶ LocusEvidence
 STR:      MappedRead ─prepare▶ SsrTractObs    ─▶ tract tally    ─▶ LocusEvidence ─▶ Lr (step 7)
                                                                   └── the paths converge here ──┘
 ```
@@ -87,26 +87,61 @@ output type, `AlleleCandidates`, because that step sits *after* convergence.)
 
 ---
 
-## 3. The shared contract — the `ReadPrep` trait
+## 3. The shared contract — the `ReadPreparer` trait
 
 One trait states the shared shape; **each path owns its output type** via an associated type. The
 generic and STR outputs go to different consumers and are never held interchangeably (the router
 picks the path before prep runs), so the output is never unified — only the contract is.
 
+The names read as one idea: a **`ReadPreparer`** does **`prepare_read`** and yields a
+**`Prepared`** observation. Note what that does *not* promise: `PreparedRead` is the **generic
+path's** output specifically, not the universal step-2 output. The trait yields `Self::Prepared`
+— `PreparedRead` on the generic path, `SsrTractObs` on the STR path — so the tidy
+`ReadPreparer → PreparedRead` pairing holds for the generic path only. That asymmetry is
+deliberate (§2): do not read it as an invitation to re-unify the two outputs.
+
 ```rust
-pub trait ReadPrep {
+pub trait ReadPreparer {
+    /// What this implementation needs to know about the locus — path-owned:
+    /// `()` on the generic path (it needs no locus at all — it prepares the read against the
+    /// reference around the read's *own* span) or `SsrLocus` on the STR path (motif, borders,
+    /// flanks — so the delimiter's gaps can be tract-aware).
+    type Locus;
+
     /// The per-read prepared observation this implementation emits — path-owned:
-    /// `PreparedReadNg` (generic) or `SsrTractObs` (STR). The two converge only downstream, at
+    /// `PreparedRead` (generic) or `SsrTractObs` (STR). The two converge only downstream, at
     /// `LocusEvidence`, never here.
     type Prepared;
 
-    /// Prepare one filtered read at its routed locus. `window` carries the reference bases (and,
-    /// for the STR impl, the tract structure — motif/borders — so gaps can be tract-aware).
-    /// `None` = the read produced no usable observation here (§5) — a tallied per-read outcome,
-    /// not a run error.
-    fn prepare_read(&self, read: &MappedRead, window: &LocusWindow) -> Option<Self::Prepared>;
+    /// Prepare one filtered read. The implementation **holds its own reference accessors**
+    /// (`RefSeq` / `RawRefSeq`) as fields and fetches what it needs — there is no window
+    /// argument (see below). `None` = the read produced no usable observation here (§5) — a
+    /// tallied per-read outcome, not a run error.
+    fn prepare_read(&self, read: &MappedRead, locus: &Self::Locus) -> Option<Self::Prepared>;
 }
 ```
+
+### No window argument — the preparer holds its accessors (a decision, and the alternative)
+
+An earlier sketch passed a pre-materialised reference window (`window: &RefWindow`, then a
+bundled `LocusWindow`). Production shows that is wrong on **both** paths:
+
+- **Generic:** `process_read(read, baq, raw_ref, cfg)` takes **no window**. It holds the
+  reference fetchers and reads around the read's own span. It also needs *two* views of the
+  reference — raw, case-preserving bytes for left-alignment and canonical bytes for the BAQ HMM
+  — which a single materialised span cannot carry.
+- **STR:** `delimit_read(region_seq, region_qual, locus, model, scratch)` takes the **locus**,
+  not a window — the tract structure is the whole point.
+
+So the reference is a **field on the preparer**, fetched per read — exactly as step 1's
+`ReadFilter` holds `reference: R` plus a reused `ref_buf` scratch — and the only per-call context
+is the routed locus, which the generic path does not need at all (`type Locus = ()`).
+
+*Alternative considered:* keep a window type carrying bases plus tract structure. **Rejected** —
+it needs a name for a concept that isn't one ("a window of *what*?"); it duplicates production's
+existing `RefSpan` (the sequence-carrying span); it would hand the generic path STR fields it
+ignores — the same papering-over we rejected for the output (§2); and it still could not carry
+the raw+canonical duality the generic transform requires.
 
 Three properties every implementation upholds:
 
@@ -122,9 +157,9 @@ Three properties every implementation upholds:
   drop and never a masked run error (§5).
 
 The `read/` module holds every step-2 implementation side by side (`module_layout.md` principle
-1): the generic impls (`trust_mapper.rs`, later `reassemble.rs`) and the STR impl (`pair_hmm.rs`)
-are siblings, each an `impl ReadPrep`. STR-ness is a property of the *implementation*, not a
-separate subtree (principle 2).
+1): the generic impls (`left_align_baq.rs`, later `reassembly.rs`) and the STR impl
+(`pair_hmm.rs`) are siblings, each an `impl ReadPreparer`. STR-ness is a property of the
+*implementation*, not a separate subtree (principle 2).
 
 ---
 
@@ -135,11 +170,12 @@ Common to both paths (path-specific reuse lives in each path spec's reuse map):
 | what | existing code | ng reuse |
 |---|---|---|
 | the read itself | `MappedRead` ([bam/alignment_input.rs](../../../../src/bam/alignment_input.rs)) | reuse as-is — the step-2 input |
-| reference access | `RefSeq` + `RawRefSeq` ([ref_seq.md](ref_seq.md)) | reuse as-is — raw bytes where the aligner's view matters, canonical bytes for HMM alignment |
+| reference access | `RefSeq` + `RawRefSeq` ([ref_seq.md](ref_seq.md)) | reuse as-is — held **as a field on the preparer** and fetched per read (§3), raw bytes where the aligner's view matters, canonical bytes for HMM alignment |
 
-`LocusWindow` (the `prepare_read` argument) bundles the reference window with the routed locus;
-its exact shape is co-owned with the router spec (`LocusKind`) and each path uses the parts it
-needs. A per-sample running tally (the step-2 analogue of `ReadFilterCounts`) records every
+There is **no window/span type** to define: the preparer fetches the reference itself (§3), so
+nothing needs to bundle bases with a locus. The only per-call context is the routed locus
+(`Self::Locus`), whose STR shape is co-owned with the router spec (`LocusKind`) and is `()` on the
+generic path. A per-sample running tally (the step-2 analogue of `ReadFilterCounts`) records every
 `None` by reason — the "no silent caps" discipline — with the reasons enumerated per path (§5).
 
 ---
@@ -164,7 +200,7 @@ needs. A per-sample running tally (the step-2 analogue of `ReadFilterCounts`) re
   `read_filtering.md` §6, which deferred the same two operations. (The generic prepared read
   *carries* the adaptor boundary as an annotation but does not apply it — the walker does.)
 - **Read likelihood `P(read | allele)` → step 7.** Preparation emits observations, not scores.
-- **Local haplotype reassembly → a future generic `ReadPrep` alternative** (see the generic spec).
+- **Local haplotype reassembly → a future generic `ReadPreparer` alternative** (see the generic spec).
 
 Everything else — the transforms, the output types, the consumers, the path-specific reuse and
 open questions — is in the two path specs.

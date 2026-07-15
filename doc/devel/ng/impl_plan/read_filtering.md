@@ -23,7 +23,7 @@ traits with a test fake **and** the ng-owned noodles adapter; the `ReadFilter` i
 
 **Out (later plans):**
 
-- **Step 2, read preparation (`ReadPrep`)** — the `read/` sibling; its own plan.
+- **Step 2, read preparation (`ReadPreparer`)** — the `read/` sibling; its own plan.
 - **Adaptor-clip *application*, mate-overlap reconciliation** — per-base work that lands in
   `pileup/` (spec §6), not here. Filtering only *preserves* `MappedRead.adaptor_boundary`.
 - **Output-`MappedRead` allocation reuse** — a locus-stream memory decision (spec §6).
@@ -67,7 +67,7 @@ traits with a test fake **and** the ng-owned noodles adapter; the `ReadFilter` i
 ### Milestone A — module scaffold + vocabulary + local types (types, no logic)
 
 **A1. Scaffold the `read/` module.**  ✅
-`src/ng/read/mod.rs` (declares `filtering`; the `ReadPrep` trait lands later, step 2) and an
+`src/ng/read/mod.rs` (declares `filtering`; the `ReadPreparer` trait lands later, step 2) and an
 empty `src/ng/read/filtering.rs` with its `#[cfg(test)]` block; wire `pub mod read;` into
 `ng/mod.rs`. One file, no folder — no bake-off (module_layout 1a). *Source:* arch §Module home.
 
@@ -172,7 +172,7 @@ byte-identical. Also enforce the `DropReason`↔`ReadFilterCounts` 1:1 mapping (
 
 ## Out of scope (next plans)
 
-- **Step 2, read preparation (`ReadPrep`)** — the `read/` sibling; its own plan.
+- **Step 2, read preparation (`ReadPreparer`)** — the `read/` sibling; its own plan.
 - **`pileup/`** (adaptor-clip application, mate-overlap reconciliation, the non-STR
   loci+evidence generator), the **locus router** (step 3), and the **research probes** —
   later (`ng_proposal.md` §3).

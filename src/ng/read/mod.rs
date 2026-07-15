@@ -6,9 +6,9 @@
 //! - **step 1 — [`filtering`]** — the fixed whole-read keep/drop prelude (this
 //!   milestone). A single file, no bake-off: it is a fixed prelude with no
 //!   competing implementations.
-//! - **step 2 — read preparation (`ReadPrep`)** — realign/delimit a kept read
+//! - **step 2 — read preparation (`ReadPreparer`)** — realign/delimit a kept read
 //!   against the reference; its swappable implementations land here as siblings
-//!   (`trust_mapper.rs`, `pair_hmm.rs`, …) in a later plan.
+//!   (`left_align_baq.rs`, `pair_hmm.rs`, …) in a later plan.
 //!
 //! This is the deliberate, documented deviation from the "one folder per step"
 //! rule in `doc/devel/ng/arch/module_layout.md` principle 1 — see

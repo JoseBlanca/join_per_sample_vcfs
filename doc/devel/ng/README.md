@@ -12,7 +12,7 @@ by document kind:
   - [`read_preparation.md`](spec/read_preparation.md) — step 2 (the per-read transform),
     the shared discipline; two path specs:
     [`read_preparation_generic.md`](spec/read_preparation_generic.md) (SNP/indel: left-align +
-    BAQ → `PreparedReadNg`) and
+    BAQ → `PreparedRead`) and
     [`read_preparation_ssr.md`](spec/read_preparation_ssr.md) (STR: tract extraction →
     `SsrTractObs`).
   - [`ref_seq.md`](spec/ref_seq.md) — the `RefSeq` reference-sequence accessor

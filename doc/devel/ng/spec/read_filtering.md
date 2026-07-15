@@ -76,15 +76,15 @@ filtering's output (`MappedRead`) is read preparation's input.
 
 ```
 src/ng/read/
-├── mod.rs         – module declarations + the ReadPrep trait (step 2, added later)
+├── mod.rs         – module declarations + the ReadPreparer trait (step 2, added later)
 ├── filtering.rs   – step 1: the fixed filtering prelude  (this spec)  (+ #[cfg(test)])
-└── …              – step 2 impls land here as siblings: trust_mapper.rs, pair_hmm.rs, …
+└── …              – step 2 impls land here as siblings: left_align_baq.rs, pair_hmm.rs, …
 ```
 
 This is a deliberate, documented deviation from the "one folder per step" rule in
 `module_layout.md` principle 1, and it *keeps* that rule's real intent: a step's
 competing implementations sit side by side. Read filtering has no competitors (it is a
-fixed prelude), so it is a single file; step 2's `ReadPrep` implementations still sit
+fixed prelude), so it is a single file; step 2's `ReadPreparer` implementations still sit
 side by side within `read/`.
 
 ### 2.2 The shared vocabulary — seeding `types.rs`

@@ -33,8 +33,8 @@ src/ng/
 ├── read/             – steps 1+2, one read-handling module (see principle 1, note):
 │                        · filtering.rs – step 1: the fixed filtering prelude (a single
 │                          file — no bake-off; wraps the bam/alignment_input filters)
-│                        · mod.rs + trust_mapper.rs / reassemble.rs / pair_hmm.rs –
-│                          step 2: ReadPrep trait + its swappable impls, side by side
+│                        · mod.rs + left_align_baq.rs / reassembly.rs / pair_hmm.rs –
+│                          step 2: ReadPreparer trait + its swappable impls, side by side
 ├── locus_router/     – step 3  LocusRouter + LocusSource + impls (catalog, active_region)
 ├── pileup/           – the non-STR loci+evidence generator (NOT a step — infrastructure,
 │                       like pipeline.rs/bench). Walks each non-STR stretch, splits it
@@ -80,7 +80,7 @@ by side. **(b) Tightly-coupled steps may share one folder.** Steps 1 (filtering)
 (read preparation) both turn a `MappedRead` into locus evidence and share the same input
 type and reference accessor, so they live together in one `read/` module rather than in
 two sibling folders. This bends "one folder per step" while keeping its intent: step 2's
-`ReadPrep` implementations still sit side by side within `read/`.
+`ReadPreparer` implementations still sit side by side within `read/`.
 
 **2. STR-ness is not a separate subtree.** An STR candidate generator is just
 `allele_candidates/rung_ladder.rs` sitting next to the generic `allele_candidates/assembly.rs`; the
@@ -156,7 +156,7 @@ So `pileup/` is where a non-STR locus and its `LocusEvidence` are actually built
 real algorithm (the reused `pileup/walker/`), not driver glue. It is deliberately **not
 a step folder**: it has no swappable-trait bake-off surface of its own (like
 `pipeline.rs` and `bench/`). *Open design question when `pileup/` is built:* whether it
-subsumes the generic path's step-2 (`ReadPrep`) and locus-windowing, or is built from
+subsumes the generic path's step-2 (`ReadPreparer`) and locus-windowing, or is built from
 them — i.e. how much of the generic path opts out of the per-step bake-off in favour of
 the one battle-tested walker (see *Open items*).
 
@@ -169,8 +169,12 @@ thread, reuse freely. The module tree here is the
 ## Naming to confirm
 
 - `read/` (steps 1+2) — the merged read-handling module (see principle 1). Step 2's
-  files are named for their approach (`trust_mapper.rs`, `pair_hmm.rs`, …); the `ReadPrep`
-  trait lives in `read/mod.rs`. "prep" survives only in the trait name.
+  files are named for the **transform they perform** (`left_align_baq.rs`, `reassembly.rs`,
+  `pair_hmm.rs`, …), not for the taxonomy pole they sit on — "trust the mapper" is an *axis*
+  (`ng_proposal.md` §2) and names a family, not one implementation. The `ReadPreparer` trait
+  lives in `read/mod.rs`; its impls are `LeftAlignBaqPreparer`, `ReassemblyPreparer`,
+  `SsrDelimitPreparer`. The "prep" abbreviation is gone: a `ReadPreparer` does `prepare_read`
+  and yields a `Prepared` observation (verb, agent noun, product).
 - `types.rs` (the one shared-types file) — a common Rust convention, honest for a mixed
   starting file; naming.md leans against a *permanent* generic module, so the plan is to
   split it into concept modules (`units`/`locus`/`genotype`/`params`) as it grows
@@ -183,7 +187,7 @@ thread, reuse freely. The module tree here is the
   generation; likely a submodule of `allele_candidates/` or `locus_router/`, not its own top-level step
   folder. Decide when the STR path is built.
 - **`pileup/` — subsume or compose?** When the non-STR pileup is built, decide whether it
-  *subsumes* the generic path's step-2 (`ReadPrep`) and locus-windowing into one reused
+  *subsumes* the generic path's step-2 (`ReadPreparer`) and locus-windowing into one reused
   walker (so the generic path largely opts out of the per-step bake-off), or is *built
   from* the swappable step-2/window traits. The asymmetry — generic = one battle-tested
   engine, STR = finely decomposed research surface — may be exactly right, but it should be

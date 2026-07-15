@@ -241,13 +241,18 @@ step but a fixed prelude, so it gets its own doc rather than a trait sketch here
 
 ### Step 2 — read preparation / realignment
 ```rust
-pub trait ReadPrep {
-    /// The per-read prepared observation — PATH-OWNED (no single unified type): PreparedReadNg
-    /// (generic) or SsrTractObs (STR). The two converge only downstream, at LocusEvidence.
+pub trait ReadPreparer {
+    /// What the impl needs to know about the locus — PATH-OWNED: () (generic — needs no locus)
+    /// or SsrLocus (STR — motif/borders/flanks make the delimiter's gaps tract-aware).
+    type Locus;
+    /// The per-read prepared observation — PATH-OWNED (no single unified type): PreparedRead
+    /// (generic, reused from pileup/walker) or SsrTractObs (STR). The two converge only
+    /// downstream, at LocusEvidence.
     type Prepared;
-    /// Realign/delimit one read against the routed window (the STR impl's window carries the
-    /// tract so gaps can be tract-aware). None if the read is unusable here.
-    fn prepare_read(&self, read: &MappedRead, window: &LocusWindow) -> Option<Self::Prepared>;
+    /// Realign/delimit one read. The impl HOLDS its own RefSeq/RawRefSeq accessors and fetches
+    /// around the read's span — there is no window argument (production's process_read takes
+    /// none, and the generic transform needs both raw and canonical views). None if unusable.
+    fn prepare_read(&self, read: &MappedRead, locus: &Self::Locus) -> Option<Self::Prepared>;
 }
 ```
 *Impls to bench:* trust-mapper+left-align (freebayes-style), local reassembly
@@ -256,13 +261,15 @@ pub trait ReadPrep {
 Design settled across three specs: the shared contract
 [`../spec/read_preparation.md`](../spec/read_preparation.md) plus the generic
 ([`read_preparation_generic.md`](../spec/read_preparation_generic.md): left-align + BAQ →
-`PreparedReadNg`, consumed by the pileup) and STR
+`PreparedRead` — production's, reused as-is — consumed by the pileup) and STR
 ([`read_preparation_ssr.md`](../spec/read_preparation_ssr.md): Viterbi tract extraction →
 `SsrTractObs`, consumed by the tract tally + step-7 likelihood) paths. Read prep **composes**
 with the gatherer, it is not subsumed (resolving the `module_layout.md` open question). The
 trait's output is **path-owned** (`type Prepared`), not a single unified type — the two paths
-converge only downstream at `LocusEvidence`; `window` becomes a `LocusWindow` carrying reference
-bases + (STR) tract structure.
+converge only downstream at `LocusEvidence`. There is **no window argument**: the preparer holds
+its own `RefSeq`/`RawRefSeq` accessors and fetches around each read's span (as step 1's
+`ReadFilter` does), and the only per-call context is the routed locus (`type Locus`) — `()` on the
+generic path, `SsrLocus` on the STR path.
 
 ### Step 3 — the locus router
 ```rust
@@ -416,7 +423,7 @@ field, holds the rest, and re-measures.
 
 ```rust
 pub struct CallerRecipe {
-    pub read_prep:    Box<dyn ReadPrep>,
+    pub read_preparer: Box<dyn ReadPreparer>,
     pub router:       Box<dyn LocusRouter>,
     pub rough_caller: Box<dyn Caller>,
     pub summarizer:   Box<dyn SampleSummarizer>,   // per-sample -> .psp
@@ -505,10 +512,10 @@ were not freshly re-read.
 | ng name | existing code | action |
 |---|---|---|
 | `GenomeRegion` | `Region` ([regions.rs](../../../../src/regions.rs)), `ContigInterval` ([bam/alignment_input.rs](../../../../src/bam/alignment_input.rs)) | consolidate the coordinate-span types into one |
-| `RefWindow` | ≈ `RefSpan` ([var_calling/types.rs](../../../../src/var_calling/types.rs)) | the sequence-carrying span |
+| `RefWindow` | ≈ `RefSpan` ([var_calling/types.rs](../../../../src/var_calling/types.rs)) — `{ genomic_start, bytes }` | the sequence-carrying span. **`OPEN:` is `RefWindow` needed at all?** Read preparation dropped it (it holds accessors and fetches per read, §3-step-2), leaving step 3's `route_locus` as its only consumer. If that consumer also fetches, the name is a duplicate of production's `RefSpan` and should be retired rather than minted — "window" also names no real concept here (a window of *what*?). Settle in the router spec |
 | `RefSeq` + `RawRefSeq` (traits) | `ChromRefFetcher` + `MultiChromRefFetcher` + `RepositoryRefFetcher` + `StreamingChromRefFetcher` + `ManualEvictChromRefFetcher` ([fasta/fetcher.rs](../../../../src/fasta/fetcher.rs)) | **consolidate** into `RefSeq` (universal canonical fetch) + the `RawRefSeq` capability + an inherent `evict_before` (no silent no-ops); reuse the fetcher impls behind them. Spec: [`../spec/ref_seq.md`](../spec/ref_seq.md) |
 | `MappedRead` | `MappedRead` ([bam/alignment_input.rs](../../../../src/bam/alignment_input.rs)) | reuse as-is (the step-2 input) |
-| `LocusRead` (prepared-read output) | — (new) | refined by the read-preparation specs into **path-owned** types — `PreparedReadNg` (generic) + `SsrTractObs` (STR); there is no single unified type (they converge downstream at `LocusEvidence`). Still distinct from production's `PreparedRead` (name not reused). Downstream sketches that still say `LocusRead` reconcile when their steps are specced |
+| `LocusRead` (prepared-read output) | — (name retired) | refined by the read-preparation specs into **path-owned** types — `PreparedRead` (generic) + `SsrTractObs` (STR); there is no single unified type (they converge downstream at `LocusEvidence`). **Correction:** an earlier row here called production's `PreparedRead` "a different concept (a decoded walker read)" and said not to reuse the name — the production survey disproved that: it *is* the generic step-2 output, field for field, so ng **reuses it as-is** (may want hoisting out of `pileup/walker/`). Downstream sketches that still say `LocusRead` reconcile when their steps are specced |
 | `AlleleCandidates` | `CandidateSet` ([ssr/cohort/candidate_set.rs](../../../../src/ssr/cohort/candidate_set.rs)) | rename |
 | `SampleSummary` | ≈ the `.psp` `SampleSummary` ([sample_summary/](../../../../src/sample_summary/)) | reuse / align |
 | `ModelParams` | ≈ the SSR chemistry param set ([ssr/cohort/param_estimation.rs](../../../../src/ssr/cohort/param_estimation.rs)) + per-individual `F` | assemble from both levels |
