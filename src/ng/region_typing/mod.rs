@@ -327,12 +327,13 @@ pub struct TypedRegionCounts {
 /// Simplest implementation first, as the next one's yardstick — so a windowing bug
 /// shows up as a disagreement with a version that has no windows to get wrong.
 ///
-/// # Not yet
+/// # A rejected repeat is generic territory, not a hole (spec §2.2)
 ///
-/// `SsrBundle` is D2's. Until then the cluster members admission sets aside fall
-/// into `Generic`, which is where a repeat admission turns down for *any* reason
-/// belongs (spec §2.2) — so the partition is already complete and already correct;
-/// D2 only makes it *sharper*, by naming a region `Generic` currently lumps in.
+/// The generic path is the **default**; the other three are exceptions carved out
+/// of it. So a repeat admission turns down for being impure, or low-copy, or
+/// compound simply stays `Generic` — it is not a bundle, and it is certainly not a
+/// hole. Only the *flank test* makes a bundle: a repeat with another repeat within
+/// `flank_bp` of it, which is exactly the set [`admission::admit`] hands back.
 pub fn partition_resident(
     chrom: &str,
     contig: ContigId,
@@ -394,19 +395,21 @@ pub fn partition_resident(
             });
         }
     }
+    // A satellite array is typed as one object, not searched for loci inside it
+    // (spec §2.1) — so anything admission produced inside one is dropped, and the
+    // one-label-per-base rule needs no tie-break.
+    let swallowed = |start: Position| {
+        runs.iter()
+            .any(|r| r.len() > max_repeat_len && r.contains(start))
+    };
+
     for locus in admitted.loci {
         let span = GenomeRegion {
             contig,
             start: Position(locus.start()),
             end: Position(locus.end()),
         };
-        // A satellite array is typed as one object, not searched for loci inside
-        // it (spec §2.1) — so an admitted locus swallowed by one is dropped, and
-        // the one-label-per-base rule needs no tie-break.
-        if runs
-            .iter()
-            .any(|r| r.len() > max_repeat_len && r.contains(span.start))
-        {
+        if swallowed(span.start) {
             continue;
         }
         features.push(TypedRegion {
@@ -414,6 +417,29 @@ pub fn partition_resident(
             kind: RegionKind::SsrLocus(locus),
         });
     }
+
+    // Bundles (D2). `admit` set these aside — repeats too close to each other for
+    // any of them to have a clean flank (spec §2.4) — and handed them back rather
+    // than deleting them, which is the whole point of `Admitted::bundled`. Each
+    // cluster becomes **one** region spanning the hull of its tracts: the gaps
+    // between members are inside it, and rightly so — they are shorter than a
+    // flank, so nothing can be anchored in them either.
+    for cluster in admission::bundle_clusters(&admitted.bundled, config.admission.flank_bp) {
+        // 0-based half-open → 1-based inclusive, the same one conversion as
+        // everywhere else (spec §4).
+        let start = Position(cluster.first().expect("non-empty cluster").start + 1);
+        let end = Position(cluster.iter().map(|iv| iv.end).max().expect("non-empty"));
+        if swallowed(start) {
+            continue;
+        }
+        features.push(TypedRegion {
+            region: GenomeRegion { contig, start, end },
+            kind: RegionKind::SsrBundle {
+                tracts: cluster.into_boxed_slice(),
+            },
+        });
+    }
+
     features.sort_by_key(|f| f.region.start);
 
     fill_generic_gaps(features, contig, contig_len)
@@ -986,6 +1012,178 @@ mod tests {
         assert!(
             partition_resident("chr1", ContigId(0), b"", &TypedRegionConfig::default()).is_empty()
         );
+    }
+
+    // ---- D2: bundle detection --------------------------------------------
+
+    /// Build a contig with `(AT)*10` tracts at the given 0-based offsets, aperiodic
+    /// filler between and around them. Each tract is 20 bp.
+    fn contig_with_tracts_at(offsets: &[usize], total: usize) -> Vec<u8> {
+        let mut bases = filler(total);
+        for &off in offsets {
+            bases[off..off + 20].copy_from_slice(b"ATATATATATATATATATAT");
+        }
+        bases
+    }
+
+    /// **Two tracts 10 bp apart are ONE `SsrBundle` carrying both** — not two
+    /// `Generic` regions, and not a hole. Neither can have a clean flank, so
+    /// neither is a locus; but they are real repeats, and production would simply
+    /// have deleted them (spec §2.4).
+    #[test]
+    fn two_close_tracts_become_one_bundle_carrying_both() {
+        // Tracts at [60,80) and [90,110): a 10 bp gap, well inside flank_bp = 50.
+        let bases = contig_with_tracts_at(&[60, 90], 240);
+        let len = bases.len() as u64;
+        let regions =
+            partition_resident("chr1", ContigId(0), &bases, &TypedRegionConfig::default());
+        assert_partitions(&regions, ContigId(0), len, "two close tracts");
+
+        let bundles: Vec<_> = regions
+            .iter()
+            .filter_map(|r| match &r.kind {
+                RegionKind::SsrBundle { tracts } => Some((r.region, tracts)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(bundles.len(), 1, "ONE bundle, not two Generic regions");
+        assert_eq!(bundles[0].1.len(), 2, "carrying BOTH tracts");
+        // **The hull covers both tracts** — asserted as bounds, not as an exact
+        // coordinate. The detector decides where a repeat starts and stops, and a
+        // ±1–2 bp boundary/phase wobble is expected of it (`scanner_parity`
+        // documents the same thing against trf-mod); pinning the exact edge would
+        // be testing the detector's phase, not the bundle's hull.
+        let (hull, tracts) = (bundles[0].0, bundles[0].1);
+        assert!(hull.start <= Position(61), "hull reaches the first tract");
+        assert!(hull.end >= Position(110), "hull reaches the last tract");
+        assert_eq!(
+            hull.start.get(),
+            tracts.iter().map(|t| t.start).min().unwrap() + 1,
+            "the hull IS the tracts' span, 1-based"
+        );
+        assert_eq!(hull.end.get(), tracts.iter().map(|t| t.end).max().unwrap());
+        assert!(
+            !regions
+                .iter()
+                .any(|r| matches!(r.kind, RegionKind::SsrLocus(_))),
+            "neither tract has a clean flank, so neither is a locus"
+        );
+    }
+
+    /// **Three tracts chained 30 bp apart are ONE bundle of three** — emergent
+    /// transitivity. There is no separate transitive rule to implement: membership
+    /// is the local flank test, and the cluster falls out of it (spec §2.4).
+    ///
+    /// A–B–C where A and C are 70 bp apart — further than `flank_bp` — still chain,
+    /// because B is close to both.
+    #[test]
+    fn three_chained_tracts_become_one_bundle_of_three() {
+        // [60,80), [110,130), [160,180): each gap 30 bp; A→C is 80 bp apart.
+        let bases = contig_with_tracts_at(&[60, 110, 160], 300);
+        let len = bases.len() as u64;
+        let regions =
+            partition_resident("chr1", ContigId(0), &bases, &TypedRegionConfig::default());
+        assert_partitions(&regions, ContigId(0), len, "three chained tracts");
+
+        let bundles: Vec<_> = regions
+            .iter()
+            .filter_map(|r| match &r.kind {
+                RegionKind::SsrBundle { tracts } => Some((r.region, tracts)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(bundles.len(), 1, "the chain is ONE bundle, not two");
+        assert_eq!(
+            bundles[0].1.len(),
+            3,
+            "all three, though the outer pair is further apart than flank_bp — \
+             transitivity is emergent, not a rule"
+        );
+        // Bounds, not exact edges — the detector's ±1–2 bp phase wobble is its
+        // business, not this test's.
+        assert!(bundles[0].0.start <= Position(61));
+        assert!(
+            bundles[0].0.end >= Position(180),
+            "the hull spans the whole chain, outermost tract to outermost tract"
+        );
+    }
+
+    /// **Bundles do not spread.** A tract far enough from a cluster is admitted
+    /// normally — the flank test is local, so a bundle does not contaminate its
+    /// neighbourhood.
+    #[test]
+    fn a_tract_clear_of_a_bundle_is_still_admitted() {
+        // A close pair at [60,80)+[90,110), and a lone tract at [400,420) — far
+        // from everything, with room for its 50 bp flanks.
+        let bases = contig_with_tracts_at(&[60, 90, 400], 600);
+        let len = bases.len() as u64;
+        let regions =
+            partition_resident("chr1", ContigId(0), &bases, &TypedRegionConfig::default());
+        assert_partitions(&regions, ContigId(0), len, "bundle + lone tract");
+
+        assert_eq!(
+            regions
+                .iter()
+                .filter(|r| matches!(r.kind, RegionKind::SsrBundle { .. }))
+                .count(),
+            1,
+            "the close pair bundles"
+        );
+        let loci: Vec<_> = regions
+            .iter()
+            .filter_map(|r| match &r.kind {
+                RegionKind::SsrLocus(l) => Some(l),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            loci.len(),
+            1,
+            "the lone tract is a locus — bundles don't spread"
+        );
+        assert_eq!(loci[0].start(), 401);
+    }
+
+    /// **A repeat rejected for any reason OTHER than the flank test is `Generic`,
+    /// not a bundle** (spec §2.2). Only closeness makes a bundle; being low-copy
+    /// makes you ordinary.
+    #[test]
+    fn a_low_copy_repeat_is_generic_not_a_bundle() {
+        let mut bases = filler(240);
+        // (AT)*3 — below the period-2 copy floor of 5, and isolated.
+        bases[100..106].copy_from_slice(b"ATATAT");
+        let len = bases.len() as u64;
+        let regions =
+            partition_resident("chr1", ContigId(0), &bases, &TypedRegionConfig::default());
+
+        assert_partitions(&regions, ContigId(0), len, "low-copy repeat");
+        assert!(
+            !regions
+                .iter()
+                .any(|r| matches!(r.kind, RegionKind::SsrBundle { .. })),
+            "a copy-floor rejection is Generic territory, NOT a bundle"
+        );
+        assert_eq!(regions.len(), 1, "and no hole: the contig is one Generic");
+    }
+
+    /// The clustering must reproduce exactly the split that produced it — a
+    /// singleton "bundle" would mean the two disagree.
+    #[test]
+    fn bundle_clusters_regroups_exactly_what_the_split_set_aside() {
+        let iv = |start, end| RepeatInterval {
+            start,
+            end,
+            period: 2,
+            score: 100,
+        };
+        // Two clusters: {100,130 / 150,180} and {5000,5030 / 5040,5070}.
+        let bundled = [iv(100, 130), iv(150, 180), iv(5000, 5030), iv(5040, 5070)];
+        let clusters = admission::bundle_clusters(&bundled, 50);
+        assert_eq!(clusters.len(), 2, "two clusters, not one and not four");
+        assert_eq!(clusters[0].len(), 2);
+        assert_eq!(clusters[1].len(), 2);
+        assert_eq!(clusters[0][0].start, 100);
+        assert_eq!(clusters[1][0].start, 5000);
     }
 
     /// **`.cat` parity — the oracle, and D1's real bar** (spec §8.1).

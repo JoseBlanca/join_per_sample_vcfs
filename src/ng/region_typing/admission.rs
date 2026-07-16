@@ -1222,6 +1222,39 @@ fn is_close(a: &RepeatInterval, b: &RepeatInterval, thresh: u64) -> bool {
         || b.end.abs_diff(a.end) < thresh
 }
 
+/// Group [`Admitted::bundled`] back into its clusters — one `Vec` per bundle.
+///
+/// [`admit`] returns the members flattened (spec §5a's shape), but the walk emits
+/// **one region per cluster**, so it needs the grouping back. Re-deriving it is
+/// exact rather than approximate: `bundled` is the concatenation of the clusters
+/// in coordinate order, and two *adjacent* clusters are by definition not close
+/// (or they would be one cluster) — so re-running the same [`is_close`] chaining
+/// reproduces exactly the grouping [`split_bundles`] found.
+///
+/// It lives here, beside the flank test, rather than in the walk: **the cluster
+/// rule is admission's**, and a second copy of `is_close` is how the two would
+/// drift.
+///
+/// `flank_bp` must be the same radius [`admit`] was given, or the grouping will
+/// not match the split.
+pub fn bundle_clusters(bundled: &[RepeatInterval], flank_bp: u64) -> Vec<Vec<RepeatInterval>> {
+    let mut out: Vec<Vec<RepeatInterval>> = Vec::new();
+    for &iv in bundled {
+        match out.last_mut() {
+            Some(cluster) if is_close(cluster.last().expect("non-empty"), &iv, flank_bp) => {
+                cluster.push(iv);
+            }
+            _ => out.push(vec![iv]),
+        }
+    }
+    debug_assert!(
+        out.iter().all(|c| c.len() >= 2),
+        "a bundle has >= 2 members by definition (spec §2.4); a singleton means \
+         the grouping disagrees with the split that produced it"
+    );
+    out
+}
+
 /// Split every maximal run of consecutive close records off from the isolated
 /// ones (GangSTR `remove_bundles.py`'s selection). `recs` must be start-sorted.
 /// Returns `(isolated, bundled)`.

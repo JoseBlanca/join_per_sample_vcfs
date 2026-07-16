@@ -253,7 +253,7 @@ the coverage merge + satellite cap — all of Milestone A. *Depends:* A, B, C. *
 present, or absent *and* inside a satellite run; `scanner_parity`'s overlap tolerance for detector
 wobble, spec §8.1) on a small reference. **This is D3's oracle.**
 
-**D2. Bundle detection — the flank test, and the rejected-repeat split.**  ☐
+**D2. Bundle detection — the flank test, and the rejected-repeat split.**  ✅
 A repeat with another repeat within `flank_bp` on either side is a bundle member; the cluster (hull of
 its tracts) is one `SsrBundle`; a repeat admission turns down for any *other* reason is `Generic`, not a
 hole (spec §2.2). Consumes `admit`'s `Admitted.bundled` (A3). *Depends:* D1. *Source:* spec §2.2,
