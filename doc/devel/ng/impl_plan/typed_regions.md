@@ -149,7 +149,7 @@ Verified: **A1's differential still green at `Default`** (that is what "same def
 is the whole reason A1 came first); a non-default period scope / copy floor demonstrably changes the
 admitted set.
 
-**A3. `admit` windowed, and returns what it set aside.**  ☐
+**A3. `admit` windowed, and returns what it set aside.**  ✅
 Add `bases_start` + `contig_len` params — the two facts a bare slice silently stood in for (spec §2.6);
 whole-contig (`bases_start = 1`, `contig_len = bases.len()`) is the degenerate case → unchanged output.
 Return `Admitted { loci, bundled }`, where `bundled` is the cluster members `build_loci` silently drops
@@ -158,9 +158,20 @@ at the degenerate case** (this is what makes windowing provably behaviour-preser
 non-empty on a clustered fixture; a locus near a slice edge is **not** dropped when `contig_len` says
 the contig continues — the §2.6 bug, tested directly rather than argued.
 
-> **Checkpoint A:** ng owns a 1-based/`u64` admission policy whose every rule is a knob, windowable and
-> bundle-reporting, **pinned to production's `build_loci` by a green differential** — and `src/ssr/` has
-> not been touched. Pause for review.
+> **Checkpoint A — REACHED 2026-07-16.** ng owns a 1-based/`u64` admission policy whose every rule is a
+> knob, windowable and bundle-reporting, **pinned to production's `build_loci` by a green differential**
+> — and `src/ssr/` has not been touched. Pause for review.
+>
+> **Routed forward from A3's review, so they are not lost:**
+> - **C1** — a `Window { bases, bases_start, contig_len }` newtype (or `Position`/`Bp` doing the same
+>   job). `admit`'s three window params are co-dependent and two are same-typed `u64`s that transpose
+>   silently; more importantly, the `contig_len` guard is **inherently incomplete** — a caller passing
+>   the window's own end as `contig_len` is arithmetically legal, and only *provenance* (a contig table)
+>   can catch it. C1's newtypes are already scheduled and need no spec amendment.
+> - **D1** — assert the partition on the scanner-output fixture; today it projects `.loci` and throws
+>   `bundled` away, so the only realistic-density fixture asserts nothing about the whole partition.
+> - **Own step** — a `proptest` property over `assert_agrees`. `proptest` is already a dev-dependency
+>   and `assert_agrees` is a ready-made property body; it is the strongest remaining lever on the port.
 
 ### Milestone B — the windowed, wide, raw substrate the walk stands on
 

@@ -677,6 +677,45 @@ impl From<RepeatInterval> for Candidate {
     }
 }
 
+impl From<Candidate> for RepeatInterval {
+    /// Back out, for [`Admitted::bundled`] — the caller's own intervals handed
+    /// back, so they must round-trip exactly.
+    ///
+    /// The narrowing is lossless *because* every `Candidate` came from a
+    /// `RepeatInterval` (`Candidate` has no other constructor), so the values
+    /// still fit. `try_into().expect()` rather than `as`: this is precisely where
+    /// B2's widening of `RepeatInterval` to `u64` would make the reasoning stale,
+    /// and a panic naming the field beats a silently truncated coordinate.
+    // PANIC-FREE: both `try_into`s are infallible in practice — every `Candidate`
+    // is built by `Candidate::from(RepeatInterval)` (the only constructor), so the
+    // values round-trip. `expect` over `as` because this is exactly where B2's
+    // widening of `RepeatInterval` would make that reasoning stale, and a panic
+    // naming the field beats a silently truncated coordinate. The crate sets
+    // `fallible_impl_from = "warn"`; this is the documented exception, and B2
+    // retires the conversion entirely.
+    fn from(c: Candidate) -> Self {
+        // Destructured, not field-read: a new `Candidate` field then fails to
+        // compile here rather than being silently dropped from a value whose whole
+        // contract is to round-trip.
+        let Candidate {
+            start,
+            end,
+            period,
+            score,
+        } = c;
+        Self {
+            start: start
+                .try_into()
+                .expect("Candidate::start came from a RepeatInterval, so it fits"),
+            end: end
+                .try_into()
+                .expect("Candidate::end came from a RepeatInterval, so it fits"),
+            period,
+            score,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------
 // The pre-filter
 // ---------------------------------------------------------------------
@@ -769,32 +808,121 @@ pub fn prefilter(intervals: &[RepeatInterval], params: &SsrAdmissionParams) -> V
 // Admission
 // ---------------------------------------------------------------------
 
-/// Admit detected repeats into start-sorted STR loci — ng's `build_loci`.
+/// What [`admit`] made of one window's candidates.
 ///
-/// `chrom` is the contig name; `contig_seq` is the full contig (any case — the
-/// tract, motif, and `ref_bytes` are upper-cased here for case-stable identity).
-/// Feed it [`prefilter`]ed intervals, never raw scanner output (spec §5b).
+/// **`bundled` is the A3 change of substance** (spec §2.4, §6a). Production's
+/// `build_loci` *deletes* the members of a too-close cluster: they are neither
+/// loci nor anything else, and the bases they cover become a hole nobody accounts
+/// for. ng keeps the **selection** and rejects the **disposal** — the same records
+/// are set aside, but handed back so the walk can route them as an `SsrBundle`
+/// region and a consumer can decide later, with the evidence in hand, rather than
+/// having the decision taken here by deletion.
 ///
-/// **A1: whole-contig, as production is.** Milestone A3 adds `bases_start` +
-/// `contig_len` so a window can be admitted without the slice being mistaken for
-/// the whole chromosome (spec §2.6), and swaps the return for
-/// `Admitted { loci, bundled }` (spec §2.4).
+/// Keeping selection and disposal separable is also what preserves spec §8's
+/// oracle: the *selection* is unchanged, so ng's locus set stays comparable with
+/// production's (a bundle member is not a locus in either system).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Admitted {
+    /// The admitted STR loci, start-sorted. Exactly what `build_loci` returns.
+    pub loci: Vec<Locus>,
+    /// The cluster members `build_loci` silently drops — every repeat that
+    /// cleared the period/score/compound gates but sits within `flank_bp` of
+    /// another, so no clean flank can be built around it (spec §2.4).
+    ///
+    /// **Coordinates are the input's**, i.e. offsets into `bases`, not genomic —
+    /// these are the caller's own `RepeatInterval`s handed straight back. The walk
+    /// re-bases them when it emits the region's hull, the same way it re-bases
+    /// everything else it reads out of a window.
+    pub bundled: Vec<RepeatInterval>,
+}
+
+/// Admit detected repeats into start-sorted STR loci — ng's `build_loci`,
+/// **windowed**.
 ///
-/// Output coordinates are **1-based inclusive** ([`Locus`]); the input's are
-/// 0-based half-open. That conversion is the only intended numeric difference
-/// from production's `build_loci`, and the two
-/// `differential_vs_production_build_loci_*` tests pin it.
+/// `chrom` is the contig name. `bases` is a slice of that contig (any case — the
+/// tract, motif, and `ref_bytes` are upper-cased here for case-stable identity);
+/// `recs` are offsets into `bases`. Feed it [`prefilter`]ed intervals, never raw
+/// scanner output (spec §5b).
+///
+/// # The two facts a bare slice cannot tell you (spec §2.6)
+///
+/// - **`bases_start`** — the 1-based genomic coordinate of `bases[0]`.
+/// - **`contig_len`** — how long the contig *really* is.
+///
+/// Production takes neither, because it only ever sees whole contigs, so
+/// `contig_seq.len()` silently plays two different roles: the bound on what can be
+/// read, **and** the position of the chromosome's end. Hand that code a 100 kb
+/// window and it believes the chromosome ends at your window edge — so it clamps
+/// every flank there and **throws away every locus within `flank_bp` of every
+/// boundary, a different set for every `window_bp`**. It makes no noise at all
+/// when it does. Splitting the two roles is the fix, and it is the whole reason
+/// this signature exists.
+///
+/// **Whole-contig is the degenerate case**: `bases_start = 1`,
+/// `contig_len = bases.len()`. Then the two roles coincide again and the output is
+/// production's, unchanged — which is what keeps
+/// `differential_vs_production_build_loci_*` a valid oracle for the windowed code
+/// (spec §5a). Every window-only path is therefore proved *by* the degenerate
+/// case staying green, plus `admit_keeps_a_locus_the_window_edge_would_have_eaten`.
+///
+/// # Panics
+///
+/// If `bases` cannot supply a survivor's flanks — i.e. the caller windowed without
+/// leaving a margin (spec §2.6 fetches core ± `max_repeat_len`, and 1 kb is far
+/// more than the 50 bp of flank). Loudly, because the alternative is dropping the
+/// locus quietly, which is the very bug this signature exists to kill.
+///
+/// Output coordinates are **1-based inclusive genomic** ([`Locus`]); the input's
+/// are 0-based half-open offsets into `bases`.
 pub fn admit(
     recs: Vec<RepeatInterval>,
     chrom: &str,
-    contig_seq: &[u8],
+    bases: &[u8],
+    bases_start: u64,
+    contig_len: u64,
     p: &SsrAdmissionParams,
-) -> Vec<Locus> {
-    // The `SsrAdmissionParams` contracts that are otherwise only prose. A NaN
-    // `min_purity` is the one that bites quietly: every `purity < p.min_purity`
-    // comparison below is then false, so the purity gate passes everything rather
-    // than failing.
-    debug_assert!(
+) -> Admitted {
+    assert!(
+        bases_start >= 1,
+        "bases_start is 1-based; got {bases_start}"
+    );
+    // **A real `assert!`, for the same reason the period ceiling below is one:
+    // sweeps run in release.** An understated `contig_len` clamps `ref_end` early,
+    // and the `ref_end == tract_end` test still passes — so a locus comes out with
+    // a **silently truncated right flank**, or vanishes. That is spec §2.6's bug
+    // reappearing inside the code written to kill it, and §10's flank and routing
+    // sweeps drive this path in release. Once per `admit` call.
+    //
+    // **It is inherently incomplete, and that is worth stating rather than
+    // trusting.** `<=` admits equality, so a caller passing *the window's own end*
+    // as `contig_len` — production's exact mistake — is arithmetically legal and
+    // no check here can catch it. The other half needs **provenance**: a
+    // `contig_len` read from the reference's contig table, not derived from
+    // whatever slice is in hand. That belongs where the walk gets its contig table
+    // (spec §3's `contigs()` accessor, Milestone C), not here.
+    assert!(
+        bases_start + bases.len() as u64 - 1 <= contig_len,
+        "the window [{bases_start}, {}] runs past the contig end ({contig_len}): \
+         contig_len must be the CONTIG's length, never the window's",
+        bases_start + bases.len() as u64 - 1
+    );
+    // `flank_bp = 0` admits nothing at all, from any input: every tract's own flank
+    // test (`ref_start == tract_start`) fires, so every locus is dropped and
+    // nothing is even bundled — an empty result, no error, from a knob spec §10
+    // plans to sweep. The M7 shape again: the knob appears to move, and instead
+    // switches the whole step off.
+    assert!(
+        p.flank_bp >= 1,
+        "flank_bp must be at least 1: at 0 every locus fails its own flank test \
+         and admit silently returns nothing"
+    );
+    // A NaN `min_purity` bites quietly: every `purity < p.min_purity` comparison
+    // below is then false, so the purity gate passes **everything** rather than
+    // failing. `assert!` for the same reason as its neighbours — the purity floor
+    // is a swept knob (spec §10), sweeps run in release, and a release sweep that
+    // silently admitted every tract would report a finding about the data that is
+    // really a fact about a `NaN`.
+    assert!(
         p.min_purity.is_finite() && (0.0..=1.0).contains(&p.min_purity),
         "min_purity must be finite in [0, 1], got {}",
         p.min_purity
@@ -819,6 +947,10 @@ pub fn admit(
 
     // 1. scope + score gate, then 2. compound-motif drop. Both need the tract,
     //    so we slice the (upper-cased) prefix motif here and filter on it.
+    //
+    //    `r.end <= bases.len()` stays a SLICE bound, not a contig bound: `r` is an
+    //    offset into `bases`, and this guards the slicing two lines down. The
+    //    contig end is a different question, and it is asked in `finish_locus`.
     let mut kept: Vec<Candidate> = recs
         .into_iter()
         .map(Candidate::from)
@@ -827,11 +959,11 @@ pub fn admit(
                 && r.period <= p.periods.max()
                 && r.score >= p.min_score
                 && r.end > r.start
-                && (r.end as usize) <= contig_seq.len()
+                && (r.end as usize) <= bases.len()
         })
         .filter(|r| {
             let period = r.period as usize;
-            let tract = &contig_seq[r.start as usize..r.end as usize];
+            let tract = &bases[r.start as usize..r.end as usize];
             // Need at least one full motif to form the prefix.
             if tract.len() < period {
                 return false;
@@ -845,34 +977,41 @@ pub fn admit(
     //    start-sorted for the streaming clustering.
     kept.sort_by_key(|r| (r.start, r.end));
     // `flank_bp` IS the bundle radius (spec §2.4) — see `SsrAdmissionParams`.
-    let kept = drop_bundles(kept, p.flank_bp);
+    // A3: the cluster members come back rather than being deleted (`Admitted`).
+    let (kept, bundled) = split_bundles(kept, p.flank_bp);
 
     // 4-5. per record: end-trim + copy floor, recompute purity + floor, embed.
-    let mut out = Vec::with_capacity(kept.len());
+    let mut loci = Vec::with_capacity(kept.len());
     for r in &kept {
-        if let Some(locus) = finish_locus(r, chrom, contig_seq, p) {
-            out.push(locus);
+        if let Some(locus) = finish_locus(r, chrom, bases, bases_start, contig_len, p) {
+            loci.push(locus);
         }
     }
-    out
+    Admitted {
+        loci,
+        bundled: bundled.into_iter().map(RepeatInterval::from).collect(),
+    }
 }
 
 /// Steps 4-5 for one record: end-trim, copy-number floor, motif, purity floor,
 /// `ref_bytes` embed. `None` if the record fails any gate.
 ///
-/// **The one place the coordinate base changes.** Everything above works in the
-/// detector's 0-based half-open space (which is also the slice's, so the
-/// arithmetic is production's unchanged); the 1-based inclusive [`Locus`] is
-/// built at the bottom, once. Spec §4 predicted exactly this: "the arithmetic
-/// cancels … exactly one site does not".
+/// **The one place the coordinate base changes**, and (since A3) the one place
+/// the *contig* end is asked about. Everything above works in the detector's
+/// 0-based half-open offsets into `bases` — which is also the slice's own space,
+/// so the arithmetic stays production's unchanged. The 1-based inclusive genomic
+/// [`Locus`] is built at the bottom, once. Spec §4 predicted exactly this: "the
+/// arithmetic cancels … exactly one site does not".
 fn finish_locus(
     r: &Candidate,
     chrom: &str,
-    contig_seq: &[u8],
+    bases: &[u8],
+    bases_start: u64,
+    contig_len: u64,
     p: &SsrAdmissionParams,
 ) -> Option<Locus> {
     let period = r.period as usize;
-    let raw_tract = upper(&contig_seq[r.start as usize..r.end as usize]);
+    let raw_tract = upper(&bases[r.start as usize..r.end as usize]);
     let motif_bytes = raw_tract.get(..period)?.to_vec();
 
     // End-trim to clean whole-motif boundaries (GangSTR minimal_trim).
@@ -918,33 +1057,77 @@ fn finish_locus(
         return None;
     }
 
-    // Embed ref_bytes: trimmed tract + flank each side, clamped at contig ends.
-    let ref_start = new_start.saturating_sub(p.flank_bp);
-    let ref_end = (new_end + p.flank_bp).min(contig_seq.len() as u64);
+    // **The window-boundary fix (spec §2.6), and the whole of it.**
+    //
+    // Move to genomic 1-based inclusive first, because the flank clamp is a
+    // question about the *contig*, and `bases` cannot answer it. `[s, e)` at
+    // offset `s` is `[bases_start + s, bases_start + e - 1]`.
+    let tract_start = bases_start + new_start;
+    let tract_end = bases_start + new_end - 1;
+
+    // Clamp the flanks at the CONTIG's ends — 1 and `contig_len` — never at the
+    // slice's. Production writes `.min(contig_seq.len())` because for it the two
+    // are the same thing; for a window they are not, and believing the chromosome
+    // stops at the window edge is what silently eats every locus near every
+    // boundary.
+    let ref_start = tract_start.saturating_sub(p.flank_bp).max(1);
+    let ref_end = (tract_end + p.flank_bp).min(contig_len);
 
     // Drop a locus whose flank clamped to nothing on either side — a tract
-    // abutting position 0 of the contig (empty left flank) or ending on the
-    // contig's last base (empty right flank). The delimiter anchors the repeat
-    // region on *both* flank junctions; a zero-length flank leaves nothing to
-    // anchor against, so the tract is not genotypeable.
-    if ref_start == new_start || ref_end == new_end {
+    // abutting base 1 of the contig (empty left flank) or ending on its last base
+    // (empty right flank). The delimiter anchors the repeat region on *both* flank
+    // junctions; a zero-length flank leaves nothing to anchor against, so the
+    // tract is not genotypeable. These are now genuinely about the contig, so a
+    // window edge no longer impersonates one.
+    if ref_start == tract_start || ref_end == tract_end {
         return None;
     }
 
-    let ref_bytes = upper(&contig_seq[ref_start as usize..ref_end as usize]);
+    // Back to slice offsets to actually read the bytes. The caller must have
+    // supplied the margin (spec §2.6 fetches core ± max_repeat_len = 1 kb against
+    // a 50 bp flank), so failing here is a caller bug — and a loud one, because
+    // the quiet alternative is dropping the locus, which is the bug this whole
+    // signature exists to kill.
+    //
+    // The two messages are deliberately **distinct**: `should_panic` matches a
+    // substring, so a shared phrase would let the left-edge test be satisfied by a
+    // right-edge panic. Both name `flank_bp`, because "grow the window" is the
+    // actionable fix and the number is how much by.
+    let ref_range = {
+        let lo = ref_start.checked_sub(bases_start).unwrap_or_else(|| {
+            panic!(
+                "flank runs LEFT of the window: locus at {tract_start} needs bases from \
+                 {ref_start} (flank_bp = {}), but the window starts at {bases_start} — \
+                 the caller windowed without a left margin",
+                p.flank_bp
+            )
+        });
+        // Checked, so a wrong `contig_len` cannot wrap this into a plausible-looking
+        // count and make the assert below report the wrong diagnosis.
+        let hi = ref_end
+            .checked_sub(bases_start)
+            .and_then(|h| h.checked_add(1))
+            .expect("ref_end precedes the window start, which the clamps forbid");
+        assert!(
+            hi as usize <= bases.len(),
+            "flank runs RIGHT of the window: locus at {tract_end} needs bases to \
+             {ref_end} (flank_bp = {}), i.e. {hi} bytes, but the window holds {} — \
+             the caller windowed without a right margin",
+            p.flank_bp,
+            bases.len()
+        );
+        lo as usize..hi as usize
+    };
+    let ref_bytes = upper(&bases[ref_range]);
 
-    // 0-based half-open -> 1-based inclusive (spec §4). `[s, e)` is `[s+1, e]`:
-    // the start shifts by one, the end does not move, and the length is
-    // unchanged — which is why every span above could stay in production's
-    // arithmetic.
     match Locus::new(
         chrom.to_string().into_boxed_str(),
-        new_start + 1,
-        new_end,
+        tract_start,
+        tract_end,
         motif,
         purity,
         ref_bytes.into_boxed_slice(),
-        ref_start + 1,
+        ref_start,
     ) {
         Ok(locus) => Some(locus),
         // Unreachable: every gate above guarantees the invariants (`minimal_trim`
@@ -963,7 +1146,8 @@ fn finish_locus(
             debug_assert!(
                 false,
                 "admit built an invalid locus, so the port's arithmetic is wrong: {e} \
-                 (tract {new_start}..{new_end} 0-based, ref_bytes {ref_start}..{ref_end})"
+                 (tract [{tract_start}, {tract_end}], ref_bytes [{ref_start}, {ref_end}], \
+                  window starts at {bases_start}, contig is {contig_len} long)"
             );
             None
         }
@@ -1082,31 +1266,41 @@ fn is_close(a: &Candidate, b: &Candidate, thresh: u64) -> bool {
         || b.end.abs_diff(a.end) < thresh
 }
 
-/// Drop bundles: discard every maximal run of consecutive close records in its
-/// entirety (GangSTR `remove_bundles.py`). `recs` must be start-sorted.
+/// Split every maximal run of consecutive close records off from the isolated
+/// ones (GangSTR `remove_bundles.py`'s selection). `recs` must be start-sorted.
+/// Returns `(isolated, bundled)`.
 ///
-/// **A3 keeps this selection and rejects its disposal** — the cluster members are
-/// handed back as an `SsrBundle` rather than deleted (spec §2.4). A1 transcribes
-/// the drop as-is, because the differential can only compare what production
-/// also does.
-fn drop_bundles(recs: Vec<Candidate>, thresh: u64) -> Vec<Candidate> {
-    let mut out = Vec::new();
+/// **The selection is production's, verbatim; only the disposal differs** (spec
+/// §2.4). `remove_bundles.py` — and A1, transcribing it — *deletes* the cluster;
+/// this hands it back. The partition is the same one production computes, member
+/// for member, which is what keeps spec §8's oracle valid: a bundle member is not
+/// a locus in either system, so the two locus sets stay comparable. What changes
+/// is only that ng can now *route* the cluster (as an `SsrBundle` region) instead
+/// of leaving its bases an unaccounted hole.
+///
+/// No source comment of GangSTR's says why bundles are dropped at all (spec §10);
+/// keeping selection and disposal separable is what lets that question be asked
+/// later, with the evidence in hand.
+fn split_bundles(recs: Vec<Candidate>, thresh: u64) -> (Vec<Candidate>, Vec<Candidate>) {
+    let mut isolated = Vec::new();
+    let mut bundled = Vec::new();
     let n = recs.len();
     let mut i = 0;
     while i < n {
         if i + 1 < n && is_close(&recs[i], &recs[i + 1], thresh) {
-            // Advance through the whole close cluster; drop all of it.
+            // Advance through the whole close cluster; set all of it aside.
             let mut j = i;
             while j + 1 < n && is_close(&recs[j], &recs[j + 1], thresh) {
                 j += 1;
             }
+            bundled.extend_from_slice(&recs[i..=j]);
             i = j + 1;
         } else {
-            out.push(recs[i]);
+            isolated.push(recs[i]);
             i += 1;
         }
     }
-    out
+    (isolated, bundled)
 }
 
 impl fmt::Display for Locus {
@@ -1130,6 +1324,23 @@ mod tests {
     /// The catalog's settings with a 5 bp flank, so the fixtures can be small.
     fn params() -> SsrAdmissionParams {
         matched_params(0.8, 0, 5).0
+    }
+
+    /// `admit` over a whole contig — spec §5a's **degenerate case**:
+    /// `bases_start = 1`, `contig_len = bases.len()`, so the window IS the contig
+    /// and the two roles `contig_seq.len()` used to play coincide again.
+    ///
+    /// This is what makes the A1 differential a valid oracle for A3's windowed
+    /// code: production only ever ran whole-contig, so it is the only
+    /// configuration the two can be compared at — and every window-only path is
+    /// proved by this staying green plus the direct edge tests.
+    fn admit_whole_contig(
+        recs: Vec<RepeatInterval>,
+        chrom: &str,
+        contig: &[u8],
+        p: &SsrAdmissionParams,
+    ) -> Vec<Locus> {
+        admit(recs, chrom, contig, 1, contig.len() as u64, p).loci
     }
 
     /// A 0-based half-open interval, the way the scanner emits one.
@@ -1323,26 +1534,34 @@ mod tests {
     }
 
     #[test]
-    fn drop_bundles_discards_whole_clusters_keeps_isolated() {
+    fn split_bundles_sets_aside_whole_clusters_and_keeps_isolated() {
         let recs = vec![
             Candidate::from(iv(100, 130, 2, 100)),
             Candidate::from(iv(150, 180, 3, 100)),
             Candidate::from(iv(200, 230, 2, 100)),
             Candidate::from(iv(5000, 5030, 2, 100)),
         ];
-        let kept = drop_bundles(recs, 50);
-        assert_eq!(kept.len(), 1, "only the isolated D survives");
-        assert_eq!(kept[0].start, 5000);
+        let (isolated, bundled) = split_bundles(recs, 50);
+        assert_eq!(isolated.len(), 1, "only the isolated D survives");
+        assert_eq!(isolated[0].start, 5000);
+        // A3: the cluster comes back rather than vanishing (spec §2.4).
+        assert_eq!(bundled.len(), 3, "A, B, C are handed back, not deleted");
+        assert_eq!(
+            bundled.iter().map(|c| c.start).collect::<Vec<_>>(),
+            vec![100, 150, 200]
+        );
     }
 
     #[test]
-    fn drop_bundles_keeps_all_when_none_close() {
+    fn split_bundles_keeps_all_when_none_close() {
         let recs = vec![
             Candidate::from(iv(100, 130, 2, 100)),
             Candidate::from(iv(1000, 1030, 2, 100)),
             Candidate::from(iv(2000, 2030, 2, 100)),
         ];
-        assert_eq!(drop_bundles(recs, 50).len(), 3);
+        let (isolated, bundled) = split_bundles(recs, 50);
+        assert_eq!(isolated.len(), 3);
+        assert!(bundled.is_empty(), "nothing close, nothing set aside");
     }
 
     // ---- admit end-to-end, in ng's 1-based coordinates ----------------------
@@ -1355,7 +1574,7 @@ mod tests {
         let tract = b"ATATATATATATATAT"; // 16 bp = 8 copies of AT
         let right = b"GCGCG"; // 5 bp right flank
         let contig = [left.as_ref(), tract.as_ref(), right.as_ref()].concat();
-        let loci = admit(vec![iv(5, 21, 2, 100)], "chr1", &contig, &params());
+        let loci = admit_whole_contig(vec![iv(5, 21, 2, 100)], "chr1", &contig, &params());
 
         assert_eq!(loci.len(), 1);
         let l = &loci[0];
@@ -1376,7 +1595,7 @@ mod tests {
         let contig = b"AAAACGATATATATATATATCCCC";
         let too_long = iv(0, 14, 7, 100); // period 7 > MAX_PERIOD
         let compound = iv(6, 20, 4, 100); // ATAT = (AT)^2
-        let loci = admit(vec![too_long, compound], "chr1", contig, &params());
+        let loci = admit_whole_contig(vec![too_long, compound], "chr1", contig, &params());
         assert!(loci.is_empty(), "both records are dropped, got {loci:?}");
     }
 
@@ -1384,7 +1603,7 @@ mod tests {
     fn admit_drops_below_copy_number_floor() {
         // period 2 needs >= 5 copies; (AT)*3 is only 3 → dropped.
         let contig = b"CCCCCATATATCCCCC";
-        assert!(admit(vec![iv(5, 11, 2, 100)], "chr1", contig, &params()).is_empty());
+        assert!(admit_whole_contig(vec![iv(5, 11, 2, 100)], "chr1", contig, &params()).is_empty());
     }
 
     #[test]
@@ -1392,7 +1611,7 @@ mod tests {
         // Tract (AT)*8 starts at 0-based 1; the 5 bp left flank clamps to 1 bp.
         // A 1 bp flank is still a (weak) anchor, so the locus is kept.
         let contig = b"GATATATATATATATATCGCGCGCGCG";
-        let loci = admit(vec![iv(1, 17, 2, 100)], "chr1", contig, &params());
+        let loci = admit_whole_contig(vec![iv(1, 17, 2, 100)], "chr1", contig, &params());
         assert_eq!(loci.len(), 1);
         let l = &loci[0];
         assert_eq!(l.ref_bytes_start(), 1, "clamped to the contig's first base");
@@ -1404,7 +1623,7 @@ mod tests {
         // Tract abuts 0-based position 0 — no left flank, nothing to anchor.
         let contig = b"ATATATATATATATATCGCGC";
         assert!(
-            admit(vec![iv(0, 16, 2, 100)], "chr1", contig, &params()).is_empty(),
+            admit_whole_contig(vec![iv(0, 16, 2, 100)], "chr1", contig, &params()).is_empty(),
             "a tract at contig position 0 has no left flank and is not genotypeable"
         );
     }
@@ -1413,7 +1632,7 @@ mod tests {
     fn admit_drops_locus_with_empty_right_flank() {
         let contig = b"CGCGCATATATATATATATAT";
         assert!(
-            admit(vec![iv(5, 21, 2, 100)], "chr1", contig, &params()).is_empty(),
+            admit_whole_contig(vec![iv(5, 21, 2, 100)], "chr1", contig, &params()).is_empty(),
             "a tract ending on the contig's last base has no right flank"
         );
     }
@@ -1425,7 +1644,7 @@ mod tests {
             contig.extend_from_slice(b"CAG");
         }
         contig.extend_from_slice(b"TTTTT");
-        let loci = admit(
+        let loci = admit_whole_contig(
             vec![iv(0, 20, 1, 100), iv(20, 50, 3, 100)],
             "chr1",
             &contig,
@@ -1599,7 +1818,7 @@ mod tests {
         seq: &[u8],
         case: &str,
     ) {
-        let ours = admit(intervals.to_vec(), chrom, seq, ng_p);
+        let ours = admit_whole_contig(intervals.to_vec(), chrom, seq, ng_p);
         let theirs = build_loci(as_trf(intervals), chrom, seq, prod_p);
 
         assert_eq!(
@@ -1732,7 +1951,7 @@ mod tests {
         let right = b"gcgcg";
         let contig = [left.as_ref(), tract.as_ref(), right.as_ref()].concat();
 
-        let loci = admit(vec![iv(5, 21, 2, 100)], "chr1", &contig, &params());
+        let loci = admit_whole_contig(vec![iv(5, 21, 2, 100)], "chr1", &contig, &params());
         assert_eq!(loci.len(), 1, "a soft-masked tract is still a locus");
         let l = &loci[0];
         assert_eq!(l.motif().as_bytes(), b"AT", "motif upper-cased");
@@ -1753,7 +1972,7 @@ mod tests {
             b"GCGCG".as_ref(),
         ]
         .concat();
-        let mixed_loci = admit(vec![iv(5, 21, 2, 100)], "chr1", &mixed, &params());
+        let mixed_loci = admit_whole_contig(vec![iv(5, 21, 2, 100)], "chr1", &mixed, &params());
         assert_eq!(mixed_loci, loci, "case must not change the locus");
         assert_agrees(&[iv(5, 21, 2, 100)], "chr1", &mixed, "mixed-case contig");
     }
@@ -1778,7 +1997,7 @@ mod tests {
         // The detector reports the whole junk+tract span, as detectors do.
         let detected = iv(5, 20, 2, 100);
 
-        let loci = admit(vec![detected], "chr1", &contig, &params());
+        let loci = admit_whole_contig(vec![detected], "chr1", &contig, &params());
         assert_eq!(loci.len(), 1);
         let l = &loci[0];
         assert_eq!(
@@ -1812,7 +2031,7 @@ mod tests {
         let detected = iv(5, 21, 2, 100);
 
         let (ng_p, prod_p) = matched_params(0.8, 0, 5);
-        let loci = admit(vec![detected], "chr1", &contig, &ng_p);
+        let loci = admit_whole_contig(vec![detected], "chr1", &contig, &ng_p);
         assert_eq!(loci.len(), 1, "imperfect but above the floor: KEPT");
         assert!(
             !loci[0].is_perfect() && loci[0].purity_fraction() > 0.8,
@@ -1833,7 +2052,7 @@ mod tests {
         // is compared against production at all.
         let (ng_hi, prod_hi) = matched_params(0.99, 0, 5);
         assert!(
-            admit(vec![detected], "chr1", &contig, &ng_hi).is_empty(),
+            admit_whole_contig(vec![detected], "chr1", &contig, &ng_hi).is_empty(),
             "purity below the floor: DROPPED"
         );
         assert_agrees_at(
@@ -1863,7 +2082,7 @@ mod tests {
         let (ng_p, prod_p) = matched_params(0.8, 50, 5);
         // Above the floor: admitted.
         assert_eq!(
-            admit(vec![iv(5, 21, 2, 100)], "chr1", &contig, &ng_p).len(),
+            admit_whole_contig(vec![iv(5, 21, 2, 100)], "chr1", &contig, &ng_p).len(),
             1,
             "score 100 >= floor 50"
         );
@@ -1879,7 +2098,7 @@ mod tests {
         // Below the floor: dropped. This is the assertion that makes deleting the
         // gate fail.
         assert!(
-            admit(vec![iv(5, 21, 2, 49)], "chr1", &contig, &ng_p).is_empty(),
+            admit_whole_contig(vec![iv(5, 21, 2, 49)], "chr1", &contig, &ng_p).is_empty(),
             "score 49 < floor 50 must be dropped"
         );
         assert_agrees_at(
@@ -1893,7 +2112,7 @@ mod tests {
 
         // Exactly at the floor: `>=`, kept. Pins the boundary direction.
         assert_eq!(
-            admit(vec![iv(5, 21, 2, 50)], "chr1", &contig, &ng_p).len(),
+            admit_whole_contig(vec![iv(5, 21, 2, 50)], "chr1", &contig, &ng_p).len(),
             1,
             "the gate is `score >= min_score`, so equality is admitted"
         );
@@ -1919,7 +2138,7 @@ mod tests {
         contig.extend_from_slice(b"ATATATATATATATAT");
         contig.resize(140, b'G');
         let at_default = |score| {
-            admit(
+            admit_whole_contig(
                 vec![iv(60, 76, 2, score)],
                 "chr1",
                 &contig,
@@ -2079,6 +2298,353 @@ mod tests {
         );
     }
 
+    // ---- A3: windowing, and what admission sets aside ------------------------
+
+    /// A contig with one clean, isolated (AT)*8 tract at a known offset, padded so
+    /// a window can be cut around it with room for flanks either side.
+    fn contig_with_one_tract_at(tract_offset: usize, total: usize) -> (Vec<u8>, RepeatInterval) {
+        let mut contig = vec![b'C'; tract_offset];
+        contig.extend_from_slice(b"ATATATATATATATAT"); // 16 bp, 8 copies
+        contig.resize(total, b'G');
+        let iv = iv(tract_offset as u32, (tract_offset + 16) as u32, 2, 100);
+        (contig, iv)
+    }
+
+    /// **A3 — the spec §2.6 bug, tested rather than argued.**
+    ///
+    /// A locus 10 bp from the *window's* right edge, but 10 kb from the *contig's*.
+    /// Production's rule clamps the flank at `contig_seq.len()`, so handed this
+    /// window it believes the chromosome stops at the edge, clamps the right flank
+    /// to nothing, and drops the locus — **and a different set of loci for every
+    /// `window_bp` you pick, with no error**. Telling `admit` where the contig
+    /// really ends is the entire fix.
+    #[test]
+    fn admit_keeps_a_locus_the_window_edge_would_have_eaten() {
+        // Contig: 10 kb. Tract at offset 1000..1016. Window: [901, 1026] 1-based —
+        // i.e. bases[900..1026] — so the tract sits 10 bp from the window's right
+        // edge, with only 10 of its 50 bp right flank inside the window... which is
+        // a caller bug (no margin), so build the window with a real margin instead:
+        // [901, 1076], leaving 60 bp past the tract — more than `flank_bp` = 50.
+        let (contig, tract) = contig_with_one_tract_at(1000, 10_000);
+        let win_start_1 = 901u64;
+        let win = &contig[900..1076];
+        // Re-base the interval onto the window slice.
+        let in_window = iv(100, 116, 2, 100); // 1000-900 .. 1016-900
+
+        let admitted = admit(
+            vec![in_window],
+            "chr1",
+            win,
+            win_start_1,
+            contig.len() as u64,
+            &SsrAdmissionParams::default(), // flank_bp = 50
+        );
+        assert_eq!(
+            admitted.loci.len(),
+            1,
+            "the contig continues past the window, so the flank is real and the \
+             locus must survive"
+        );
+        let l = &admitted.loci[0];
+        // Genomic 1-based, NOT window-relative: the window must not appear in the
+        // output (spec §2.3).
+        assert_eq!(l.start(), 1001, "genomic, not window-relative");
+        assert_eq!(l.end(), 1016);
+        assert_eq!(l.ref_bytes_start(), 951, "1001 - 50 bp of flank");
+        assert_eq!(l.left_flank().len(), 50);
+        assert_eq!(l.right_flank().len(), 50);
+
+        // And it is the SAME locus the whole-contig call produces — the window is a
+        // memory knob, never an answer (spec §2.3).
+        let whole =
+            admit_whole_contig(vec![tract], "chr1", &contig, &SsrAdmissionParams::default());
+        assert_eq!(whole.len(), 1);
+        assert_eq!(
+            &admitted.loci, &whole,
+            "windowed output must equal whole-contig output, byte for byte"
+        );
+    }
+
+    /// The other half of §2.6: a tract genuinely at the contig's end still loses
+    /// its flank and is still dropped. `contig_len` must be believed when it says
+    /// "this really is the end", not only when it says "keep going".
+    #[test]
+    fn admit_still_drops_a_locus_at_the_real_contig_end() {
+        // Tract runs to the last base of a 1016 bp contig, viewed through a window
+        // that starts at 901.
+        let (contig, _) = contig_with_one_tract_at(1000, 1016);
+        let win = &contig[900..1016];
+        let admitted = admit(
+            vec![iv(100, 116, 2, 100)],
+            "chr1",
+            win,
+            901,
+            contig.len() as u64,
+            &SsrAdmissionParams::default(),
+        );
+        assert!(
+            admitted.loci.is_empty(),
+            "no right flank exists at the true contig end: not genotypeable"
+        );
+    }
+
+    /// A window without a margin is a caller bug, and it fails loudly — because
+    /// the quiet alternative is dropping the locus, which is the §2.6 bug wearing
+    /// a different hat.
+    ///
+    /// **The left edge needs its own test, and mutation is what said so.** The
+    /// clamp is `.max(1)` — the contig's start. Writing `.max(bases_start)` — the
+    /// *window's* start — is indistinguishable whenever the caller left a margin
+    /// (both give `tract_start - flank_bp`), so no legitimate case can tell them
+    /// apart. They differ only here: `.max(1)` reaches for bytes left of the
+    /// window and panics; `.max(bases_start)` silently emits a locus with a
+    /// **truncated left flank** — a wrong locus, no error. Exactly the §2.6 class
+    /// of failure, on the other side.
+    #[test]
+    #[should_panic(expected = "flank runs LEFT of the window")]
+    fn admit_panics_when_the_window_cannot_supply_the_left_flank() {
+        let (contig, _) = contig_with_one_tract_at(1000, 10_000);
+        // Window starts 10 bp before the tract, but flank_bp is 50 — and the
+        // contig has 990 bp more to the left, so the flank is real and reachable,
+        // just not in this window.
+        let win = &contig[990..1076];
+        let _ = admit(
+            vec![iv(10, 26, 2, 100)],
+            "chr1",
+            win,
+            991,
+            contig.len() as u64,
+            &SsrAdmissionParams::default(),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "flank runs RIGHT of the window")]
+    fn admit_panics_when_the_window_cannot_supply_the_right_flank() {
+        let (contig, _) = contig_with_one_tract_at(1000, 10_000);
+        // Window ends 10 bp past the tract, but flank_bp is 50, and the contig
+        // says there are 9 kb more to read.
+        let win = &contig[900..1026];
+        let _ = admit(
+            vec![iv(100, 116, 2, 100)],
+            "chr1",
+            win,
+            901,
+            contig.len() as u64,
+            &SsrAdmissionParams::default(),
+        );
+    }
+
+    /// **`bundled` is in the INPUT's coordinate space, not genomic.**
+    ///
+    /// Pinned by nothing until now: every other test that reads `bundled` runs at
+    /// `bases_start = 1`, where window offsets and genomic coordinates coincide —
+    /// so the convention could silently flip and no test would notice. Milestone D
+    /// re-bases these to build each `SsrBundle`'s hull; if they were already
+    /// genomic it would **double-shift every hull by `bases_start`**, silently.
+    ///
+    /// Read this test as the contract D must code against.
+    #[test]
+    fn bundled_coordinates_are_window_offsets_not_genomic() {
+        // Two tracts 30 bp apart, seen through a window starting at genomic 901.
+        let mut contig = vec![b'C'; 1000];
+        contig.extend_from_slice(b"ATATATATATATATATATAT"); // 1000..1020
+        contig.resize(1050, b'C');
+        contig.extend_from_slice(b"ATATATATATATATATATAT"); // 1050..1070
+        contig.resize(10_000, b'C');
+
+        let win = &contig[900..1200]; // genomic [901, 1200]
+        // Window-relative: 1000-900 = 100, 1050-900 = 150.
+        let a = iv(100, 120, 2, 100);
+        let b = iv(150, 170, 2, 100);
+
+        let admitted = admit(
+            vec![a, b],
+            "chr1",
+            win,
+            901,
+            contig.len() as u64,
+            &SsrAdmissionParams::default(),
+        );
+        assert!(
+            admitted.loci.is_empty(),
+            "30 bp apart: both are bundle members"
+        );
+        assert_eq!(
+            admitted.bundled,
+            vec![a, b],
+            "handed back verbatim in the caller's own space — NOT genomic \
+             (which would read 1001/1051 here)"
+        );
+        // Said the other way, so the intent survives a careless edit: the genomic
+        // positions do NOT appear.
+        assert!(
+            !admitted
+                .bundled
+                .iter()
+                .any(|iv| iv.start == 1000 || iv.start == 1050),
+            "genomic coordinates must not leak into `bundled`"
+        );
+    }
+
+    /// `bases_start` is 1-based; `0` is not a position (spec §4). Untested until
+    /// review caught it.
+    #[test]
+    #[should_panic(expected = "bases_start is 1-based")]
+    fn admit_rejects_a_zero_bases_start() {
+        let contig = [
+            b"CGCGC".as_ref(),
+            b"ATATATATATATATAT".as_ref(),
+            b"GCGCG".as_ref(),
+        ]
+        .concat();
+        let _ = admit(
+            vec![iv(5, 21, 2, 100)],
+            "chr1",
+            &contig,
+            0,
+            contig.len() as u64,
+            &params(),
+        );
+    }
+
+    /// A `contig_len` that understates the contig is spec §2.6's bug wearing the
+    /// caller's clothes: `ref_end` clamps early, the `ref_end == tract_end` test
+    /// still passes, and a locus comes out with a **silently truncated flank**.
+    /// Caught in release, not just debug — §10's sweeps run the walk in release.
+    #[test]
+    #[should_panic(expected = "contig_len must be the CONTIG's length")]
+    fn admit_rejects_a_contig_len_that_understates_the_contig() {
+        let (contig, _) = contig_with_one_tract_at(1000, 10_000);
+        let win = &contig[900..1076]; // genomic [901, 1076]
+        let _ = admit(
+            vec![iv(100, 116, 2, 100)],
+            "chr1",
+            win,
+            901,
+            1000, // a lie: the window itself already reaches 1076
+            &SsrAdmissionParams::default(),
+        );
+    }
+
+    /// `flank_bp = 0` switches the whole step off — every tract fails its own flank
+    /// test — and spec §10 plans to sweep `flank_bp`. The M7 shape: a knob that
+    /// appears to move and instead silently returns nothing.
+    #[test]
+    #[should_panic(expected = "flank_bp must be at least 1")]
+    fn admit_rejects_a_zero_flank() {
+        let contig = [
+            b"CGCGC".as_ref(),
+            b"ATATATATATATATAT".as_ref(),
+            b"GCGCG".as_ref(),
+        ]
+        .concat();
+        let no_flank = SsrAdmissionParams {
+            flank_bp: 0,
+            ..params()
+        };
+        let _ = admit_whole_contig(vec![iv(5, 21, 2, 100)], "chr1", &contig, &no_flank);
+    }
+
+    /// **A3 — the bundle members come back** (spec §2.4, §6a).
+    ///
+    /// Production deletes them, so their bases become a hole nobody accounts for.
+    /// ng keeps the *selection* and rejects the *disposal*, which is what lets the
+    /// walk route them as an `SsrBundle` and lets spec §10's "what are bundles
+    /// worth?" question be asked at all — the answer was previously deleted
+    /// uncounted.
+    #[test]
+    fn admit_hands_back_the_bundle_members_it_sets_aside() {
+        // Two tracts 30 bp apart (inside a 50 bp flank radius) plus one isolated
+        // far away.
+        let mut contig = vec![b'C'; 100];
+        contig.extend_from_slice(b"ATATATATATATATATATAT"); // 100..120
+        contig.resize(150, b'C');
+        contig.extend_from_slice(b"ATATATATATATATATATAT"); // 150..170
+        contig.resize(5000, b'C');
+        contig.extend_from_slice(b"ATATATATATATATATATAT"); // 5000..5020
+        contig.resize(5100, b'C');
+        let a = iv(100, 120, 2, 100);
+        let b = iv(150, 170, 2, 100);
+        let lone = iv(5000, 5020, 2, 100);
+
+        let admitted = admit(
+            vec![a, b, lone],
+            "chr1",
+            &contig,
+            1,
+            contig.len() as u64,
+            &SsrAdmissionParams::default(),
+        );
+
+        assert_eq!(admitted.loci.len(), 1, "only the isolated tract is a locus");
+        assert_eq!(admitted.loci[0].start(), 5001);
+        assert_eq!(
+            admitted.bundled,
+            vec![a, b],
+            "the cluster is handed back, verbatim and in coordinate order — \
+             production would have deleted it"
+        );
+
+        // The selection is production's: the loci sets still agree, which is what
+        // keeps spec §8's oracle valid (a bundle member is not a locus in either
+        // system).
+        let (ng_p, prod_p) = matched_params(0.8, 0, 50);
+        assert_agrees_at(
+            &ng_p,
+            &prod_p,
+            &[a, b, lone],
+            "chr1",
+            &contig,
+            "bundled + isolated",
+        );
+    }
+
+    /// Nothing is set aside when nothing clusters — `bundled` is not a dumping
+    /// ground for every rejection. A repeat admission turns down for any *other*
+    /// reason (impure, low-copy, compound) is the walk's `Generic` territory, not
+    /// a bundle (spec §2.2), and must not appear here.
+    #[test]
+    fn admit_bundles_only_what_the_flank_test_rejects() {
+        let contig = [
+            b"CGCGC".as_ref(),
+            b"ATATATATATATATAT".as_ref(),
+            b"GCGCG".as_ref(),
+        ]
+        .concat();
+
+        // A clean isolated tract: a locus, nothing bundled.
+        let admitted = admit(
+            vec![iv(5, 21, 2, 100)],
+            "chr1",
+            &contig,
+            1,
+            contig.len() as u64,
+            &params(),
+        );
+        assert_eq!(admitted.loci.len(), 1);
+        assert!(
+            admitted.bundled.is_empty(),
+            "nothing close, nothing bundled"
+        );
+
+        // A tract rejected by the copy floor: neither a locus NOR a bundle member.
+        let short = b"CCCCCATATATCCCCC";
+        let admitted = admit(
+            vec![iv(5, 11, 2, 100)],
+            "chr1",
+            short,
+            1,
+            short.len() as u64,
+            &params(),
+        );
+        assert!(admitted.loci.is_empty(), "below the copy floor");
+        assert!(
+            admitted.bundled.is_empty(),
+            "a copy-floor rejection is Generic territory, not a bundle (spec §2.2)"
+        );
+    }
+
     /// **A2 — the period scope is a knob, and moving it moves the admitted set.**
     ///
     /// Spec §5.2's routing frontier is *"for which (period, tract length) cells does
@@ -2095,7 +2661,7 @@ mod tests {
         let cag = iv(5, 35, 3, 100);
 
         assert_eq!(
-            admit(vec![cag], "chr1", &contig, &params()).len(),
+            admit_whole_contig(vec![cag], "chr1", &contig, &params()).len(),
             1,
             "period 3 is inside the default 2..=6 scope"
         );
@@ -2106,7 +2672,7 @@ mod tests {
             ..params()
         };
         assert!(
-            admit(vec![cag], "chr1", &contig, &dinucs_only).is_empty(),
+            admit_whole_contig(vec![cag], "chr1", &contig, &dinucs_only).is_empty(),
             "a 2..=2 scope must exclude the period-3 tract — the knob has to bite"
         );
 
@@ -2116,7 +2682,7 @@ mod tests {
         poly.extend_from_slice(b"TTTTT");
         let homopolymer = iv(5, 35, 1, 100);
         assert!(
-            admit(vec![homopolymer], "chr1", &poly, &params()).is_empty(),
+            admit_whole_contig(vec![homopolymer], "chr1", &poly, &params()).is_empty(),
             "period-1 homopolymers are off the STR path by default"
         );
         let with_homopolymers = SsrAdmissionParams {
@@ -2124,7 +2690,7 @@ mod tests {
             ..params()
         };
         assert_eq!(
-            admit(vec![homopolymer], "chr1", &poly, &with_homopolymers).len(),
+            admit_whole_contig(vec![homopolymer], "chr1", &poly, &with_homopolymers).len(),
             1,
             "a 1..=6 scope admits it — the question spec §10 wants asked"
         );
@@ -2148,14 +2714,14 @@ mod tests {
         // Radius 50: the 30 bp gap is inside it → one cluster → both dropped.
         let wide = matched_params(0.8, 0, 50).0;
         assert!(
-            admit(pair.to_vec(), "chr1", &contig, &wide).is_empty(),
+            admit_whole_contig(pair.to_vec(), "chr1", &contig, &wide).is_empty(),
             "30 bp apart is inside a 50 bp flank radius: both are bundle members"
         );
 
         // Radius 5: the gap clears it → neither is bundled → both admitted.
         let narrow = matched_params(0.8, 0, 5).0;
         assert_eq!(
-            admit(pair.to_vec(), "chr1", &contig, &narrow).len(),
+            admit_whole_contig(pair.to_vec(), "chr1", &contig, &narrow).len(),
             2,
             "30 bp apart clears a 5 bp flank radius: both are loci"
         );
@@ -2211,7 +2777,7 @@ mod tests {
             min_copies: MinCopies::new([10, 9, 4, 3, 3, 3], 3),
             ..params()
         };
-        let loci = admit(vec![di, tri], "chr1", &contig, &picky);
+        let loci = admit_whole_contig(vec![di, tri], "chr1", &contig, &picky);
         assert_eq!(
             loci.len(),
             1,
@@ -2226,7 +2792,7 @@ mod tests {
             min_copies: MinCopies::new([10, 5, 11, 3, 3, 3], 3),
             ..params()
         };
-        let loci = admit(vec![di, tri], "chr1", &contig, &mirrored);
+        let loci = admit_whole_contig(vec![di, tri], "chr1", &contig, &mirrored);
         assert_eq!(loci.len(), 1, "now only the period-2 tract clears its own");
         assert_eq!(loci[0].motif().as_bytes(), b"AT");
 
@@ -2289,7 +2855,7 @@ mod tests {
             periods: PeriodRange::new(2, (MAX_MOTIF_LEN + 1) as u8).unwrap(),
             ..params()
         };
-        let _ = admit(vec![iv(5, 21, 2, 100)], "chr1", &contig, &too_wide);
+        let _ = admit_whole_contig(vec![iv(5, 21, 2, 100)], "chr1", &contig, &too_wide);
     }
 
     /// The `min_purity` contract `admit` guards: a `NaN` floor would make every
@@ -2307,7 +2873,7 @@ mod tests {
             min_purity: f32::NAN,
             ..params()
         };
-        let _ = admit(vec![iv(5, 21, 2, 100)], "chr1", &contig, &nan);
+        let _ = admit_whole_contig(vec![iv(5, 21, 2, 100)], "chr1", &contig, &nan);
     }
 
     /// **A2 — the copy floor is a knob, and it is the "length" axis.**
@@ -2327,7 +2893,7 @@ mod tests {
         let tract = iv(5, 21, 2, 100);
 
         assert_eq!(
-            admit(vec![tract], "chr1", &contig, &params()).len(),
+            admit_whole_contig(vec![tract], "chr1", &contig, &params()).len(),
             1,
             "8 copies clears the default floor of 5"
         );
@@ -2338,7 +2904,7 @@ mod tests {
             ..params()
         };
         assert!(
-            admit(vec![tract], "chr1", &contig, &strict).is_empty(),
+            admit_whole_contig(vec![tract], "chr1", &contig, &strict).is_empty(),
             "8 copies is below a floor of 9"
         );
 
@@ -2508,7 +3074,7 @@ mod tests {
             let cleaned = prefilter(&intervals, &params());
             assert_agrees(&cleaned, &name, seq, &format!("scanner output on {name}"));
 
-            total_loci += admit(cleaned.clone(), &name, seq, &params()).len();
+            total_loci += admit_whole_contig(cleaned.clone(), &name, seq, &params()).len();
             contigs += 1;
         }
         assert!(contigs > 0, "the fixture must have contigs");
