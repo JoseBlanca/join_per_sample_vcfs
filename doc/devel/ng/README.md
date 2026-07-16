@@ -36,6 +36,8 @@ by document kind:
     `types.rs` seed, and the `RefSeq` accessor (three impls).
   - [`read_filtering.md`](impl_plan/read_filtering.md) — step 1: the `read/` module,
     the cascade, the `RecordSource`/`RawRecord` seam, the `ReadFilter` iterator.
+  - [`typed_regions.md`](impl_plan/typed_regions.md) — step 3: the catalog rebase/knobs,
+    the windowed substrate, and the `region_typing.rs` walk (resident → windowed).
 
 This mirrors the repo-wide `doc/devel/{specs,architecture,implementation_plans}`
 convention but scoped to ng, so the growing set of ng docs stays together.
