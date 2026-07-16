@@ -29,10 +29,96 @@
 
 pub mod admission;
 
+use std::path::Path;
+
 use crate::ng::ref_seq::RefSeqError;
 use crate::ng::tandem_repeat::{PeriodRange, RepeatInterval, ScanParams};
-use crate::ng::types::{Bp, GenomeRegion};
+use crate::ng::types::{Bp, ContigId, GenomeRegion, Position};
+use crate::regions::{BedError, ContigBounds, RegionSet};
 use admission::{Locus, SsrAdmissionParams};
+
+// ---------------------------------------------------------------------
+// What to walk
+// ---------------------------------------------------------------------
+
+/// The set of genome regions to walk — sorted, non-overlapping, coalesced,
+/// clamped, in genomic order.
+///
+/// **Wraps production's `RegionSet` read-only; reimplements nothing.** That type
+/// already parses BED, coalesces overlapping and adjacent spans, clamps to contig
+/// lengths, resolves names against the contig table, and drops zero-length
+/// contigs — and it is the same code the production caller's `--regions` runs, so
+/// ng and production agree on what a BED *means* by construction rather than by
+/// coincidence. `src/regions.rs` is not edited (spec Revision): this wrapper adds
+/// ng's width and ng's names, and nothing else.
+///
+/// **A user BED is not a special case**, which `regions.rs` settled first: *"'Whole
+/// genome' is not a special case — it is the region set whose every region covers
+/// an entire contig."* [`Self::whole_contigs`] is the default, not a bypass.
+///
+/// ## The conversion this owns — and it is smaller than the spec expected
+///
+/// Spec §4 called this "the one conversion seam", *"`GenomeRegions` widening (and
+/// **rebasing**) `RegionSet`'s `u32`"*. **There is no rebasing.** `regions::Region`
+/// is already **1-based inclusive** — its own doc says so, and its invariant is
+/// `1 <= start <= end`. So production and ng already agree on the base, and the
+/// only conversion here is `u32` → `u64`, which is lossless and infallible.
+///
+/// That is worth stating rather than quietly enjoying: the spec anticipated an
+/// off-by-one seam at ng's busiest boundary and there is none, because the
+/// production author had already made the same call for the same reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GenomeRegions {
+    inner: RegionSet,
+}
+
+impl GenomeRegions {
+    /// One full-length span per contig — **the default** (spec §2.5).
+    ///
+    /// Zero-length contigs contribute no span, so they never reach the walk
+    /// (`RegionSet`'s rule, and the reason spec §2.3 can say "zero-length contigs
+    /// never reach the walk" without a guard of its own).
+    pub fn whole_contigs(contigs: &[ContigBounds]) -> Self {
+        Self {
+            inner: RegionSet::whole_contigs(contigs),
+        }
+    }
+
+    /// Parse a BED and resolve it against the contig table.
+    ///
+    /// Every failure mode — a short line, non-numeric coordinates, `end <= start`,
+    /// an unknown contig name, a span past a contig's end — is `RegionSet`'s to
+    /// reject, **up front**. That is what lets `TypedRegionError` have exactly one
+    /// variant and `TypedRegionIterator::over_regions` be infallible (spec §8.2):
+    /// by the time the walk runs, the only thing left that can fail is reading the
+    /// reference.
+    pub fn from_bed_path(bed: &Path, contigs: &[ContigBounds]) -> Result<Self, BedError> {
+        Ok(Self {
+            inner: RegionSet::from_bed_path(bed, contigs)?,
+        })
+    }
+
+    /// The regions, in genomic order, as ng's [`GenomeRegion`].
+    ///
+    /// The `u32` → `u64` widening lives here and only here (above).
+    pub fn iter(&self) -> impl Iterator<Item = GenomeRegion> + '_ {
+        self.inner.iter().map(|r| GenomeRegion {
+            contig: ContigId(r.chrom_id),
+            start: Position(u64::from(r.start)),
+            end: Position(u64::from(r.end)),
+        })
+    }
+
+    /// How many regions will be walked.
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    /// Whether there is nothing to walk.
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+}
 
 // ---------------------------------------------------------------------
 // The walk's output
@@ -298,9 +384,145 @@ mod tests {
     /// mid-walk. `#[from]` is what lets the walk write `?`.
     #[test]
     fn a_reference_failure_converts_into_the_walk_error() {
-        use crate::ng::types::ContigId;
         let err: TypedRegionError = RefSeqError::UnknownContig(ContigId(7)).into();
         assert!(matches!(err, TypedRegionError::Reference(_)));
         assert!(err.to_string().contains("reference read failed"));
+    }
+
+    // ---- GenomeRegions (C3) ---------------------------------------------
+
+    const CONTIGS: &[ContigBounds] = &[
+        ContigBounds {
+            name: "chr1",
+            length: 100,
+        },
+        ContigBounds {
+            name: "chr2",
+            length: 50,
+        },
+    ];
+
+    /// `whole_contigs` is the default, and the spans are what `regions.rs` calls
+    /// "the region set whose every region covers an entire contig" — full-length,
+    /// **1-based inclusive**, one per contig, in table order.
+    #[test]
+    fn whole_contigs_covers_each_contig_end_to_end() {
+        let g = GenomeRegions::whole_contigs(CONTIGS);
+        let regions: Vec<_> = g.iter().collect();
+
+        assert_eq!(g.len(), 2);
+        assert!(!g.is_empty());
+        assert_eq!(regions[0].contig, ContigId(0));
+        assert_eq!(regions[0].start, Position(1), "1-based: starts at 1, not 0");
+        assert_eq!(
+            regions[0].end,
+            Position(100),
+            "inclusive: the last base IS 100"
+        );
+        assert_eq!(regions[0].len(), 100, "a 100 bp contig walks 100 bases");
+        assert_eq!(regions[1].contig, ContigId(1));
+        assert_eq!(regions[1].end, Position(50));
+        assert_eq!(regions[1].len(), 50);
+    }
+
+    /// **No rebasing happens here, and that is the finding.** Spec §4 expected this
+    /// seam to widen *and rebase*; `regions::Region` is already 1-based inclusive
+    /// (its own invariant is `1 <= start <= end`), so only the width converts.
+    ///
+    /// This test is the guard on that: if production's base ever moved, the
+    /// coordinates below would shift by one and ng's whole 1-based contract would
+    /// quietly break at its busiest boundary.
+    #[test]
+    fn the_seam_widens_but_does_not_rebase() {
+        let production = RegionSet::whole_contigs(CONTIGS);
+        let ours = GenomeRegions::whole_contigs(CONTIGS);
+
+        for (p, n) in production.iter().zip(ours.iter()) {
+            assert_eq!(
+                u64::from(p.start),
+                n.start.get(),
+                "start is carried across verbatim — production is already 1-based"
+            );
+            assert_eq!(u64::from(p.end), n.end.get(), "end likewise");
+            assert_eq!(p.chrom_id, n.contig.get(), "and the id is the same index");
+        }
+    }
+
+    /// Zero-length contigs contribute no span, so they never reach the walk —
+    /// `RegionSet`'s rule, inherited. This is why spec §2.3 can assert "zero-length
+    /// contigs never reach the walk" without the walk guarding for it.
+    #[test]
+    fn a_zero_length_contig_is_dropped_before_the_walk_sees_it() {
+        let contigs = &[
+            ContigBounds {
+                name: "empty",
+                length: 0,
+            },
+            ContigBounds {
+                name: "chr1",
+                length: 10,
+            },
+        ];
+        let g = GenomeRegions::whole_contigs(contigs);
+        let regions: Vec<_> = g.iter().collect();
+        assert_eq!(regions.len(), 1, "the empty contig contributes nothing");
+        assert_eq!(
+            regions[0].contig,
+            ContigId(1),
+            "and the ids do NOT renumber"
+        );
+    }
+
+    /// A BED round-trip: ng inherits `RegionSet`'s parsing, its 0-based-BED → 1-based
+    /// conversion, and its coalescing — none of which ng reimplements. The
+    /// overlapping pair must come back merged.
+    #[test]
+    fn from_bed_path_parses_converts_and_coalesces() {
+        use std::io::Write;
+        std::fs::create_dir_all("tmp").unwrap();
+        let dir = tempfile::tempdir_in("tmp").unwrap();
+        let bed = dir.path().join("r.bed");
+        {
+            let mut f = std::fs::File::create(&bed).unwrap();
+            // BED is 0-based half-open: [0,10) is 1-based [1,10].
+            writeln!(f, "chr1\t0\t10").unwrap();
+            // Overlaps the first — must coalesce into [1, 20].
+            writeln!(f, "chr1\t5\t20").unwrap();
+            writeln!(f, "chr2\t0\t5").unwrap();
+        }
+        let g = GenomeRegions::from_bed_path(&bed, CONTIGS).expect("valid bed");
+        let regions: Vec<_> = g.iter().collect();
+
+        assert_eq!(regions.len(), 2, "the chr1 pair coalesced");
+        assert_eq!(regions[0].contig, ContigId(0));
+        assert_eq!(
+            (regions[0].start, regions[0].end),
+            (Position(1), Position(20)),
+            "BED 0-based [0,20) becomes 1-based inclusive [1,20]"
+        );
+        assert_eq!(regions[1].contig, ContigId(1));
+        assert_eq!(
+            (regions[1].start, regions[1].end),
+            (Position(1), Position(5))
+        );
+    }
+
+    /// Every BED failure is `RegionSet`'s to reject **up front** — which is what
+    /// lets `TypedRegionError` have one variant and the walk's constructor be
+    /// infallible (spec §8.2).
+    #[test]
+    fn a_bad_bed_is_rejected_before_any_walk_exists() {
+        use std::io::Write;
+        std::fs::create_dir_all("tmp").unwrap();
+        let dir = tempfile::tempdir_in("tmp").unwrap();
+        let bed = dir.path().join("bad.bed");
+        {
+            let mut f = std::fs::File::create(&bed).unwrap();
+            writeln!(f, "nosuchcontig\t0\t10").unwrap();
+        }
+        assert!(
+            GenomeRegions::from_bed_path(&bed, CONTIGS).is_err(),
+            "an unknown contig is caught at construction, not mid-walk"
+        );
     }
 }

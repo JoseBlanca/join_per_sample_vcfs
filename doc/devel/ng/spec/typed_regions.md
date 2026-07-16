@@ -493,8 +493,14 @@ ours to change. Deferring any of it leaves ng mixed-width, which is the state th
 end. The catalog's `Locus`/`build_loci`/`CatalogParams` are **not** on this list any more — ng's copies
 are born wide, and production's stay narrow.
 
-**That leaves exactly one conversion seam**: `GenomeRegions` widening (and rebasing) `RegionSet`'s
-`u32` on the way in. One seam, one place, at the edge — which is the shape §2.5 wanted anyway.
+**That leaves exactly one conversion seam**: `GenomeRegions` widening `RegionSet`'s `u32` on the way
+in. One seam, one place, at the edge — which is the shape §2.5 wanted anyway.
+
+*(Corrected 2026-07-16 at C3: this said "widening **and rebasing**". There is no rebasing.
+`regions::Region` is **already 1-based inclusive** — its own doc says so and its invariant is
+`1 <= start <= end` — so production and ng agree on the base already, and the seam widens only. The
+spec anticipated an off-by-one at ng's busiest boundary and there is none, because the production
+author had made the same call for the same reason. Pinned by `the_seam_widens_but_does_not_rebase`.)*
 
 The line stops at `regions.rs` on purpose: it is *"a top-level peer consumed by both pipeline
 stages"*, so widening it is a change to the whole production caller, not to ng. (It is also already

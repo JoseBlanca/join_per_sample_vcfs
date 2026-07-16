@@ -228,7 +228,9 @@ The module was scaffolded in A1; this adds the walk's own types. `TypedRegion`, 
 `SsrAdmissionParams`), `TypedRegionCounts`, `TypedRegionError`. No logic. *Depends:*
 A, B, C1. *Source:* arch §types. Verified: `Default` config test.
 
-**C3. `GenomeRegions` wrapping `RegionSet`.**  ☐
+**C3. `GenomeRegions` wrapping `RegionSet`.**  ✅
+*(Found: the seam **widens only** — `regions::Region` is already 1-based inclusive, so spec §4's
+"and rebasing" was wrong and is corrected there.)*
 `whole_contigs` (default), `from_bed_path`, `iter()` widening `RegionSet`'s `u32` → `u64`. Reimplements
 nothing — `RegionSet` already parses/coalesces/clamps/converts-BED/drops-empty-contigs. *Depends:* C1.
 *Source:* spec §2.5, arch §types. Verified: `whole_contigs` over a contig table; a BED round-trip.
