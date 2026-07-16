@@ -211,7 +211,13 @@ verbatim bytes matching `ResidentRefSeq`'s raw path; `contigs()` returns the tab
 
 ### Milestone C — ng vocabulary + local types (types, no logic)
 
-**C1. `GenomeRegion` + `Position` in `ng::types`.**  ☐
+**C1. `GenomeRegion` + `Position` in `ng::types`.**  ✅
+*(Also lands A3's routed follow-up: `admit`'s two adjacent, same-typed, silently-transposable `u64`s
+become `Position` + `Bp`, so the compiler catches always what the runtime guard caught sometimes —
+the reviewer's own preferred option, since it needs no spec amendment. The **provenance** half is
+not a signature problem and is not fixed here: nothing `admit` is handed proves where `contig_len`
+came from, so it is a contract stated at `admit` and discharged by the **walk** (D), which is the
+only party holding both the reference table (`contigs()`, B3a) and the window.)*
 1-based inclusive, `u64` (`Position(u64)`; `GenomeRegion { contig, start, end }`). The consolidation
 `ng_step_interfaces.md` §6 reserved — this step's first real use. *Source:* arch §types.
 

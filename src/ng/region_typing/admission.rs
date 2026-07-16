@@ -70,6 +70,7 @@ use std::fmt;
 use std::ops::Range;
 
 use crate::ng::tandem_repeat::{PeriodRange, RepeatInterval};
+use crate::ng::types::{Bp, Position};
 
 // ---------------------------------------------------------------------
 // The motif — ported, though the spec expected it reused
@@ -820,10 +821,17 @@ pub fn admit(
     recs: Vec<RepeatInterval>,
     chrom: &str,
     bases: &[u8],
-    bases_start: u64,
-    contig_len: u64,
+    bases_start: Position,
+    contig_len: Bp,
     p: &SsrAdmissionParams,
 ) -> Admitted {
+    // **Newtypes, not two bare `u64`s** (A3 review). They were adjacent, same-typed,
+    // and silently transposable — and the guard below catches a transposition only
+    // sometimes. `Position` and `Bp` are different types, so the compiler catches it
+    // always. This is the cheap half of that finding; the other half is *provenance*
+    // (below), which no signature can fix.
+    let bases_start = bases_start.get();
+    let contig_len = contig_len.get();
     assert!(
         bases_start >= 1,
         "bases_start is 1-based; got {bases_start}"
@@ -840,8 +848,13 @@ pub fn admit(
     // as `contig_len` — production's exact mistake — is arithmetically legal and
     // no check here can catch it. The other half needs **provenance**: a
     // `contig_len` read from the reference's contig table, not derived from
-    // whatever slice is in hand. That belongs where the walk gets its contig table
-    // (spec §3's `contigs()` accessor, Milestone C), not here.
+    // whatever slice is in hand.
+    //
+    // `WindowedRefSeq::contigs()` (B3) is that table, and reading from it is the
+    // **walk's** obligation (Milestone D) — it is the only party that holds both
+    // the reference and the window. Nothing `admit` can be handed proves where the
+    // number came from, so this is a contract stated here and discharged there,
+    // not a check that was forgotten.
     assert!(
         bases_start + bases.len() as u64 - 1 <= contig_len,
         "the window [{bases_start}, {}] runs past the contig end ({contig_len}): \
@@ -1286,7 +1299,7 @@ mod tests {
         contig: &[u8],
         p: &SsrAdmissionParams,
     ) -> Vec<Locus> {
-        admit(recs, chrom, contig, 1, contig.len() as u64, p).loci
+        admit(recs, chrom, contig, Position(1), Bp(contig.len() as u64), p).loci
     }
 
     /// A 0-based half-open interval, the way the scanner emits one.
@@ -2294,8 +2307,8 @@ mod tests {
             vec![in_window],
             "chr1",
             win,
-            win_start_1,
-            contig.len() as u64,
+            Position(win_start_1),
+            Bp(contig.len() as u64),
             &SsrAdmissionParams::default(), // flank_bp = 50
         );
         assert_eq!(
@@ -2337,8 +2350,8 @@ mod tests {
             vec![iv(100, 116, 2, 100)],
             "chr1",
             win,
-            901,
-            contig.len() as u64,
+            Position(901),
+            Bp(contig.len() as u64),
             &SsrAdmissionParams::default(),
         );
         assert!(
@@ -2371,8 +2384,8 @@ mod tests {
             vec![iv(10, 26, 2, 100)],
             "chr1",
             win,
-            991,
-            contig.len() as u64,
+            Position(991),
+            Bp(contig.len() as u64),
             &SsrAdmissionParams::default(),
         );
     }
@@ -2388,8 +2401,8 @@ mod tests {
             vec![iv(100, 116, 2, 100)],
             "chr1",
             win,
-            901,
-            contig.len() as u64,
+            Position(901),
+            Bp(contig.len() as u64),
             &SsrAdmissionParams::default(),
         );
     }
@@ -2421,8 +2434,8 @@ mod tests {
             vec![a, b],
             "chr1",
             win,
-            901,
-            contig.len() as u64,
+            Position(901),
+            Bp(contig.len() as u64),
             &SsrAdmissionParams::default(),
         );
         assert!(
@@ -2461,8 +2474,8 @@ mod tests {
             vec![iv(5, 21, 2, 100)],
             "chr1",
             &contig,
-            0,
-            contig.len() as u64,
+            Position(0),
+            Bp(contig.len() as u64),
             &params(),
         );
     }
@@ -2480,8 +2493,8 @@ mod tests {
             vec![iv(100, 116, 2, 100)],
             "chr1",
             win,
-            901,
-            1000, // a lie: the window itself already reaches 1076
+            Position(901),
+            Bp(1000), // a lie: the window itself already reaches 1076
             &SsrAdmissionParams::default(),
         );
     }
@@ -2531,8 +2544,8 @@ mod tests {
             vec![a, b, lone],
             "chr1",
             &contig,
-            1,
-            contig.len() as u64,
+            Position(1),
+            Bp(contig.len() as u64),
             &SsrAdmissionParams::default(),
         );
 
@@ -2577,8 +2590,8 @@ mod tests {
             vec![iv(5, 21, 2, 100)],
             "chr1",
             &contig,
-            1,
-            contig.len() as u64,
+            Position(1),
+            Bp(contig.len() as u64),
             &params(),
         );
         assert_eq!(admitted.loci.len(), 1);
@@ -2593,8 +2606,8 @@ mod tests {
             vec![iv(5, 11, 2, 100)],
             "chr1",
             short,
-            1,
-            short.len() as u64,
+            Position(1),
+            Bp(short.len() as u64),
             &params(),
         );
         assert!(admitted.loci.is_empty(), "below the copy floor");

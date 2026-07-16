@@ -17,6 +17,72 @@ impl ContigId {
     }
 }
 
+/// A **1-based** reference position — the coordinate ng speaks everywhere
+/// (`ng_step_interfaces.md` §1), matching VCF/SAM/IGV and the production engine.
+/// Unconstrained: any `u64` is a legal value at the type level, so the field is
+/// public and there is no checked constructor.
+///
+/// The base is the point. ng chose 1-based so that a coordinate printed in a log,
+/// a VCF, or a bug report means the same thing everywhere — no mental `+ 1`, and
+/// no class of off-by-one that only shows up as a wrong genotype. The exceptions
+/// are named and local: `RepeatInterval` is 0-based because it indexes a byte
+/// slice, and `regions::RegionSet` is production's (converted at
+/// `GenomeRegions`).
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct Position(pub u64);
+
+impl Position {
+    #[inline]
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// A **physical** piece of DNA: a contig plus a 1-based **inclusive** range
+/// `[start, end]`. No genetic claim — that is what distinguishes it from a
+/// *locus* (`typed_regions.md` §1.1).
+///
+/// The consolidation `ng_step_interfaces.md` §1 reserved, and the typed-region
+/// generator is its first real use: it replaces `regions::Region` (0-based,
+/// `u32`, production's) and `bam::ContigInterval` for ng's purposes.
+///
+/// **Inclusive, not half-open**, and deliberately: a half-open `end` cannot name
+/// the last base of a contig without arithmetic, and "the region ends at 21"
+/// meaning base 20 is exactly the ambiguity the 1-based decision exists to
+/// delete. The cost is one `+ 1` in [`Self::len`], which is where it belongs —
+/// stated once, in the type.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub struct GenomeRegion {
+    pub contig: ContigId,
+    pub start: Position,
+    pub end: Position,
+}
+
+impl GenomeRegion {
+    /// The region's length in bases. **The one place the inclusive `+ 1` lives.**
+    ///
+    /// Saturating rather than panicking on an inverted region: this is a plain
+    /// data type with public fields (no constructor to enforce `start <= end`),
+    /// and a length of 0 is a truer answer for an empty span than a panic in a
+    /// getter would be. Callers that require well-formedness say so themselves.
+    #[inline]
+    pub fn len(self) -> u64 {
+        (self.end.get() + 1).saturating_sub(self.start.get())
+    }
+
+    /// Whether the region covers no bases (`end < start`).
+    #[inline]
+    pub fn is_empty(self) -> bool {
+        self.end.get() < self.start.get()
+    }
+
+    /// Whether `pos` falls inside the region, bounds included.
+    #[inline]
+    pub fn contains(self, pos: Position) -> bool {
+        self.start <= pos && pos <= self.end
+    }
+}
+
 // ---------------------------------------------------------------------
 // Scalar newtypes — the domain quantities cross-step code speaks. Seeded
 // here with only the scalars read filtering (ng step 1) touches; the rest
@@ -144,5 +210,54 @@ mod tests {
         assert_eq!(MapQual(20).get(), 20);
         assert_eq!(BaseQual(93).get(), 93);
         assert_eq!(Bp(150).get(), 150);
+        assert_eq!(Position(1).get(), 1);
+    }
+
+    fn region(start: u64, end: u64) -> GenomeRegion {
+        GenomeRegion {
+            contig: ContigId(0),
+            start: Position(start),
+            end: Position(end),
+        }
+    }
+
+    /// **Inclusive is the whole point**, so `len` is where the `+ 1` lives — and
+    /// the single-base case is the one that catches a half-open slip.
+    #[test]
+    fn region_len_counts_both_ends() {
+        assert_eq!(region(1, 1).len(), 1, "a single base is length 1, not 0");
+        assert_eq!(region(1, 10).len(), 10);
+        assert_eq!(region(6, 21).len(), 16, "the admission fixture's tract");
+        assert!(!region(1, 1).is_empty());
+    }
+
+    /// A region can be built inverted (public fields, no constructor), so the
+    /// accessors must answer rather than panic.
+    #[test]
+    fn an_inverted_region_is_empty_not_a_panic() {
+        assert!(region(10, 9).is_empty());
+        assert_eq!(region(10, 9).len(), 0);
+        // Saturating, not wrapping: a wildly inverted span is still 0, not ~u64::MAX.
+        assert_eq!(region(u64::MAX, 1).len(), 0);
+    }
+
+    #[test]
+    fn region_contains_includes_both_bounds() {
+        let r = region(6, 21);
+        assert!(r.contains(Position(6)), "start is inside");
+        assert!(r.contains(Position(21)), "end is inside — inclusive");
+        assert!(!r.contains(Position(5)));
+        assert!(!r.contains(Position(22)));
+    }
+
+    /// Position 0 is representable but meaningless, since 1-based coordinates
+    /// begin at one. Recorded rather than enforced: `Position` is unconstrained,
+    /// as `MapQual` and `Bp` are, and every place where a 0 is a *bug* rejects it
+    /// itself — `RefSeq::fetch_into` with `InvalidStart`, `Locus::new` with
+    /// `BadCoordinates`, `admit` with an assert.
+    #[test]
+    fn position_zero_is_representable_and_rejected_where_it_matters() {
+        assert_eq!(Position(0).get(), 0);
+        assert!(region(0, 5).contains(Position(0)));
     }
 }
