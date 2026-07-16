@@ -10,10 +10,12 @@
 //!   &ScanParams) -> Vec<RepeatInterval>` — raw, possibly-overlapping intervals, for
 //!   consumers that resolve overlaps themselves (the STR catalog); and
 //! - a mid-level **windowed scan** — [`scan_windowed`], which yields one
-//!   [`ScannedWindow`] at a time (core + margin, coverage clipped to cores, intervals
-//!   attributed by start) and takes **no routing decision**; for a consumer that must
-//!   inject its own policy between detection and any merge — the typed-region
-//!   generator, which is why this layer is public (`typed_regions.md` §6.1); and
+//!   [`ScannedWindow`] at a time (the core + margin geometry, every detection in the
+//!   fetched slice, and the two window rules — coverage clipped to cores, intervals
+//!   attributed by start — as methods the consumer applies to *its own* interval set)
+//!   and takes **no routing decision**; for a consumer that must inject its own policy
+//!   between detection and any merge — the typed-region generator, which is why this
+//!   layer is public (`typed_regions.md` §6.1); and
 //! - a high-level **region seam** — `RegionScanner`, a streaming iterator that yields
 //!   a gap-free repeat/satellite/unique tiling of the reference, built on the above.
 //!
@@ -525,31 +527,104 @@ fn tile(
 
 /// One window's worth of scan — what [`scan_windowed`] yields per step.
 ///
-/// `coverage` and `intervals` are derived from the same detections but answer
-/// different questions, and keeping them apart is what makes the scan
-/// window-invariant (see [`scan_windowed`]).
+/// **The data is one field; the window *rules* are the two methods.** A window
+/// yields every detection in the slice it fetched, and the two derivations that
+/// make a windowed scan add up to a whole-contig one —
+/// [`coverage_in_core`](Self::coverage_in_core) and
+/// [`starting_in_core`](Self::starting_in_core) — are methods **taking the
+/// intervals as an argument** rather than pre-computed fields.
+///
+/// That shape is what lets the two consumers differ where they must and agree
+/// where they must not. `RegionScanner` applies the rules to the raw detections;
+/// the typed-region walk applies them to its **pre-filtered** ones (`admission::
+/// prefilter`, which the scanner must not know about — this module holds no
+/// consumer policy). Pre-computed fields would have forced the walk to either
+/// accept raw-derived coverage — capping detector noise, which spec §2.4 forbids —
+/// or to re-implement the clipping, which is exactly the invariant duplication
+/// `typed_regions.md` §6.1 says to avoid.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScannedWindow {
-    /// The window's core, `[start, end)`, 0-based — **not** the fetched slice,
-    /// which is the core plus a `max_repeat_len` margin each side. Cores tile the
-    /// contig exactly: each starts where the last ended, so `coverage` from
-    /// adjacent windows abuts and a later union can rejoin a satellite across
-    /// every window it spans.
-    pub coverage_core: RegionSpan,
-    /// Repeat coverage **clipped to the core**, in contig coordinates.
-    pub coverage: Vec<(u64, u64)>,
-    /// Exact repeat intervals, **whole** (never clipped), in contig coordinates —
-    /// only those whose *start* lands in the core, so each is emitted by exactly
-    /// one window.
+    /// The window's core, `[start, end)`, 0-based — **not** the fetched slice
+    /// ([`fetched`](Self::fetched)), which is the core plus a `max_repeat_len`
+    /// margin each side. Cores tile the contig exactly: each starts where the last
+    /// ended, so core-clipped coverage from adjacent windows abuts and a later union
+    /// can rejoin a satellite across every window it spans.
+    pub core: RegionSpan,
+    /// The slice actually fetched and scanned, `[start, end)`, 0-based: the core
+    /// plus a `max_repeat_len` margin each side, **clamped to the contig**.
+    ///
+    /// Public because the walk fetches these same bases for itself — admission needs
+    /// the sequence, which a scan result does not carry — and must not compute the
+    /// range independently: that arithmetic is this module's rule, and two copies of
+    /// it are two copies that can drift.
+    pub fetched: RegionSpan,
+    /// **Every** detection in the fetched slice, in contig coordinates — including
+    /// those starting in the margin, which is what makes them useful: a consumer's
+    /// set-wise policy (redundancy elimination, the bundle flank test) needs an
+    /// in-core interval's *neighbours* to reach the same verdict a whole-contig run
+    /// would, and the `max_repeat_len` margin is exactly the radius that guarantees
+    /// it.
+    ///
+    /// **Two caveats, both handled by the methods** rather than by the reader:
+    ///
+    /// - a detection is whole *unless* it runs off the fetched slice, where it is
+    ///   **truncated**. Harmless by construction: to be truncated it must be longer
+    ///   than `max_repeat_len` (i.e. satellite coverage, which
+    ///   [`coverage_in_core`](Self::coverage_in_core) rejoins across windows anyway),
+    ///   and it cannot then start in this core, so
+    ///   [`starting_in_core`](Self::starting_in_core) never hands one out as exact.
+    /// - concatenating these across windows **double-counts** the margins. Use
+    ///   [`starting_in_core`](Self::starting_in_core) to attribute each to exactly
+    ///   one window.
     ///
     /// **Order: period-major, then ascending start** — inherited from
     /// [`find_tandem_repeats`], which scans one period at a time. It is **not**
-    /// globally start-sorted, and concatenating these across windows is not
-    /// start-sorted either (it is window-major, period-major, start-minor). A
-    /// consumer that needs coordinate order must sort; `admit` and `prefilter`
-    /// both do, and `build_regions` re-sorts. Stated because the type is public
-    /// and the ordering is not what a reader would assume.
-    pub intervals: Vec<RepeatInterval>,
+    /// start-sorted, and neither is the concatenation across windows. A consumer
+    /// that needs coordinate order must sort; `admit` and `prefilter` both do, and
+    /// `build_regions` re-sorts. Stated because the type is public and the ordering
+    /// is not what a reader would assume.
+    pub detections: Vec<RepeatInterval>,
+}
+
+impl ScannedWindow {
+    /// `intervals`, **clipped to this window's core** — the coverage rule.
+    ///
+    /// Cores tile the contig, so unioning this across every window reconstructs the
+    /// whole-contig coverage of the same intervals, and a satellite (necessarily
+    /// longer than a window's reach) rejoins across all the windows it spans. This
+    /// is why a truncated detection is harmless: whatever it loses lies outside
+    /// some core, and that core's own window contributes it.
+    ///
+    /// `intervals` is a parameter rather than `self.detections` because the caller's
+    /// policy decides *which* intervals count — see the type's docs.
+    pub fn coverage_in_core(&self, intervals: &[RepeatInterval]) -> Vec<(u64, u64)> {
+        intervals
+            .iter()
+            .filter_map(|iv| {
+                let start = iv.start.max(self.core.start);
+                let end = iv.end.min(self.core.end);
+                (start < end).then_some((start, end))
+            })
+            .collect()
+    }
+
+    /// The intervals this window **owns**: kept whole, and only those whose *start*
+    /// lands in the core — the attribution rule.
+    ///
+    /// Cores tile and do not overlap, so every interval is owned by exactly one
+    /// window, whichever holds its start. An owned interval is never truncated: it
+    /// starts at least `max_repeat_len` inside the fetched slice on the left and,
+    /// were it long enough to reach the right edge, it would be satellite coverage
+    /// rather than an exact repeat.
+    pub fn starting_in_core<'a>(
+        &self,
+        intervals: &'a [RepeatInterval],
+    ) -> impl Iterator<Item = &'a RepeatInterval> {
+        let core = self.core;
+        intervals
+            .iter()
+            .filter(move |iv| iv.start >= core.start && iv.start < core.end)
+    }
 }
 
 /// Scan a contig in windows through a `ChromRefFetcher`, **yielding one
@@ -664,37 +739,31 @@ where
             core = contig_len;
             return Some(Err(e));
         }
-        let bytes = &bases;
-
-        let mut coverage = Vec::new();
-        let mut intervals = Vec::new();
-        for iv in find_tandem_repeats(bytes, periods, &params) {
-            let global_start = iv.start + fetch_start;
-            let global_end = iv.end + fetch_start;
-            // Coverage: clip to the core so cores tile.
-            let cov_start = global_start.max(core);
-            let cov_end = global_end.min(core_end);
-            if cov_start < cov_end {
-                coverage.push((cov_start, cov_end));
-            }
-            // Exact intervals: whole, attributed to the core that holds the start.
-            if global_start >= core && global_start < core_end {
-                intervals.push(RepeatInterval {
-                    start: global_start,
-                    end: global_end,
-                    period: iv.period,
-                    score: iv.score,
-                });
-            }
-        }
+        // Every detection in the fetched slice, lifted from slice offsets to contig
+        // coordinates — the raw material. The two derivations that make the scan
+        // window-invariant (clip to the core; attribute by start) are
+        // `ScannedWindow`'s methods, so the consumer applies them to the interval
+        // set *its own policy* selects. See the type's docs.
+        let detections = find_tandem_repeats(&bases, periods, &params)
+            .into_iter()
+            .map(|iv| RepeatInterval {
+                start: iv.start + fetch_start,
+                end: iv.end + fetch_start,
+                period: iv.period,
+                score: iv.score,
+            })
+            .collect();
 
         let scanned = ScannedWindow {
-            coverage_core: RegionSpan {
+            core: RegionSpan {
                 start: core,
                 end: core_end,
             },
-            coverage,
-            intervals,
+            fetched: RegionSpan {
+                start: fetch_start,
+                end: fetch_end,
+            },
+            detections,
         };
         core = core_end;
         Some(Ok(scanned))
@@ -770,8 +839,13 @@ impl RegionScanner {
         });
         for window in windows {
             let window = window?;
-            coverage.extend(window.coverage);
-            str_intervals.extend(window.intervals);
+            // The two window rules, applied to the **raw** detections: this consumer
+            // has no policy to insert between detection and merge, which is exactly
+            // why it cannot serve the typed-region walk and `scan_windowed` is public
+            // (`typed_regions.md` §6.1). The walk applies the same two rules to its
+            // pre-filtered set.
+            coverage.extend(window.coverage_in_core(&window.detections));
+            str_intervals.extend(window.starting_in_core(&window.detections).copied());
         }
         let regions = build_regions(coverage, str_intervals, contig_len, opts);
         Ok(Self {
@@ -1285,8 +1359,10 @@ mod tests {
         // scan [2,2,3,4,4,4,6] — same intervals, different order. An ordered
         // assertion here would be true only for a single period, which is exactly
         // how it was first written and why it passed.
-        let mut streamed: Vec<RepeatInterval> =
-            windows.iter().flat_map(|w| w.intervals.clone()).collect();
+        let mut streamed: Vec<RepeatInterval> = windows
+            .iter()
+            .flat_map(|w| w.starting_in_core(&w.detections).copied())
+            .collect();
         let mut resident = find_tandem_repeats(&seq, p(2, 6), &ScanParams::default());
         assert!(!resident.is_empty(), "the fixture must find repeats");
         let key = |i: &RepeatInterval| (i.start, i.end, i.period);
@@ -1313,7 +1389,7 @@ mod tests {
             };
             let cores: Vec<RegionSpan> =
                 scan_over(&fetcher, p(3, 3), &ScanParams::default(), &opts)
-                    .map(|w| w.expect("fetch").coverage_core)
+                    .map(|w| w.expect("fetch").core)
                     .collect();
 
             assert_eq!(cores[0].start, 0, "window_bp = {window_bp}: starts at 0");
@@ -1334,9 +1410,9 @@ mod tests {
         }
     }
 
-    /// Coverage is clipped to the core and intervals are kept whole — the two
+    /// Coverage is clipped to the core and owned intervals are kept whole — the two
     /// derivations that make the scan window-invariant, and the reason they are
-    /// separate fields rather than one.
+    /// **methods over a caller-chosen interval set** rather than fields.
     #[test]
     fn scan_windowed_clips_coverage_to_the_core_but_keeps_intervals_whole() {
         let seq = mixed_contig();
@@ -1351,28 +1427,84 @@ mod tests {
             .collect();
 
         for w in &windows {
-            for &(s, e) in &w.coverage {
+            for (s, e) in w.coverage_in_core(&w.detections) {
                 assert!(
-                    s >= w.coverage_core.start && e <= w.coverage_core.end,
+                    s >= w.core.start && e <= w.core.end,
                     "coverage {s}..{e} escapes core {:?}",
-                    w.coverage_core
+                    w.core
                 );
             }
-            for iv in &w.intervals {
+            for iv in w.starting_in_core(&w.detections) {
                 assert!(
-                    iv.start >= w.coverage_core.start && iv.start < w.coverage_core.end,
+                    iv.start >= w.core.start && iv.start < w.core.end,
                     "an interval is attributed to the core holding its START"
                 );
             }
         }
 
-        // Whole, not clipped: at least one interval must reach past its own core,
-        // or this fixture is not exercising the property it claims to.
+        // Whole, not clipped: at least one owned interval must reach past its own
+        // core, or this fixture is not exercising the property it claims to.
         assert!(
-            windows
-                .iter()
-                .any(|w| w.intervals.iter().any(|iv| iv.end > w.coverage_core.end)),
+            windows.iter().any(|w| w
+                .starting_in_core(&w.detections)
+                .any(|iv| iv.end > w.core.end)),
             "the fixture must place a tract across a core edge"
+        );
+    }
+
+    /// **The margin is visible, and it is what a set-wise consumer stands on.**
+    ///
+    /// `detections` carries the margin's repeats too, which is the whole reason the
+    /// walk can pre-filter a window and reach the verdict a whole-contig run would:
+    /// redundancy elimination and the bundle flank test are both *neighbour* rules,
+    /// and the neighbours live in the margin. The old shape threw them away.
+    ///
+    /// Also pins the fetched span, which the walk re-fetches its bases from (it must
+    /// not compute that range itself).
+    #[test]
+    fn a_window_carries_its_margins_detections_and_says_what_it_fetched() {
+        let seq = mixed_contig();
+        let (_dir, fetcher) = fetcher_over(&seq);
+        let opts = SegmentOptions {
+            window_bp: 8,
+            // A margin the fixture can actually show: the 1 kb default would swallow
+            // this whole contig, and every window would be the whole contig.
+            max_repeat_len: 12,
+            ..SegmentOptions::default()
+        };
+        let windows: Vec<_> = scan_over(&fetcher, p(3, 3), &ScanParams::default(), &opts)
+            .map(|w| w.expect("fetch"))
+            .collect();
+
+        for w in &windows {
+            assert_eq!(
+                w.fetched.start,
+                w.core.start.saturating_sub(12),
+                "the fetched slice reaches a margin left of the core, clamped at 0"
+            );
+            assert_eq!(
+                w.fetched.end,
+                (w.core.end + 12).min(seq.len() as u64),
+                "and a margin right of it, clamped at the contig end"
+            );
+            for iv in &w.detections {
+                assert!(
+                    iv.start >= w.fetched.start && iv.end <= w.fetched.end,
+                    "a detection lies inside the slice it was found in"
+                );
+            }
+        }
+
+        // The property that matters: some window sees a repeat it does NOT own —
+        // the neighbour context. Without this, `detections` would be `starting_in_core`
+        // by another name and the walk's pre-filter would have no more context than
+        // the old shape gave it.
+        assert!(
+            windows.iter().any(|w| {
+                let owned = w.starting_in_core(&w.detections).count();
+                w.detections.len() > owned
+            }),
+            "the margins must actually carry detections the core does not own"
         );
     }
 
@@ -1462,15 +1594,13 @@ mod tests {
             seq.len(),
             "window_bp = 0 coerces to 1, so there is one core per base"
         );
-        assert!(
-            windows
-                .iter()
-                .all(|w| w.coverage_core.end == w.coverage_core.start + 1)
-        );
+        assert!(windows.iter().all(|w| w.core.end == w.core.start + 1));
 
         // And it is still the same answer — a memory knob must not move the result.
-        let mut streamed: Vec<RepeatInterval> =
-            windows.iter().flat_map(|w| w.intervals.clone()).collect();
+        let mut streamed: Vec<RepeatInterval> = windows
+            .iter()
+            .flat_map(|w| w.starting_in_core(&w.detections).copied())
+            .collect();
         let mut resident = find_tandem_repeats(&seq, p(2, 6), &ScanParams::default());
         let key = |i: &RepeatInterval| (i.start, i.end, i.period);
         streamed.sort_by_key(key);
@@ -1495,7 +1625,7 @@ mod tests {
             .collect();
         assert!(windows.len() > 1);
         assert!(
-            windows.iter().all(|w| w.intervals.is_empty()),
+            windows.iter().all(|w| w.detections.is_empty()),
             "no repeats to find, but every window must still be reported"
         );
     }

@@ -184,6 +184,32 @@ pub trait RawRefSeq: RefSeq {
     ) -> Result<(), RefSeqError>;
 }
 
+/// A reference that knows **its own** contig table — the names and lengths, in
+/// `@SQ` / `.fai` order, of the contigs it serves.
+///
+/// # Provenance, not convenience (`typed_regions.md` §2.6)
+///
+/// This trait exists for one caller with one need. The typed-region walk must tell
+/// `admit` how long a contig *really* is, and that number cannot be derived from the
+/// window in hand: a slice mistaken for a chromosome makes every flank clamp at the
+/// window edge, which silently throws away every locus within `flank_bp` of every
+/// boundary — a different set for every `window_bp`, and no error either way.
+///
+/// `admit` guards what arithmetic can catch, and its guard is **inherently
+/// incomplete**: a caller passing the window's own end as `contig_len` is
+/// arithmetically legal. No signature can close that; only *provenance* can — the
+/// length must be **read from the reference's table**, and the walk is the only
+/// party holding both the reference and the window.
+///
+/// So this is a bound the walk requires, not a getter someone might find handy. A
+/// reference that cannot say how long its contigs are cannot be walked, and that is
+/// now a compile-time fact.
+pub trait ContigTable {
+    /// The contig table — names and lengths, in `@SQ` / `.fai` order, indexed by
+    /// [`ContigId`].
+    fn contigs(&self) -> &ContigList;
+}
+
 /// A synthetic, fully in-memory reference: each contig's bytes held directly, indexed by
 /// [`ContigId`] (`contigs[i]` is `ContigId(i)`). For tests — it needs no FASTA on disk,
 /// so the mismatch filter and the pileup can be exercised against a hand-built reference.
@@ -191,12 +217,52 @@ pub trait RawRefSeq: RefSeq {
 /// on the fly, exactly as the file-backed impls do.
 pub struct InMemoryRefSeq {
     contigs: Vec<Vec<u8>>,
+    /// The [`ContigTable`], derived from `contigs` at construction and kept in step
+    /// with it by construction — every constructor builds this from the very bytes
+    /// it stores, so `entries[i].length` cannot disagree with `contigs[i].len()`.
+    ///
+    /// A held table rather than one synthesised per call: `contigs()` returns a
+    /// reference, and there is nowhere to borrow a temporary from.
+    table: ContigList,
 }
 
 impl InMemoryRefSeq {
-    /// Build from one byte vector per contig, in [`ContigId`] order.
+    /// Build from one byte vector per contig, in [`ContigId`] order, naming them
+    /// `contig0`, `contig1`, … .
+    ///
+    /// The names are synthetic because this constructor's callers never look at them
+    /// (they fetch by [`ContigId`]). A caller that *does* — the typed-region walk
+    /// puts the contig name in every `Locus` — wants
+    /// [`from_named_contigs`](Self::from_named_contigs).
     pub fn from_contigs(contigs: Vec<Vec<u8>>) -> Self {
-        Self { contigs }
+        Self::from_named_contigs(
+            contigs
+                .into_iter()
+                .enumerate()
+                .map(|(i, bases)| (format!("contig{i}"), bases))
+                .collect(),
+        )
+    }
+
+    /// Build from `(name, bases)` pairs, in [`ContigId`] order — the constructor for
+    /// a caller that reads the contig table, not just the bytes.
+    pub fn from_named_contigs(contigs: Vec<(String, Vec<u8>)>) -> Self {
+        let table = ContigList {
+            entries: contigs
+                .iter()
+                .map(|(name, bases)| ContigEntry {
+                    name: name.clone(),
+                    // The stored bytes ARE the contig, so its length is not a fact
+                    // from somewhere else that could disagree with them.
+                    length: bases.len() as u64,
+                    md5: None,
+                })
+                .collect(),
+        };
+        Self {
+            contigs: contigs.into_iter().map(|(_, bases)| bases).collect(),
+            table,
+        }
     }
 
     /// Resolve a `(contig, start_1based, length)` request to the raw stored slice, or the
@@ -231,6 +297,12 @@ impl RefSeq for InMemoryRefSeq {
         dst.clear();
         dst.extend(raw.iter().copied().map(canonicalise));
         Ok(())
+    }
+}
+
+impl ContigTable for InMemoryRefSeq {
+    fn contigs(&self) -> &ContigList {
+        &self.table
     }
 }
 
@@ -332,6 +404,12 @@ impl RefSeq for ResidentRefSeq {
     }
 }
 
+impl ContigTable for ResidentRefSeq {
+    fn contigs(&self) -> &ContigList {
+        &self.contigs
+    }
+}
+
 impl RawRefSeq for ResidentRefSeq {
     fn fetch_raw_into(
         &self,
@@ -416,20 +494,6 @@ impl WindowedRefSeq {
         }
     }
 
-    /// The reference's contig table — names and lengths, in `@SQ` / `.fai` order.
-    ///
-    /// **Provenance, not convenience** (typed_regions.md §2.6, §3). The walk must
-    /// tell `admit` how long a contig *really* is, and that number cannot be
-    /// derived from the window in hand — a slice mistaken for a chromosome is the
-    /// silent bug §2.6 exists to kill. `admit` guards what arithmetic can catch,
-    /// but its check is inherently incomplete: a caller passing the window's own
-    /// end as `contig_len` is arithmetically legal, and only *reading the length
-    /// from here* rules it out. That is why this accessor is part of the walk's
-    /// substrate rather than a getter.
-    pub fn contigs(&self) -> &ContigList {
-        &self.contigs
-    }
-
     /// Release buffered bytes before `pos` on the currently-resident contig — the
     /// caller-driven memory bound (drain `[.., pos)`, keep capacity). No-op when no
     /// contig is resident. Correctness is preserved: a later fetch of an evicted
@@ -502,6 +566,19 @@ impl RefSeq for WindowedRefSeq {
     }
 }
 
+impl ContigTable for WindowedRefSeq {
+    /// The table this reference was built with, verbatim.
+    ///
+    /// **This is the walk's provenance source** ([`ContigTable`], `typed_regions.md`
+    /// §2.6, §3): the one contig length in the system that did not come from
+    /// whatever slice happens to be in hand. It was an inherent accessor until the
+    /// walk needed the same fact from `InMemoryRefSeq` too; making it a trait turned
+    /// "the walk should read the length from here" from a comment into a bound.
+    fn contigs(&self) -> &ContigList {
+        &self.contigs
+    }
+}
+
 impl RawRefSeq for WindowedRefSeq {
     /// Raw, verbatim bases — soft-mask and IUPAC codes intact.
     ///
@@ -551,6 +628,39 @@ mod tests {
     fn fetch_canonical_uppercases_acgt_and_folds_the_rest_to_n() {
         let r = in_memory();
         assert_eq!(r.fetch(ContigId(0), 1, 8).unwrap(), b"ACGTNNNN");
+    }
+
+    /// **The in-memory table is measured off the very bytes it serves**, which is
+    /// what makes this impl a legitimate [`ContigTable`] — the walk's provenance
+    /// source (§2.6) — rather than a convenient fake whose lengths are a second,
+    /// independently-wrong fact.
+    ///
+    /// The fetch below is the check that bites: a length the bytes do not support
+    /// is an `OutOfBounds`, not a quiet disagreement.
+    #[test]
+    fn the_in_memory_contig_table_is_measured_off_the_stored_bytes() {
+        let r = InMemoryRefSeq::from_named_contigs(vec![
+            ("chr1".to_string(), b"acgtACGT".to_vec()),
+            ("chr2".to_string(), b"AC".to_vec()),
+        ]);
+
+        let table = r.contigs();
+        assert_eq!(table.entries[0].name, "chr1", "the caller's name, verbatim");
+        assert_eq!(table.entries[0].length, 8);
+        assert_eq!(table.entries[1].length, 2);
+
+        // The table's length is exactly what the contig can serve — if the two
+        // could drift, this fetch would be out of bounds.
+        let whole = r.fetch(ContigId(0), 1, table.entries[0].length).unwrap();
+        assert_eq!(whole.len(), 8);
+
+        // `from_contigs` names synthetically (its callers fetch by id) but measures
+        // the same way.
+        let s = InMemoryRefSeq::from_contigs(vec![vec![b'A'; 5], vec![b'C'; 3]]);
+        assert_eq!(s.contigs().entries[0].name, "contig0");
+        assert_eq!(s.contigs().entries[1].name, "contig1");
+        assert_eq!(s.contigs().entries[0].length, 5);
+        assert_eq!(s.contigs().entries[1].length, 3);
     }
 
     #[test]

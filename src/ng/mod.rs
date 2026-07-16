@@ -24,5 +24,7 @@ pub mod region_typing;
 pub mod tandem_repeat;
 pub mod types;
 
-pub use ref_seq::{InMemoryRefSeq, RawRefSeq, RefSeq, RefSeqError, ResidentRefSeq, WindowedRefSeq};
+pub use ref_seq::{
+    ContigTable, InMemoryRefSeq, RawRefSeq, RefSeq, RefSeqError, ResidentRefSeq, WindowedRefSeq,
+};
 pub use types::{BaseQual, Bp, ContigId, DomainError, MapQual, MismatchFraction};
