@@ -260,7 +260,7 @@ hole (spec §2.2). Consumes `admit`'s `Admitted.bundled` (A3). *Depends:* D1. *S
 §2.4. Verified: two tracts 10 bp apart → one `SsrBundle` carrying both; three chained 30 bp apart → one
 bundle of three; a locus 60 bp from a bundle → admitted; an impure/low-copy repeat → `Generic`.
 
-**D3. The windowed walk.**  ⛔ **BLOCKED — a decision is needed first (2026-07-16).**
+**D3. The windowed walk.**  ☐ *(unblocked — see below)*
 
 > **B1 and B3 contradict each other, and neither step could see it alone.**
 >
@@ -277,8 +277,12 @@ bundle of three; a locus 60 bp from a bundle → admitted; an impure/low-copy re
 > then drift"* — while spec §6 forbids holding two readers (*"one reader for the whole run … that is
 > what cost 14.6 GB of peak RSS"*).
 >
-> **Options** (D3's first commit, whichever is chosen):
-> 1. **Generalise `scan_windowed` over its byte source** — a trait or a `FnMut(start, len) ->
+> **RESOLVED (owner, 2026-07-16): option 1, landed.** `scan_windowed` now takes `contig_len` and an
+> `FnMut(start, len, &mut Vec<u8>) -> Result<(), E>`; both sources pass their own bytes through one
+> copy of the window rules, and the error type is the caller's. All 31 B1 tests pass unchanged.
+>
+> **Options considered:**
+> 1. **Generalise `scan_windowed` over its byte source** ✅ — a trait or a `FnMut(start, len) ->
 >    Result<Vec<u8>, _>`, so ng's raw reader and production's fetcher both fit. Keeps §6.1's reuse,
 >    keeps one reader, and is a small change to B1's own code. **Recommended.**
 > 2. The walk windows for itself — duplicates exactly the invariant §6.1 says not to duplicate.

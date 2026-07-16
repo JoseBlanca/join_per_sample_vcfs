@@ -572,6 +572,38 @@ pub struct ScannedWindow {
 /// (`typed_regions.md` §2.6, §7). `RegionScanner::stream` collects it right back
 /// up, which is fine — it was always whole-contig-eager.
 ///
+/// # Why the byte source is a closure and not a `ChromRefFetcher`
+///
+/// Because its two consumers need **different bytes**, and neither can have the
+/// other's:
+///
+/// - `RegionScanner` reads through production's `ChromRefFetcher`, which
+///   **canonicalises** (`{A,C,G,T,N}`) as it fills its buffer.
+/// - The **typed-region walk** needs **raw** bytes: the STR catalog reads the FASTA
+///   verbatim and `Locus` compares *by value*, so canonical bytes would make every
+///   IUPAC-carrying locus compare unequal to the catalog's and silently break the
+///   `.cat` oracle (`typed_regions.md` §6). That is what
+///   [`crate::ng::ref_seq::WindowedRefSeq`]'s raw path exists for — and it is a
+///   `RawRefSeq`, not a `ChromRefFetcher`, so it cannot be handed to a fetcher-bound
+///   scan at all.
+///
+/// Binding this to either source would force the other to reimplement the
+/// windowing — which `typed_regions.md` §6.1 names as exactly the thing not to do
+/// (*"duplicates a subtle invariant that can then drift"*) — or to hold **two**
+/// readers, which §6's 14.6 GB lesson forbids. A closure lets both pass their own
+/// bytes through **one** copy of the window rules.
+///
+/// Only *admission* needs raw, incidentally: detection is case-insensitive and
+/// non-ACGT never matches, so `find_tandem_repeats` gives the same answer either
+/// way. That is why nothing before the walk tripped on this.
+///
+/// The error type is the **caller's** (`E`): this function never inspects it, only
+/// propagates it, so `RegionScanner` can yield a `ScanError` and the walk a
+/// `TypedRegionError` without either bending to the other. `contig_len` likewise
+/// comes from the caller — the source knows its own length, and for the walk that
+/// number must come from the reference's contig table (`typed_regions.md` §2.6's
+/// provenance obligation), which a fetcher-derived length could not guarantee.
+///
 /// A fetch failure is yielded once as `Some(Err(_))`, and the iterator then stops:
 /// continuing would silently scan a hole, which is the failure this module's
 /// callers are least able to see. The stop is a latch (`core` jumps to the contig
@@ -596,24 +628,27 @@ pub struct ScannedWindow {
 /// The `max_repeat_len` margins are load-bearing: Ruzzo–Tompa segmentation is
 /// context-dependent, so a shorter margin would let a window re-segment a long repeat
 /// mid-tract and emit a spurious in-core fragment.
-pub fn scan_windowed<'f>(
-    fetcher: &'f dyn ChromRefFetcher,
+pub fn scan_windowed<F, E>(
+    contig_len: u64,
     periods: PeriodRange,
     params: &ScanParams,
     opts: &SegmentOptions,
-) -> impl std::iter::FusedIterator<Item = Result<ScannedWindow, ScanError>> + 'f {
-    // Only `fetcher`'s lifetime is in the return type: both config structs are
-    // `Copy` and are read out here, so tying the stream to their borrows would
-    // constrain it for nothing.
+    mut fetch: F,
+) -> impl std::iter::FusedIterator<Item = Result<ScannedWindow, E>>
+where
+    F: FnMut(u64, u64, &mut Vec<u8>) -> Result<(), E>,
+{
+    // Both config structs are `Copy` and are read out here, so tying the stream to
+    // their borrows would constrain it for nothing.
     let params = *params;
-    // ng is `u64`; production's `ChromRefFetcher` is `u32` and frozen, so the width
-    // meets here (spec §4). Widening in is lossless; the narrowing back out, at the
-    // `fetch` below, is *provably* lossless because every coordinate derives from
-    // this `u32` length.
-    let contig_len = u64::from(fetcher.length());
     let window = opts.window_bp.max(1);
     let margin = opts.max_repeat_len;
     let mut core = 0u64;
+    // One buffer, reused across windows — the caller's `fetch` fills it. This is
+    // why `fetch` writes into a `&mut Vec<u8>` rather than returning one: a window
+    // is ~102 kb, and re-allocating it per step would be the memory profile the
+    // streaming shape exists to avoid.
+    let mut bases: Vec<u8> = Vec::new();
 
     let scan = std::iter::from_fn(move || {
         if core >= contig_len {
@@ -622,27 +657,18 @@ pub fn scan_windowed<'f>(
         let core_end = core.saturating_add(window).min(contig_len);
         let fetch_start = core.saturating_sub(margin);
         let fetch_end = core_end.saturating_add(margin).min(contig_len);
-        // PANIC-FREE: `core < contig_len` (guard above) and every value here is
-        // `.min(contig_len)`-bounded, so `fetch_start < fetch_end <= contig_len`,
-        // which came from a `u32`. Both casts therefore fit by construction.
-        // `expect` over `as`: if that reasoning ever stops holding, a truncated
-        // fetch would silently scan the WRONG WINDOW — the failure this module is
-        // least able to see. `fetch` is 1-based.
-        let start_1based = u32::try_from(fetch_start + 1).expect("fetch_start <= contig_len: u32");
-        let fetch_len = u32::try_from(fetch_end - fetch_start).expect("span <= contig_len: u32");
-        let bytes = match fetcher.fetch(start_1based, fetch_len) {
-            Ok(b) => b,
-            Err(source) => {
-                // Stop after reporting: a fetch failure is fatal, and continuing
-                // would silently scan a hole.
-                core = contig_len;
-                return Some(Err(ScanError::Fetch { source }));
-            }
-        };
+        // `fetch` is 1-based.
+        if let Err(e) = fetch(fetch_start + 1, fetch_end - fetch_start, &mut bases) {
+            // Stop after reporting: a fetch failure is fatal, and continuing would
+            // silently scan a hole.
+            core = contig_len;
+            return Some(Err(e));
+        }
+        let bytes = &bases;
 
         let mut coverage = Vec::new();
         let mut intervals = Vec::new();
-        for iv in find_tandem_repeats(&bytes, periods, &params) {
+        for iv in find_tandem_repeats(bytes, periods, &params) {
             let global_start = iv.start + fetch_start;
             let global_end = iv.end + fetch_start;
             // Coverage: clip to the core so cores tile.
@@ -719,9 +745,30 @@ impl RegionScanner {
         // (`build_regions` needs every window's coverage before it can union a
         // satellite). The streaming shape exists for the typed-region walk, which
         // cannot afford that — see `scan_windowed`.
+        //
+        // This closure is the **canonical** byte source: production's fetcher folds
+        // to `{A,C,G,T,N}` as it fills, which is right for a routing tiling and
+        // wrong for the walk (see `scan_windowed`'s docs on why the source is a
+        // parameter at all).
+        //
+        // PANIC-FREE: every coordinate `scan_windowed` produces is bounded by
+        // `contig_len`, which came from this fetcher's own `u32` length, so both
+        // casts fit by construction. `expect` over `as`: were that reasoning ever
+        // to lapse, a truncated fetch would silently scan the WRONG WINDOW — the
+        // failure this module is least able to see.
         let mut coverage = Vec::new();
         let mut str_intervals = Vec::new();
-        for window in scan_windowed(&fetcher, periods, params, opts) {
+        let windows = scan_windowed(contig_len, periods, params, opts, |start, len, dst| {
+            let start = u32::try_from(start).expect("start <= contig_len, itself a u32");
+            let len = u32::try_from(len).expect("len <= contig_len, itself a u32");
+            let bytes = fetcher
+                .fetch(start, len)
+                .map_err(|source| ScanError::Fetch { source })?;
+            dst.clear();
+            dst.extend_from_slice(&bytes);
+            Ok(())
+        });
+        for window in windows {
             let window = window?;
             coverage.extend(window.coverage);
             str_intervals.extend(window.intervals);
@@ -1183,6 +1230,32 @@ mod tests {
 
     // ---- scan_windowed (the streamed primitive, B1) -------------------------
 
+    /// `scan_windowed` over a `ChromRefFetcher` — the canonical source, which is
+    /// what `RegionScanner` uses and what these tests exercise. The typed-region
+    /// walk passes a **raw** source instead; that the two share one copy of the
+    /// window rules is the reason the source is a parameter (see `scan_windowed`).
+    fn scan_over<'f>(
+        fetcher: &'f impl ChromRefFetcher,
+        periods: PeriodRange,
+        params: &'f ScanParams,
+        opts: &'f SegmentOptions,
+    ) -> impl std::iter::FusedIterator<Item = Result<ScannedWindow, ScanError>> + 'f {
+        scan_windowed(
+            u64::from(fetcher.length()),
+            periods,
+            params,
+            opts,
+            |start, len, dst| {
+                let bytes = fetcher
+                    .fetch(start as u32, len as u32)
+                    .map_err(|source| ScanError::Fetch { source })?;
+                dst.clear();
+                dst.extend_from_slice(&bytes);
+                Ok(())
+            },
+        )
+    }
+
     /// The streamed scan must say exactly what the whole-contig-eager form said —
     /// B1 reshapes the seam, it does not change the answer. `RegionScanner::stream`
     /// collecting it back up and still passing its own tests is one half of that;
@@ -1196,7 +1269,7 @@ mod tests {
             ..SegmentOptions::default()
         };
 
-        let windows: Vec<_> = scan_windowed(&fetcher, p(2, 6), &ScanParams::default(), &opts)
+        let windows: Vec<_> = scan_over(&fetcher, p(2, 6), &ScanParams::default(), &opts)
             .map(|w| w.expect("fetch"))
             .collect();
         assert!(windows.len() > 1, "the fixture must actually span windows");
@@ -1239,7 +1312,7 @@ mod tests {
                 ..SegmentOptions::default()
             };
             let cores: Vec<RegionSpan> =
-                scan_windowed(&fetcher, p(3, 3), &ScanParams::default(), &opts)
+                scan_over(&fetcher, p(3, 3), &ScanParams::default(), &opts)
                     .map(|w| w.expect("fetch").coverage_core)
                     .collect();
 
@@ -1273,7 +1346,7 @@ mod tests {
             window_bp: 8,
             ..SegmentOptions::default()
         };
-        let windows: Vec<_> = scan_windowed(&fetcher, p(3, 3), &ScanParams::default(), &opts)
+        let windows: Vec<_> = scan_over(&fetcher, p(3, 3), &ScanParams::default(), &opts)
             .map(|w| w.expect("fetch"))
             .collect();
 
@@ -1340,8 +1413,7 @@ mod tests {
             ..SegmentOptions::default()
         };
 
-        let items: Vec<_> =
-            scan_windowed(&fetcher, p(3, 3), &ScanParams::default(), &opts).collect();
+        let items: Vec<_> = scan_over(&fetcher, p(3, 3), &ScanParams::default(), &opts).collect();
 
         let errs = items.iter().filter(|i| i.is_err()).count();
         assert_eq!(
@@ -1379,7 +1451,7 @@ mod tests {
             window_bp: 0,
             ..SegmentOptions::default()
         };
-        let windows: Vec<_> = scan_windowed(&fetcher, p(2, 6), &ScanParams::default(), &degenerate)
+        let windows: Vec<_> = scan_over(&fetcher, p(2, 6), &ScanParams::default(), &degenerate)
             .map(|w| w.expect("fetch"))
             .collect();
 
@@ -1418,7 +1490,7 @@ mod tests {
             window_bp: 16,
             ..SegmentOptions::default()
         };
-        let windows: Vec<_> = scan_windowed(&fetcher, p(3, 3), &ScanParams::default(), &opts)
+        let windows: Vec<_> = scan_over(&fetcher, p(3, 3), &ScanParams::default(), &opts)
             .map(|w| w.expect("fetch"))
             .collect();
         assert!(windows.len() > 1);
