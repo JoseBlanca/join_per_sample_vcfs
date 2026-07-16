@@ -3,15 +3,19 @@
 //! spec [`doc/devel/ng/spec/ssr_repeat_scanner.md`], arch
 //! [`doc/devel/ng/arch/ssr_repeat_scanner.md`].
 //!
-//! It exposes **two interfaces** over one detection core (a lag-`p` self-comparison
+//! It exposes **three interfaces** over one detection core (a lag-`p` self-comparison
 //! plus a Ruzzo–Tompa maximal-scoring-segment pass):
 //!
 //! - a low-level **interval finder** — `find_tandem_repeats(seq, PeriodRange,
 //!   &ScanParams) -> Vec<RepeatInterval>` — raw, possibly-overlapping intervals, for
 //!   consumers that resolve overlaps themselves (the STR catalog); and
+//! - a mid-level **windowed scan** — [`scan_windowed`], which yields one
+//!   [`ScannedWindow`] at a time (core + margin, coverage clipped to cores, intervals
+//!   attributed by start) and takes **no routing decision**; for a consumer that must
+//!   inject its own policy between detection and any merge — the typed-region
+//!   generator, which is why this layer is public (`typed_regions.md` §6.1); and
 //! - a high-level **region seam** — `RegionScanner`, a streaming iterator that yields
-//!   a gap-free repeat/satellite/unique tiling of the reference, for the caller's
-//!   router.
+//!   a gap-free repeat/satellite/unique tiling of the reference, built on the above.
 //!
 //! The scanner holds **no consumer policy** (no purity floor, homopolymer rule, or
 //! period ceiling): a consumer passes the period range it wants, and that plus the two
@@ -21,10 +25,12 @@
 //! period-shifted copy; grow runs of matches) and our own code — **not** from the
 //! AGPL-v3 `TRF-mod` source, which was not read.
 //!
-//! Build status (incremental, per the impl plan): **Milestones A–C done** — the type
-//! vocabulary, the `find_tandem_repeats` interval finder (lag-`p` scoring + a Ruzzo–Tompa
-//! maximal-scoring-segment pass), and the `RegionScanner` region seam (coverage-merge
-//! tiling, resident via `over_slice` and windowed-streaming via `stream`).
+//! Build status (incremental, per the impl plan): **the scanner plan's Milestones A–D are
+//! done** — the type vocabulary, the `find_tandem_repeats` interval finder (lag-`p`
+//! scoring + a Ruzzo–Tompa maximal-scoring-segment pass), the `RegionScanner` region seam
+//! (coverage-merge tiling, resident via `over_slice` and windowed-streaming via `stream`),
+//! and trf-mod parity. **Plus typed-regions B1**: [`scan_windowed`] promoted from a private
+//! whole-contig-eager helper to a public per-window stream (`typed_regions.md` §6.1).
 //!
 //! Visibility note: types are `pub` (matching the sibling ng modules, e.g. `types.rs`),
 //! not the arch doc's illustrative `pub(crate)` — the ng convention exposes its module
@@ -503,13 +509,62 @@ fn tile(
     build_regions(coverage, intervals, n, opts)
 }
 
-/// A windowed scan's two outputs: the repeat **coverage** spans (`[start, end)`, span-level)
-/// and the exact STR **intervals** — kept separate on purpose (§`build_regions`).
-type WindowedScan = (Vec<(u32, u32)>, Vec<RepeatInterval>);
+/// One window's worth of scan — what [`scan_windowed`] yields per step.
+///
+/// `coverage` and `intervals` are derived from the same detections but answer
+/// different questions, and keeping them apart is what makes the scan
+/// window-invariant (see [`scan_windowed`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScannedWindow {
+    /// The window's core, `[start, end)`, 0-based — **not** the fetched slice,
+    /// which is the core plus a `max_repeat_len` margin each side. Cores tile the
+    /// contig exactly: each starts where the last ended, so `coverage` from
+    /// adjacent windows abuts and a later union can rejoin a satellite across
+    /// every window it spans.
+    pub coverage_core: RegionSpan,
+    /// Repeat coverage **clipped to the core**, in contig coordinates.
+    pub coverage: Vec<(u32, u32)>,
+    /// Exact repeat intervals, **whole** (never clipped), in contig coordinates —
+    /// only those whose *start* lands in the core, so each is emitted by exactly
+    /// one window.
+    ///
+    /// **Order: period-major, then ascending start** — inherited from
+    /// [`find_tandem_repeats`], which scans one period at a time. It is **not**
+    /// globally start-sorted, and concatenating these across windows is not
+    /// start-sorted either (it is window-major, period-major, start-minor). A
+    /// consumer that needs coordinate order must sort; `admit` and `prefilter`
+    /// both do, and `build_regions` re-sorts. Stated because the type is public
+    /// and the ordering is not what a reader would assume.
+    pub intervals: Vec<RepeatInterval>,
+}
 
-/// Scan a whole contig in windows through a `ChromRefFetcher`, returning the repeat
-/// `coverage` and the exact STR `intervals` — memory-bounded (peak ≈ `window_bp +
+/// Scan a contig in windows through a `ChromRefFetcher`, **yielding one
+/// [`ScannedWindow`] at a time** — memory-bounded (peak ≈ `window_bp +
 /// 2·max_repeat_len`, not the contig length; spec §3.6).
+///
+/// # Why this is public, and why it streams
+///
+/// It is the primitive the **typed-region generator** stands on
+/// (`typed_regions.md` §6.1): that walk cannot use [`RegionScanner`], because
+/// `RegionScanner` merges coverage and classifies satellites **before any
+/// admission policy can run**, on raw permissive intervals, with nowhere to inject
+/// the pre-filter between detection and merge. The layer underneath it fits
+/// exactly — this one — because it does the genuinely hard part (core + margin,
+/// coverage clipped to cores, intervals attributed by start) and takes **no
+/// routing decision at all**.
+///
+/// Streaming rather than returning two contig-wide `Vec`s is what makes it usable
+/// there: the walk holds one window plus a few open coordinates, never a contig
+/// (`typed_regions.md` §2.6, §7). `RegionScanner::stream` collects it right back
+/// up, which is fine — it was always whole-contig-eager.
+///
+/// A fetch failure is yielded once as `Some(Err(_))`, and the iterator then stops:
+/// continuing would silently scan a hole, which is the failure this module's
+/// callers are least able to see. The stop is a latch (`core` jumps to the contig
+/// end), **and the returned iterator is `FusedIterator`** — [`ScanError`]'s own doc
+/// already promises this, and `std::iter::FromFn` does not provide it, so the
+/// promise is declared rather than merely kept. Mirrors the ng sibling
+/// `ReadFilter`, which states the same contract the same way.
 ///
 /// Each window fetches its core `[c, core_end)` plus a `max_repeat_len` margin on **each**
 /// side and runs `find_tandem_repeats` on that slice. From each found interval it derives two
@@ -527,27 +582,42 @@ type WindowedScan = (Vec<(u32, u32)>, Vec<RepeatInterval>);
 /// The `max_repeat_len` margins are load-bearing: Ruzzo–Tompa segmentation is
 /// context-dependent, so a shorter margin would let a window re-segment a long repeat
 /// mid-tract and emit a spurious in-core fragment.
-fn collect_windowed(
-    fetcher: &dyn ChromRefFetcher,
+pub fn scan_windowed<'f>(
+    fetcher: &'f dyn ChromRefFetcher,
     periods: PeriodRange,
     params: &ScanParams,
     opts: &SegmentOptions,
-) -> Result<WindowedScan, ScanError> {
+) -> impl std::iter::FusedIterator<Item = Result<ScannedWindow, ScanError>> + 'f {
+    // Only `fetcher`'s lifetime is in the return type: both config structs are
+    // `Copy` and are read out here, so tying the stream to their borrows would
+    // constrain it for nothing.
+    let params = *params;
     let contig_len = fetcher.length();
     let window = opts.window_bp.max(1);
     let margin = opts.max_repeat_len;
-    let mut coverage: Vec<(u32, u32)> = Vec::new();
-    let mut str_intervals: Vec<RepeatInterval> = Vec::new();
     let mut core = 0u32;
-    while core < contig_len {
+
+    let scan = std::iter::from_fn(move || {
+        if core >= contig_len {
+            return None;
+        }
         let core_end = core.saturating_add(window).min(contig_len);
         let fetch_start = core.saturating_sub(margin);
         let fetch_end = core_end.saturating_add(margin).min(contig_len);
         // `fetch` is 1-based.
-        let bytes = fetcher
-            .fetch(fetch_start + 1, fetch_end - fetch_start)
-            .map_err(|source| ScanError::Fetch { source })?;
-        for iv in find_tandem_repeats(&bytes, periods, params) {
+        let bytes = match fetcher.fetch(fetch_start + 1, fetch_end - fetch_start) {
+            Ok(b) => b,
+            Err(source) => {
+                // Stop after reporting: a fetch failure is fatal, and continuing
+                // would silently scan a hole.
+                core = contig_len;
+                return Some(Err(ScanError::Fetch { source }));
+            }
+        };
+
+        let mut coverage = Vec::new();
+        let mut intervals = Vec::new();
+        for iv in find_tandem_repeats(&bytes, periods, &params) {
             let global_start = iv.start + fetch_start;
             let global_end = iv.end + fetch_start;
             // Coverage: clip to the core so cores tile.
@@ -556,9 +626,9 @@ fn collect_windowed(
             if cov_start < cov_end {
                 coverage.push((cov_start, cov_end));
             }
-            // STR intervals: whole, attributed to the core that holds the start.
+            // Exact intervals: whole, attributed to the core that holds the start.
             if global_start >= core && global_start < core_end {
-                str_intervals.push(RepeatInterval {
+                intervals.push(RepeatInterval {
                     start: global_start,
                     end: global_end,
                     period: iv.period,
@@ -566,9 +636,19 @@ fn collect_windowed(
                 });
             }
         }
+
+        let scanned = ScannedWindow {
+            coverage_core: RegionSpan {
+                start: core,
+                end: core_end,
+            },
+            coverage,
+            intervals,
+        };
         core = core_end;
-    }
-    Ok((coverage, str_intervals))
+        Some(Ok(scanned))
+    });
+    scan.fuse()
 }
 
 /// Streams a repeat/satellite/unique tiling of a reference as an iterator of [`Region`]s —
@@ -582,7 +662,7 @@ fn collect_windowed(
 /// `window_bp`. A `Satellite` (a repeat longer than `max_repeat_len`, hence longer than a
 /// window's reach) may segment differently between the two, because its internal structure
 /// depends on global context a bounded window cannot see; that is harmless, since satellites
-/// are mask/skip regions, not genotyping targets (§`collect_windowed`).
+/// are mask/skip regions, not genotyping targets (see [`scan_windowed`]).
 pub struct RegionScanner {
     regions: std::vec::IntoIter<Region>,
 }
@@ -610,7 +690,17 @@ impl RegionScanner {
         opts: &SegmentOptions,
     ) -> Result<Self, ScanError> {
         let contig_len = fetcher.length();
-        let (coverage, str_intervals) = collect_windowed(&fetcher, periods, params, opts)?;
+        // Collected straight back up: this consumer was always whole-contig-eager
+        // (`build_regions` needs every window's coverage before it can union a
+        // satellite). The streaming shape exists for the typed-region walk, which
+        // cannot afford that — see `scan_windowed`.
+        let mut coverage = Vec::new();
+        let mut str_intervals = Vec::new();
+        for window in scan_windowed(&fetcher, periods, params, opts) {
+            let window = window?;
+            coverage.extend(window.coverage);
+            str_intervals.extend(window.intervals);
+        }
         let regions = build_regions(coverage, str_intervals, contig_len, opts);
         Ok(Self {
             regions: regions.into_iter(),
@@ -1066,6 +1156,253 @@ mod tests {
         assert_tiles(&on, seq.len() as u32);
     }
 
+    // ---- scan_windowed (the streamed primitive, B1) -------------------------
+
+    /// The streamed scan must say exactly what the whole-contig-eager form said —
+    /// B1 reshapes the seam, it does not change the answer. `RegionScanner::stream`
+    /// collecting it back up and still passing its own tests is one half of that;
+    /// this is the other, stated directly against the primitive.
+    #[test]
+    fn scan_windowed_concatenates_to_the_whole_contig_scan() {
+        let seq = mixed_contig();
+        let (_dir, fetcher) = fetcher_over(&seq);
+        let opts = SegmentOptions {
+            window_bp: 40,
+            ..SegmentOptions::default()
+        };
+
+        let windows: Vec<_> = scan_windowed(&fetcher, p(2, 6), &ScanParams::default(), &opts)
+            .map(|w| w.expect("fetch"))
+            .collect();
+        assert!(windows.len() > 1, "the fixture must actually span windows");
+
+        // The exact intervals, concatenated across windows, are the SAME SET a
+        // single whole-contig scan finds — each attributed to exactly one core,
+        // none lost, none doubled.
+        //
+        // **As a set, not a sequence, and the difference is real** (review found
+        // this): `find_tandem_repeats` is period-major, so a whole-contig scan
+        // groups by period while the stream groups by window. On this fixture at
+        // `p(2, 6)` the stream yields periods [2,3,4,6,2,4,4] and the resident
+        // scan [2,2,3,4,4,4,6] — same intervals, different order. An ordered
+        // assertion here would be true only for a single period, which is exactly
+        // how it was first written and why it passed.
+        let mut streamed: Vec<RepeatInterval> =
+            windows.iter().flat_map(|w| w.intervals.clone()).collect();
+        let mut resident = find_tandem_repeats(&seq, p(2, 6), &ScanParams::default());
+        assert!(!resident.is_empty(), "the fixture must find repeats");
+        let key = |i: &RepeatInterval| (i.start, i.end, i.period);
+        streamed.sort_by_key(key);
+        resident.sort_by_key(key);
+        assert_eq!(
+            streamed, resident,
+            "the streamed intervals must be exactly the resident scan's set"
+        );
+    }
+
+    /// The cores tile `[0, contig_len)` exactly — contiguous, non-overlapping,
+    /// complete. That is what lets a consumer trust that concatenating per-window
+    /// coverage reconstructs the contig's, and it is the property the typed-region
+    /// walk's own partition invariant will rest on.
+    #[test]
+    fn scan_windowed_cores_tile_the_contig_exactly() {
+        let seq = mixed_contig();
+        let (_dir, fetcher) = fetcher_over(&seq);
+        for window_bp in [1u32, 7, 40, 1000, 100_000] {
+            let opts = SegmentOptions {
+                window_bp,
+                ..SegmentOptions::default()
+            };
+            let cores: Vec<RegionSpan> =
+                scan_windowed(&fetcher, p(3, 3), &ScanParams::default(), &opts)
+                    .map(|w| w.expect("fetch").coverage_core)
+                    .collect();
+
+            assert_eq!(cores[0].start, 0, "window_bp = {window_bp}: starts at 0");
+            assert_eq!(
+                cores.last().unwrap().end,
+                seq.len() as u32,
+                "window_bp = {window_bp}: ends at the contig end"
+            );
+            for pair in cores.windows(2) {
+                assert_eq!(
+                    pair[0].end, pair[1].start,
+                    "window_bp = {window_bp}: cores must abut, not gap or overlap"
+                );
+            }
+            for c in &cores {
+                assert!(c.start < c.end, "window_bp = {window_bp}: no empty core");
+            }
+        }
+    }
+
+    /// Coverage is clipped to the core and intervals are kept whole — the two
+    /// derivations that make the scan window-invariant, and the reason they are
+    /// separate fields rather than one.
+    #[test]
+    fn scan_windowed_clips_coverage_to_the_core_but_keeps_intervals_whole() {
+        let seq = mixed_contig();
+        let (_dir, fetcher) = fetcher_over(&seq);
+        // A window small enough that the (CAG)*15 tract must straddle a core edge.
+        let opts = SegmentOptions {
+            window_bp: 8,
+            ..SegmentOptions::default()
+        };
+        let windows: Vec<_> = scan_windowed(&fetcher, p(3, 3), &ScanParams::default(), &opts)
+            .map(|w| w.expect("fetch"))
+            .collect();
+
+        for w in &windows {
+            for &(s, e) in &w.coverage {
+                assert!(
+                    s >= w.coverage_core.start && e <= w.coverage_core.end,
+                    "coverage {s}..{e} escapes core {:?}",
+                    w.coverage_core
+                );
+            }
+            for iv in &w.intervals {
+                assert!(
+                    iv.start >= w.coverage_core.start && iv.start < w.coverage_core.end,
+                    "an interval is attributed to the core holding its START"
+                );
+            }
+        }
+
+        // Whole, not clipped: at least one interval must reach past its own core,
+        // or this fixture is not exercising the property it claims to.
+        assert!(
+            windows
+                .iter()
+                .any(|w| w.intervals.iter().any(|iv| iv.end > w.coverage_core.end)),
+            "the fixture must place a tract across a core edge"
+        );
+    }
+
+    /// **A fetch failure is reported once and stops the scan.**
+    ///
+    /// New behaviour in B1, and untested until mutation said so: the eager form
+    /// used `?` and returned `Err` immediately, so there was no "and then what?".
+    /// An iterator has to answer it, and the wrong answers are both silent — keep
+    /// yielding `Ok(empty)` and the consumer scans a **hole** it cannot see; keep
+    /// going after the `Err` and it gets partial data past a failure.
+    ///
+    /// Driven by a `.fai` that overstates the contig: the fetcher believes there
+    /// are 4 kb to read and the file holds ~100 bytes, so a window past the real
+    /// EOF fails the way a truncated or corrupt reference would.
+    #[test]
+    fn scan_windowed_reports_a_fetch_failure_once_then_stops() {
+        use std::io::Write;
+        std::fs::create_dir_all("tmp").unwrap();
+        let dir = tempfile::tempdir_in("tmp").unwrap();
+        let fa = dir.path().join("ref.fa");
+        let fai = dir.path().join("ref.fa.fai");
+        let seq = mixed_contig();
+        {
+            let mut f = std::fs::File::create(&fa).unwrap();
+            f.write_all(b">chr\n").unwrap();
+            f.write_all(&seq).unwrap();
+            f.write_all(b"\n").unwrap();
+        }
+        {
+            // The lie: claim 4 kb where the file holds `seq.len()`.
+            let mut f = std::fs::File::create(&fai).unwrap();
+            writeln!(f, "chr\t4000\t5\t4000\t4001").unwrap();
+        }
+        let fetcher = crate::fasta::StreamingChromRefFetcher::for_contig(&fa, "chr").unwrap();
+        let opts = SegmentOptions {
+            window_bp: 64,
+            max_repeat_len: 8,
+            ..SegmentOptions::default()
+        };
+
+        let items: Vec<_> =
+            scan_windowed(&fetcher, p(3, 3), &ScanParams::default(), &opts).collect();
+
+        let errs = items.iter().filter(|i| i.is_err()).count();
+        assert_eq!(
+            errs, 1,
+            "the failure is reported exactly once, not per window"
+        );
+        assert!(
+            items.last().unwrap().is_err(),
+            "the Err is the LAST item: the scan must stop, not carry on past a \
+             window it could not read"
+        );
+        assert!(
+            items[..items.len() - 1].iter().all(|i| i.is_ok()),
+            "windows before the failure are still reported"
+        );
+    }
+
+    /// **`window_bp = 0` must terminate.** The `.max(1)` is the only thing between
+    /// this and `core_end == core`, which never advances the cursor: an iterator
+    /// yielding empty windows **forever** — no panic, no memory growth, just a
+    /// hang. Worse than a crash, and `window_bp` is a `pub` unvalidated field on a
+    /// now-`pub` function.
+    ///
+    /// Untested until review: the other sweep starts at 1, and the pre-existing
+    /// invariance helper does its own `.max(1)` over a sweep whose smallest value
+    /// is 3 — so zero never reached the function from any direction. Coercion (not
+    /// rejection) is the inherited behaviour and is kept: `window_bp` is a pure
+    /// memory knob, so 0 → 1 changes the memory profile and not the answer, which
+    /// the equality below states.
+    #[test]
+    fn scan_windowed_terminates_at_window_bp_zero() {
+        let seq = mixed_contig();
+        let (_dir, fetcher) = fetcher_over(&seq);
+        let degenerate = SegmentOptions {
+            window_bp: 0,
+            ..SegmentOptions::default()
+        };
+        let windows: Vec<_> = scan_windowed(&fetcher, p(2, 6), &ScanParams::default(), &degenerate)
+            .map(|w| w.expect("fetch"))
+            .collect();
+
+        // It terminates (reaching this line at all is the assertion), and coerces
+        // to a 1 bp core: one window per base.
+        assert_eq!(
+            windows.len(),
+            seq.len(),
+            "window_bp = 0 coerces to 1, so there is one core per base"
+        );
+        assert!(
+            windows
+                .iter()
+                .all(|w| w.coverage_core.end == w.coverage_core.start + 1)
+        );
+
+        // And it is still the same answer — a memory knob must not move the result.
+        let mut streamed: Vec<RepeatInterval> =
+            windows.iter().flat_map(|w| w.intervals.clone()).collect();
+        let mut resident = find_tandem_repeats(&seq, p(2, 6), &ScanParams::default());
+        let key = |i: &RepeatInterval| (i.start, i.end, i.period);
+        streamed.sort_by_key(key);
+        resident.sort_by_key(key);
+        assert_eq!(
+            streamed, resident,
+            "window_bp = 0 must not change the answer"
+        );
+    }
+
+    /// A repeat-free contig still tiles: every window yields, with nothing in it.
+    #[test]
+    fn scan_windowed_yields_empty_windows_for_repeat_free_sequence() {
+        let seq = b"ACGTTGCAAGCTTGCAACGTTGCAAGCTTGCA".repeat(4);
+        let (_dir, fetcher) = fetcher_over(&seq);
+        let opts = SegmentOptions {
+            window_bp: 16,
+            ..SegmentOptions::default()
+        };
+        let windows: Vec<_> = scan_windowed(&fetcher, p(3, 3), &ScanParams::default(), &opts)
+            .map(|w| w.expect("fetch"))
+            .collect();
+        assert!(windows.len() > 1);
+        assert!(
+            windows.iter().all(|w| w.intervals.is_empty()),
+            "no repeats to find, but every window must still be reported"
+        );
+    }
+
     // ---- RegionScanner::stream (windowed, C2) ------------------------------
 
     /// Build a single-contig `StreamingChromRefFetcher` over `seq` via a project-local temp
@@ -1193,7 +1530,7 @@ mod tests {
         // A small cap makes the whole mixed contig one satellite. Windowed streaming
         // reproduces the resident tiling when the window contains the satellite; a satellite
         // longer than a window's reach may segment differently (context-dependent, and it is
-        // mask/skip not an analysis target — see `collect_windowed`), so this asserts the
+        // mask/skip not an analysis target — see `scan_windowed`), so this asserts the
         // fits-in-window case only.
         let seq = mixed_contig();
         let opts = SegmentOptions {
