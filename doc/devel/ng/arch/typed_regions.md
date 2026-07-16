@@ -189,7 +189,7 @@ Every row read at the cited line (2026-07-16). Convergence, not new types.
 | `RegionKind::SsrBundle` tracts | `RepeatInterval` ([ng/tandem_repeat.rs:186](../../../../src/ng/tandem_repeat.rs)) | reuse; widened to `u64` (ng's own code, spec §4) |
 | `TypedRegionConfig.admission` | `CatalogParams` ([ssr/catalog/mod.rs:42](../../../../src/ssr/catalog/mod.rs)) | **copy into ng** as `SsrAdmissionParams`: same defaults, no `bundle_threshold`, gains the hardcoded period/floor knobs (spec §5) |
 | `admission::admit` | `build_loci` ([ssr/catalog/postprocess.rs:69](../../../../src/ssr/catalog/postprocess.rs)) | **copy into ng** — logic transcribed unchanged; takes `RepeatInterval`, windowed, returns `Admitted { loci, bundled }` (spec §5a). Production's `build_loci` and `TrfRecord` stay |
-| the pre-filter | `catalog_prefilter` ([ssr/catalog/scanner_parity.rs:59](../../../../src/ssr/catalog/scanner_parity.rs)) | **copy into ng**, beside `admit` (spec §5.1) |
+| the pre-filter | `catalog_prefilter` ([ng/scanner_parity.rs](../../../../src/ng/scanner_parity.rs), moved out of `src/ssr/` at B2) | **copy into ng**, beside `admit` (spec §5.1) |
 | the windowed scan | `collect_windowed` ([ng/tandem_repeat.rs:530](../../../../src/ng/tandem_repeat.rs)) | promote (private → crate) and stream (spec §6.1) |
 | reference access | `WindowedRefSeq` ([ng/ref_seq.rs](../../../../src/ng/ref_seq.rs)) | + a raw-bytes path (`ref_seq.md` YAGNI now spent) + a `contigs()` accessor |
 | `TypedRegionError` | new (`thiserror`, `#[non_exhaustive]`) | one variant; mirrors `ReadFilterError`'s in-stream-fatal shape |

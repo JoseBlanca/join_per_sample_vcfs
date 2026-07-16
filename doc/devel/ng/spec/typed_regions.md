@@ -613,7 +613,7 @@ to prove the original claim disproved it.)*
 ### 5.1 Where the pre-filter lives
 
 It exists only in a test file (`catalog_prefilter`,
-[scanner_parity.rs:59](../../../../src/ssr/catalog/scanner_parity.rs)), and
+[scanner_parity.rs](../../../../src/ng/scanner_parity.rs) — which B2 moved into ng, see §9), and
 `ssr_repeat_scanner.md` §6 says it "belongs in `catalog::run`" — written when the catalog swap was
 the only consumer.
 
@@ -874,7 +874,7 @@ contig's end abutting one at the next's start (transition arithmetic).
 | the region tiling | `RegionScanner` ([tandem_repeat.rs:586](../../../../src/ng/tandem_repeat.rs)) | **not reused** — merges before policy (§6.1) |
 | the admission policy | `build_loci` ([postprocess.rs:69](../../../../src/ssr/catalog/postprocess.rs)) | **copied into ng** — logic transcribed unchanged; windowed, `RepeatInterval`-taking, 1-based/`u64`, all-knobs, returns `Admitted` (§5a). Production's stays as it is |
 | the bundle selection | `drop_bundles`/`is_close` ([postprocess.rs:274](../../../../src/ssr/catalog/postprocess.rs)) | **copied with it** — selection kept, disposal not; re-associated to stream (§2.4, §2.6) |
-| the pre-filter | `catalog_prefilter` ([scanner_parity.rs:59](../../../../src/ssr/catalog/scanner_parity.rs)) | **copied into ng**, beside ng's `admit` (§5.1); production keeps its test-only copy |
+| the pre-filter | `catalog_prefilter` ([ng/scanner_parity.rs](../../../../src/ng/scanner_parity.rs)) | **copied into ng**, beside ng's `admit` (§5.1); the parity test keeps its own frozen copy, and B2 moved that test out of `src/ssr/` too (§9) |
 | admission knobs | `CatalogParams` ([catalog/mod.rs:42](../../../../src/ssr/catalog/mod.rs)) | **ng's own `SsrAdmissionParams`** — same defaults, plus the hardcoded period scope + copy floors as real knobs; no separate `bundle_threshold` (§2.4) |
 | the STR locus | `ssr::types::Locus` ([types.rs:136](../../../../src/ssr/types.rs)) | **copied into ng**, born 1-based/`u64` (§4). Production's stays 0-based/`u32` |
 | the motif | `ssr::types::Motif` ([types.rs:36](../../../../src/ssr/types.rs)) | **copied into ng** — reuse looked free (no coordinates, no width) but production's is `pub(crate)` and would leak through ng's `pub` `Locus` (§4, corrected at the A1 review) |
@@ -894,8 +894,31 @@ gatherer's spec, and it is the piece the first integration slice will discover i
 whichever step first needs a stable cross-run id. **Shrinking the two carries** → here,
 measure-first.
 
-**What this step changes elsewhere: nothing outside `src/ng/` (Revision 2026-07-16).** The earlier
-draft said the opposite — *"where the rest of the code does not match a decision here, we change the
+**What this step changes elsewhere: one test move, and nothing else (Revision 2026-07-16).**
+
+> **The one exception, owner-approved 2026-07-16 at B2.** `src/ssr/catalog/scanner_parity.rs` moved to
+> [`src/ng/scanner_parity.rs`](../../../../src/ng/scanner_parity.rs). It was **the only place in the
+> whole tree where production `use`d `crate::ng`** — and that dependency pointed the wrong way: the
+> file is *ng's* test (its subject is ng's scanner; production is only the yardstick), living in
+> `src/ssr/` for the historical reason that the golden path was there.
+>
+> **It bit at B2.** Widening ng's `RepeatInterval` to `u64` (§4) could not compile without editing
+> frozen production, because that file baked in its `u32`-ness — four sites, most bindingly
+> `TrfRecord::for_test(start: u32, end: u32, …)`. **A freeze the experiment can break is not a
+> freeze:** the entire point of leaving production alone is that ng cannot destabilise the yardstick
+> it is scored against, and this made every ng type change a potential `src/ssr/` edit.
+>
+> So the move pays a one-time cost — delete the file, drop one `mod` declaration — to remove the
+> coupling **permanently**. It is test-only: nothing shipping changed, the parity bar is the same, and
+> the result is unchanged (16/16 recall, 15 exact, 1 boundary/phase wobble, 1 scanner-only). After it,
+> **production depends on nothing in ng**, and this plan's "no file outside `src/ng/`" rule holds for
+> everything that follows.
+>
+> Rejected: casting at the four sites (production keeps importing ng, so the tax recurs at every ng
+> type change); and not widening at all (leaves ng mixed-width — the state §4's decision exists to
+> end).
+
+The earlier draft said the opposite — *"where the rest of the code does not match a decision here, we change the
 code"* — and listed a rebase of `ssr::types::Locus` across 59 call sites, three changes to
 `CatalogParams`, and a `.cat`-side conversion, all as *"work this step includes"*. **All of it is
 cancelled.** Production is frozen; ng copies what it needs (§5). The list below is what remains, and

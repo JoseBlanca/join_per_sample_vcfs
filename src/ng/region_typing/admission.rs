@@ -736,7 +736,7 @@ impl From<Candidate> for RepeatInterval {
 /// higher-period interval overlapping a divisor-period one is the same tract).
 ///
 /// Ported from the test-only `catalog_prefilter`
-/// (`ssr::catalog::scanner_parity`), which had no production home; here it sits
+/// ([`crate::ng::scanner_parity`]), which had no production home; here it sits
 /// beside the policy whose ordering makes it necessary (spec §5.1).
 ///
 /// **It reads the same [`MinCopies`] as [`admit`] — since A2, there is one
@@ -2229,7 +2229,7 @@ mod tests {
     /// table must give what **each** original gave, at every period each could
     /// reach. The two originals live in frozen production and are private
     /// (`postprocess::copy_number_floor`, and `copy_floor` inside
-    /// `scanner_parity`'s `#[cfg(test)]` module), so they are restated here as the
+    /// `scanner_parity`'s copy), so they are restated here as the
     /// oracle — which is the point: if production ever changes, this fails and says
     /// so, rather than ng drifting quietly.
     ///

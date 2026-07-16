@@ -99,7 +99,7 @@ step. **Production does not move.**
   `RegionScanner` ([ng/tandem_repeat.rs](../../../../src/ng/tandem_repeat.rs)).
 - **The port's sources are readable and the oracles are live**: `build_loci`
   ([postprocess.rs:69](../../../../src/ssr/catalog/postprocess.rs)), `catalog_prefilter`
-  ([scanner_parity.rs:59](../../../../src/ssr/catalog/scanner_parity.rs)), `Locus` + `Motif`
+  ([scanner_parity.rs](../../../../src/ng/scanner_parity.rs) — moved into ng at B2, see below), `Locus` + `Motif`
   ([ssr/types.rs](../../../../src/ssr/types.rs), both `pub(crate)`), `CatalogParams`, `RegionSet`
   ([regions.rs](../../../../src/regions.rs)), the **golden catalog fixture**
   (`tests/data/tandem_repeat/golden.ssr_catalog.bed.gz`), and the **`RefSeq` impls**.

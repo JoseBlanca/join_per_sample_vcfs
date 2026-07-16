@@ -14,6 +14,9 @@
 //! production nothing. Winning steps are ported back only after the experiments
 //! ng exists to run have decided something.
 
+#[cfg(test)]
+mod scanner_parity;
+
 pub mod read;
 pub mod ref_seq;
 pub mod region_typing;

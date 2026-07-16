@@ -424,7 +424,8 @@ orchestrator (`catalog::run`) stops spawning `trf-mod` per contig and instead ca
   in: the **per-period copy floor** and **period-multiple redundancy elimination** (`IsRedundant`).
   This is *catalog policy* — it stays out of the use-agnostic scanner and the unchanged
   post-filter. With it, the scanner reproduces the golden catalog at **16/16 recall** (the parity
-  test `src/ssr/catalog/scanner_parity.rs`); it is required whenever the production swap lands.
+  test `src/ng/scanner_parity.rs` — moved there from `src/ssr/catalog/` on 2026-07-16, see
+  `typed_regions.md` §9); it is required whenever the production swap lands.
 - **The post-filter is unchanged, consuming `RepeatInterval` directly.** `postprocess::build_loci`
   currently takes `Vec<TrfRecord>` and reads only `start/end/period/score` — exactly
   `RepeatInterval`'s fields. So `TrfRecord` is **deleted** and `build_loci` (and its internal

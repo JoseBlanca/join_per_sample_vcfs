@@ -1,34 +1,61 @@
-//! Milestone-D parity test: the in-crate tandem-repeat scanner
-//! ([`crate::ng::tandem_repeat`]) must reproduce the **final catalog** the external
-//! `trf-mod` produces, run through the *unchanged* post-filter ([`super::postprocess`]).
+//! **Golden-catalog parity for ng's tandem-repeat scanner.**
 //!
-//! The oracle is a golden catalog snapshot committed under `tests/data/tandem_repeat/` —
-//! built once by the current `trf-mod` → `postprocess` path (`ssr-catalog`) on a synthetic
-//! STR-diversity reference. This test bypasses `trf-mod`: it runs
-//! [`find_tandem_repeats`](crate::ng::tandem_repeat::find_tandem_repeats) on the same
-//! reference, bridges the intervals into the post-filter's input via the test-only
-//! [`TrfRecord::for_test`], and asserts the resulting [`Locus`] set reproduces the golden
-//! one (impl plan Milestone D2, spec §6). **Production stays on `trf-mod`** — this only
-//! *validates* the scanner; nothing here changes the shipping path.
+//! [`find_tandem_repeats`](crate::ng::tandem_repeat::find_tandem_repeats) must
+//! reproduce the **final catalog** the external `trf-mod` produces, run through
+//! production's *unchanged* post-filter (`ssr::catalog::postprocess`).
+//!
+//! The oracle is a golden catalog snapshot committed under
+//! `tests/data/tandem_repeat/` — built once by the current `trf-mod` →
+//! `postprocess` path (`ssr-catalog`) on a synthetic STR-diversity reference. This
+//! test bypasses `trf-mod`: it runs the scanner on the same reference, bridges the
+//! intervals into the post-filter's input via the test-only `TrfRecord::for_test`,
+//! and asserts the resulting `Locus` set reproduces the golden one.
+//! **Production stays on `trf-mod`** — this only *validates* ng's scanner; nothing
+//! here changes the shipping path, and it reads `src/ssr/` without writing to it.
+//!
+//! ## Why this lives in `src/ng/`, having been written in `src/ssr/catalog/`
+//!
+//! It is **ng's test**: its subject is ng's scanner, and production is only the
+//! yardstick. It began in `src/ssr/catalog/` because that is where the golden path
+//! was, and that made `src/ssr/` — which is **frozen** (owner, 2026-07-16: *"leave
+//! production as is"*) — the **only** part of the tree that `use`d `crate::ng`.
+//!
+//! That dependency pointed the wrong way, and it bit: typed-regions Milestone B2
+//! widens ng's coordinates to `u64`, and `RepeatInterval`'s `u32`-ness was baked
+//! into this file (four sites, most bindingly `TrfRecord::for_test(start: u32,
+//! end: u32, …)`) — so an **ng-internal** change could not compile without editing
+//! frozen production. A freeze that ng can break is not a freeze; the whole point
+//! is that an experiment cannot destabilise the yardstick it is scored against.
+//!
+//! Moving it (owner-approved) severs that: **production now depends on nothing in
+//! ng**, permanently, and this test follows ng's types as they move. The move is
+//! test-only — no shipped behaviour changed, and the parity bar is the same one.
 //!
 //! ## The catalog pre-filter (a validated integration finding)
 //!
-//! `trf-mod` hands `postprocess` a **clean** candidate set — statistically significant
-//! repeats, redundancy already eliminated. The raw scanner is deliberately permissive
-//! (`min_copies = 2`), so in aperiodic sequence it emits many low-copy noise repeats and
-//! every period-multiple of a real tract. Fed straight to `build_loci`, that noise triggers
-//! `drop_bundles` (which runs *before* the copy-number floor) and cascades away the real
-//! loci. So the catalog consumer must apply, **before** `build_loci`, the same two cleanups
-//! `trf-mod` bakes in — the per-period copy floor and period-multiple redundancy elimination
-//! (its `IsRedundant`). [`catalog_prefilter`] is that policy; when the production swap lands
-//! (spec §6–§7, deferred) it belongs in `catalog::run`, not in the scanner (which stays
-//! use-agnostic) nor in `postprocess` (which stays unchanged).
+//! `trf-mod` hands `postprocess` a **clean** candidate set — statistically
+//! significant repeats, redundancy already eliminated. The raw scanner is
+//! deliberately permissive (`min_copies = 2`), so in aperiodic sequence it emits
+//! many low-copy noise repeats and every period-multiple of a real tract. Fed
+//! straight to `build_loci`, that noise triggers `drop_bundles` (which runs
+//! *before* the copy-number floor) and cascades away the real loci. So a consumer
+//! must apply, **before** `build_loci`, the same two cleanups `trf-mod` bakes in —
+//! the per-period copy floor and period-multiple redundancy elimination (its
+//! `IsRedundant`).
+//!
+//! [`catalog_prefilter`] is that policy, kept here **verbatim as trf-mod's
+//! shape**. Note ng has since ported it properly, with the floors as a real knob,
+//! to [`crate::ng::region_typing::admission::prefilter`] — this copy stays frozen
+//! against the golden path rather than tracking ng's, so that the two oracles stay
+//! independent: if ng's prefilter drifts, `admission`'s own differential says so,
+//! and this one keeps measuring the scanner against trf-mod.
 
 use std::fs::File;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 
 use crate::ng::tandem_repeat::{PeriodRange, RepeatInterval, ScanParams, find_tandem_repeats};
+use crate::ssr::catalog::CatalogParams;
 use crate::ssr::catalog::io::CatalogReader;
 use crate::ssr::catalog::postprocess::build_loci;
 use crate::ssr::catalog::trf::TrfRecord;
@@ -83,7 +110,7 @@ fn catalog_prefilter(intervals: &[RepeatInterval]) -> Vec<RepeatInterval> {
 
 /// Run the scanner path (`find_tandem_repeats` → catalog pre-filter → `build_loci`) over the
 /// reference the golden was built from, and return its loci.
-fn scanner_loci(reference: &Path, params: &super::CatalogParams) -> Vec<Locus> {
+fn scanner_loci(reference: &Path, params: &CatalogParams) -> Vec<Locus> {
     let file = File::open(reference).unwrap();
     let mut reader = noodles_fasta::io::Reader::new(BufReader::new(file));
     let mut out = Vec::new();

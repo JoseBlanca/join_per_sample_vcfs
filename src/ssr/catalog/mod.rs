@@ -31,9 +31,6 @@ pub mod io;
 pub mod postprocess;
 pub mod trf;
 
-#[cfg(test)]
-mod scanner_parity;
-
 /// Build/accept parameters — the post-process knobs that both drive
 /// [`postprocess::build_loci`] and are recorded in the catalog header
 /// ([`io::CatalogHeader`]) so a reader sees exactly how it was built. The
