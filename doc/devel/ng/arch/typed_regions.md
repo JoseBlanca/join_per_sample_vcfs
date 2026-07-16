@@ -10,14 +10,30 @@ Naming: **STR** in prose, `ssr` in code.*
 
 ---
 
+## Revision — 2026-07-16: ng owns its copies
+
+Tracks the spec's Revision of the same date: **production (`src/ssr/`, `src/regions.rs`) is frozen**;
+ng copies what it needs rather than reshaping production in place, and ng must not depend on trf-mod.
+What changed in this doc: the module is a folder; `SsrLocus` holds **ng's** `Locus`, not
+`ssr::types::Locus`; `TypedRegionConfig.catalog: CatalogParams` becomes
+`admission: SsrAdmissionParams` (ng's own); and the reconciliation table's "use directly / reuse,
+widened" rows become "copy into ng". The interface, the iterator contract, and every decision below
+them are unaffected — none of them ever depended on where the code lived.
+
 ## Module home
 
-`src/ng/region_typing.rs` — a single file (a step with no bake-off is a file, not a folder; spec
-§6). It is a **step** module, so it sits in the step layer of the `src/ng/` tree, replacing the
+`src/ng/region_typing/` — a folder, though **not** because of a bake-off (there is none; spec §6):
+it carries the ~500-line port of the admission policy alongside the walk, and those are two concerns
+with two test suites.
+
+- `region_typing/mod.rs` — `TypedRegion`, `RegionKind`, `TypedRegionConfig`, `TypedRegionCounts`,
+  `TypedRegionError`, `GenomeRegions`, `TypedRegionIterator`, the walk.
+- `region_typing/admission.rs` — ng's port (spec §5): `Locus`, `SsrAdmissionParams`, `Admitted`, the
+  pre-filter, `admit`, and the differential test against production's `build_loci` (spec §8.0).
+
+It is a **step** module, so it sits in the step layer of the `src/ng/` tree, replacing the
 `locus_router/` folder the layout doc reserved. `GenomeRegion` and `Position` are shared vocabulary
 and land in `ng::types`, not here.
-
-Promoted to `region_typing/` only if it outgrows one file — the `tandem_repeat.rs` precedent.
 
 ## The types
 
@@ -32,17 +48,35 @@ pub struct TypedRegion { pub region: GenomeRegion, pub kind: RegionKind }
 /// Exactly one kind is a genetic object (a locus); the other three are physical regions.
 /// `Generic`/`Satellite` carry nothing — they *are* just their region. (spec §1.1)
 pub enum RegionKind {
-    SsrLocus(Locus),                               // ssr::types::Locus, used directly (see below)
+    SsrLocus(Locus),                               // ng's own Locus (admission.rs) — see below
     SsrBundle { tracts: Box<[RepeatInterval]> },   // >= 2, coordinate-ordered; hull = TypedRegion.region
     Generic,
     Satellite,
 }
 ```
 
-**`SsrLocus` wraps nothing — it holds the catalog's `Locus` directly.** This is the payoff of
-rebasing `Locus` to 1-based (spec §4, §9): with no coordinate mismatch to hide, the earlier
-`ng::SsrLocus` wrapper has no job. `Locus` carries motif, borders, purity, and the embedded
-flank+tract+flank bases, and is `ReadPreparer::Locus` (closes `read_preparation_ssr.md` §8).
+**`SsrLocus` wraps nothing — it holds ng's own `Locus` directly.** `Locus` is a port of
+`ssr::types::Locus` (spec §5), born 1-based/`u64` where production's is 0-based/`u32`; production's is
+left alone (spec Revision). With no coordinate mismatch to hide, the earlier `ng::SsrLocus` wrapper
+has no job. It carries motif, borders, purity, and the embedded flank+tract+flank bases, and is
+`ReadPreparer::Locus` (closes `read_preparation_ssr.md` §8).
+
+```rust
+/// ng's port of the catalog's Locus — same fields, 1-based inclusive, u64. Reuses ssr::types::Motif
+/// as-is (no coordinates, no width → nothing to change; spec §4). Private fields + a validating
+/// `new`, exactly as production's. (spec §4, §5)
+pub struct Locus { /* chrom, start, end, motif: Motif, purity_fraction, ref_bytes, ref_bytes_start */ }
+
+/// ng's admission policy — the port of `postprocess::build_loci`, windowed and all-knobs. (spec §5a)
+pub fn admit(recs: Vec<RepeatInterval>, chrom: &str,
+             bases: &[u8], bases_start: u64, contig_len: u64,
+             p: &SsrAdmissionParams) -> Admitted;
+
+pub struct Admitted {
+    pub loci: Vec<Locus>,                 // what build_loci returns today
+    pub bundled: Vec<RepeatInterval>,     // what it silently drops today (spec §2.4, §6a)
+}
+```
 
 ```rust
 /// A set of genome regions to walk — sorted, non-overlapping, coalesced, clamped, genomic order.
@@ -56,13 +90,15 @@ impl GenomeRegions {
 
 /// The walk's policy. `Default` = the catalog's settings, for oracle comparability only — not an
 /// endorsement of them (spec §5, §5.2). Every field is a parameter, including the period scope and
-/// copy floors that are hardcoded consts today (spec §9 moves them into `CatalogParams`).
+/// copy floors production hardcodes — ng's copy makes them knobs (spec §5).
 pub struct TypedRegionConfig {
     pub periods: PeriodRange,
     pub scan: ScanParams,
     pub max_repeat_len: Bp,       // the satellite cap AND the detection margin — one field (spec §2.6)
     pub window_bp: Bp,            // memory knob; must not change the output (spec §2.3)
-    pub catalog: CatalogParams,   // all admission knobs; `flank_bp` is now also the bundle threshold
+    pub admission: SsrAdmissionParams,  // ng's own (admission.rs), NOT ssr's CatalogParams: same
+                                  // defaults + the hardcoded period scope and copy floors as real
+                                  // knobs; no separate `bundle_threshold` (spec §2.4, §5)
 }
 
 /// Running tally — "no silent caps": a base typed away from the STR path is accounted for. (spec §3.1)
@@ -119,17 +155,18 @@ output. The queue that fans work out to analysis workers is the pipeline's, not 
 
 ## Decisions — one line each, *why* in the spec
 
-- **`SsrLocus(Locus)`, no wrapper** — `Locus` is rebased to 1-based, so there is nothing to wrap
+- **`SsrLocus(Locus)`, no wrapper** — ng's `Locus` is born 1-based, so there is nothing to wrap
   (spec §4).
+- **ng copies; production is frozen** — the admission policy, the pre-filter, `Locus`, and the
+  admission knobs are ng's own (spec Revision, §5). `Motif` and `RegionSet` are reused as-is, because
+  reusing them costs production nothing.
 - **Concrete iterator, no trait** — no bake-off; `LocusRouter`/`LocusSource`/`RefWindow` retire
   (spec §6). `LocusKind` does **not** — it stays as the per-*locus* core's input (`Ssr`/`Generic`),
   which is a different type from this step's per-*region* `RegionKind` (`ng_step_interfaces.md` §3).
 - **`Item = Result<_, _>`, one error variant** — fatal errors in-stream so a failure can't look like
   end-of-walk; `GenomeRegions` owns all the input validation (spec §8.2).
 - **Owns its inputs, no lifetime** — so it moves onto a producer thread (spec §7).
-- **`GenomeRegions` wraps `RegionSet`; `SsrLocus` holds `Locus`; `TypedRegionConfig.catalog` is
-  `CatalogParams`** — reuse production types directly, widened/rebased rather than duplicated (recon
-  below).
+- **`GenomeRegions` wraps `RegionSet`** — read-only reuse, the one conversion seam (spec §2.5, §4).
 - `OPEN:` none at this layer — the open questions (period × length frontier, bundle disposal,
   satellite cap, flank size) are all *parameter values*, not interface shape (spec §10).
 
@@ -140,20 +177,30 @@ Every row read at the cited line (2026-07-16). Convergence, not new types.
 | ng name | existing code | action |
 |---|---|---|
 | `GenomeRegion` | `regions::Region` ([regions.rs:38](../../../../src/regions.rs)), `ContigInterval` ([bam/alignment_input.rs:544](../../../../src/bam/alignment_input.rs)) | the consolidation `ng_step_interfaces.md` §6 reserved — this step is its first use (1-based, `u64`) |
-| `GenomeRegions` | `RegionSet` ([regions.rs:74](../../../../src/regions.rs)) | **wrap**, not reimplement — it already sorts/coalesces/clamps/converts-BED; wrapper adds ng's width + name |
-| `SsrLocus`'s payload | `ssr::types::Locus` ([ssr/types.rs:136](../../../../src/ssr/types.rs)) | **use directly**, rebased to 1-based + widened to `u64` (spec §9); no wrapper |
-| `RegionKind::SsrBundle` tracts | `RepeatInterval` ([ng/tandem_repeat.rs:186](../../../../src/ng/tandem_repeat.rs)) | reuse as-is |
-| `TypedRegionConfig.catalog` | `CatalogParams` ([ssr/catalog/mod.rs:42](../../../../src/ssr/catalog/mod.rs)) | reuse; loses `bundle_threshold`, gains the hardcoded period/floor knobs (spec §5, §9) |
-| the admission call | `build_loci` ([ssr/catalog/postprocess.rs:69](../../../../src/ssr/catalog/postprocess.rs)) | windowed + returns `Admitted { loci, bundled }`; `#[cfg(test)]` bridge must open (spec §5) |
+| `GenomeRegions` | `RegionSet` ([regions.rs:74](../../../../src/regions.rs)) | **wrap read-only**, not reimplement — it already sorts/coalesces/clamps/converts-BED; wrapper adds ng's width + base + name. `regions.rs` does not move |
+| `SsrLocus`'s payload | `ssr::types::Locus` ([ssr/types.rs:136](../../../../src/ssr/types.rs)) | **copy into ng**, born 1-based/`u64` (spec §4, §5); production's untouched |
+| ng `Locus`'s motif | `ssr::types::Motif` ([ssr/types.rs:36](../../../../src/ssr/types.rs)) | **reuse as-is** — `pub(crate)`, no coordinates, no width (spec §4) |
+| `RegionKind::SsrBundle` tracts | `RepeatInterval` ([ng/tandem_repeat.rs:186](../../../../src/ng/tandem_repeat.rs)) | reuse; widened to `u64` (ng's own code, spec §4) |
+| `TypedRegionConfig.admission` | `CatalogParams` ([ssr/catalog/mod.rs:42](../../../../src/ssr/catalog/mod.rs)) | **copy into ng** as `SsrAdmissionParams`: same defaults, no `bundle_threshold`, gains the hardcoded period/floor knobs (spec §5) |
+| `admission::admit` | `build_loci` ([ssr/catalog/postprocess.rs:69](../../../../src/ssr/catalog/postprocess.rs)) | **copy into ng** — logic transcribed unchanged; takes `RepeatInterval`, windowed, returns `Admitted { loci, bundled }` (spec §5a). Production's `build_loci` and `TrfRecord` stay |
+| the pre-filter | `catalog_prefilter` ([ssr/catalog/scanner_parity.rs:59](../../../../src/ssr/catalog/scanner_parity.rs)) | **copy into ng**, beside `admit` (spec §5.1) |
 | the windowed scan | `collect_windowed` ([ng/tandem_repeat.rs:530](../../../../src/ng/tandem_repeat.rs)) | promote (private → crate) and stream (spec §6.1) |
 | reference access | `WindowedRefSeq` ([ng/ref_seq.rs](../../../../src/ng/ref_seq.rs)) | + a raw-bytes path (`ref_seq.md` YAGNI now spent) + a `contigs()` accessor |
 | `TypedRegionError` | new (`thiserror`, `#[non_exhaustive]`) | one variant; mirrors `ReadFilterError`'s in-stream-fatal shape |
 
-**Parity oracle:** an `ssr-catalog` `.cat` on the same reference, at the catalog's settings — the
-`SsrLocus` set is a strict subset (differs only by the satellite cap). Full contract in spec §8.
+**Two oracles, both in spec §8:**
+
+- **Port fidelity** (spec §8.0) — ng's `admit` vs production's `build_loci` on the same intervals,
+  whole-contig, at the catalog's settings; `Locus` sets identical modulo the coordinate base. The
+  bridge is `TrfRecord::for_test` (`#[cfg(test)] pub(crate)`, same crate). This is what the Revision
+  bought: what was once true by construction is now a test.
+- **`.cat` parity** (spec §8.1) — the committed **trf-mod-built** golden catalog on the same
+  reference; the `SsrLocus` set is a strict subset (differs only by the satellite cap), with
+  `scanner_parity`'s overlap tolerance for detector wobble.
 
 ## Test & bench shape
 
-Tests beside the code in `region_typing.rs`. No `bench/` — no competing impls (spec §6). The
-regression anchors are the parity oracle and the invariant tests (partition, window-invariance,
-BED-invariance) detailed in spec §8; the arch doc adds no test surface of its own.
+Tests beside the code in `region_typing/` — the walk's in `mod.rs`, the port's (including spec §8.0's
+differential) in `admission.rs`. No `bench/` — no competing impls (spec §6). The regression anchors
+are the two oracles above and the invariant tests (partition, window-invariance, BED-invariance)
+detailed in spec §8; the arch doc adds no test surface of its own.

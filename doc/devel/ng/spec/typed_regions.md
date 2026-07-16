@@ -14,6 +14,47 @@ sibling docs; see §9. Code-facing companion: [`../arch/typed_regions.md`](../ar
 
 ---
 
+## Revision — 2026-07-16: ng owns its copies; production is frozen
+
+**Owner decision, and it reverses this spec's central reuse argument.** The first draft had ng edit
+`src/ssr/` — rebase `Locus`, widen `CatalogParams`, change `build_loci`'s signature — on the grounds
+that "ng is early, so we change the code rather than work around it". That was wrong, and the owner
+overruled it:
+
+> *"Don't touch `src/ssr`. If you need to, copy the code to `ng/` and modify there whatever you need.
+> The objective is to leave production as is and create a fresh ng caller from scratch. In the
+> future, once we have done the experiments that ng is supposed to carry out, we'll decide how to
+> port the functionalities to production. If you could reuse something without messing production up,
+> that's fine, but if you need to change something and is not just a small tweak, let ng have its own
+> version."* — owner, 2026-07-16
+
+**Why it is right.** ng exists to *decide* things — the period × length routing frontier, the flank
+size, the satellite cap (§10). Binding production to answers we do not have yet buys instability for
+nothing, and it destroys the very thing that makes the answers checkable: an **independent yardstick**.
+A production catalog we have not touched is a real oracle. A production catalog we rebased to suit ng
+is a mirror.
+
+**The rule.** Reuse from `src/ssr/` **only where it costs production nothing** — calling an existing
+`pub(crate)` item at its existing signature. The moment reuse would need a signature change, a widened
+type, or a coordinate rebase over there, **stop and copy it into `src/ng/`**. ng owning a divergent
+copy is the intended outcome, not a smell. Likewise **ng must not depend on `trf-mod`**: it stays
+production's catalog detector and may serve as a *comparison oracle*, never as an ng dependency. The
+`ssr_repeat_scanner.md` §6–§7 production detector swap is **not** happening.
+
+**What this rewrites below:** §4 (ng's coordinates are ng's; nothing in `src/ssr/` rebases), §5 and
+§5.1 (ng **ports** the admission policy rather than reusing and reshaping it in place), §8 (parity
+gains a port-fidelity check — what used to be true by construction is now a test), and §9 (the "what
+this breaks elsewhere" list largely evaporates, because ng now breaks nothing elsewhere). §1–§3 and
+§6–§7 — the walk itself — are unaffected: the algorithm never depended on where the code lived.
+
+**What it costs.** Two copies of the admission policy, which §5.1 rightly warned can silently
+diverge. The mitigation is that divergence is now *tested* rather than *prevented*: §8's port-fidelity
+oracle pins ng's port against production's `build_loci` on shared inputs. That is a weaker guarantee
+than sharing one function, and it is the price of a production tree that cannot be destabilised by an
+experiment.
+
+---
+
 ## 1. What it is
 
 Walk the reference end to end — streaming, never loading it all into memory — and cut it into
@@ -38,7 +79,7 @@ concept, each naming what the value *is*:
 | **region** | a **physical** piece of DNA: contig + 1-based inclusive range, no genetic claim | `GenomeRegion` |
 | **typed region** | a region **+ what the sequence there is** | `TypedRegion { region, kind }` |
 | **region kind** | that "what" — one of four | `RegionKind` |
-| **locus** | a **genetic** object: has alleles, segregates, gets genotyped | `Locus` (the catalog's, rebased — §4) |
+| **locus** | a **genetic** object: has alleles, segregates, gets genotyped | `Locus` (ng's own, 1-based — §4) |
 | **tract** | the repeat's own extent inside an STR locus | `Locus::ref_tract()` |
 | **window** | the walk's memory unit. Never appears in output (§2.3) | `window_bp` |
 
@@ -75,8 +116,8 @@ has clean flanks (§2.4).
 ### 1.2 Goals, non-goals
 
 **Goals.** Produce the partition. **Make the typing policy a parameter**, so the experiments that
-are ng's whole point can move it (§5, §5.2) — reusing the catalog's *implementation* rather than
-rewriting it, and starting at its settings only so there is something to compare against (§8). Give
+are ng's whole point can move it (§5, §5.2) — porting the catalog's *implementation* rather than
+re-deriving it, and starting at its settings only so there is something to compare against (§8). Give
 the STR path the locus it asked for — motif, borders, flanks — in a type it can already consume
 (§4). Be a pure function of the reference, the regions, and the config.
 
@@ -99,15 +140,16 @@ and an **open generic run costs 8 bytes however many megabases it spans** — wh
 
 ### 2.1 The algorithm
 
-Per window, five steps. The first three are the catalog's *implementation*, driven by whatever
-settings the config carries (§5) — running them at the catalog's own settings is what makes §8's
-oracle a check on the machinery.
+Per window, five steps. The first three are ng's port of the catalog's *implementation* (§5), driven
+by whatever settings the config carries — running them at the catalog's own settings is what makes
+§8's oracle a check on the machinery.
 
 1. **Detect** — `find_tandem_repeats(bases, periods, params)` → raw, overlapping candidate
    intervals (coordinates, period, score). No policy.
-2. **Clean** — the catalog's pre-filter: per-period copy floor, then period-multiple redundancy
+2. **Clean** — the ported pre-filter: per-period copy floor, then period-multiple redundancy
    (one tract is re-detected at every multiple of its period). **Not optional** (§5).
-3. **Admit** — `build_loci` → the STR loci *and* the tracts it set aside as bundle members (§5).
+3. **Admit** — ng's `admit` (the ported `build_loci`) → the STR loci *and* the tracts it set aside as
+   bundle members (§5).
 4. **Cap** — merge cleaned intervals into coverage runs; a run over `max_repeat_len` (1 kb) is
    satellite. Drop admitted loci *and bundles* inside one.
 5. **Partition** — emit `SsrLocus` at each surviving tract, `SsrBundle` across each surviving
@@ -178,7 +220,8 @@ Algorithm notes:
   resolving it. Collapse them — **the flank requirement is the primitive, bundle-ness is derived** —
   so when we explore what flank the delimiter actually needs (§10), the bundle definition follows
   for free. It also gives us a reason GangSTR never had: no source comment of theirs says why
-  bundles are dropped at all (§10). Since this is the catalog's config, it moves the catalog (§9).
+  bundles are dropped at all (§10). The collapse happens in **ng's** `SsrAdmissionParams` (§5); the
+  catalog keeps both knobs, because production does not move (Revision).
 - **Membership is a local test:** a repeat is a bundle member iff another repeat lies within
   `flank_bp` on either side. The cluster falls out of that — there is no separate transitive rule to
   implement. It also selects exactly the records `drop_bundles` sets aside today, so §8's oracle is
@@ -239,9 +282,10 @@ locus needs 50 bp of clean sequence each side to build its flanks, and 1 kb is a
 
 **This is `collect_windowed` — already written, already tested. Reuse it, don't rewrite it** (§6.1).
 
-**2. Tell `build_loci` where the contig actually ends.**
+**2. Tell admission where the contig actually ends.**
 
-It works out a locus's right flank as `(new_end + flank_bp).min(contig_seq.len())` and throws the
+The rule ng inherits from `build_loci` works out a locus's right flank as
+`(new_end + flank_bp).min(contig_seq.len())` and throws the
 locus away if that clamped to nothing — that is how it detects "this tract is at the end of the
 chromosome, there is nothing to anchor against". Hand it a 100 kb slice and `contig_seq.len()` is
 100 kb, so **it believes the chromosome ends at your window edge**: every locus within 50 bp of
@@ -273,7 +317,9 @@ nothing (§7).
 
 ## 3. The types
 
-Live in `src/ng/region_typing.rs`; `GenomeRegion` is shared vocabulary and lands in `ng::types`.
+Live in `src/ng/region_typing/` (§6): the walk's types in `mod.rs`, ng's ported `Locus` /
+`SsrAdmissionParams` / `admit` in `admission.rs`. `GenomeRegion` is shared vocabulary and lands in
+`ng::types`.
 
 ```rust
 /// A genome region plus what the sequence there IS — the walk's output.
@@ -284,11 +330,11 @@ pub struct TypedRegion { pub region: GenomeRegion, pub kind: RegionKind }
 /// Exactly one of the four is a genetic object; the other three are physical (§1.1).
 /// `Generic` and `Satellite` carry nothing because they *are* just spans.
 pub enum RegionKind {
-    /// The catalog's `Locus`, used directly — motif, borders, purity, and the embedded
-    /// flank+tract+flank bases. No ng wrapper: `Locus` is 1-based like everything else (§4), and
-    /// `TypedRegion` already carries the region. It is `ReadPreparer::Locus`, closing
-    /// `read_preparation_ssr.md` §8.
-    SsrLocus(Locus),                               // Locus = ssr::types::Locus
+    /// ng's own `Locus` — motif, borders, purity, and the embedded flank+tract+flank bases. A
+    /// port of the catalog's, born 1-based/`u64` (§4, §5); production's stays 0-based/`u32`. No
+    /// wrapper: it is 1-based like everything else in ng, and `TypedRegion` already carries the
+    /// region. It is `ReadPreparer::Locus`, closing `read_preparation_ssr.md` §8.
+    SsrLocus(Locus),                               // Locus = ng's, NOT ssr::types::Locus
     /// A cluster of repeats none of which has clean flanks (§2.4). Carries the tracts as
     /// coordinates — enough to see the structure (each interval has its period) without this step
     /// pre-deciding what it is for. The hull is the `TypedRegion`'s own span.
@@ -353,9 +399,11 @@ pub struct TypedRegionConfig {
     pub max_repeat_len: Bp,       // the satellite cap AND the scan margin — one field because
                                   //   they must be the same number (§2.6)
     pub window_bp: Bp,            // the memory knob; default 100 kb. Must not change the output
-    pub catalog: CatalogParams,   // admission's rules — ALL of them, once the hardcoded period
-                                  //   scope and copy floors move in (§5). `flank_bp` (50) is now
-                                  //   the bundle threshold too, so `bundle_threshold` goes (§2.4)
+    pub admission: SsrAdmissionParams,  // ng's own (§5) — ALL of admission's rules, including the
+                                  //   period scope and copy floors the catalog hardcodes. `flank_bp`
+                                  //   (50) is the bundle threshold too, so there is no separate
+                                  //   `bundle_threshold` knob (§2.4). Default = the catalog's
+                                  //   values, for §8's comparability only
 }
 
 /// Running tally. "No silent caps": a base typed away from the STR path must be accounted for.
@@ -385,18 +433,28 @@ the catalog's measured ~35% STR coverage gap.
 
 ## 4. Coordinates
 
-**1-based inclusive, `u64`, ids stay `u32` — everywhere, with no seam.** ng decided 1-based
-(`ng_step_interfaces.md` §5). The scanner and the catalog are 0-based half-open today, so **we change
-them** (§9) rather than converting at every boundary forever: ng is early enough that consistency is
-worth more than the legacy, and a straddle in the coordinate system is the kind of legacy that gets
+**1-based inclusive, `u64`, ids stay `u32` — everywhere in ng, with one seam.** ng decided 1-based
+(`ng_step_interfaces.md` §5). ng's *own* code (the scanner, `RefSeq`, `Bp`) is 0-based/`u32` today, so
+**we change it** rather than converting at every boundary forever: ng is early enough that consistency
+is worth more than the legacy, and a straddle in the coordinate system is the kind of legacy that gets
 more expensive every month it survives.
 
-That decision pays for itself immediately. An earlier draft kept `Locus` 0-based and wrapped it in an
-`ng::SsrLocus` to present a 1-based surface — a type whose *entire* purpose was to hide the
-mismatch. Rebase `Locus` and the wrapper has nothing left to do: `RegionKind::SsrLocus(Locus)` uses
-the catalog's type directly, `TypedRegion` already carries the region, and
-`ReadPreparer::Locus = ssr::types::Locus` (`read_preparation_ssr.md` §8). **The workaround was
-bigger than the fix.**
+**Production is not ng's code, and does not move (Revision 2026-07-16).** `ssr::types::Locus` stays
+0-based/`u32`; `src/regions.rs` stays `u32`. ng's `Locus` is **its own type** — the same fields, born
+1-based and `u64`. The rebase an earlier draft costed at "59 call sites across `src/ssr/`" is not
+performed at all: there is nothing to rebase, because ng's copy is written right the first time.
+
+That still buys what the rebase was for. An even earlier draft kept `Locus` 0-based and wrapped it in
+an `ng::SsrLocus` to present a 1-based surface — a type whose *entire* purpose was to hide the
+mismatch. With ng owning the type the wrapper has nothing left to do: `RegionKind::SsrLocus(Locus)`
+holds ng's `Locus` directly, `TypedRegion` already carries the region, and `ReadPreparer::Locus` is
+ng's `Locus` (`read_preparation_ssr.md` §8). **The workaround was bigger than the fix** — and the fix
+turned out to be cheaper still, since owning the type costs less than rebasing someone else's.
+
+**What ng reuses from `src/ssr/` unchanged.** `Motif` ([ssr/types.rs:36](../../../../src/ssr/types.rs))
+is already `pub(crate)`, carries **no coordinates and no width**, and so has nothing to rebase — the
+Revision's "reuse where it costs production nothing" case exactly. ng uses it as-is. `Locus` is the
+opposite: coordinates and width are all it is.
 
 **`TypedRegion` carries its 1-based region as a struct field**, converted once at construction — one
 span, one base, one place. Rejected: repeating it per variant with a `region()` accessor over four,
@@ -417,14 +475,14 @@ loses because it optimises for a port-back `ng_proposal.md` §3 explicitly makes
 `u32::try_from(contig_len).unwrap_or(u32::MAX)` — a >4 Gb contig **silently clamps**, in built ng
 code, today. `u64` deletes it rather than guarding it.
 
-**The `u32` holdouts widen in this step, not later** — ng's own (`RefSeq::fetch_into` and its three
-impls, the scanner's `RepeatInterval`/`RegionSpan`/`SegmentOptions`, `Bp`) **and the catalog's**
-(`Locus`, `build_loci`, `CatalogParams::flank_bp`), which the rebase is touching anyway (§9).
-Deferring any of it leaves ng mixed-width, which is the state the decision exists to end.
+**ng's `u32` holdouts widen in this step, not later** — `RefSeq::fetch_into` and its three impls, the
+scanner's `RepeatInterval`/`RegionSpan`/`SegmentOptions`, `Bp`. All of it is `src/ng/`, so all of it is
+ours to change. Deferring any of it leaves ng mixed-width, which is the state the decision exists to
+end. The catalog's `Locus`/`build_loci`/`CatalogParams` are **not** on this list any more — ng's copies
+are born wide, and production's stay narrow.
 
-**That leaves exactly one conversion seam, not two**: `GenomeRegions` widening `RegionSet`'s `u32`
-on the way in. Widening the catalog *removes* a seam rather than moving one — `build_loci`/`Locus`
-stop converting entirely.
+**That leaves exactly one conversion seam**: `GenomeRegions` widening (and rebasing) `RegionSet`'s
+`u32` on the way in. One seam, one place, at the edge — which is the shape §2.5 wanted anyway.
 
 The line stops at `regions.rs` on purpose: it is *"a top-level peer consumed by both pipeline
 stages"*, so widening it is a change to the whole production caller, not to ng. (It is also already
@@ -441,57 +499,72 @@ to call SNPs, indels, and STRs; where the STR route beats the generic one is one
 here to measure (§5.2, §10). So this step does not *have* an admission policy — it takes one, and
 the partition is a function of it.
 
-**We reuse the catalog's implementation; we do not adopt its policy.** Those are different, and an
+**We port the catalog's implementation; we do not adopt its policy.** Those are different, and an
 earlier draft of this spec collapsed them into a goal ("reuse the catalog's admission policy"),
 which was backwards. `postprocess::build_loci`
 ([postprocess.rs:69](../../../../src/ssr/catalog/postprocess.rs)) is a working, tested
 implementation of the whole rule set — period scope, score gate, compound-motif drop, bundle drop,
-minimal trim, copy floor, purity floor, flank embed, contig-edge drop — and rewriting it would be
-daft. **v1 starts at its settings for one reason only: comparability** (§8). The catalog is a
-yardstick, not an authority.
+minimal trim, copy floor, purity floor, flank embed, contig-edge drop — and **re-deriving that rule
+set from scratch would be daft**. So ng takes the code. **v1 starts at its settings for one reason
+only: comparability** (§8). The catalog is a yardstick, not an authority.
 
-**The rules must therefore be parameters — and half of them are not.** This is a real gap, and it
-bites exactly where it hurts:
+**Copied into ng, not reshaped in place (Revision 2026-07-16).** An earlier draft had ng call
+`build_loci` directly, which meant editing it — windowing it, widening it, rebasing it, and prising
+its hardcoded rules into parameters. Production is frozen, so ng gets **its own copy**, in `src/ng/`,
+carrying every change this step needs at once:
 
-| rule | how it is set today |
+| change | why ng needs it |
 |---|---|
-| purity floor, score gate, flank bp, bundle radius | `CatalogParams` — real parameters |
-| **period scope** (`MIN_PERIOD` = 2, `MAX_PERIOD` = 6) | **hardcoded `const`** |
-| **copy floor per period** (`copy_number_floor`) | **hardcoded `const fn`** — and the pre-filter has a *second*, disagreeing table (§10) |
+| 1-based inclusive, `u64` | ng's coordinate system (§4); production stays 0-based/`u32` |
+| takes `Vec<RepeatInterval>` | ng's detector is the scanner; `TrfRecord` is trf-mod's shape and ng must not depend on it |
+| windowed — `bases_start` + `contig_len` passed in | §2.6's silent bug: a slice cannot be asked where the contig ends |
+| returns `Admitted { loci, bundled }` | §2.4 routes bundles instead of deleting them |
+| **every rule a parameter** | §5.2's experiment (below) |
 
-**The two dimensions §5.2 wants measured — period and length — are precisely the two that are not
-knobs.** So the experiment cannot be run against this code as it stands. Moving them into
-`CatalogParams` (and reconciling the two copy-floor tables) is a co-requisite of this step, not a
-follow-up (§9): a config that cannot express the question is not a config.
+That is five changes to one function; "a small tweak" it is not, which is exactly when the owner's
+rule says copy. **The logic itself is transcribed unchanged** — that is what keeps §8's oracle
+meaningful, and what the port-fidelity test pins.
+
+**Every rule must be a parameter — and in production half of them are not:**
+
+| rule | how the catalog sets it | ng's copy |
+|---|---|---|
+| purity floor, score gate, flank bp, bundle radius | `CatalogParams` — real parameters | parameters |
+| **period scope** (`MIN_PERIOD` = 2, `MAX_PERIOD` = 6) | **hardcoded `const`** | **parameters** |
+| **copy floor per period** (`copy_number_floor`) | **hardcoded `const fn`** — and the pre-filter has a *second*, disagreeing table (§10) | **one parameter table, reconciled** |
+
+**The two dimensions §5.2 wants measured — period and length — are precisely the two the catalog
+hardcodes.** A config that cannot express the question is not a config, so ng's copy makes them
+knobs. This is now a change ng makes *to its own code*, which is the whole point of the owner's rule:
+the experiment no longer needs production's permission to run.
 
 **One rule we do re-decide.** The **bundle drop** we keep as a *selection* and reject as a
 *disposal* (§2.4) — the same records are set aside, but handed back and routed rather than deleted.
 That is a design decision, not a parameter, and it costs no comparability because the selection is
 unchanged.
 
-**Three constraints on how it is called.**
+**Three constraints on the port.**
 
-**(a) It must be generalised to a window, and must return what it set aside.** Not a behaviour
-change:
+**(a) It is windowed, and it returns what it set aside.** Neither is a behaviour change:
 
 ```rust
-// today
+// production, untouched (src/ssr/catalog/postprocess.rs) — 0-based, u32, whole-contig
 fn build_loci(recs: Vec<TrfRecord>, chrom: &str, contig_seq: &[u8], p: &CatalogParams) -> Vec<Locus>
 
-// u64 throughout: the catalog widens with ng (§4), so nothing converts in this call.
-fn build_loci(recs: Vec<RepeatInterval>, chrom: &str,
-              bases: &[u8], bases_start: u64, contig_len: u64,
-              p: &CatalogParams) -> Admitted
+// ng's copy (src/ng/) — 1-based, u64 throughout, so nothing converts in this call.
+fn admit(recs: Vec<RepeatInterval>, chrom: &str,
+         bases: &[u8], bases_start: u64, contig_len: u64,
+         p: &SsrAdmissionParams) -> Admitted
 
 struct Admitted {
-    loci: Vec<Locus>,                 // exactly what it returns today
-    bundled: Vec<RepeatInterval>,     // NEW: the cluster members it silently drops today
+    loci: Vec<Locus>,                 // ng's Locus (§4) — exactly what build_loci returns today
+    bundled: Vec<RepeatInterval>,     // NEW: the cluster members build_loci silently drops today
 }
 ```
 
 `bases_start` + `contig_len` are the two facts `contig_seq` silently stood in for (§2.6).
-**Whole-contig is the degenerate case**, so `catalog::run` is unchanged and byte-identical **by
-construction** — that is what preserves the oracle.
+**Whole-contig is the degenerate case** (`bases_start = 1`, `contig_len = bases.len()`), which is what
+makes the port testable against production's whole-contig-only original at all (§8).
 
 **Returning the bundled tracts rather than re-deriving them is what makes this safe.** The obvious
 alternative — run the flank test ourselves in the pre-filter, before `build_loci` — **breaks parity
@@ -504,28 +577,38 @@ noise and every period-multiple of every real tract. Fed straight in, that noise
 drop — which runs *before* the copy floor — and cascades the real loci away. With the two cleanups
 (`copy floor`, period-multiple redundancy) the scanner reproduces the golden catalog at 16/16.
 
-**(c) `build_loci`'s door is not open yet.** It takes `Vec<TrfRecord>`, and the only bridge from a
-scanner interval is `TrfRecord::for_test`, which is `#[cfg(test)]` — so non-test code **cannot call
-it at all**. `ssr_repeat_scanner.md` §6 already settled the fix (delete `TrfRecord`, substitute
-`RepeatInterval`). **This step is blocked on, or co-lands with, that substitution.**
+**(c) The port is what opens the door.** Production's `build_loci` takes `Vec<TrfRecord>`, and the
+only bridge from a scanner interval is `TrfRecord::for_test`, which is `#[cfg(test)]` — so non-test ng
+code **could not call it at all**. An earlier draft made this step "blocked on, or co-landing with"
+the `ssr_repeat_scanner.md` §6 detector swap that deletes `TrfRecord`. That swap is cancelled
+(Revision), and the block dissolves with it: **ng's copy takes `RepeatInterval` because ng wrote it
+that way.** The `#[cfg(test)]` bridge survives in exactly one place it is welcome — §8's
+port-fidelity test, which is itself `#[cfg(test)]`.
 
-**A trap in the reused defaults:** `CatalogParams::default()` sets `min_score: 0`, and the field's
-comment says why — *"leaves filtering to trf-mod's own `-s 30`"*. There is no `-s 30` here, and
-`RepeatInterval::score` is a Ruzzo–Tompa segment total, not a TRF score. So reusing the default
+**A trap in the inherited defaults:** `CatalogParams::default()` sets `min_score: 0`, and the field's
+comment says why — *"leaves filtering to trf-mod's own `-s 30`"*. There is no `-s 30` in ng, and
+`RepeatInterval::score` is a Ruzzo–Tompa segment total, not a TRF score. So carrying that default over
 ships **no score gate**. Acceptable — the copy and purity floors are the real gates, and the 16/16
-parity ran exactly this way — but it must be known, not inherited by accident.
+parity ran exactly this way — but it must be known, not inherited by accident. ng's copy states it.
 
 ### 5.1 Where the pre-filter lives
 
 It exists only in a test file (`catalog_prefilter`,
 [scanner_parity.rs:59](../../../../src/ssr/catalog/scanner_parity.rs)), and
 `ssr_repeat_scanner.md` §6 says it "belongs in `catalog::run`" — written when the catalog swap was
-the only consumer. There are now two. Buried inside `catalog::run`, the generator would have to copy
-it, and **two copies of an admission policy is how the caller and the catalog silently diverge** —
-which would invalidate the oracle this step's validation rests on.
+the only consumer.
 
-**Recommended: a named `pub(crate)` fn in `src/ssr/catalog/`, called by both.** Still catalog policy;
-just not buried in an orchestrator (§9).
+**ng copies it, alongside the admission policy it is inseparable from** (§5b — it exists because the
+bundle drop runs before the copy floor, which is `build_loci`'s ordering). Production keeps its
+test-only copy; ng's lives beside ng's `admit`.
+
+**The warning the earlier draft raised here was real, and is now accepted rather than dodged.** It
+said: *"two copies of an admission policy is how the caller and the catalog silently diverge — which
+would invalidate the oracle this step's validation rests on."* True. But the alternative it proposed —
+one shared `pub(crate)` fn in `src/ssr/catalog/` — requires production to move whenever an experiment
+does, which is the coupling the owner's rule exists to prevent. **We take the divergence risk and
+test for it** (§8's port-fidelity oracle) instead of designing it away at production's expense.
+Divergence caught by a test is a bug; divergence prevented by coupling is a frozen experiment.
 
 ### 5.2 Which repeats belong on the STR path — a starting value, not a decision
 
@@ -576,7 +659,13 @@ here — period range, satellite cap, admission strictness — are **config knob
 swept by changing a number, not a `Box<dyn _>`. **`bench/` is deferred**, same reasoning as read
 filtering: no competitors, no frontier to plot.
 
-**Module: `src/ng/region_typing.rs`** — a file, promoted to a folder only if it grows.
+**Module: `src/ng/region_typing/`** — a folder, and the Revision is why. A step with no bake-off is a
+file, not a folder (`module_layout.md` principle 1), and step 3 has no bake-off — but it now also
+carries a ~500-line port of the admission policy (§5), which is a *different* concern from the walk
+and has its own dense test suite. So: `region_typing/mod.rs` for the types and the walk,
+`region_typing/admission.rs` for the port (ng's `Locus`, `SsrAdmissionParams`, the pre-filter, `admit`,
+and §8.0's differential test against production). The folder tracks the code's size, not a bake-off —
+the `tandem_repeat.rs` precedent, promoted on the same grounds.
 
 **Memory: windowed, raw bytes.** Peak is *not* `window_bp`:
 
@@ -658,6 +747,38 @@ scepticism about interfaces designed ahead of an implementation.
 
 ## 8. Tests and the parity oracle
 
+### 8.0 Port fidelity — the oracle the Revision made necessary
+
+**What used to be true by construction is now a test.** The earlier design had ng *call* production's
+`build_loci`, so "ng admits what the catalog admits" needed no proving — it was the same function.
+ng now owns a copy (§5), and a copy can drift: on transcription, and later, as experiments edit ng's
+side. §5.1 named this the real cost of the Revision. This is the mitigation.
+
+**Differential test: ng's `admit` vs production's `build_loci`, same inputs, same answers.** Both are
+in this crate, so the test needs nothing new from production — `TrfRecord::for_test` is
+`#[cfg(test)] pub(crate)`, and a test module is exactly where it belongs (§5c):
+
+1. Take a set of `RepeatInterval`s (scanner output on the synthetic fixture, plus the crafted cases
+   from `postprocess.rs`'s own tests).
+2. Feed ng's `admit` directly; feed production's `build_loci` the same intervals bridged through
+   `TrfRecord::for_test`, at the **whole-contig degenerate case** (§5a) and the catalog's settings.
+3. Assert the `Locus` sets are identical **modulo the coordinate base** — ng's 1-based inclusive
+   `[start, end]` is production's 0-based half-open `[start, end)` shifted by exactly one on `start`
+   (and on `ref_bytes_start`), with `end` and `ref_bytes` unchanged. Compare through one conversion
+   helper, stated once, so the test pins the arithmetic rather than restating the bug.
+
+**What it proves and what it does not.** It proves the transcription is faithful *at the catalog's
+settings, whole-contig*. It does **not** cover the windowed path (§8's window-invariance does) or any
+other configuration (nothing can — that is §5.2's experiment). It is a **fixed-config regression
+test**, and it is expected to be *deleted or re-pinned* the day an experiment deliberately moves ng's
+admission away from the catalog's rules. Until then it is the tripwire on silent drift.
+
+**It also outlives the port.** Production is frozen *now*; when the experiments conclude and the
+port-back decision is taken (`ng_proposal.md` §3), this test is the thing that says what ng changed
+and what it merely moved.
+
+### 8.1 The `.cat` parity oracle
+
 **The oracle checks the machinery, not the policy — and only at one configuration.** `ssr-catalog`
 produces a `.cat` whose contents are a `Vec<Locus>`: same type, same reference, and — *if we
 configure it so* — the same settings. Run the walk at the catalog's settings, collect every
@@ -671,8 +792,22 @@ rather than to whatever `Default` happens to be, or it will start failing the fi
 moves a floor and reads it as a bug rather than a result.
 
 `scanner_parity.rs` is the precedent (compares `Locus` sets, tolerant of boundary wobble via span
-overlap, readable diff). Prefer a `.cat` built through the **scanner** path, not `trf-mod`'s — that
-isolates this step's logic from the detector-swap question `ssr_repeat_scanner.md` §6 already owns.
+overlap, readable diff).
+
+**Which `.cat`, now that the detector swap is cancelled (Revision).** An earlier draft preferred a
+`.cat` built through the *scanner* path, to isolate this step from the swap question. There is no
+swap: the committed golden fixture (`tests/data/tandem_repeat/golden.ssr_catalog.bed.gz`) is
+**trf-mod-built**, and that is the one to use. Two consequences, both fine:
+
+- **It is a genuinely independent yardstick** — a different detector, a different code path, nothing
+  ng touched. That is worth more than isolation, and it is precisely the "trf-mod for comparison"
+  use the Revision sanctioned.
+- **The detector difference is already characterised**, so it is not a confound: `scanner_parity`
+  measured scanner-vs-trf-mod at **16/16 recall** — 15 exact, one ±1–2 bp boundary/phase wobble, one
+  genuine scanner-only locus trf-mod's significance model rejected. Read the `.cat` through
+  production's `CatalogReader` (read-only; no production change), and inherit `scanner_parity`'s
+  overlap tolerance rather than demanding byte-exact borders. §8.0 is what pins the *arithmetic*
+  exactly; this oracle pins the *pipeline*.
 
 **At those settings, the one expected divergence is the satellite cap.** Our loci are then a
 **strict subset**: identical pipeline, then the cap drops loci inside satellite coverage, which the
@@ -718,12 +853,13 @@ contig's end abutting one at the next's start (transition arithmetic).
 | the windowed scan (core + margin, coverage clipped, intervals by start) | `collect_windowed` ([tandem_repeat.rs:530](../../../../src/ng/tandem_repeat.rs)) | **the primitive this is built on** — must be promoted and streamed (§6.1) |
 | repeat detection | `find_tandem_repeats` ([tandem_repeat.rs:354](../../../../src/ng/tandem_repeat.rs)) | called per window by the above |
 | the region tiling | `RegionScanner` ([tandem_repeat.rs:586](../../../../src/ng/tandem_repeat.rs)) | **not reused** — merges before policy (§6.1) |
-| the admission policy | `build_loci` ([postprocess.rs:69](../../../../src/ssr/catalog/postprocess.rs)) | logic unchanged; windowed + returns `Admitted` (§5a) |
-| the bundle selection | `drop_bundles`/`is_close` ([postprocess.rs:274](../../../../src/ssr/catalog/postprocess.rs)) | selection kept, disposal not; re-associated to stream (§2.4, §2.6) |
-| the pre-filter | `catalog_prefilter` ([scanner_parity.rs:59](../../../../src/ssr/catalog/scanner_parity.rs)) | **needs a real home** (§5.1) |
-| admission knobs | `CatalogParams` ([catalog/mod.rs:42](../../../../src/ssr/catalog/mod.rs)) | reuse; `bundle_threshold` collapses into `flank_bp` (§2.4) |
-| the STR locus | `ssr::types::Locus` ([types.rs:136](../../../../src/ssr/types.rs)) | **used directly** — rebased to 1-based so no wrapper is needed (§4, §9) |
-| what to walk | `RegionSet`/`Region`/`ContigBounds` ([regions.rs](../../../../src/regions.rs)) | wrapped by `GenomeRegions` (§2.5) |
+| the admission policy | `build_loci` ([postprocess.rs:69](../../../../src/ssr/catalog/postprocess.rs)) | **copied into ng** — logic transcribed unchanged; windowed, `RepeatInterval`-taking, 1-based/`u64`, all-knobs, returns `Admitted` (§5a). Production's stays as it is |
+| the bundle selection | `drop_bundles`/`is_close` ([postprocess.rs:274](../../../../src/ssr/catalog/postprocess.rs)) | **copied with it** — selection kept, disposal not; re-associated to stream (§2.4, §2.6) |
+| the pre-filter | `catalog_prefilter` ([scanner_parity.rs:59](../../../../src/ssr/catalog/scanner_parity.rs)) | **copied into ng**, beside ng's `admit` (§5.1); production keeps its test-only copy |
+| admission knobs | `CatalogParams` ([catalog/mod.rs:42](../../../../src/ssr/catalog/mod.rs)) | **ng's own `SsrAdmissionParams`** — same defaults, plus the hardcoded period scope + copy floors as real knobs; no separate `bundle_threshold` (§2.4) |
+| the STR locus | `ssr::types::Locus` ([types.rs:136](../../../../src/ssr/types.rs)) | **copied into ng**, born 1-based/`u64` (§4). Production's stays 0-based/`u32` |
+| the motif | `ssr::types::Motif` ([types.rs:36](../../../../src/ssr/types.rs)) | **reused as-is** — `pub(crate)`, no coordinates, no width, nothing to change (§4) |
+| what to walk | `RegionSet`/`Region`/`ContigBounds` ([regions.rs](../../../../src/regions.rs)) | **wrapped, read-only**, by `GenomeRegions` (§2.5); it already parses/coalesces/clamps BED. `regions.rs` does not move |
 | reference bases | `WindowedRefSeq` ([ng/ref_seq.rs](../../../../src/ng/ref_seq.rs)) | + a raw path (§6) and a `contigs()` accessor |
 | the iterator seam | `ReadFilter` ([read_filtering.md](read_filtering.md) §5) | the shape to match |
 | **the parity oracle** | an `ssr-catalog` `.cat` on the same reference | §8 |
@@ -739,38 +875,34 @@ gatherer's spec, and it is the piece the first integration slice will discover i
 whichever step first needs a stable cross-run id. **Shrinking the two carries** → here,
 measure-first.
 
-**What this step also changes, elsewhere.** ng is early. Where the rest of the code does not match
-a decision here, **we change the code** rather than work around it — at this stage consistency is
-worth more than legacy (owner, 2026-07-16). So most of this list is *work this step includes*, not
-consequences to admire from a distance. The `SsrLocus` wrapper is the object lesson: it existed only
-to paper over one mismatch, and it was bigger than the fix (§4).
+**What this step changes elsewhere: nothing outside `src/ng/` (Revision 2026-07-16).** The earlier
+draft said the opposite — *"where the rest of the code does not match a decision here, we change the
+code"* — and listed a rebase of `ssr::types::Locus` across 59 call sites, three changes to
+`CatalogParams`, and a `.cat`-side conversion, all as *"work this step includes"*. **All of it is
+cancelled.** Production is frozen; ng copies what it needs (§5). The list below is what remains, and
+it is entirely ng's own code.
 
-**Rebase `ssr::types::Locus` to 1-based, and widen it to `u64`** — the one that earns the principle. 59 call sites across
-`src/ssr/`, but the arithmetic **cancels**: `start`, `end`, and `ref_bytes_start` all shift together
-and every slice goes through one `tract_range()`, where only the length gains a `+1`. Exactly one
-site does not cancel — `build_loci`'s index into the raw `contig_seq`. The `.cat` format does **not**
-move: it is a tabix-indexed BED-flavoured TSV, so convert at `catalog/io.rs`, which is the pattern
-`regions.rs` already set. Do the width in the same pass — the sites are already open, and it drops
-ng's last catalog-side conversion (§4). Payoff: the coordinate straddle disappears, the wrapper
-disappears, `fetch_locus_reads`' inline 0→1 conversion goes away, and `build_loci` stops converting. Guards: the golden catalog fixture
-(`tests/data/tandem_repeat/golden.ssr_catalog.bed.gz`), `scanner_parity.rs`,
-`benchmarks/ssr_tomato1`, HipSTR concordance. **The risk is real — an off-by-one here is a silently
-wrong genotype, not a crash — so it lands as its own commit, green fixture before and after, not
-smuggled inside this step.**
+**The `Locus` rebase is not performed — it is not needed.** This was the draft's riskiest single item
+("an off-by-one here is a silently wrong genotype, not a crash"), scoped at 59 call sites across
+`src/ssr/`, and it earns a note because *deleting it is the Revision's clearest dividend*: ng's
+`Locus` is born 1-based, so there is no rebase, no 59 sites, no silent-genotype risk, and no need for
+the isolated-commit ritual the draft designed around it. Production's `Locus`, its `.cat` format, and
+`fetch_locus_reads`' inline conversion all stay exactly as they are. The one place the arithmetic
+still has to be right is ng's port — and §8.0 pins it against production directly, which is a
+*stronger* check than the fixture-green-before-and-after the rebase would have had.
 
-- **`ssr_repeat_scanner.md`**, three ways: the pre-filter's home is a shared fn, not `catalog::run`
-  (§5.1); the post-filter is *not* consumed "unchanged" — it is windowed and returns `Admitted`
-  (§5a); `collect_windowed` must be promoted and streamed while `RegionScanner` goes unused (§6.1).
-  Plus its `u32` types widen (§4).
-- **`ssr_catalog.md`** — three changes to `CatalogParams`. Its coordinates and `flank_bp` **widen to
-  `u64`** with `Locus` (§4), so nothing converts at the admission call. It **loses**
-  `bundle_threshold` (§2.4;
-  confirm no shipped catalog set it differently from `flank_bp`). And it **gains the rules that are
-  hardcoded today**: `MIN_PERIOD`, `MAX_PERIOD`, and `copy_number_floor` must become parameters, and
-  the pre-filter's second copy-floor table must be reconciled with them (§5, §10). Without that the
-  period × length experiment — the thing this step exists to enable — cannot be expressed, let alone
-  run. The catalog keeps today's values as its `Default`, so its own behaviour is unchanged.
-- **`ref_seq.md`** — the parked raw-from-windowed YAGNI has fired (§6); `u32` → `u64` (§4).
+- **`ssr_repeat_scanner.md`**, three ways: its **§6–§7 production detector swap is cancelled** (the
+  Revision) — trf-mod keeps building the catalog, `TrfRecord` and `trf.rs` stay, and ng simply never
+  depends on any of it. The pre-filter's home is **ng**, not `catalog::run` (§5.1). And
+  `collect_windowed` must be promoted and streamed while `RegionScanner` goes unused (§6.1). Plus its
+  `u32` types widen (§4) — those are `src/ng/`, so they are ours.
+- **`ssr_catalog.md`** — **no changes.** The earlier draft's three (`u64` widening, dropping
+  `bundle_threshold`, hoisting `MIN_PERIOD`/`MAX_PERIOD`/`copy_number_floor` into knobs) all now land
+  in ng's own `SsrAdmissionParams` instead (§5). The catalog keeps its hardcoded rules, its `u32`, and
+  its two disagreeing copy-floor tables; ng's copy reconciles them **on ng's side only**. The catalog
+  documents production, and production did not move.
+- **`ref_seq.md`** — the parked raw-from-windowed YAGNI has fired (§6); `u32` → `u64` (§4). `src/ng/`,
+  ours to change.
 - **`ng_step_interfaces.md`** — `CallerRecipe` loses its `router` field (§6). Its
   `read_preparer: Box<dyn ReadPreparer>` **cannot compile as written**: `ReadPreparer` has associated
   types, so it is not object-safe, and naming them would pin one path's types and never hold the
