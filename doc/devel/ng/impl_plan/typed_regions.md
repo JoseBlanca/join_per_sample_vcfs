@@ -260,7 +260,22 @@ hole (spec §2.2). Consumes `admit`'s `Admitted.bundled` (A3). *Depends:* D1. *S
 §2.4. Verified: two tracts 10 bp apart → one `SsrBundle` carrying both; three chained 30 bp apart → one
 bundle of three; a locus 60 bp from a bundle → admitted; an impure/low-copy repeat → `Generic`.
 
-**D3. The windowed walk.**  ☐ *(unblocked — see below)*
+**D3. The windowed walk.**  ✅
+*(Landed 2026-07-16. Three findings worth keeping. **(1) The spec's windowing recipe was wrong in
+the same paragraph, twice** — §2.6's "keep only the repeats whose start lands in the core" reads as
+*filter, then admit*, which is window-**variant**: admission's rules are neighbour rules (the bundle
+flank test, redundancy elimination), and a core tract's neighbour lives in the margin. Attribution
+is the **last** step, not the first. And "1 kb of margin covers admission for free" is false —
+admission reads `tract ± flank_bp` out of the bases it was handed and **panics** rather than quietly
+drop a locus, and the tracts at the slice's own edge have no margin of their own. Fix: the **scan**
+gets core ± `max_repeat_len`, the **bases handed to admission** are that slice grown by a further
+`flank_bp`. Spec §2.6 corrected. **(2) `max_repeat_len >= flank_bp` is a real constraint**, now
+asserted (release — §10 sweeps both). **(3) D1's known-untested claim is now tested**: the cap
+applies to the *cleaned* coverage, and D3's 6 kb fixture is the first to discriminate it. Also:
+`ScannedWindow` was reshaped — the fetched span plus **every** detection in it, with the two window
+rules as methods over a caller-chosen interval set, so `RegionScanner` applies them to raw intervals
+and the walk to pre-filtered ones, from one copy of each rule (§6.1). `ContigTable` (a trait on the
+reference) is how the walk reads `contig_len`, which discharges A3's provenance obligation.)*
 
 > **B1 and B3 contradict each other, and neither step could see it alone.**
 >

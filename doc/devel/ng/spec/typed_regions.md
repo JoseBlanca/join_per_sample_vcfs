@@ -277,10 +277,40 @@ detection on the whole slice, then keep only the repeats whose **start** lands i
 
 That gives you both properties at once: each repeat is found **exactly once** (by the one window
 that owns its start) and **whole** (an STR is at most 1 kb by definition, so the extra 1 kb always
-covers it — and anything longer is a satellite, handled in 3). It also covers admission for free: a
-locus needs 50 bp of clean sequence each side to build its flanks, and 1 kb is a lot more than 50.
+covers it — and anything longer is a satellite, handled in 3).
 
 **This is `collect_windowed` — already written, already tested. Reuse it, don't rewrite it** (§6.1).
+
+> **Corrected at D3, 2026-07-16 — two claims this paragraph used to make were wrong, and both were
+> found by writing the test meant to confirm them.**
+>
+> **(a) "Keep only the repeats whose start lands in the core" — not before the policy runs.** Where
+> that sentence sits, it reads as: filter to the core, then admit. Do that and the answer stops being
+> window-invariant. Admission's rules are **neighbour** rules — the bundle flank test asks whether
+> another repeat is within 50 bp, and the pre-filter's redundancy elimination asks whether an
+> overlapping lower-period interval survived. A core tract's neighbour can sit 10 bp beyond the core
+> edge, in the margin. Filter first and that neighbour is invisible, so the tract is admitted as a
+> clean locus instead of bundled — silently, and differently for every `window_bp`.
+>
+> So the margin is not only the detector's context, it is the **policy's** context, and the order is:
+> detect on the slice → pre-filter on the slice → admit on the slice → **then** attribute by start.
+> Attribution is the last step, not the first. (Mutation-verified: pre-filtering the core-attributed
+> set alone fails `windowed_matches_the_resident_oracle_at_every_window_size`.)
+>
+> **(b) "It also covers admission for free … 1 kb is a lot more than 50" — it does not, and admission
+> says so with a panic rather than a wrong answer.** Admission is handed every repeat in the slice
+> (see (a)), including ones at the *slice's* own edges, which have no margin of their own; and a
+> satellite is truncated at the slice edge, so it ends exactly there. `admit` reads
+> `[tract_start - 50, tract_end + 50]` out of the bases it was given and **panics** if that runs off
+> them — deliberately, because the quiet alternative is dropping the locus, which is the bug this
+> whole section exists to kill. 1 kb of margin does not help: the offending tracts are at the
+> margin's own edge.
+>
+> The fix keeps the two margins apart, because they answer different questions: the **scan** gets
+> the core ± `max_repeat_len` (what makes a repeat *segment* identically), and the **bases handed to
+> admission** are that slice grown by a further `flank_bp` each side, clamped to the contig (what
+> makes a repeat *readable*). One extra `flank_bp` at each end of a window, and no filtering, no
+> divergence, no panic.
 
 **2. Tell admission where the contig actually ends.**
 
@@ -397,7 +427,10 @@ pub struct TypedRegionConfig {
                                   //   comparability only. A parameter, not a policy (§5)
     pub scan: ScanParams,         // the scanner's defaults (2 / 7 / 2)
     pub max_repeat_len: Bp,       // the satellite cap AND the scan margin — one field because
-                                  //   they must be the same number (§2.6)
+                                  //   they must be the same number (§2.6). It must also be >=
+                                  //   admission's flank_bp, or a window cannot see a core tract's
+                                  //   bundle neighbours — asserted in the walk (D3), because §10
+                                  //   sweeps both knobs and sweeps run in release
     pub window_bp: Bp,            // the memory knob; default 100 kb. Must not change the output
     pub admission: SsrAdmissionParams,  // ng's own (§5) — ALL of admission's rules, including the
                                   //   period scope and copy floors the catalog hardcodes. `flank_bp`
