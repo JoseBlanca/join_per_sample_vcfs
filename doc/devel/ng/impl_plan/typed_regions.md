@@ -260,7 +260,33 @@ hole (spec §2.2). Consumes `admit`'s `Admitted.bundled` (A3). *Depends:* D1. *S
 §2.4. Verified: two tracts 10 bp apart → one `SsrBundle` carrying both; three chained 30 bp apart → one
 bundle of three; a locus 60 bp from a bundle → admitted; an impure/low-copy repeat → `Generic`.
 
-**D3. The windowed walk.**  ☐
+**D3. The windowed walk.**  ⛔ **BLOCKED — a decision is needed first (2026-07-16).**
+
+> **B1 and B3 contradict each other, and neither step could see it alone.**
+>
+> - **B1** promoted `scan_windowed` as spec §6.1 asked, keeping its source: it reads through
+>   production's `ChromRefFetcher`, which **canonicalises into its buffer**.
+> - **B3** established that the walk needs **raw** bytes: the STR catalog reads the FASTA verbatim
+>   and `Locus` compares **by value**, so canonical bytes make every IUPAC-carrying locus compare
+>   unequal to the catalog's — silently breaking the `.cat` oracle on any assembly carrying them
+>   (spec §6). That is why `RawChromReader` and `WindowedRefSeq: RawRefSeq` exist.
+>
+> **So D3 cannot both reuse `scan_windowed` and read raw.** `WindowedRefSeq` is a `RawRefSeq`, not a
+> `ChromRefFetcher`; `scan_windowed` cannot be handed it. And spec §6.1 is explicit that
+> reimplementing the windowing is the thing *not* to do — *"duplicates a subtle invariant that can
+> then drift"* — while spec §6 forbids holding two readers (*"one reader for the whole run … that is
+> what cost 14.6 GB of peak RSS"*).
+>
+> **Options** (D3's first commit, whichever is chosen):
+> 1. **Generalise `scan_windowed` over its byte source** — a trait or a `FnMut(start, len) ->
+>    Result<Vec<u8>, _>`, so ng's raw reader and production's fetcher both fit. Keeps §6.1's reuse,
+>    keeps one reader, and is a small change to B1's own code. **Recommended.**
+> 2. The walk windows for itself — duplicates exactly the invariant §6.1 says not to duplicate.
+> 3. Two sources (canonical for detection, raw for admission) — what §6's 14.6 GB lesson forbids.
+>
+> *Detection itself is width- and case-agnostic (`find_tandem_repeats` is case-insensitive and
+> non-ACGT never matches), so only **admission** needs raw — which is why nothing before D3 tripped
+> on this.*
 The three carries (open cluster, open coverage run, open generic run); the `max_repeat_len` detection
 margin; the contig length **passed in** to `admit`, never inferred from the slice (spec §2.6 — the
 silent window-boundary bug). Built on B1's streamed `collect_windowed`. *Depends:* D1, D2. *Source:*
