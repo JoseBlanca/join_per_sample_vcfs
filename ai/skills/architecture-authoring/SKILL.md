@@ -17,6 +17,27 @@ Exemplars: [`doc/devel/ng/arch/ng_step_interfaces.md`](../../../doc/devel/ng/arc
 [`doc/devel/ng/arch/read_filtering.md`](../../../doc/devel/ng/arch/read_filtering.md). Read
 the closest match before writing.
 
+## One reader, and one job — don't re-write the spec
+
+**The reader is the coder about to implement this. Only them.** The manager — the spec's second
+reader — already got their answers (what it costs, what it moves, what's still open) from the spec,
+and does not read this. That is what makes the arch doc different from the spec, and it is the whole
+discipline: **the arch doc adds exactly one thing the spec lacks — the types and signatures as they
+appear in code — and for everything else it points back.**
+
+This matters most when the spec is *detailed*. A thorough spec (say the sibling `spec-authoring`
+skill's five-question one, run well) has already stated the traps, the reconciliation, the open
+questions. The arch doc's failure mode is then not omission — it is **being a shorter copy of the
+spec**. Every paragraph, ask: *is this the code shape, or is it the spec's material re-typed?* If
+the latter, cut it to a cross-ref (`why: spec §4`). The arch doc is **shorter than its spec**, not a
+condensation of it — its exemplar `read_filtering.md` is 261 lines against a longer spec. If yours
+is approaching its spec's length, you are duplicating.
+
+**The bar:** the coder builds from this doc + the spec without re-deciding anything, and never has
+to reconstruct a type's shape or a trait's contract from prose. Not "could this survive design
+review" — that bar produced defensive, re-argued arch docs; the coder does not need the argument,
+they need the signature and the invariant.
+
 ## The governing stance
 
 > **Signatures are illustrative; the contract is the deliverable.**
@@ -72,30 +93,59 @@ naming, defaults, errors, and module-structure rules from
   what they build on. Prefer a single home for a shared contract so impls "cannot drift"
   (`ref_seq.rs::validate_window`).
 
+## Ground every claim in the code — the reconciliation table most of all
+
+The reconciliation table is the arch doc's highest-value section *and* its highest-risk one,
+because every row is a claim about existing code: *this new name is that old type; reuse it; it has
+this shape.* A wrong row sends the implementer to converge on a type that doesn't hold what you
+said, and they discover it at the keyboard.
+
+- **`file:line` for every row, and you actually looked.** A row you reason from memory is a row you
+  guessed. If you can't cite it, open the file or cut the row.
+- **Do not ship an "approximate, not re-read" row.** The existing `ng_step_interfaces.md` §6 marks
+  some mappings `≈` "were not freshly re-read" — honest, but it is an ungrounded claim wearing a
+  disclaimer, and the implementer still has to do the read you skipped. When you touch such a table,
+  resolve the `≈`: read it, and either confirm the mapping or fix it.
+- This is the same rule the spec skill states; in an arch doc it is not optional, because
+  *converging on existing types* is the arch doc's core promise and the table is where it is kept.
+
 ## Decision records — the `— decided` form
 
 Mirror `ng_step_interfaces.md` §5: **one decision per record**, each a bolded claim + one or two
-sentences of *why*, ending with the spec cross-ref. A good record states **what was rejected and
-why**, not only what was chosen (the ADR discipline — the rejected alternative is what makes the
-record worth keeping). Open questions use `OPEN:` inline so a reader can grep the unresolved set.
-Distinguish a genuine open *design* item from an impl-time confirmation (a concrete type to pin
-when coding) — the latter is not a decision.
+sentences of *why*, ending with the spec cross-ref. Where a choice had a **genuine fork**, name the
+rejected option and why it lost — but only where one was actually live. **Do not manufacture a
+rejected alternative to make a record look considered**: a decision with no real fork is a
+one-line statement of fact (`SsrLocus wraps the catalog Locus — spec §5`), not a staged contest.
+The *why* here is usually a pointer, not a paragraph: the spec already argued it, so the record's
+job is to carry the code shape plus a cross-ref, not to re-run the argument.
+
+Open questions use `OPEN:` inline so a reader can grep the unresolved set. Distinguish a genuine
+open *design* item from an impl-time confirmation (a concrete type to pin when coding) — the latter
+is not a decision.
 
 ## Revision pass (before calling an arch doc done)
 
-1. Does every trait/type carry a **contract**, not just a signature?
-2. Is there a **reconciliation row for every new name**, and is the parity/reuse target named?
+1. **Cut what the spec already says.** Go block by block: *code shape, or spec material re-typed?*
+   Re-typed → replace with a cross-ref. If the doc is near its spec's length, you are duplicating.
+2. **Every reconciliation row cited `file:line`, and you looked.** No `≈`-not-re-read rows survive.
    Did you check you are not minting a duplicate of an existing type?
-3. Do the **decision records** each cross-ref the spec section that argued the *why* (so this
-   doc stays distillation, not re-argument)?
-4. Are **naming, defaults, errors, module placement** all pinned per the code-shape discipline?
-5. Are **open items** split into real open design questions (`OPEN:`) vs impl-time confirmations?
-6. Run the **clear-technical-writing** pass (explanation before each code block; names say what
+3. Does every trait/type carry a **contract** (invariants, errors, laziness, ownership), not just a
+   signature?
+4. Do the **decision records** cross-ref the spec's *why* rather than re-argue it — and did you
+   avoid manufacturing a rejected alternative where there was no real fork?
+5. Are **naming, defaults, errors, module placement** all pinned per the code-shape discipline?
+6. Are **open items** split into real open design questions (`OPEN:`) vs impl-time confirmations?
+7. Run the **clear-technical-writing** pass (explanation before each code block; names say what
    the value is).
-7. Is the doc **cross-linked** both ways with its spec, and discoverable from any index/README?
+8. Is the doc **cross-linked** both ways with its spec, and discoverable from any index/README?
 
-The bar: an implementer can build from this doc and the spec without re-deciding anything, and
-the implementation-plan author can turn it straight into ordered steps.
+**The bar:** the coder builds from this doc + the spec without re-deciding anything and without
+reconstructing a type or contract from prose; the plan author turns it straight into ordered steps.
+Not "could this survive design review."
+
+**When an arch doc gets sent back, the skill is half the fix.** As with its sibling
+`spec-authoring`: ask what here permitted the failure, and mend it. These rules are this project's
+scar tissue, not imported best practice.
 
 ## Sources & influences
 
