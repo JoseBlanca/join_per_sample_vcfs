@@ -543,7 +543,7 @@ meaningful, and what the port-fidelity test pins.
 |---|---|---|
 | purity floor, score gate, flank bp, bundle radius | `CatalogParams` — real parameters | parameters |
 | **period scope** (`MIN_PERIOD` = 2, `MAX_PERIOD` = 6) | **hardcoded `const`** | **parameters** |
-| **copy floor per period** (`copy_number_floor`) | **hardcoded `const fn`** — and the pre-filter has a *second copy* of it (§10) | **one parameter table** |
+| **copy floor per period** (`copy_number_floor`) | **hardcoded `const fn`** — and the pre-filter has a *second copy* of it (§10) | **one parameter table** (`MinCopies` — named for `min_copies`, the vocabulary ng's scanner already uses; "copy number" means CNV in this crate) |
 
 **The two dimensions §5.2 wants measured — period and length — are precisely the two the catalog
 hardcodes.** A config that cannot express the question is not a config, so ng's copy makes them

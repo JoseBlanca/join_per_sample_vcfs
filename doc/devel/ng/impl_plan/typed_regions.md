@@ -138,7 +138,7 @@ asserting identical `Locus` sets **modulo the coordinate base**, through one sta
 No behaviour change is attempted here: the only intended difference from production is the coordinate
 base and the width. *Source:* spec §4, §5, §5.1, §8.0; arch §types, §recon.
 
-**A2. `SsrAdmissionParams` — collapse the redundant knob, expose the hidden ones.**  ☐
+**A2. `SsrAdmissionParams` — collapse the redundant knob, expose the hidden ones.**  ✅
 Now that the transcription is pinned, change it — **on ng's side only**. Fold `bundle_threshold` into
 `flank_bp` (spec §2.4 — one number). Hoist `MIN_PERIOD` / `MAX_PERIOD` / `copy_number_floor` from
 hardcoded consts into fields (`Default` = today's values), and reconcile the pre-filter's second,

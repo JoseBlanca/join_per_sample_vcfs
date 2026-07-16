@@ -58,7 +58,7 @@
 //!    dropped before bundling, so a poly-A run cannot bundle-drop a real STR.
 //! 2. **Drop compound-motif loci** — a motif itself internally periodic
 //!    (`ATAT` = `(AT)²`).
-//! 3. **Drop bundles** — any repeat within `bundle_threshold` bp of another goes
+//! 3. **Drop bundles** — any repeat within `flank_bp` of another goes
 //!    with its whole cluster. (ng keeps the *selection* and rejects the
 //!    *disposal* in A3 — spec §2.4 — but A1 transcribes it as-is.)
 //! 4. **End-trim** to whole-motif boundaries, then the per-period copy floor.
@@ -69,7 +69,7 @@
 use std::fmt;
 use std::ops::Range;
 
-use crate::ng::tandem_repeat::RepeatInterval;
+use crate::ng::tandem_repeat::{PeriodRange, RepeatInterval};
 
 // ---------------------------------------------------------------------
 // The motif — ported, though the spec expected it reused
@@ -409,20 +409,169 @@ pub const DEFAULT_MIN_SCORE: i32 = 0;
 /// (spec §2.4) also the bundle radius.
 pub const DEFAULT_FLANK_BP: u64 = 50;
 
-/// Admission's parameters — ng's copy of `ssr::catalog::CatalogParams`.
+/// The narrowest period admitted by default: **2**, excluding period-1
+/// homopolymers. The standard GangSTR/HipSTR drop — error-prone for STR
+/// genotyping, and not the di/tri/tetra-nucleotide target. Dropping them
+/// *before* bundling is load-bearing: it stops a long poly-A/T run from
+/// bundle-dropping an adjacent real STR.
+pub const DEFAULT_MIN_PERIOD: u8 = 2;
+
+/// The widest period admitted by default: **6**, the microsatellite ceiling.
+pub const DEFAULT_MAX_PERIOD: u8 = 6;
+
+/// A period ceiling above [`MAX_MOTIF_LEN`] cannot work — [`Motif`] could not
+/// hold the motif. The default must satisfy it; a *configured*
+/// [`SsrAdmissionParams::periods`] is checked at [`admit`] instead, since A2
+/// makes it a knob (see [`SsrAdmissionParams::periods`]).
+const _: () = assert!(
+    DEFAULT_MAX_PERIOD as usize <= MAX_MOTIF_LEN,
+    "the default period ceiling must fit in a Motif"
+);
+const _: () = assert!(DEFAULT_MIN_PERIOD <= DEFAULT_MAX_PERIOD);
+/// `PeriodRange::new` rejects a zero floor, so `SsrAdmissionParams::default`'s
+/// `expect` rests on this. Not idle: §10's period experiment is precisely about
+/// moving this floor toward 1, and 0 is one step further.
+const _: () = assert!(
+    DEFAULT_MIN_PERIOD >= 1,
+    "PeriodRange::new rejects a zero period floor"
+);
+
+/// The fewest motif copies a tract must have, per period, to be admitted.
 ///
-/// **A1 transcribes it field-for-field**, widened to `u64`; A2 collapses
-/// `bundle_threshold` into `flank_bp` (spec §2.4) and hoists the period scope
-/// and copy floors in from the hardcoded consts below (spec §5). `Default` is
-/// the catalog's own values — for §8's comparability **only**, not an
-/// endorsement (spec §5.2).
+/// **The "length" half of the period × length routing frontier** the experiments
+/// exist to measure (spec §5.2, §10) — requiring *n* copies at period *p* is
+/// requiring a tract of *n·p* bases. It is a knob for that reason, and it is what
+/// A2 exists for: production hardcodes it in a `const fn`, so the question could
+/// not even be *expressed* against that code.
 ///
-/// The fields are `pub` and unvalidated, as production's `CatalogParams` is.
-/// [`admit`] `debug_assert`s the two contracts that are otherwise only prose —
-/// `min_purity` finite in `[0, 1]` and `bundle_threshold >= flank_bp` — because
-/// a `NaN` `min_purity` would silently disable the purity gate rather than fail.
+/// **The name.** This is the per-period, stricter sibling of
+/// [`ScanParams::min_copies`](crate::ng::tandem_repeat::ScanParams::min_copies) —
+/// whose own doc calls itself "a permissive floor" and defers to exactly this. So
+/// it takes that vocabulary rather than coining a third word for one quantity.
+/// It is deliberately **not** called a "copy number": in this crate that phrase
+/// means CNV (`relative_copy_number`, `carrier_copy_numbers` in `paralog/`), so
+/// for the geneticist reader it would point at the wrong concept entirely.
+///
+/// **This is the single table.** A1 carried two copies — `copy_number_floor`
+/// (admission's) and a nested `copy_floor` inside [`prefilter`] — because
+/// production has two: the pre-filter's cleanup has to apply the floor *before*
+/// the bundle drop (which runs before admission's own floor), so the number was
+/// written twice. They were **duplicates, not rivals**: identical for every
+/// period either could reach. A2 folds them into this one value, which both
+/// [`prefilter`] and [`admit`] read — so a swept floor moves both, which is the
+/// whole point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MinCopies {
+    /// `by_period[p - 1]` is the minimum for period `p`, so the array is exactly
+    /// GangSTR's `{1:10, 2:5, …}` values in order, with no dead slot to explain.
+    by_period: [u32; MAX_MOTIF_LEN],
+    /// The minimum for a period this table does not cover.
+    ///
+    /// Faithful to production's `_ => 3` arm, and it earns its keep: [`prefilter`]
+    /// sees **raw detector output**, so an interval wider than [`MAX_MOTIF_LEN`]
+    /// (the detector's range is the caller's choice, not admission's) must be
+    /// gated on its copy count exactly as production gates it — not indexed out
+    /// of bounds, and not silently admitted.
+    for_wider_periods: u32,
+}
+
+impl MinCopies {
+    /// A per-period table: `by_period[p - 1]` is the minimum for period `p`.
+    /// `for_wider_periods` covers periods above [`MAX_MOTIF_LEN`].
+    pub fn new(by_period: [u32; MAX_MOTIF_LEN], for_wider_periods: u32) -> Self {
+        Self {
+            by_period,
+            for_wider_periods,
+        }
+    }
+
+    /// The same minimum at every period — the shape for a sweep that varies one
+    /// dimension at a time (spec §5.2).
+    pub fn uniform(copies: u32) -> Self {
+        Self::new([copies; MAX_MOTIF_LEN], copies)
+    }
+
+    /// The minimum for `period`.
+    ///
+    /// Period `0` and periods above [`MAX_MOTIF_LEN`] both fall to
+    /// `for_wider_periods` — which is what production's two `_ => 3` arms do for
+    /// them, so the total function agrees with the originals everywhere, not just
+    /// on the reachable range. (Period 0 is unreachable in practice:
+    /// `PeriodRange::new` rejects a zero floor.)
+    #[inline]
+    pub fn for_period(&self, period: u8) -> u32 {
+        period
+            .checked_sub(1)
+            .and_then(|i| self.by_period.get(usize::from(i)))
+            .copied()
+            .unwrap_or(self.for_wider_periods)
+    }
+}
+
+impl Default for MinCopies {
+    /// GangSTR's table (`minimal_trim.py`: `thresholds = {1:10, 2:5, 3:4, 4:3,
+    /// 5:3, 6:3}`, default 3), which production hardcodes in two places and this
+    /// folds into one. Period 1's entry is unreachable at the default period scope
+    /// — [`DEFAULT_MIN_PERIOD`] excludes it — and is kept for parity with the
+    /// source table, and because §10's experiment may put period 1 back.
+    fn default() -> Self {
+        //         period:  1  2  3  4  5  6
+        Self::new([10, 5, 4, 3, 3, 3], 3)
+    }
+}
+
+/// Admission's parameters — ng's copy of `ssr::catalog::CatalogParams`, **with
+/// every rule a knob** (spec §5).
+///
+/// A1 transcribed it field-for-field; **A2 makes it a config that can express the
+/// question ng exists to ask.** Production's `CatalogParams` cannot: the two
+/// dimensions spec §5.2 wants swept — **period** and **length** — are precisely
+/// the two it hardcodes (`MIN_PERIOD`/`MAX_PERIOD` consts, a `copy_number_floor`
+/// `const fn`), so the routing experiment could not be run against that code at
+/// all. Here they are [`periods`](Self::periods) and
+/// [`min_copies`](Self::min_copies). A config that cannot express
+/// the question is not a config.
+///
+/// **`bundle_threshold` is gone — it and `flank_bp` were always one number**
+/// (spec §2.4). They are two histories, not two designs: `bundle_threshold` is
+/// GangSTR's `THRESH=50`, ported from a panel builder with **no flank concept at
+/// all**, so over there the number related to nothing; `flank_bp` is ours, the
+/// margin embedded in `ref_bytes`. Both landed on 50 independently, and
+/// production's documented `bundle_threshold >= flank_bp` invariant records that
+/// coincidence rather than resolving it. **The flank requirement is the
+/// primitive and bundle-ness is derived from it** — a repeat is bundled exactly
+/// when another sits too close for it to have a clean flank — so one number says
+/// it, and the §10 experiment on flank size moves the bundle definition with it
+/// for free. `default_matches_the_frozen_catalog_params` pins that the collapse
+/// is safe: production ships both at the same value.
+///
+/// `Default` is the catalog's own values — for §8's comparability **only**, not
+/// an endorsement (spec §5.2).
+///
+/// The fields are `pub` and unvalidated, as production's `CatalogParams` is;
+/// [`admit`] `debug_assert`s the contracts that are otherwise only prose.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SsrAdmissionParams {
+    /// The period range admitted, inclusive. Default:
+    /// [`DEFAULT_MIN_PERIOD`]`..=`[`DEFAULT_MAX_PERIOD`] (2..=6) — production's
+    /// hardcoded consts, now a knob (spec §5).
+    ///
+    /// **The "period" half of the routing frontier** (spec §5.2, §10). Widening
+    /// the floor to 1 puts homopolymers on the STR path; narrowing the ceiling
+    /// takes penta/hexamers off it. Both are questions ng exists to answer, and
+    /// neither could be asked of production's code.
+    ///
+    /// **`max` must not exceed [`MAX_MOTIF_LEN`].** [`Motif`] cannot hold a
+    /// longer unit, so a wider tract would clear this gate and then be discarded
+    /// at `Motif::new` — the knob would *appear* to move and would not. A1 caught
+    /// that as a static assert; a knob cannot be checked at compile time, so
+    /// [`admit`] `debug_assert`s it and [`finish_locus`] fails loudly rather than
+    /// dropping the locus quietly.
+    pub periods: PeriodRange,
+    /// The fewest motif copies a tract needs, per period — the "length" half of
+    /// the routing frontier. Default: [`MinCopies::default`]. Read by **both**
+    /// [`prefilter`] and [`admit`], so a swept minimum moves both (spec §5.2).
+    pub min_copies: MinCopies,
     /// Purity floor applied after recomputation (a degeneracy cutoff in
     /// `[0, 1]`); imperfect-but-above-floor loci are kept. Default:
     /// [`DEFAULT_MIN_PURITY`].
@@ -446,13 +595,15 @@ pub struct SsrAdmissionParams {
     /// parity ran exactly this way. Inherited knowingly, not by accident;
     /// `admit_at_default_never_rejects_a_score_the_scanner_can_emit` pins it.
     pub min_score: i32,
-    /// Flank margin (bp) embedded each side of the tract in `ref_bytes`.
+    /// Flank margin (bp) embedded each side of the tract in `ref_bytes` — **and,
+    /// since A2, the bundle radius too** (spec §2.4; see the type's docs).
     /// Default: [`DEFAULT_FLANK_BP`].
+    ///
+    /// One number, two jobs, because they are the same requirement seen twice: a
+    /// locus needs `flank_bp` of clean sequence each side to anchor reads, so a
+    /// repeat with another repeat inside `flank_bp` cannot have one — which is
+    /// what makes it a bundle member rather than a locus.
     pub flank_bp: u64,
-    /// Bundle-drop radius (bp). `>= flank_bp` guarantees clean survivor flanks —
-    /// a contract [`admit`] `debug_assert`s. A2 collapses this into `flank_bp`
-    /// (spec §2.4: the flank requirement is the primitive, bundle-ness derived).
-    pub bundle_threshold: u64,
 }
 
 impl Default for SsrAdmissionParams {
@@ -468,69 +619,18 @@ impl Default for SsrAdmissionParams {
     /// Note `min_score`'s value is a no-op gate — see the field's own doc.
     fn default() -> Self {
         Self {
+            // Infallible at the defaults: the const asserts above prove
+            // `1 <= DEFAULT_MIN_PERIOD <= DEFAULT_MAX_PERIOD`, which is exactly
+            // what `PeriodRange::new` rejects.
+            periods: PeriodRange::new(DEFAULT_MIN_PERIOD, DEFAULT_MAX_PERIOD)
+                .expect("the default period range is const-asserted valid"),
+            min_copies: MinCopies::default(),
             min_purity: DEFAULT_MIN_PURITY,
             min_score: DEFAULT_MIN_SCORE,
             flank_bp: DEFAULT_FLANK_BP,
-            bundle_threshold: DEFAULT_FLANK_BP,
         }
     }
 }
-
-/// Per-period minimum copy number a tract must reach to survive (GangSTR
-/// `minimal_trim.py` `thresholds = {1:10, 2:5, 3:4, 4:3, 5:3, 6:3}`; default 3
-/// for any other period). Period 1 is filtered out upstream ([`MIN_PERIOD`]), so
-/// its floor is retained only for parity with the source table.
-///
-/// A2 makes this a parameter — it is one of the two dimensions the routing
-/// experiment must sweep (spec §5, §5.2), and it is where [`prefilter`]'s second
-/// copy-floor table gets folded in.
-///
-/// **The two tables duplicate, they do not disagree** — worth stating, because
-/// spec §5/§10 and an earlier draft of this file both called them "disagreeing".
-/// They give the same floor for **every reachable period**: their one numeric
-/// difference is period 1 (10 here, 3 there), and period 1 cannot reach either —
-/// [`prefilter`] gates on `iv.period >= 2` and [`MIN_PERIOD`] drops it again.
-/// So the duplication is *structural*, not behavioural, and A2's job is to
-/// delete a copy, not to resolve a conflict. Pinned by
-/// `the_two_copy_floor_tables_agree_on_every_reachable_period`.
-const fn copy_number_floor(period: usize) -> u64 {
-    match period {
-        1 => 10,
-        2 => 5,
-        3 => 4,
-        4 => 3,
-        5 => 3,
-        6 => 3,
-        _ => 3,
-    }
-}
-
-/// The narrowest period admission keeps. Period-1 homopolymers are excluded (the
-/// standard GangSTR/HipSTR drop — error-prone for STR genotyping and not the
-/// di/tri/tetra-nucleotide target); dropping them *before* bundling stops a long
-/// poly-A/T run from bundle-dropping an adjacent real STR. A2 makes it a knob.
-const MIN_PERIOD: u16 = 2;
-
-/// The widest period admission keeps. A2 makes it a knob.
-///
-/// **It may never exceed [`MAX_MOTIF_LEN`]** — the two encode one ceiling from
-/// two directions (this one is admission *policy*; that one is [`Motif`]'s buffer
-/// *capacity*). Break the relation and the failure is silent rather than loud: a
-/// wider tract clears this gate, then `Motif::new` rejects it for being too long
-/// and [`finish_locus`] discards it through the same `.ok()?` as a legitimate
-/// policy rejection. The knob would appear to move and would not. A2 makes
-/// `MAX_PERIOD` a field, which is exactly when this becomes easy to get wrong —
-/// hence the static assert below rather than a comment.
-const MAX_PERIOD: u16 = 6;
-
-const _: () = assert!(
-    MAX_PERIOD as usize <= MAX_MOTIF_LEN,
-    "MAX_PERIOD must fit in a Motif, or admitted tracts are silently dropped at Motif::new"
-);
-const _: () = assert!(
-    MIN_PERIOD <= MAX_PERIOD,
-    "empty period range admits nothing"
-);
 
 // ---------------------------------------------------------------------
 // The candidate — the four fields the policy reads
@@ -556,8 +656,12 @@ struct Candidate {
     start: u64,
     /// Tract end, exclusive (0-based).
     end: u64,
-    /// Repeat period (motif length, bp).
-    period: u16,
+    /// Repeat period (motif length, bp). `u8`, like [`RepeatInterval::period`]
+    /// and [`PeriodRange`] — A1 chose `u16` to mirror `TrfRecord`'s field, but
+    /// `Candidate` is not a `TrfRecord`, and the width had no source and no sink:
+    /// it only bought a `u16::from` at each gate and an unchecked `as u8` at the
+    /// copy-count lookup.
+    period: u8,
     /// Detector segment score.
     score: i32,
 }
@@ -567,7 +671,7 @@ impl From<RepeatInterval> for Candidate {
         Self {
             start: u64::from(iv.start),
             end: u64::from(iv.end),
-            period: u16::from(iv.period),
+            period: iv.period,
             score: iv.score,
         }
     }
@@ -596,11 +700,31 @@ impl From<RepeatInterval> for Candidate {
 /// (`ssr::catalog::scanner_parity`), which had no production home; here it sits
 /// beside the policy whose ordering makes it necessary (spec §5.1).
 ///
-/// **The copy floor here is `scanner_parity`'s table, not [`copy_number_floor`]**
-/// — a *second copy* of the same numbers, which A2 folds into one parameter. They
-/// duplicate rather than disagree; [`copy_number_floor`]'s docs say why. A1
-/// transcribes both verbatim so the differential measures the port, not the fix
-/// (spec §5, §10).
+/// **It reads the same [`MinCopies`] as [`admit`] — since A2, there is one
+/// table.** A1 carried production's two copies verbatim (see
+/// [`MinCopies`]); folding them is what makes a swept floor actually move
+/// the whole policy, rather than half of it. `p.periods.min()` likewise replaces
+/// the bare `2` this was ported with.
+///
+/// **The period *ceiling* is deliberately not applied here — only the floor is —
+/// and the reason is transcription fidelity, nothing cleverer.** Production's
+/// pre-filter gates `period >= 2` and leaves the ceiling to `build_loci`, so this
+/// does the same. Since no test can compare it (above), matching the original by
+/// inspection is the whole of the evidence, and staying close to it is the point.
+///
+/// *Two arguments an earlier draft gave here were wrong, recorded so they are not
+/// re-invented: (1) that applying the ceiling early "would change which survivors
+/// eliminate which" — it cannot, because `floored` sorts ascending by period, so
+/// an out-of-scope interval only ever sorts after in-scope ones and can only be a
+/// victim of redundancy elimination, never an eliminator; every interval it could
+/// eliminate is its own multiple, which [`admit`]'s ceiling drops regardless. And
+/// (2) that "the differential would catch it otherwise" — it cannot, and the
+/// paragraph above says so.*
+///
+/// The **floor**, by contrast, is load-bearing here and is tested directly: it
+/// runs before redundancy elimination, and **period 1 divides every period**, so a
+/// homopolymer that survives it eliminates every real STR it overlaps (see
+/// `prefilter_drops_period_one_before_it_can_eliminate_a_real_str`).
 ///
 /// **Malformed intervals are dropped, not trusted.** `RepeatInterval`'s fields are
 /// `pub` and carry no ordering invariant, and this fn is `pub` — unlike the
@@ -610,26 +734,17 @@ impl From<RepeatInterval> for Candidate {
 /// through the very floor this filter exists to apply. So the ordering is checked
 /// rather than assumed. Well-formed intervals are unaffected, so the port stays
 /// faithful.
-pub fn prefilter(intervals: &[RepeatInterval]) -> Vec<RepeatInterval> {
-    /// The per-period floor `scanner_parity`'s pre-filter applies. Deliberately
-    /// a *separate* table from [`copy_number_floor`] until A2 folds them into one.
-    fn copy_floor(period: u8) -> u32 {
-        match period {
-            2 => 5,
-            3 => 4,
-            _ => 3,
-        }
-    }
-
+pub fn prefilter(intervals: &[RepeatInterval], params: &SsrAdmissionParams) -> Vec<RepeatInterval> {
     let mut floored: Vec<RepeatInterval> = intervals
         .iter()
         .copied()
         .filter(|iv| {
             // `iv.end > iv.start` first: it guards the subtraction below (see the
             // fn docs), and it is what `admit` independently requires anyway.
-            iv.period >= MIN_PERIOD as u8
+            iv.period >= params.periods.min()
                 && iv.end > iv.start
-                && (iv.end - iv.start) / u32::from(iv.period) >= copy_floor(iv.period)
+                && (iv.end - iv.start) / u32::from(iv.period)
+                    >= params.min_copies.for_period(iv.period)
         })
         .collect();
     // Process low periods first so a fundamental tract is kept and its multiples
@@ -675,20 +790,31 @@ pub fn admit(
     contig_seq: &[u8],
     p: &SsrAdmissionParams,
 ) -> Vec<Locus> {
-    // The two `SsrAdmissionParams` contracts that are otherwise only prose. A
-    // NaN `min_purity` is the one that bites: every `purity < p.min_purity`
-    // comparison below is then false, so the purity gate silently passes
-    // everything rather than failing.
+    // The `SsrAdmissionParams` contracts that are otherwise only prose. A NaN
+    // `min_purity` is the one that bites quietly: every `purity < p.min_purity`
+    // comparison below is then false, so the purity gate passes everything rather
+    // than failing.
     debug_assert!(
         p.min_purity.is_finite() && (0.0..=1.0).contains(&p.min_purity),
         "min_purity must be finite in [0, 1], got {}",
         p.min_purity
     );
-    debug_assert!(
-        p.bundle_threshold >= p.flank_bp,
-        "bundle_threshold ({}) < flank_bp ({}): survivors would not have clean flanks",
-        p.bundle_threshold,
-        p.flank_bp
+    // A1 could assert this at compile time; A2 made the ceiling a knob, so it
+    // moves here. Above `MAX_MOTIF_LEN` a tract clears the period gate and is then
+    // discarded at `Motif::new` — the knob appears to move and does not.
+    //
+    // **A real `assert!`, not a `debug_assert!`** — `PeriodRange::new` bounds
+    // neither end, so `PeriodRange::new(2, 7)` is legal and this is reachable. The
+    // point of the knob is to be **swept by the §5.2 routing experiment, and
+    // sweeps run in release**: a debug-only check would let that experiment record
+    // "period 7 admits nothing" when the code never tried, which is a wrong
+    // *result*, not a missing panic. Once per `admit` call — free next to the scan
+    // it guards.
+    assert!(
+        p.periods.max() as usize <= MAX_MOTIF_LEN,
+        "period ceiling {} exceeds MAX_MOTIF_LEN ({MAX_MOTIF_LEN}): wider tracts would pass \
+         this gate and then be silently dropped at Motif::new",
+        p.periods.max()
     );
 
     // 1. scope + score gate, then 2. compound-motif drop. Both need the tract,
@@ -697,8 +823,8 @@ pub fn admit(
         .into_iter()
         .map(Candidate::from)
         .filter(|r| {
-            r.period >= MIN_PERIOD
-                && r.period <= MAX_PERIOD
+            r.period >= p.periods.min()
+                && r.period <= p.periods.max()
                 && r.score >= p.min_score
                 && r.end > r.start
                 && (r.end as usize) <= contig_seq.len()
@@ -718,7 +844,8 @@ pub fn admit(
     // 3. drop bundles (on the raw, pre-trim coordinates). Records must be
     //    start-sorted for the streaming clustering.
     kept.sort_by_key(|r| (r.start, r.end));
-    let kept = drop_bundles(kept, p.bundle_threshold);
+    // `flank_bp` IS the bundle radius (spec §2.4) — see `SsrAdmissionParams`.
+    let kept = drop_bundles(kept, p.flank_bp);
 
     // 4-5. per record: end-trim + copy floor, recompute purity + floor, embed.
     let mut out = Vec::with_capacity(kept.len());
@@ -757,13 +884,33 @@ fn finish_locus(
     // Copy-number floor — GangSTR computes copies from the ORIGINAL span
     // (integer division), as an accept-gate after trimming.
     let ref_copy = (r.end - r.start) / u64::from(r.period);
-    if ref_copy < copy_number_floor(period) {
+    if ref_copy < u64::from(p.min_copies.for_period(r.period)) {
         return None;
     }
 
     // After minimal_trim the tract starts on a motif boundary, so
     // `trimmed[..period] == motif_bytes`; use it as the phase-faithful motif.
-    let motif = Motif::new(&motif_bytes).ok()?;
+    //
+    // A1 wrote `.ok()?` here, faithfully to production, where it was unreachable:
+    // the period ceiling was a `const` a static assert held at `<= MAX_MOTIF_LEN`.
+    // **A2 made that ceiling a knob and the arm reachable** — set
+    // `periods.max() > MAX_MOTIF_LEN` and every widest-period tract clears the
+    // gate, fails here, and vanishes through the same `None` as a legitimate
+    // policy rejection. That is M7's silent failure exactly: the knob appears to
+    // move and does not. So it fails loudly instead (release behaviour unchanged —
+    // still `None`; `admit` debug_asserts the same contract up front).
+    let motif = match Motif::new(&motif_bytes) {
+        Ok(m) => m,
+        Err(e) => {
+            debug_assert!(
+                false,
+                "period {} admitted but has no valid Motif ({e}) — is \
+                 SsrAdmissionParams::periods.max() above MAX_MOTIF_LEN ({MAX_MOTIF_LEN})?",
+                r.period
+            );
+            return None;
+        }
+    };
 
     // Recompute purity from the trimmed tract vs a perfect motif tiling.
     let purity = recompute_purity(trimmed, &motif_bytes);
@@ -980,13 +1127,9 @@ impl fmt::Display for Locus {
 mod tests {
     use super::*;
 
+    /// The catalog's settings with a 5 bp flank, so the fixtures can be small.
     fn params() -> SsrAdmissionParams {
-        SsrAdmissionParams {
-            min_purity: 0.8,
-            min_score: 0,
-            flank_bp: 5,
-            bundle_threshold: 50,
-        }
+        matched_params(0.8, 0, 5).0
     }
 
     /// A 0-based half-open interval, the way the scanner emits one.
@@ -1302,7 +1445,7 @@ mod tests {
         let real = iv(100, 120, 2, 100);
         let multiple = iv(100, 120, 4, 100);
         let noise = iv(500, 504, 2, 10);
-        let kept = prefilter(&[real, multiple, noise]);
+        let kept = prefilter(&[real, multiple, noise], &params());
         assert_eq!(
             kept,
             vec![real],
@@ -1315,7 +1458,7 @@ mod tests {
         // Period 3 overlapping period 2 is not a period-multiple → both stay.
         let two = iv(100, 120, 2, 100);
         let three = iv(100, 121, 3, 100);
-        let kept = prefilter(&[two, three]);
+        let kept = prefilter(&[two, three], &params());
         assert_eq!(kept.len(), 2);
     }
 
@@ -1339,24 +1482,35 @@ mod tests {
     /// would quietly stop doing so — the test would keep passing while comparing
     /// two different questions. Deriving production's from ng's makes that
     /// impossible by construction.
+    ///
+    /// **`flank_bp` maps onto *both* of production's knobs**, which is the A2
+    /// collapse stated as code: ng has one number where production has
+    /// `flank_bp` and `bundle_threshold`, and this pair is only equivalent
+    /// because production ships them equal (spec §2.4;
+    /// `default_matches_the_frozen_catalog_params` pins it). Anywhere the two
+    /// sides are compared, they must therefore agree — so the differential is
+    /// also the evidence the collapse costs nothing.
     fn matched_params(
         min_purity: f32,
         min_score: i32,
         flank_bp: u32,
-        bundle_threshold: u32,
     ) -> (SsrAdmissionParams, CatalogParams) {
         (
             SsrAdmissionParams {
                 min_purity,
                 min_score,
                 flank_bp: u64::from(flank_bp),
-                bundle_threshold: u64::from(bundle_threshold),
+                // `periods` and `min_copies` take the catalog's values —
+                // which is what makes them comparable with production's hardcoded
+                // ones at all. A2's knobs are exercised by the tests that set them
+                // explicitly, never by a silent default drifting in here.
+                ..SsrAdmissionParams::default()
             },
             CatalogParams {
                 min_purity,
                 min_score,
                 flank_bp,
-                bundle_threshold,
+                bundle_threshold: flank_bp,
             },
         )
     }
@@ -1425,7 +1579,7 @@ mod tests {
     /// settings, and compare.
     #[track_caller]
     fn assert_agrees(intervals: &[RepeatInterval], chrom: &str, seq: &[u8], case: &str) {
-        let (ng_p, prod_p) = matched_params(0.8, 0, 5, 50);
+        let (ng_p, prod_p) = matched_params(0.8, 0, 5);
         assert_agrees_at(&ng_p, &prod_p, intervals, chrom, seq, case);
     }
 
@@ -1523,7 +1677,17 @@ mod tests {
         bundled.resize(5000, b'G');
         bundled.extend_from_slice(b"ATATATATATATATATATAT"); // 5000..5020
         bundled.resize(5100, b'T');
-        assert_agrees(
+        // **At a 50 bp radius, not `params()`'s 5.** A2 collapsed `flank_bp` and
+        // `bundle_threshold` into one number, and this fixture was built for A1's
+        // `flank_bp: 5, bundle_threshold: 50` — its closest pair is 30 bp apart, so
+        // at a radius of 5 nothing bundles and the case silently stops testing the
+        // bundle drop. It kept passing because *both sides moved together*: the
+        // exact "wrong together, still green" blindness the differential has by
+        // construction. Pinned by `admit_bundles_at_the_flank_radius` below.
+        let (ng_p, prod_p) = matched_params(0.8, 0, 50);
+        assert_agrees_at(
+            &ng_p,
+            &prod_p,
             &[
                 iv(100, 120, 2, 100),
                 iv(150, 180, 3, 100),
@@ -1647,7 +1811,7 @@ mod tests {
         let contig = [left.as_ref(), impure.as_ref(), right.as_ref()].concat();
         let detected = iv(5, 21, 2, 100);
 
-        let (ng_p, prod_p) = matched_params(0.8, 0, 5, 50);
+        let (ng_p, prod_p) = matched_params(0.8, 0, 5);
         let loci = admit(vec![detected], "chr1", &contig, &ng_p);
         assert_eq!(loci.len(), 1, "imperfect but above the floor: KEPT");
         assert!(
@@ -1667,7 +1831,7 @@ mod tests {
         // Same tract, floor raised above its purity: now the gate fires. Driving
         // the differential here is the point — it is the only way the purity gate
         // is compared against production at all.
-        let (ng_hi, prod_hi) = matched_params(0.99, 0, 5, 50);
+        let (ng_hi, prod_hi) = matched_params(0.99, 0, 5);
         assert!(
             admit(vec![detected], "chr1", &contig, &ng_hi).is_empty(),
             "purity below the floor: DROPPED"
@@ -1696,7 +1860,7 @@ mod tests {
         let right = b"GCGCG";
         let contig = [left.as_ref(), tract.as_ref(), right.as_ref()].concat();
 
-        let (ng_p, prod_p) = matched_params(0.8, 50, 5, 50);
+        let (ng_p, prod_p) = matched_params(0.8, 50, 5);
         // Above the floor: admitted.
         assert_eq!(
             admit(vec![iv(5, 21, 2, 100)], "chr1", &contig, &ng_p).len(),
@@ -1796,54 +1960,399 @@ mod tests {
         assert_eq!(ours.min_purity, theirs.min_purity, "min_purity");
         assert_eq!(ours.min_score, theirs.min_score, "min_score");
         assert_eq!(ours.flank_bp, u64::from(theirs.flank_bp), "flank_bp");
+
+        // **The A2 collapse, justified rather than asserted.** ng has one number
+        // where production has two. That is only lossless because production ships
+        // them equal — so this is the evidence for the collapse, and the tripwire
+        // if the premise ever stops holding.
         assert_eq!(
-            ours.bundle_threshold,
             u64::from(theirs.bundle_threshold),
-            "bundle_threshold"
+            ours.flank_bp,
+            "spec §2.4 collapses bundle_threshold into flank_bp; that is safe ONLY \
+             because the catalog ships them at the same value"
         );
-        // spec §2.4: the flank requirement is the primitive, bundle-ness derived.
-        // A2 collapses these into one field; until then they must not diverge.
+
+        // The knobs A2 hoisted: `Default` must still be the catalog's hardcoded
+        // rules, or spec §8's oracles stop comparing like with like.
+        //
+        // **Against literals, not against our own consts.** Asserting
+        // `ours.periods.min() == DEFAULT_MIN_PERIOD` would compare the constant
+        // with itself — `Default` is *defined* as `PeriodRange::new(
+        // DEFAULT_MIN_PERIOD, DEFAULT_MAX_PERIOD)` — so it could not fail, and
+        // the one A2 knob that can silently decalibrate both §8 oracles would be
+        // free to drift with this test green. Production's `MIN_PERIOD` /
+        // `MAX_PERIOD` are private consts ng cannot read, so they are restated
+        // here as the oracle, exactly as
+        // `the_folded_copy_floor_table_reproduces_both_of_productions` does for
+        // the minimums. If production ever moves, this fails and says so.
         assert_eq!(
-            ours.bundle_threshold, ours.flank_bp,
-            "the two knobs are one number (spec §2.4)"
+            ours.periods.min(),
+            2,
+            "postprocess.rs's MIN_PERIOD is 2 — period-1 homopolymers are dropped"
+        );
+        assert_eq!(
+            ours.periods.max(),
+            6,
+            "postprocess.rs's MAX_PERIOD is 6 — the microsatellite ceiling"
+        );
+        assert_eq!(
+            ours.min_copies,
+            MinCopies::default(),
+            "the folded minimum table; its VALUES are pinned against production by \
+             the_folded_copy_floor_table_reproduces_both_of_productions"
         );
     }
 
-    /// **Mi1 — the two copy-floor tables duplicate; they do not disagree.**
+    /// **A2 — the folded table reproduces *both* of production's, exactly.**
     ///
-    /// Spec §5/§10 and an earlier draft of this file both described A2 as
-    /// *reconciling a disagreement*. There is none to reconcile: the tables give
-    /// the same floor for every period either can see. Their one numeric
-    /// difference is period 1 (10 vs 3), which neither reaches — `prefilter` gates
-    /// `period >= 2` and `MIN_PERIOD` drops it again. So A2's job is to delete a
-    /// copy, and this test says what A2 must preserve.
+    /// A1 carried production's two copy-floor tables verbatim; A2 folds them into
+    /// one [`MinCopies`]. This is the fold's proof obligation: the single
+    /// table must give what **each** original gave, at every period each could
+    /// reach. The two originals live in frozen production and are private
+    /// (`postprocess::copy_number_floor`, and `copy_floor` inside
+    /// `scanner_parity`'s `#[cfg(test)]` module), so they are restated here as the
+    /// oracle — which is the point: if production ever changes, this fails and says
+    /// so, rather than ng drifting quietly.
+    ///
+    /// The docs called these tables "disagreeing" (spec §5/§10, and A1's code).
+    /// They do not: their one numeric difference is period 1, which neither gate
+    /// can reach. That is why A2 is a *deletion*, not a reconciliation.
     #[test]
-    fn the_two_copy_floor_tables_agree_on_every_reachable_period() {
-        fn prefilter_floor(period: u8) -> u32 {
+    fn the_folded_copy_floor_table_reproduces_both_of_productions() {
+        // `postprocess::copy_number_floor` — admission's, verbatim.
+        fn productions_admission_floor(period: usize) -> u64 {
+            match period {
+                1 => 10,
+                2 => 5,
+                3 => 4,
+                4 => 3,
+                5 => 3,
+                6 => 3,
+                _ => 3,
+            }
+        }
+        // `scanner_parity::catalog_prefilter`'s nested `copy_floor` — the second
+        // copy, verbatim.
+        fn productions_prefilter_floor(period: u8) -> u32 {
             match period {
                 2 => 5,
                 3 => 4,
                 _ => 3,
             }
         }
-        for period in MIN_PERIOD..=MAX_PERIOD {
+
+        let folded = MinCopies::default();
+        let defaults = SsrAdmissionParams::default();
+
+        for period in defaults.periods.min()..=defaults.periods.max() {
             assert_eq!(
-                copy_number_floor(period as usize),
-                u64::from(prefilter_floor(period as u8)),
-                "the two copy-floor tables must agree at period {period}"
+                u64::from(folded.for_period(period)),
+                productions_admission_floor(period as usize),
+                "folded table must match production's ADMISSION floor at period {period}"
+            );
+            assert_eq!(
+                folded.for_period(period),
+                productions_prefilter_floor(period),
+                "folded table must match production's PRE-FILTER floor at period {period}"
             );
         }
-        // The one place they differ is unreachable through either gate — which
-        // is *why* "disagreeing" was the wrong word for them.
-        assert_ne!(
-            copy_number_floor(1),
-            u64::from(prefilter_floor(1)),
-            "period 1 is the only value the two tables differ on"
+
+        // The `_ => 3` arm both originals carry, for a period wider than the table.
+        assert_eq!(folded.for_period(7), productions_prefilter_floor(7));
+        assert_eq!(
+            u64::from(folded.for_period(7)),
+            productions_admission_floor(7)
         );
-        const _: () = assert!(
-            MIN_PERIOD > 1,
-            "if period 1 ever became admissible, the two tables WOULD disagree \
-             and this test's premise would need revisiting"
+
+        // Period 1 is the ONLY value the two originals differ on (10 vs 3), and it
+        // is unreachable: the default period floor is 2. That unreachability is
+        // exactly why "disagreeing" was the wrong word for them.
+        assert_ne!(
+            productions_admission_floor(1),
+            u64::from(productions_prefilter_floor(1)),
+            "period 1 is the one value the two originals differ on"
+        );
+        assert!(
+            defaults.periods.min() > 1,
+            "if period 1 became admissible by default, the two originals WOULD \
+             disagree and the fold would need a decision, not a deletion"
+        );
+    }
+
+    /// **A2 — the period scope is a knob, and moving it moves the admitted set.**
+    ///
+    /// Spec §5.2's routing frontier is *"for which (period, tract length) cells does
+    /// the STR path beat the generic one?"*. Production cannot be asked: its period
+    /// scope is a `const`. This is the test that says ng can.
+    #[test]
+    fn narrowing_the_period_scope_changes_what_is_admitted() {
+        // A (CAG)*10 tract — period 3, admitted at the default 2..=6 scope.
+        let mut contig = b"TTTTT".to_vec();
+        for _ in 0..10 {
+            contig.extend_from_slice(b"CAG");
+        }
+        contig.extend_from_slice(b"TTTTT");
+        let cag = iv(5, 35, 3, 100);
+
+        assert_eq!(
+            admit(vec![cag], "chr1", &contig, &params()).len(),
+            1,
+            "period 3 is inside the default 2..=6 scope"
+        );
+
+        // Take period 3 off the STR path: same tract, no locus.
+        let dinucs_only = SsrAdmissionParams {
+            periods: PeriodRange::new(2, 2).unwrap(),
+            ..params()
+        };
+        assert!(
+            admit(vec![cag], "chr1", &contig, &dinucs_only).is_empty(),
+            "a 2..=2 scope must exclude the period-3 tract — the knob has to bite"
+        );
+
+        // And the floor moves too: period 1 is off by default, on if asked.
+        let mut poly = vec![b'T'; 5];
+        poly.extend(std::iter::repeat_n(b'A', 30));
+        poly.extend_from_slice(b"TTTTT");
+        let homopolymer = iv(5, 35, 1, 100);
+        assert!(
+            admit(vec![homopolymer], "chr1", &poly, &params()).is_empty(),
+            "period-1 homopolymers are off the STR path by default"
+        );
+        let with_homopolymers = SsrAdmissionParams {
+            periods: PeriodRange::new(1, 6).unwrap(),
+            ..params()
+        };
+        assert_eq!(
+            admit(vec![homopolymer], "chr1", &poly, &with_homopolymers).len(),
+            1,
+            "a 1..=6 scope admits it — the question spec §10 wants asked"
+        );
+    }
+
+    /// **A2 — `flank_bp` really is the bundle radius, and moving it moves bundling.**
+    ///
+    /// The collapse's live wire: `drop_bundles(kept, p.flank_bp)`. Deleting that
+    /// argument's link to `flank_bp` — or the bundle drop entirely — must not pass.
+    /// Two tracts 30 bp apart: bundled at a 50 bp radius, both admitted at 5.
+    #[test]
+    fn admit_bundles_at_the_flank_radius() {
+        // Two (AT) tracts with a 30 bp gap, each with room for a 50 bp flank.
+        let mut contig = vec![b'C'; 100];
+        contig.extend_from_slice(b"ATATATATATATATATATAT"); // 100..120
+        contig.resize(150, b'C');
+        contig.extend_from_slice(b"ATATATATATATATATATAT"); // 150..170
+        contig.resize(300, b'C');
+        let pair = [iv(100, 120, 2, 100), iv(150, 170, 2, 100)];
+
+        // Radius 50: the 30 bp gap is inside it → one cluster → both dropped.
+        let wide = matched_params(0.8, 0, 50).0;
+        assert!(
+            admit(pair.to_vec(), "chr1", &contig, &wide).is_empty(),
+            "30 bp apart is inside a 50 bp flank radius: both are bundle members"
+        );
+
+        // Radius 5: the gap clears it → neither is bundled → both admitted.
+        let narrow = matched_params(0.8, 0, 5).0;
+        assert_eq!(
+            admit(pair.to_vec(), "chr1", &contig, &narrow).len(),
+            2,
+            "30 bp apart clears a 5 bp flank radius: both are loci"
+        );
+
+        // And production agrees at both radii — which is the collapse's real
+        // claim: ng's one number does what production's two did.
+        let (ng_w, prod_w) = matched_params(0.8, 0, 50);
+        assert_agrees_at(
+            &ng_w,
+            &prod_w,
+            &pair,
+            "chr1",
+            &contig,
+            "bundled at radius 50",
+        );
+        let (ng_n, prod_n) = matched_params(0.8, 0, 5);
+        assert_agrees_at(
+            &ng_n,
+            &prod_n,
+            &pair,
+            "chr1",
+            &contig,
+            "unbundled at radius 5",
+        );
+    }
+
+    /// **A2 — the per-period minimum is read *per period*, not as one number.**
+    ///
+    /// Found by review: `raising_the_copy_floor_changes_what_is_admitted` uses
+    /// `uniform(9)`, which by construction makes every entry identical — so it
+    /// pins *that* the table is consulted, never *which entry*. A `for_period`
+    /// that ignored its argument and always returned `by_period[1]` passed every
+    /// test in this file. And **non-uniform is the only shape spec §5.2's frontier
+    /// needs**: the experiment varies the minimum *by period*.
+    #[test]
+    fn the_minimum_is_looked_up_by_the_tracts_own_period() {
+        // A period-2 tract (8 copies) and a period-3 tract (10 copies), each
+        // isolated and flanked.
+        let mut contig = vec![b'C'; 20];
+        contig.extend_from_slice(b"ATATATATATATATAT"); // 20..36, 8 copies of AT
+        contig.resize(200, b'C');
+        for _ in 0..10 {
+            contig.extend_from_slice(b"CAG"); // 200..230, 10 copies of CAG
+        }
+        contig.resize(400, b'C');
+        let di = iv(20, 36, 2, 100);
+        let tri = iv(200, 230, 3, 100);
+
+        // A table that admits the period-3 tract and rejects the period-2 one —
+        // so a lookup ignoring the period cannot produce this answer.
+        //          period:  1  2   3  4  5  6
+        let picky = SsrAdmissionParams {
+            min_copies: MinCopies::new([10, 9, 4, 3, 3, 3], 3),
+            ..params()
+        };
+        let loci = admit(vec![di, tri], "chr1", &contig, &picky);
+        assert_eq!(
+            loci.len(),
+            1,
+            "only the period-3 tract clears its own minimum"
+        );
+        assert_eq!(loci[0].motif().as_bytes(), b"CAG");
+        assert_eq!(loci[0].period(), 3);
+
+        // Mirror it: swap which period is picky, and the surviving locus swaps.
+        //           period:  1  2  3   4  5  6
+        let mirrored = SsrAdmissionParams {
+            min_copies: MinCopies::new([10, 5, 11, 3, 3, 3], 3),
+            ..params()
+        };
+        let loci = admit(vec![di, tri], "chr1", &contig, &mirrored);
+        assert_eq!(loci.len(), 1, "now only the period-2 tract clears its own");
+        assert_eq!(loci[0].motif().as_bytes(), b"AT");
+
+        // The same discrimination must reach `prefilter` — the differential is
+        // blind to it, so nothing else would notice.
+        assert_eq!(
+            prefilter(&[di, tri], &picky),
+            vec![tri],
+            "pre-filter, by period"
+        );
+        assert_eq!(
+            prefilter(&[di, tri], &mirrored),
+            vec![di],
+            "pre-filter, mirrored"
+        );
+    }
+
+    /// `for_wider_periods` must be distinguishable from the last named period —
+    /// `Default` and `uniform` both set them equal, so every other test would pass
+    /// with a `for_period` that ignored it.
+    #[test]
+    fn min_copies_uses_the_fallback_only_beyond_the_table() {
+        let m = MinCopies::new([10, 5, 4, 3, 3, 3], 99);
+        assert_eq!(m.for_period(1), 10);
+        assert_eq!(m.for_period(6), 3, "the last named period");
+        assert_eq!(m.for_period(7), 99, "the first period past the table");
+        assert_eq!(m.for_period(u8::MAX), 99);
+        // Period 0 is unreachable (PeriodRange rejects a zero floor) but the fn is
+        // total, and it agrees with production's `_ => 3` arm there.
+        assert_eq!(m.for_period(0), 99);
+
+        let u = MinCopies::uniform(4);
+        assert_eq!(u.for_period(1), 4);
+        assert_eq!(u.for_period(6), 4);
+        assert_eq!(
+            u.for_period(7),
+            4,
+            "uniform means uniform, fallback included"
+        );
+    }
+
+    /// **A2 — the period ceiling is enforced in release, not just in debug.**
+    ///
+    /// `PeriodRange::new` bounds neither end, so `PeriodRange::new(2, 7)` is legal
+    /// and this is reachable. It is an `assert!` rather than a `debug_assert!`
+    /// because the knob exists to be **swept by the §5.2 experiment, and sweeps
+    /// run in release** — a debug-only guard would let the experiment record
+    /// "period 7 admits nothing" when the code never tried. That is a wrong
+    /// result, not a missing panic.
+    #[test]
+    #[should_panic(expected = "exceeds MAX_MOTIF_LEN")]
+    fn admit_rejects_a_period_ceiling_no_motif_can_hold() {
+        let contig = [
+            b"CGCGC".as_ref(),
+            b"ATATATATATATATAT".as_ref(),
+            b"GCGCG".as_ref(),
+        ]
+        .concat();
+        let too_wide = SsrAdmissionParams {
+            periods: PeriodRange::new(2, (MAX_MOTIF_LEN + 1) as u8).unwrap(),
+            ..params()
+        };
+        let _ = admit(vec![iv(5, 21, 2, 100)], "chr1", &contig, &too_wide);
+    }
+
+    /// The `min_purity` contract `admit` guards: a `NaN` floor would make every
+    /// `purity < p.min_purity` false, silently passing everything.
+    #[test]
+    #[should_panic(expected = "min_purity")]
+    fn admit_rejects_a_nan_purity_floor() {
+        let contig = [
+            b"CGCGC".as_ref(),
+            b"ATATATATATATATAT".as_ref(),
+            b"GCGCG".as_ref(),
+        ]
+        .concat();
+        let nan = SsrAdmissionParams {
+            min_purity: f32::NAN,
+            ..params()
+        };
+        let _ = admit(vec![iv(5, 21, 2, 100)], "chr1", &contig, &nan);
+    }
+
+    /// **A2 — the copy floor is a knob, and it is the "length" axis.**
+    ///
+    /// A floor of *n* copies at period *p* is a minimum tract length of *n·p*
+    /// bases, so this knob **is** spec §5.2's length dimension. Production
+    /// hardcodes it in a `const fn`, in two places.
+    #[test]
+    fn raising_the_copy_floor_changes_what_is_admitted() {
+        // (AT)*8 = 8 copies at period 2. The default floor for period 2 is 5.
+        let contig = [
+            b"CGCGC".as_ref(),
+            b"ATATATATATATATAT".as_ref(),
+            b"GCGCG".as_ref(),
+        ]
+        .concat();
+        let tract = iv(5, 21, 2, 100);
+
+        assert_eq!(
+            admit(vec![tract], "chr1", &contig, &params()).len(),
+            1,
+            "8 copies clears the default floor of 5"
+        );
+
+        // Raise the floor above the tract: dropped.
+        let strict = SsrAdmissionParams {
+            min_copies: MinCopies::uniform(9),
+            ..params()
+        };
+        assert!(
+            admit(vec![tract], "chr1", &contig, &strict).is_empty(),
+            "8 copies is below a floor of 9"
+        );
+
+        // And it moves the PRE-FILTER too, which is the point of folding the two
+        // tables: one knob, whole policy. A1's two copies would have moved half.
+        assert_eq!(
+            prefilter(&[tract], &params()),
+            vec![tract],
+            "kept at floor 5"
+        );
+        assert!(
+            prefilter(&[tract], &strict).is_empty(),
+            "the same knob must move the pre-filter — otherwise a swept floor \
+             silently applies to only half the policy"
         );
     }
 
@@ -1897,6 +2406,54 @@ mod tests {
         );
     }
 
+    /// **The pre-filter's period floor is load-bearing, not a tidy-up.**
+    ///
+    /// Found by mutation: deleting `iv.period >= p.periods.min()` left the whole
+    /// suite green, and **no differential can ever catch it** — `assert_agrees`
+    /// runs `prefilter` once and hands the same set to both sides (review finding
+    /// M4), so the pre-filter is compared against nothing. Only a direct test
+    /// reaches it.
+    ///
+    /// Why it matters: the floor runs *before* redundancy elimination, and
+    /// **period 1 divides every period**. So a homopolymer that survives the floor
+    /// stage eliminates every real STR it overlaps, as its "period-multiple". That
+    /// is the poly-A cascade production's `iv.period >= 2` exists to prevent —
+    /// the same failure the `admit`-side period-1 drop guards from the other
+    /// direction, and the reason both are ordered before their bundling/redundancy
+    /// step.
+    #[test]
+    fn prefilter_drops_period_one_before_it_can_eliminate_a_real_str() {
+        // A 30 bp poly-A: 30 copies at period 1, which clears period 1's floor of
+        // 10 — so the floor alone will not save us.
+        let homopolymer = iv(100, 130, 1, 100);
+        // A real period-2 tract over the same span: 15 copies, clears its floor.
+        // `2 % 1 == 0` and they overlap, so without the period gate the
+        // homopolymer eliminates it as a period-multiple.
+        let real_str = iv(100, 130, 2, 100);
+
+        assert_eq!(
+            prefilter(&[homopolymer, real_str], &params()),
+            vec![real_str],
+            "the homopolymer must be dropped BEFORE redundancy elimination, or it \
+             takes the real STR with it"
+        );
+
+        // The gate follows the knob, not a hardcoded 2: admit period 1 and the
+        // cascade is back — which is a real cost of that experiment (spec §10),
+        // and should be visible rather than surprising.
+        let with_homopolymers = SsrAdmissionParams {
+            periods: PeriodRange::new(1, 6).unwrap(),
+            ..params()
+        };
+        assert_eq!(
+            prefilter(&[homopolymer, real_str], &with_homopolymers),
+            vec![homopolymer],
+            "at a 1..=6 scope the homopolymer is kept and eliminates the period-2 \
+             tract as its multiple — the documented cost of putting period 1 on \
+             the STR path"
+        );
+    }
+
     /// **M6 — a malformed interval is dropped, not underflowed.**
     ///
     /// `RepeatInterval`'s fields are `pub` with no ordering invariant, and
@@ -1908,11 +2465,14 @@ mod tests {
         let inverted = iv(120, 100, 2, 100);
         let good = iv(100, 120, 2, 100);
         assert_eq!(
-            prefilter(&[inverted, good]),
+            prefilter(&[inverted, good], &params()),
             vec![good],
             "an end < start interval is dropped, not wrapped into a huge copy count"
         );
-        assert!(prefilter(&[iv(100, 100, 2, 100)]).is_empty(), "empty span");
+        assert!(
+            prefilter(&[iv(100, 100, 2, 100)], &params()).is_empty(),
+            "empty span"
+        );
     }
 
     /// The real case: the scanner's own output over the synthetic STR-diversity
@@ -1945,7 +2505,7 @@ mod tests {
             // drop period 1 (`scanner_parity`'s configuration).
             let intervals =
                 find_tandem_repeats(seq, PeriodRange::new(1, 6).unwrap(), &ScanParams::default());
-            let cleaned = prefilter(&intervals);
+            let cleaned = prefilter(&intervals, &params());
             assert_agrees(&cleaned, &name, seq, &format!("scanner output on {name}"));
 
             total_loci += admit(cleaned.clone(), &name, seq, &params()).len();
