@@ -314,8 +314,26 @@ with features placed **astride** window boundaries (small `window_bp`, not a sma
 **maximality** case (a generic run longer than a window emits as **one** region); the contig-end-clamp
 guard (a locus near a window edge is not dropped).
 
-> **Checkpoint D:** the partition is correct resident (parity + invariant), bundles route, and the
-> windowed walk matches the resident oracle across window sizes. Pause for review.
+> **Checkpoint D — REACHED 2026-07-16.** The partition is correct resident (parity + invariant),
+> bundles route, and the windowed walk matches the resident oracle across window sizes and on the
+> golden reference. Pause for review.
+>
+> **Found at D3 and routed forward, so it is not lost:**
+> - **A bundle hull can overlap a satellite — a spec question, and D1 has it too.** `swallowed` tests
+>   only the hull's **start**, so a cluster chaining a > `max_repeat_len` array to a tract just
+>   outside it emits an `SsrBundle` spanning the array — which is also emitted as `Satellite`. Two
+>   regions, same bases. D1 builds that partition silently (it breaks its own invariant); D3 refuses
+>   it with an assert. **No fixture reaches it**, so nothing is failing today. The fix is not a
+>   cleanup: it needs an answer to *what does a bundle containing a satellite mean?* — is the array a
+>   member at all (spec §2.4 says a tract 10 bp from a 2 kb array genuinely has no clean flank), or
+>   does the cap apply before the flank test? Owner's call; spec §10's routing experiments are where
+>   the evidence would come from.
+> - **The stakes of the cleaned-vs-raw cap are still undemonstrated.** D3 pinned the *choice*
+>   (`the_satellite_cap_applies_to_the_cleaned_coverage_not_the_raw`), but only via a boundary
+>   difference. A fixture with ≥ 1 kb of contiguous low-copy noise would show the failure the spec's
+>   argument is actually about — noise inventing a satellite and swallowing the loci beneath it.
+> - **Still open from Checkpoint A:** a `proptest` property over `assert_agrees` (the strongest
+>   remaining lever on the port); D1's scanner-output fixture asserts nothing about `bundled`.
 
 ### Milestone E — public surface, BED, integration
 

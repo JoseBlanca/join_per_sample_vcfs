@@ -419,6 +419,23 @@ pub fn partition_resident(
 /// function is invisible to that comparison, by construction. It is covered instead by
 /// D1's own bar: the partition invariant and `.cat` parity. What the comparison *does*
 /// prove is what only windowing can get wrong: the carries and the attribution.
+///
+/// # Known hole: a bundle hull can overlap a satellite (D3; unreached, unfixed)
+///
+/// The `swallowed` test below reads a cluster's **start** only. A cluster chaining a repeat to
+/// an over-cap array beside it therefore emits an `SsrBundle` spanning the array — which
+/// is *also* emitted as `Satellite`. Two regions, the same bases: the partition
+/// invariant broken.
+///
+/// **No fixture reaches it**, and it is not a cleanup. It needs an answer to a question
+/// this step cannot settle: what does a bundle containing a satellite *mean*? Spec §2.4
+/// says a tract 10 bp from a 2 kb array genuinely has no clean flank, so excluding the
+/// array from the flank test would be wrong for the right-sounding reason. Routed to the
+/// owner at Checkpoint D.
+///
+/// `partition_resident` builds the broken partition silently; `partition_windowed`
+/// asserts instead (`BlockWalk::close_block`), which is why the walk is the one that
+/// would tell you.
 fn resolve_features(
     runs: &[CoverageRun],
     loci: Vec<Locus>,
