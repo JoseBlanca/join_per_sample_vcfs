@@ -271,36 +271,25 @@ its own `RefSeq`/`RawRefSeq` accessors and fetches around each read's span (as s
 `ReadFilter` does), and the only per-call context is the routed locus (`type Locus`) — `()` on the
 generic path, `SsrLocus` on the STR path.
 
-### Step 3 — the locus router
-```rust
-pub trait LocusRouter {
-    /// Classify a reference region: is it an STR (with motif/period/borders) or generic?
-    fn route_locus(&self, window: &RefWindow) -> LocusKind;
-}
-pub trait LocusSource {
-    /// Enumerate the candidate loci to genotype — a catalog iterator, or active regions.
-    fn loci(&self) -> impl Iterator<Item = GenomeRegion>;
-}
-```
-*Impls to bench:* fixed STR catalog (ours), active-region detection (GATK), the
-catalog+discovery hybrid (spec §step-3). Keeping `LocusSource` and `LocusRouter`
-separate lets a data-driven source feed the same reference-based router.
+### Step 3 — the typed-region generator
 
-**Step 3 is the head of the locus stream** (spec §1, *The locus stream*). It segments
-the genome into STR / non-STR stretches; from there **two mints feed one stream** of
-`LocusKind`-carrying `LocusEvidence`:
+**Superseded — no trait.** This section once sketched `LocusRouter` / `LocusSource` traits with a
+`route_locus(&RefWindow) -> LocusKind` fork. The step-3 spec and its arch doc retired all of it:
+step 3 has no bake-off (its variation is config, and active-region detection is data-driven and
+lives inside the pileup), so it is a **concrete iterator**, `TypedRegionIterator`, not a trait. Its
+output is `TypedRegion { region, kind }`, with `kind` a `RegionKind`: `SsrLocus` / `SsrBundle` /
+`Generic` / `Satellite`. `LocusRouter`, `LocusSource`, and `RefWindow` are retired.
 
-- an **STR** stretch is blessed as a locus 1:1 — reference-defined, minted before any
-  read is read;
-- a **non-STR** stretch is handed to the **`pileup/`** module, which walks it, splits it
-  into loci, and gathers each one's evidence — data-defined.
+**`LocusKind` is *not* retired — it is a different type at a different stage.** `RegionKind` (above)
+classifies a *region of the reference*, four ways. `LocusKind` (below, and steps 6/12) classifies a
+*locus to genotype*, two ways — `Ssr` or `Generic`. A `Generic` region is split by the pileup into
+many generic loci; an `SsrLocus` region is one Ssr locus; bundles and satellites are not loci at
+all. So step 3 no longer *outputs* `LocusKind`, but the per-locus core still consumes it.
 
-`pileup/` is **not** a step trait here: it is infrastructure (the reused
-`pileup/walker/`), the generic-path counterpart of the STR read-class/gather, and it has
-no bake-off surface of its own. What *is* still swappable inside it — the non-STR
-locus/window definition (single position vs active-region vs haplotype-fixpoint) — is the
-`LocusSource`/active-region axis above. See `module_layout.md` (*The locus stream*) for
-the open subsume-or-compose question.
+Real interface: [`typed_regions.md`](typed_regions.md); spec: [`../spec/typed_regions.md`](../spec/typed_regions.md).
+
+`pileup/` still splits a `Generic` region into loci from the data — that is the next slice's
+module, unchanged by this.
 
 ### Step 4 — the rough caller, the per-sample summary, and the cohort estimator
 
@@ -424,7 +413,8 @@ field, holds the rest, and re-measures.
 ```rust
 pub struct CallerRecipe {
     pub read_preparer: Box<dyn ReadPreparer>,
-    pub router:       Box<dyn LocusRouter>,
+    // step 3 (region typing) is not in the recipe — it is a fixed concrete stage, not a swappable
+    // impl (typed_regions.md). The `router` field is gone.
     pub rough_caller: Box<dyn Caller>,
     pub summarizer:   Box<dyn SampleSummarizer>,   // per-sample -> .psp
     pub cohort_estimator: Box<dyn CohortEstimator>, // cohort gather -> ModelParams
@@ -511,8 +501,8 @@ were not freshly re-read.
 
 | ng name | existing code | action |
 |---|---|---|
-| `GenomeRegion` | `Region` ([regions.rs](../../../../src/regions.rs)), `ContigInterval` ([bam/alignment_input.rs](../../../../src/bam/alignment_input.rs)) | consolidate the coordinate-span types into one |
-| `RefWindow` | ≈ `RefSpan` ([var_calling/types.rs](../../../../src/var_calling/types.rs)) — `{ genomic_start, bytes }` | the sequence-carrying span. **`OPEN:` is `RefWindow` needed at all?** Read preparation dropped it (it holds accessors and fetches per read, §3-step-2), leaving step 3's `route_locus` as its only consumer. If that consumer also fetches, the name is a duplicate of production's `RefSpan` and should be retired rather than minted — "window" also names no real concept here (a window of *what*?). Settle in the router spec |
+| `GenomeRegion` | `Region` ([regions.rs](../../../../src/regions.rs)), `ContigInterval` ([bam/alignment_input.rs](../../../../src/bam/alignment_input.rs)) | **done — first real use is step 3** ([`typed_regions.md`](typed_regions.md)): 1-based inclusive, `u64`. Consolidates the coordinate-span types into one |
+| ~~`RefWindow`~~ | — | **retired** (step-3 spec §6): its only consumer was `route_locus`, which is gone. The generator holds its own accessor and fetches for itself; production's `RefSpan` names a sequence-carrying span if one is ever wanted. Closes `LocusWindow` too |
 | `RefSeq` + `RawRefSeq` (traits) | `ChromRefFetcher` + `MultiChromRefFetcher` + `RepositoryRefFetcher` + `StreamingChromRefFetcher` + `ManualEvictChromRefFetcher` ([fasta/fetcher.rs](../../../../src/fasta/fetcher.rs)) | **consolidate** into `RefSeq` (universal canonical fetch) + the `RawRefSeq` capability + an inherent `evict_before` (no silent no-ops); reuse the fetcher impls behind them. Spec: [`../spec/ref_seq.md`](../spec/ref_seq.md) |
 | `MappedRead` | `MappedRead` ([bam/alignment_input.rs](../../../../src/bam/alignment_input.rs)) | reuse as-is (the step-2 input) |
 | `LocusRead` (prepared-read output) | — (name retired) | refined by the read-preparation specs into **path-owned** types — `PreparedRead` (generic) + `SsrTractObs` (STR); there is no single unified type (they converge downstream at `LocusEvidence`). **Correction:** an earlier row here called production's `PreparedRead` "a different concept (a decoded walker read)" and said not to reuse the name — the production survey disproved that: it *is* the generic step-2 output, field for field, so ng **reuses it as-is** (may want hoisting out of `pileup/walker/`). Downstream sketches that still say `LocusRead` reconcile when their steps are specced |

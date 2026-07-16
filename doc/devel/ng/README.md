@@ -15,6 +15,9 @@ by document kind:
     BAQ → `PreparedRead`) and
     [`read_preparation_ssr.md`](spec/read_preparation_ssr.md) (STR: tract extraction →
     `SsrTractObs`).
+  - [`typed_regions.md`](spec/typed_regions.md) — step 3 (the typed-region generator): walks
+    the reference and cuts it into `TypedRegion`s (SsrLocus / SsrBundle / Generic / Satellite).
+    First integrating spec — stands on `RefSeq`, the tandem-repeat scanner, and the STR catalog.
   - [`ref_seq.md`](spec/ref_seq.md) — the `RefSeq` reference-sequence accessor
     (foundational infra: resident + streaming + in-memory impls). Read filtering #8 and
     the pileup depend on it.
@@ -26,6 +29,8 @@ by document kind:
     folder per step (trait + impls + tests together), shared vocabulary, `bench/`.
   - [`read_filtering.md`](arch/read_filtering.md) — step 1's types & interfaces,
     distilled (the code-facing companion to the spec).
+  - [`typed_regions.md`](arch/typed_regions.md) — step 3's types & interfaces (the
+    typed-region generator); companion to `spec/typed_regions.md`.
 - **`impl_plan/`** — step-by-step implementation plans (build order, not new design).
   - [`foundations.md`](impl_plan/foundations.md) — the first ng code: skeleton,
     `types.rs` seed, and the `RefSeq` accessor (three impls).

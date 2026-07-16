@@ -35,7 +35,10 @@ src/ng/
 │                          file — no bake-off; wraps the bam/alignment_input filters)
 │                        · mod.rs + left_align_baq.rs / reassembly.rs / pair_hmm.rs –
 │                          step 2: ReadPreparer trait + its swappable impls, side by side
-├── locus_router/     – step 3  LocusRouter + LocusSource + impls (catalog, active_region)
+├── region_typing.rs  – step 3  the typed-region generator: walks the reference and cuts it into
+│                       TypedRegion { region, kind } (SsrLocus/SsrBundle/Generic/Satellite). A
+│                       concrete iterator, no trait (no bake-off). Spec ../spec/typed_regions.md;
+│                       arch typed_regions.md
 ├── pileup/           – the non-STR loci+evidence generator (NOT a step — infrastructure,
 │                       like pipeline.rs/bench). Walks each non-STR stretch, splits it
 │                       into loci, and gathers each locus' evidence → LocusEvidence.
@@ -57,7 +60,7 @@ src/ng/
 ```
 
 (Steps 5 — STR read-class / spanning — and the read-class machinery live inside
-`locus_router/` or `allele_candidates/`; see *Open items*.)
+`allele_candidates/` or the STR gatherer; see *Open items*.)
 
 ## Organizing principles
 
@@ -144,7 +147,7 @@ stream** (`ng_proposal.md` §1, *The locus stream*). Two modules mint loci, one 
 consumes them, keeping SNP / indel / STR at one level:
 
 ```
-locus_router/  segments the genome into STR / non-STR stretches (reference-based)
+region_typing.rs  types the reference into TypedRegions (reference-based; spec ../spec/typed_regions.md)
    ├─ STR stretch     → a locus, 1:1, defined from the reference (no reads needed)
    └─ non-STR stretch → pileup/ walks it, splits it into loci, gathers each one's
                         evidence (data-defined)
@@ -184,8 +187,8 @@ thread, reuse freely. The module tree here is the
 ## Open items
 
 - **Where step 5 (STR read-class / spanning) lives** — it is STR-only and feeds candidate
-  generation; likely a submodule of `allele_candidates/` or `locus_router/`, not its own top-level step
-  folder. Decide when the STR path is built.
+  generation; likely a submodule of `allele_candidates/` or the STR gatherer, not its own top-level
+  step folder. Decide when the STR path is built.
 - **`pileup/` — subsume or compose?** When the non-STR pileup is built, decide whether it
   *subsumes* the generic path's step-2 (`ReadPreparer`) and locus-windowing into one reused
   walker (so the generic path largely opts out of the per-step bake-off), or is *built

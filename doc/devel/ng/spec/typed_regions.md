@@ -7,7 +7,7 @@ rather than builds: it stands on `RefSeq` ([`ref_seq.md`](ref_seq.md)), the tand
 questions the read-preparation specs deferred to "the router spec" — `LocusWindow`, the `SsrLocus`
 shape, and `ReadPreparer::Locus` ([`read_preparation_ssr.md`](read_preparation_ssr.md) §8) — and
 retires `locus_router/` from [`../arch/module_layout.md`](../arch/module_layout.md). Amends four
-sibling docs; see §9.*
+sibling docs; see §9. Code-facing companion: [`../arch/typed_regions.md`](../arch/typed_regions.md).*
 
 *Naming: **STR** in prose, `ssr` in code. **Licensing:** implement from papers, never transliterate
 — TRF-mod is AGPL-3, GangSTR GPL-3, HipSTR GPL-2. Nothing here needs their source.*
