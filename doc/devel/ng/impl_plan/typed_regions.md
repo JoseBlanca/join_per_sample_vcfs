@@ -175,18 +175,33 @@ the contig continues — the §2.6 bug, tested directly rather than argued.
 
 ### Milestone B — the windowed, wide, raw substrate the walk stands on
 
-**B1. Promote and stream `collect_windowed`.**  ☐
+**B1. Promote and stream `collect_windowed`.**  ✅
 `private → pub(crate)`; return an **iterator** of per-window `{ core, coverage, intervals }` instead of
 two whole-contig `Vec`s (spec §6.1). `RegionScanner` (which consumed it) stays as-is over the streamed
 form. *Source:* spec §6.1. Verified: the existing **window-count-invariance** test still green; streamed
 output == the old collected output.
 
-**B2. Widen ng's own coordinates to `u64`.**  ☐
+**B2. Widen ng's own coordinates to `u64`.**  ✅
+*(Blocked on a conflict the plan did not foresee: `src/ssr/catalog/scanner_parity.rs` imported
+`crate::ng` and baked in `RepeatInterval`'s `u32`, so widening ng meant editing frozen production —
+i.e. **production depended on ng**, the exact coupling the freeze exists to prevent. Owner-approved
+fix: move that test into `src/ng/` (commit `d097ebf`). `rg 'use crate::ng' src/ --glob '!src/ng/**'`
+now matches nothing. Also decided here, owner-agreed: **`RepeatInterval` stays 0-based half-open**
+against spec §4's "1-based everywhere" — it is a detector/slice type whose coordinates index the
+byte slice, so 1-basing it would add a `- 1` at every site to buy consistency with a genetic
+coordinate it never expresses. The 1-based boundary belongs at `Locus`/`GenomeRegion`.)*
 `RefSeq::fetch_into` + its three impls; the scanner's `RepeatInterval` / `RegionSpan` / `SegmentOptions`;
 `Bp`. **Delete `ref_seq.rs:87`'s `unwrap_or(u32::MAX)` silent clamp** (a >4 Gb contig now represents,
 not clamps). *Source:* spec §4, §9. Verified: the ng test suite compiles and passes.
 
-**B3. `WindowedRefSeq` — raw bytes + contig table.**  ☐
+**B3. `WindowedRefSeq` — raw bytes + contig table.**  ✅
+*(Under-sized by this plan. "Add a `RawRefSeq` impl (un-canonicalised buffer)" assumed ng could reach
+the raw bytes; production's `ManualEvictChromRefFetcher` **canonicalises into its buffer**, so they
+are gone before ng sees them — and production has no windowed raw reader at all, with its `.fai`
+machinery private. Owner chose to copy it: `src/ng/raw_chrom_reader.rs`, production's design with one
+line different (`dst.push(canonicalise(b))` → `dst.push(b)`). This also settles spec §10's open
+question — **raw is the buffer, canonical the derived view**, because two readers is what §6's 14.6 GB
+lesson forbids and `canonicalise` only runs one way.)*
 Add a `RawRefSeq` impl (un-canonicalised buffer — `ref_seq.md`'s parked YAGNI, now spent, spec §6) and a
 `contigs() -> &ContigList` accessor. *Depends:* B2. *Source:* spec §6, §8.3. Verified: raw fetch returns
 verbatim bytes matching `ResidentRefSeq`'s raw path; `contigs()` returns the table.
