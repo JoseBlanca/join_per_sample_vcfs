@@ -318,16 +318,18 @@ guard (a locus near a window edge is not dropped).
 > bundles route, and the windowed walk matches the resident oracle across window sizes and on the
 > golden reference. Pause for review.
 >
-> **Found at D3 and routed forward, so it is not lost:**
-> - **A bundle hull can overlap a satellite — a spec question, and D1 has it too.** `swallowed` tests
->   only the hull's **start**, so a cluster chaining a > `max_repeat_len` array to a tract just
->   outside it emits an `SsrBundle` spanning the array — which is also emitted as `Satellite`. Two
->   regions, same bases. D1 builds that partition silently (it breaks its own invariant); D3 refuses
->   it with an assert. **No fixture reaches it**, so nothing is failing today. The fix is not a
->   cleanup: it needs an answer to *what does a bundle containing a satellite mean?* — is the array a
->   member at all (spec §2.4 says a tract 10 bp from a 2 kb array genuinely has no clean flank), or
->   does the cap apply before the flank test? Owner's call; spec §10's routing experiments are where
->   the evidence would come from.
+> **Found at D3, decided by the owner the same day, and landed — spec §2.4a:**
+> - **A satellite swallows what it touches.** The walk had no answer for a microsatellite beside a
+>   satellite and was giving two different wrong ones depending on which *side* it sat: on the left,
+>   an `SsrBundle` **overlapping** the `Satellite` (an invalid partition); on the right, the cluster
+>   dropped whole and the bases silently `Generic`. Probed rather than argued, which is what showed
+>   the asymmetry. **Owner's rule:** a microsatellite *or* a bundle within `flank_bp` of a satellite
+>   is swallowed, and the satellite **expands** to cover it. Both kinds, because both arise by
+>   different routes (the array's tract may or may not clear admission's gates, but the satellite is
+>   built from *coverage*, which does not care). Absorption subsumes §2.1's swallow — containment and
+>   adjacency are one predicate — and applies to bundle **members** before clustering, which is also
+>   what keeps the windowed walk correct (a truncated over-cap member would break the cluster
+>   re-derivation; `bundle_clusters`' `debug_assert` caught exactly that, as D2 built it to).
 > - **The stakes of the cleaned-vs-raw cap are still undemonstrated.** D3 pinned the *choice*
 >   (`the_satellite_cap_applies_to_the_cleaned_coverage_not_the_raw`), but only via a boundary
 >   difference. A fixture with ≥ 1 kb of contiguous low-copy noise would show the failure the spec's

@@ -420,22 +420,38 @@ pub fn partition_resident(
 /// D1's own bar: the partition invariant and `.cat` parity. What the comparison *does*
 /// prove is what only windowing can get wrong: the carries and the attribution.
 ///
-/// # Known hole: a bundle hull can overlap a satellite (D3; unreached, unfixed)
+/// # Absorption: a satellite swallows what it touches (spec §2.4a)
 ///
-/// The `swallowed` test below reads a cluster's **start** only. A cluster chaining a repeat to
-/// an over-cap array beside it therefore emits an `SsrBundle` spanning the array — which
-/// is *also* emitted as `Satellite`. Two regions, the same bases: the partition
-/// invariant broken.
+/// **The rule (owner, 2026-07-16): a microsatellite or a cluster too close to a satellite
+/// is swallowed by the satellite, which expands to cover it.**
 ///
-/// **No fixture reaches it**, and it is not a cleanup. It needs an answer to a question
-/// this step cannot settle: what does a bundle containing a satellite *mean*? Spec §2.4
-/// says a tract 10 bp from a 2 kb array genuinely has no clean flank, so excluding the
-/// array from the flank test would be wrong for the right-sounding reason. Routed to the
-/// owner at Checkpoint D.
+/// A microsatellite 20 bp from a 1 kb array is not genotypeable, and the reason is the
+/// array: there is no clean flank on that side, because the flank *is* array. A satellite
+/// is already the region type that says *"an array — do not look for loci in here"* (spec
+/// §2.1), so it is the one that should say it here too. The alternative — exempting the
+/// array from the flank test so the neighbour becomes a clean locus — is wrong for a
+/// right-sounding reason (spec §2.4).
 ///
-/// `partition_resident` builds the broken partition silently; `partition_windowed`
-/// asserts instead (`BlockWalk::close_block`), which is why the walk is the one that
-/// would tell you.
+/// **Both kinds, because both arise, and by different routes.** A cluster reaches here
+/// when the array's own tract passes admission's gates and bundles with its neighbour. A
+/// bare locus reaches here when it does *not*: a satellite run is built from **cleaned
+/// coverage**, while bundling only ever sees tracts that cleared the scope/score/compound
+/// gates — so an array rejected by one of those still forms a satellite and never bundles
+/// anything. One rule covers both.
+///
+/// Absorption is iterated to a **fixed point** (a grown satellite reaches further than
+/// the run it came from) and it subsumes spec §2.1's swallow: containment and adjacency
+/// are the same predicate ([`absorb_into`]). Bundle members are absorbed **before** they
+/// are clustered — an ordering that turned out to be load-bearing twice, once for the
+/// rule and once for windowing; the reasons are at the loop.
+///
+/// **What this replaces, and why it was not a nicety.** The old test read a cluster's
+/// **start** only, so the answer depended on which *side* of the array the microsat sat:
+/// on the left it emitted a bundle **overlapping** the satellite — an invalid partition;
+/// on the right the hull's start fell inside the run, so the cluster was dropped whole
+/// and the microsat's bases silently became `Generic`. Same situation, two different
+/// wrong answers. Probed before believing it, then fixed —
+/// `a_microsatellite_beside_a_satellite_is_absorbed_into_it`.
 fn resolve_features(
     runs: &[CoverageRun],
     loci: Vec<Locus>,
@@ -444,40 +460,72 @@ fn resolve_features(
     config: &TypedRegionConfig,
 ) -> Vec<TypedRegion> {
     let max_repeat_len = config.max_repeat_len.get();
+    let flank_bp = config.admission.flank_bp;
     let mut features: Vec<TypedRegion> = Vec::new();
-    for run in runs {
-        if run.len() > max_repeat_len {
-            features.push(TypedRegion {
-                region: GenomeRegion {
-                    contig,
-                    start: Position(run.start),
-                    end: Position(run.end),
-                },
-                kind: RegionKind::Satellite,
-            });
-        }
-    }
-    // A satellite array is typed as one object, not searched for loci inside it
-    // (spec §2.1) — so anything admission produced inside one is dropped, and the
-    // one-label-per-base rule needs no tie-break.
-    let swallowed = |start: Position| {
-        runs.iter()
-            .any(|r| r.len() > max_repeat_len && r.contains(start))
-    };
 
-    for locus in loci {
-        let span = GenomeRegion {
-            contig,
-            start: Position(locus.start()),
-            end: Position(locus.end()),
-        };
-        if swallowed(span.start) {
-            continue;
-        }
-        features.push(TypedRegion {
-            region: span,
-            kind: RegionKind::SsrLocus(locus),
+    // The satellites: over-cap coverage runs — as spans that can still GROW (below).
+    let mut satellites: Vec<CoverageRun> = runs
+        .iter()
+        .copied()
+        .filter(|r| r.len() > max_repeat_len)
+        .collect();
+
+    let mut loci: Vec<(CoverageRun, Locus)> = loci
+        .into_iter()
+        .map(|l| {
+            (
+                CoverageRun {
+                    start: l.start(),
+                    end: l.end(),
+                },
+                l,
+            )
+        })
+        .collect();
+    // 0-based half-open → 1-based inclusive, the same one conversion as everywhere
+    // else (spec §4).
+    let mut members: Vec<RepeatInterval> = bundled.to_vec();
+
+    // **Absorption** (spec §2.4a; see the fn docs). Anything a satellite overlaps *or*
+    // comes within `flank_bp` of is absorbed into it, and the satellite grows to cover
+    // it. Iterated to a fixed point: a satellite that has grown reaches `flank_bp`
+    // further than the run it came from, so it can absorb something the run could not.
+    //
+    // It terminates: each pass either absorbs at least one of a finite set of features
+    // or stops. And it cannot reach out of the block — absorption's reach is exactly
+    // `BlockWalk::block_barrier`, which is where the block ends.
+    //
+    // **Bundle members are absorbed one by one, BEFORE they are clustered, and that
+    // ordering is load-bearing twice over:**
+    //
+    // 1. It absorbs whole clusters, never part of one — so the survivors are still
+    //    complete clusters and `bundle_clusters` can regroup them (its precondition:
+    //    `bundled` is the concatenation of clusters in coordinate order). If a member
+    //    is absorbed, every member chained to it is too: `is_close` implies "within
+    //    `flank_bp`" (each of its four clauses puts a pair of endpoints inside the
+    //    radius), so the grown satellite reaches the next member in the chain, and so
+    //    on by induction.
+    // 2. It is what makes the **windowed** walk correct at all. A window truncates a
+    //    detection at its scanned slice's edge, and only a tract longer than
+    //    `max_repeat_len` can be truncated — i.e. an array. A truncated member's `end`
+    //    is wrong, so `is_close` cannot re-chain it, and `bundle_clusters` sees a
+    //    singleton. Absorbing members first means a truncated one never reaches
+    //    clustering: it is over-cap, so it lies inside its own satellite run.
+    //    (`bundle_clusters`' `debug_assert` is what caught this, exactly as D2 built it
+    //    to.)
+    loop {
+        let mut absorbed = false;
+        members.retain(|iv| {
+            let span = CoverageRun {
+                start: iv.start + 1,
+                end: iv.end,
+            };
+            !absorb_into(&mut satellites, span, flank_bp, &mut absorbed)
         });
+        loci.retain(|(span, _)| !absorb_into(&mut satellites, *span, flank_bp, &mut absorbed));
+        if !absorbed {
+            break;
+        }
     }
 
     // Bundles (D2). `admit` set these aside — repeats too close to each other for
@@ -486,16 +534,50 @@ fn resolve_features(
     // cluster becomes **one** region spanning the hull of its tracts: the gaps
     // between members are inside it, and rightly so — they are shorter than a
     // flank, so nothing can be anchored in them either.
-    for cluster in admission::bundle_clusters(bundled, config.admission.flank_bp) {
-        // 0-based half-open → 1-based inclusive, the same one conversion as
-        // everywhere else (spec §4).
-        let start = Position(cluster.first().expect("non-empty cluster").start + 1);
-        let end = Position(cluster.iter().map(|iv| iv.end).max().expect("non-empty"));
-        if swallowed(start) {
-            continue;
-        }
+    //
+    // A surviving cluster cannot touch a satellite even though only its *members* were
+    // tested: its hull adds only the gaps between members, and those are shorter than a
+    // flank — far too short to hide an over-cap run — so a hull that reaches a satellite
+    // has a member that reaches it.
+    let clusters: Vec<(CoverageRun, Vec<RepeatInterval>)> =
+        admission::bundle_clusters(&members, flank_bp)
+            .into_iter()
+            .map(|cluster| {
+                let hull = CoverageRun {
+                    start: cluster.first().expect("non-empty cluster").start + 1,
+                    end: cluster.iter().map(|iv| iv.end).max().expect("non-empty"),
+                };
+                (hull, cluster)
+            })
+            .collect();
+
+    for satellite in &satellites {
         features.push(TypedRegion {
-            region: GenomeRegion { contig, start, end },
+            region: GenomeRegion {
+                contig,
+                start: Position(satellite.start),
+                end: Position(satellite.end),
+            },
+            kind: RegionKind::Satellite,
+        });
+    }
+    for (span, locus) in loci {
+        features.push(TypedRegion {
+            region: GenomeRegion {
+                contig,
+                start: Position(span.start),
+                end: Position(span.end),
+            },
+            kind: RegionKind::SsrLocus(locus),
+        });
+    }
+    for (hull, cluster) in clusters {
+        features.push(TypedRegion {
+            region: GenomeRegion {
+                contig,
+                start: Position(hull.start),
+                end: Position(hull.end),
+            },
             kind: RegionKind::SsrBundle {
                 tracts: cluster.into_boxed_slice(),
             },
@@ -504,6 +586,76 @@ fn resolve_features(
 
     features.sort_by_key(|f| f.region.start);
     features
+}
+
+/// Absorb `span` into any satellite it overlaps or lies within `flank_bp` of: those
+/// satellites and `span` become **one** span covering all of them, gaps included.
+/// Returns whether it was absorbed (and sets `absorbed`, the fixed-point loop's flag).
+///
+/// # Why the gap, and not `admission::is_close`
+///
+/// This asks a **flank** question — *are there `flank_bp` clean bases between this
+/// feature and the array?* — so the gap is the measure, and `< flank_bp` is strict, as
+/// admission's own gap clause is (`is_close_is_strict_at_the_threshold`).
+///
+/// `is_close` itself is the wrong tool here despite testing the same relation between
+/// two *tracts*: it is four `abs_diff` clauses ported from GangSTR, and three of them
+/// compare start-to-start and end-to-end — meaningful between two 25 bp tracts, noise
+/// against a span that can be 2 Mb long, where a locus 20 bp past the end is millions
+/// of bases from the start. The relation is the same; the predicate cannot be.
+///
+/// The gaps swept in are deliberate: fewer than `flank_bp` bases between two repeats is
+/// sequence nothing can be anchored in — the same reasoning that puts a cluster's
+/// internal gaps inside its hull (spec §2.4).
+fn absorb_into(
+    satellites: &mut Vec<CoverageRun>,
+    span: CoverageRun,
+    flank_bp: u64,
+    absorbed: &mut bool,
+) -> bool {
+    // `span.start <= s.end + flank_bp` is "the gap on this side is < flank_bp", and it
+    // is also true whenever the two overlap — so containment (a locus *inside* a
+    // satellite, spec §2.1's swallow) and adjacency are one rule, not two. They were
+    // two, and reading only the hull's start is what made the answer depend on which
+    // side of the array the feature sat.
+    let touching: Vec<usize> = satellites
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| span.start <= s.end + flank_bp && s.start <= span.end + flank_bp)
+        .map(|(i, _)| i)
+        .collect();
+    if touching.is_empty() {
+        return false;
+    }
+
+    let mut union = span;
+    // Back to front: removing by index cannot disturb an index still to come.
+    for &i in touching.iter().rev() {
+        let s = satellites.remove(i);
+        union.start = union.start.min(s.start);
+        union.end = union.end.max(s.end);
+    }
+    satellites.push(union);
+    merge_runs(satellites);
+    *absorbed = true;
+    true
+}
+
+/// Union overlapping and abutting runs in place, leaving them ascending.
+///
+/// Shared by the satellite absorption above and by [`coverage_runs`] — the same rule
+/// (touching spans are one span), so the same code.
+fn merge_runs(runs: &mut Vec<CoverageRun>) {
+    runs.sort_by_key(|s| (s.start, s.end));
+    let mut merged: Vec<CoverageRun> = Vec::with_capacity(runs.len());
+    for s in runs.drain(..) {
+        match merged.last_mut() {
+            // `s.start <= last.end + 1` merges abutting runs as well as overlapping ones.
+            Some(last) if s.start <= last.end + 1 => last.end = last.end.max(s.end),
+            _ => merged.push(s),
+        }
+    }
+    *runs = merged;
 }
 
 /// A merged run of repeat coverage, 1-based inclusive.
@@ -540,18 +692,8 @@ fn coverage_runs(intervals: &[RepeatInterval]) -> Vec<CoverageRun> {
             end: iv.end,
         })
         .collect();
-    spans.sort_by_key(|s| (s.start, s.end));
-
-    let mut out: Vec<CoverageRun> = Vec::new();
-    for s in spans {
-        match out.last_mut() {
-            // `s.start <= last.end + 1` merges abutting runs as well as
-            // overlapping ones.
-            Some(last) if s.start <= last.end + 1 => last.end = last.end.max(s.end),
-            _ => out.push(s),
-        }
-    }
-    out
+    merge_runs(&mut spans);
+    spans
 }
 
 // ---------------------------------------------------------------------
@@ -1797,6 +1939,130 @@ mod tests {
 
     fn reference_over(chrom: &str, bases: &[u8]) -> InMemoryRefSeq {
         InMemoryRefSeq::from_named_contigs(vec![(chrom.to_string(), bases.to_vec())])
+    }
+
+    /// A `(CAG)*8` microsatellite `gap` bp from a 1.3 kb `(AT)` array, on either side of
+    /// it. Different motifs, so the detector cannot join the two into one tract.
+    fn micro_near_satellite(micro_left: bool, gap: usize) -> Vec<u8> {
+        let mut bases = filler(6000);
+        let (micro_at, array_at) = if micro_left {
+            (1000, 1000 + 24 + gap)
+        } else {
+            (1000 + 1300 + gap, 1000)
+        };
+        // (CAG)*8 — a different motif from the array's, so the detector cannot join them.
+        for i in 0..8 {
+            bases[micro_at + i * 3..micro_at + i * 3 + 3].copy_from_slice(b"CAG");
+        }
+        for i in 0..650 {
+            bases[array_at + i * 2..array_at + i * 2 + 2].copy_from_slice(b"AT");
+        }
+        bases
+    }
+
+    /// **A microsatellite too close to a satellite is swallowed by it, from either
+    /// side** (spec §2.4a — the owner's rule, 2026-07-16).
+    ///
+    /// The situation is physical and symmetric: a `(CAG)*8` tract 20 bp from a 1.3 kb
+    /// array cannot be genotyped, because the flank on that side *is* array. So the
+    /// answer must not depend on which side it sits — and before this rule it did, in
+    /// two different wrong ways (`resolve_features`' docs).
+    ///
+    /// The 200 bp arm is the **control**, and it is what makes the 20 bp arm mean
+    /// something: at 200 bp the same two features, built by the same code, give a clean
+    /// `Generic / locus / Generic / Satellite` — so absorption at 20 bp is the *rule*
+    /// firing, not admission quietly rejecting a tract that was never viable.
+    #[test]
+    fn a_microsatellite_beside_a_satellite_is_absorbed_into_it() {
+        let config = TypedRegionConfig::default();
+        let kinds = |regions: &[TypedRegion]| -> Vec<&'static str> {
+            regions
+                .iter()
+                .map(|r| match &r.kind {
+                    RegionKind::SsrLocus(_) => "locus",
+                    RegionKind::SsrBundle { .. } => "bundle",
+                    RegionKind::Generic => "generic",
+                    RegionKind::Satellite => "satellite",
+                })
+                .collect()
+        };
+
+        for micro_left in [true, false] {
+            let side = if micro_left { "left" } else { "right" };
+
+            // --- absorbed: 20 bp of gap, less than the 50 bp flank ---
+            let bases = micro_near_satellite(micro_left, 20);
+            let regions = partition_resident("chr1", ContigId(0), &bases, &config);
+            assert_partitions(
+                &regions,
+                ContigId(0),
+                bases.len() as u64,
+                &format!("micro {side} of a satellite, 20 bp"),
+            );
+            assert_eq!(
+                kinds(&regions),
+                vec!["generic", "satellite", "generic"],
+                "micro {side}: the satellite swallows it — no bundle, no locus, and \
+                 (crucially) no second region over the same bases"
+            );
+
+            // The satellite **grew to cover the microsatellite**: it is not merely that
+            // the tract went missing. The absorbed span reaches past the array's own
+            // 1.3 kb, gap included.
+            let satellite = regions
+                .iter()
+                .find(|r| matches!(r.kind, RegionKind::Satellite))
+                .expect("one satellite");
+            assert!(
+                satellite.region.len() >= 1300 + 20 + 24,
+                "micro {side}: the satellite must EXPAND over the gap and the tract — \
+                 array (1300) + gap (20) + tract (24); got {}",
+                satellite.region.len()
+            );
+
+            // --- the control: 200 bp of gap, and the flank is clean ---
+            let bases = micro_near_satellite(micro_left, 200);
+            let regions = partition_resident("chr1", ContigId(0), &bases, &config);
+            assert_partitions(
+                &regions,
+                ContigId(0),
+                bases.len() as u64,
+                &format!("micro {side} of a satellite, 200 bp"),
+            );
+            assert!(
+                kinds(&regions).contains(&"locus"),
+                "micro {side}: 200 bp away the SAME tract is a locus — so the absorption \
+                 above is the rule, not a tract that was never admissible"
+            );
+            assert!(kinds(&regions).contains(&"satellite"));
+        }
+    }
+
+    /// Absorption must not depend on the window either: the windowed walk agrees with
+    /// the oracle on both arms and both sides. (The absorbed feature and the array are
+    /// within `flank_bp`, so they are one block — this is what pins that.)
+    #[test]
+    fn absorption_is_window_invariant() {
+        for micro_left in [true, false] {
+            for gap in [20usize, 200] {
+                let bases = micro_near_satellite(micro_left, gap);
+                let reference = reference_over("chr1", &bases);
+                let resident =
+                    partition_resident("chr1", ContigId(0), &bases, &TypedRegionConfig::default());
+                for window_bp in [100u64, 700, 1000] {
+                    let config = TypedRegionConfig {
+                        window_bp: Bp(window_bp),
+                        ..TypedRegionConfig::default()
+                    };
+                    let windowed =
+                        partition_windowed(&reference, ContigId(0), &config).expect("fetch");
+                    assert_eq!(
+                        windowed, resident,
+                        "micro_left={micro_left} gap={gap} window_bp={window_bp}"
+                    );
+                }
+            }
+        }
     }
 
     /// **The cap applies to the CLEANED coverage, not the raw** (spec §2.4) — pinned at

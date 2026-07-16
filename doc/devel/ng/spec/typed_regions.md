@@ -231,6 +231,46 @@ Algorithm notes:
 - `build_loci` must hand the members back rather than dropping them (§5); carrying an open cluster
   across a window boundary is §2.6.
 
+### 2.4a A satellite swallows what it touches
+
+**Added at D3, 2026-07-16 (owner's rule), because the walk had no answer here and was quietly giving
+two different wrong ones.**
+
+**The rule: a microsatellite or a bundle too close to a satellite is swallowed by the satellite,
+which expands to cover it.** "Too close" is the flank measure — fewer than `flank_bp` clean bases in
+between — and it subsumes containment, so §2.1's "a locus inside a satellite is dropped" is this same
+rule rather than a second one.
+
+**Why it comes up.** A microsatellite 20 bp from a 1 kb array is not genotypeable, and the reason is
+the array: the flank on that side *is* array. Two independent routes get you there, which is why the
+rule is stated over regions rather than over bundling:
+
+- the array's tract clears admission's gates, so §2.4's flank test bundles the two — and the
+  cluster's hull then covers the same bases as the `Satellite`; or
+- it does **not** clear them (score, compound motif), so nothing bundles — but the satellite is built
+  from *coverage*, which does not care, so a lone `SsrLocus` ends up 20 bp from an array.
+
+**Why the satellite wins.** It is already the type that says *"an array, not a microsatellite — do
+not look for loci in here"* (§2.1). A repeat stuck to an array is unusable for the array's reason, so
+the array's region should say so. Expanding rather than merely dropping keeps the partition honest:
+those bases are accounted for, and by the region that explains them.
+
+**Rejected: exempt the array from the flank test**, so the neighbour becomes a clean locus. Wrong for
+a right-sounding reason — a tract 20 bp from a 2 kb array genuinely has no clean flank (§2.4), and
+calling it a locus would hand the gatherer a locus whose reads cannot be anchored.
+
+**What it replaced.** The walk tested a cluster's hull **start** only, so the answer depended on which
+*side* of the array the microsatellite sat: on the left it emitted a bundle **overlapping** the
+satellite — an invalid partition, breaking §2.3's spine; on the right the hull's start fell inside the
+run, so the cluster was dropped whole and the bases silently became `Generic`. The same physical
+situation, two different wrong answers, and no fixture had reached either.
+
+**Implementation note (D3):** absorption applies to bundle **members**, before they are clustered.
+That absorbs whole clusters and never part of one (`is_close` implies "within `flank_bp`", so
+absorption chains along the cluster), and it is also what keeps the windowed walk correct — a window
+truncates a detection at its slice edge, only an over-cap tract can be truncated, and a truncated
+member would break the cluster re-derivation. Absorbed first, it never reaches it.
+
 ### 2.5 What to walk — `GenomeRegions`, and why a BED must not change the answer
 
 A user BED is not a special case: `regions.rs` already settled it — *"'Whole genome' is not a special
