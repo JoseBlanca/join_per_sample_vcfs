@@ -125,6 +125,10 @@ pub struct ScanParams {
     pub mismatch_penalty: i32,
     /// A segment shorter than `min_copies · period` is not emitted (a permissive floor;
     /// a consumer applies its own, stricter, per-period floors afterward).
+    ///
+    /// `u32`, not `u64`: this is a **count**, not a coordinate or a length, so
+    /// spec §4's widening does not reach it (the same reason ids stay `u32`, and
+    /// matching `region_typing::admission::MinCopies`).
     pub min_copies: u32,
 }
 
@@ -141,14 +145,14 @@ impl Default for ScanParams {
 /// Above this merged-repeat length a region is [`Region::Satellite`], not a genotypeable
 /// STR (satellite DNA; spec §3.6). Also bounds the streaming window halo. 1 kb is
 /// comfortably above any real STR locus.
-pub const DEFAULT_MAX_REPEAT_LEN: u32 = 1000;
+pub const DEFAULT_MAX_REPEAT_LEN: u64 = 1000;
 /// Default streaming window core (bp): a memory/I/O-granularity knob only — the region
 /// tiling is invariant to it.
-pub const DEFAULT_WINDOW_BP: u32 = 100_000;
+pub const DEFAULT_WINDOW_BP: u64 = 100_000;
 /// Default unique-gap bridging (0 = off): smoothing for the region tiling.
-pub const DEFAULT_MERGE_GAP: u32 = 0;
+pub const DEFAULT_MERGE_GAP: u64 = 0;
 /// Default minimum repeat-region length (0 = off): smoothing for the region tiling.
-pub const DEFAULT_MIN_REPEAT_LEN: u32 = 0;
+pub const DEFAULT_MIN_REPEAT_LEN: u64 = 0;
 
 /// Region-seam shaping and streaming knobs — separate from [`ScanParams`] because they
 /// shape the **partition and the walk**, not the detection.
@@ -158,13 +162,13 @@ pub const DEFAULT_MIN_REPEAT_LEN: u32 = 0;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SegmentOptions {
     /// Merged repeat coverage longer than this is emitted as [`Region::Satellite`].
-    pub max_repeat_len: u32,
+    pub max_repeat_len: u64,
     /// The streaming window core in bp; a memory knob, region-count-invariant.
-    pub window_bp: u32,
+    pub window_bp: u64,
     /// Smoothing: bridge unique gaps shorter than this into the flanking repeat.
-    pub merge_gap: u32,
+    pub merge_gap: u64,
     /// Smoothing: reclassify a repeat region shorter than this as unique.
-    pub min_repeat_len: u32,
+    pub min_repeat_len: u64,
 }
 
 impl Default for SegmentOptions {
@@ -188,12 +192,22 @@ impl Default for SegmentOptions {
 /// found at; `score` is the Ruzzo–Tompa segment total (an alignment-style
 /// length-and-purity proxy). Nothing consumer-specific here — it happens to carry
 /// exactly the four fields the STR post-filter reads, which is convenience, not coupling.
+///
+/// **0-based, deliberately, where the rest of ng is 1-based** (spec §4 says 1-based
+/// *everywhere*; this is the reasoned exception, owner-agreed 2026-07-16 at B2).
+/// This is a **detector/slice type**: its coordinates index the byte slice
+/// `find_tandem_repeats` was handed, and `seq[iv.start..iv.end]` is what every
+/// producer and consumer of it actually does. Making it 1-based would put a `- 1`
+/// at every one of those sites to buy consistency with a *genetic* coordinate it
+/// never expresses. The 1-based boundary belongs where the genetics starts —
+/// `Locus`, `GenomeRegion` — which is exactly where §4's payoff lands. `u64` is
+/// the width regardless.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RepeatInterval {
     /// Tract start, inclusive (0-based).
-    pub start: u32,
+    pub start: u64,
     /// Tract end, exclusive (0-based).
-    pub end: u32,
+    pub end: u64,
     /// Repeat period (motif length, in bp).
     pub period: u8,
     /// Ruzzo–Tompa segment score.
@@ -210,9 +224,9 @@ pub struct RepeatInterval {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RegionSpan {
     /// Start, inclusive (0-based).
-    pub start: u32,
+    pub start: u64,
     /// End, exclusive (0-based).
-    pub end: u32,
+    pub end: u64,
 }
 
 /// A genotypeable tandem repeat: merged repeat coverage no longer than
@@ -379,10 +393,10 @@ pub fn find_tandem_repeats(
         maximal_scoring_subsequences(scores, |k0, k1, score| {
             // Segment [k0, k1] → tract [k0, k1 + p + 1): the earliest base involved is
             // `j0 - p = k0`, the latest is `j1 = k1 + p`, so the exclusive end is `k1+p+1`.
-            let tract_start = k0 as u32;
-            let tract_end = (k1 + p + 1) as u32;
-            let copies = (tract_end - tract_start) / u32::from(period);
-            if copies >= params.min_copies {
+            let tract_start = k0 as u64;
+            let tract_end = (k1 + p + 1) as u64;
+            let copies = (tract_end - tract_start) / u64::from(period);
+            if copies >= u64::from(params.min_copies) {
                 out.push(RepeatInterval {
                     start: tract_start,
                     end: tract_end,
@@ -405,9 +419,9 @@ pub fn find_tandem_repeats(
 /// repeat **coverage** — the positions some repeat covers — independent of which intervals
 /// produced it (so it merges identically whether fed whole-contig intervals or windowed,
 /// clipped fragments).
-fn union_spans(mut spans: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
+fn union_spans(mut spans: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
     spans.sort_unstable();
-    let mut out: Vec<(u32, u32)> = Vec::new();
+    let mut out: Vec<(u64, u64)> = Vec::new();
     for (s, e) in spans {
         match out.last_mut() {
             Some(last) if s <= last.1 => last.1 = last.1.max(e),
@@ -430,16 +444,16 @@ fn union_spans(mut spans: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
 /// whose start lies in a `Repeat` span), and fill every gap with `Unique`. The output tiles
 /// `[0, n)` exactly, coordinate-ordered, with no two same-kind tiles adjacent.
 fn build_regions(
-    coverage: Vec<(u32, u32)>,
+    coverage: Vec<(u64, u64)>,
     mut str_intervals: Vec<RepeatInterval>,
-    n: u32,
+    n: u64,
     opts: &SegmentOptions,
 ) -> Vec<Region> {
     let mut spans = union_spans(coverage);
 
     // Smoothing — bridge unique gaps shorter than `merge_gap`.
     if opts.merge_gap > 0 {
-        let mut bridged: Vec<(u32, u32)> = Vec::new();
+        let mut bridged: Vec<(u64, u64)> = Vec::new();
         for (s, e) in spans {
             match bridged.last_mut() {
                 Some(last) if s - last.1 < opts.merge_gap => last.1 = e,
@@ -457,7 +471,7 @@ fn build_regions(
     let mut iv_idx = 0usize; // a single forward cursor into the start-sorted intervals
 
     let mut out = Vec::new();
-    let mut pos = 0u32;
+    let mut pos = 0u64;
     for (start, end) in spans {
         if start > pos {
             out.push(Region::Unique(RegionSpan {
@@ -500,7 +514,7 @@ fn tile(
     params: &ScanParams,
     opts: &SegmentOptions,
 ) -> Vec<Region> {
-    let n = seq.len() as u32;
+    let n = seq.len() as u64;
     if n == 0 {
         return Vec::new();
     }
@@ -523,7 +537,7 @@ pub struct ScannedWindow {
     /// every window it spans.
     pub coverage_core: RegionSpan,
     /// Repeat coverage **clipped to the core**, in contig coordinates.
-    pub coverage: Vec<(u32, u32)>,
+    pub coverage: Vec<(u64, u64)>,
     /// Exact repeat intervals, **whole** (never clipped), in contig coordinates —
     /// only those whose *start* lands in the core, so each is emitted by exactly
     /// one window.
@@ -592,10 +606,14 @@ pub fn scan_windowed<'f>(
     // `Copy` and are read out here, so tying the stream to their borrows would
     // constrain it for nothing.
     let params = *params;
-    let contig_len = fetcher.length();
+    // ng is `u64`; production's `ChromRefFetcher` is `u32` and frozen, so the width
+    // meets here (spec §4). Widening in is lossless; the narrowing back out, at the
+    // `fetch` below, is *provably* lossless because every coordinate derives from
+    // this `u32` length.
+    let contig_len = u64::from(fetcher.length());
     let window = opts.window_bp.max(1);
     let margin = opts.max_repeat_len;
-    let mut core = 0u32;
+    let mut core = 0u64;
 
     let scan = std::iter::from_fn(move || {
         if core >= contig_len {
@@ -604,8 +622,15 @@ pub fn scan_windowed<'f>(
         let core_end = core.saturating_add(window).min(contig_len);
         let fetch_start = core.saturating_sub(margin);
         let fetch_end = core_end.saturating_add(margin).min(contig_len);
-        // `fetch` is 1-based.
-        let bytes = match fetcher.fetch(fetch_start + 1, fetch_end - fetch_start) {
+        // PANIC-FREE: `core < contig_len` (guard above) and every value here is
+        // `.min(contig_len)`-bounded, so `fetch_start < fetch_end <= contig_len`,
+        // which came from a `u32`. Both casts therefore fit by construction.
+        // `expect` over `as`: if that reasoning ever stops holding, a truncated
+        // fetch would silently scan the WRONG WINDOW — the failure this module is
+        // least able to see. `fetch` is 1-based.
+        let start_1based = u32::try_from(fetch_start + 1).expect("fetch_start <= contig_len: u32");
+        let fetch_len = u32::try_from(fetch_end - fetch_start).expect("span <= contig_len: u32");
+        let bytes = match fetcher.fetch(start_1based, fetch_len) {
             Ok(b) => b,
             Err(source) => {
                 // Stop after reporting: a fetch failure is fatal, and continuing
@@ -689,7 +714,7 @@ impl RegionScanner {
         params: &ScanParams,
         opts: &SegmentOptions,
     ) -> Result<Self, ScanError> {
-        let contig_len = fetcher.length();
+        let contig_len = u64::from(fetcher.length());
         // Collected straight back up: this consumer was always whole-contig-eager
         // (`build_regions` needs every window's coverage before it can union a
         // satellite). The streaming shape exists for the typed-region walk, which
@@ -918,7 +943,7 @@ mod tests {
             "one span across the substitution: {got:?}"
         );
         assert_eq!(period3[0].start, 0);
-        assert_eq!(period3[0].end, seq.len() as u32);
+        assert_eq!(period3[0].end, seq.len() as u64);
     }
 
     /// A single indel (a bounded mismatch burst) also keeps the tract **one** interval —
@@ -942,7 +967,7 @@ mod tests {
             "the single indel is a bounded burst, not a split: {got:?}"
         );
         assert_eq!(period3[0].start, 0);
-        assert_eq!(period3[0].end, seq.len() as u32);
+        assert_eq!(period3[0].end, seq.len() as u64);
     }
 
     /// A run of `N` yields nothing — `N == N` is not a match (spec §3.5).
@@ -996,7 +1021,7 @@ mod tests {
 
     /// A region's `(start, end, kind)` for the tiling-contract check — kind is 0 Repeat,
     /// 1 Satellite, 2 Unique.
-    fn triple(r: &Region) -> (u32, u32, u8) {
+    fn triple(r: &Region) -> (u64, u64, u8) {
         match r {
             Region::Repeat(rr) => (rr.span.start, rr.span.end, 0),
             Region::Satellite(s) => (s.start, s.end, 1),
@@ -1012,8 +1037,8 @@ mod tests {
 
     /// Every tiling is coordinate-ordered, gap-free over `[0, n)`, non-overlapping, and has
     /// no two same-kind tiles adjacent.
-    fn assert_tiles(regions: &[Region], n: u32) {
-        let mut pos = 0u32;
+    fn assert_tiles(regions: &[Region], n: u64) {
+        let mut pos = 0u64;
         let mut prev_kind: Option<u8> = None;
         for r in regions {
             let (s, e, kind) = triple(r);
@@ -1043,7 +1068,7 @@ mod tests {
         }
         seq.extend_from_slice(b"GGTTA");
         let regions = regions_of(&seq, p(3, 3), &SegmentOptions::default());
-        assert_tiles(&regions, seq.len() as u32);
+        assert_tiles(&regions, seq.len() as u64);
         let kinds: Vec<u8> = regions.iter().map(|r| triple(r).2).collect();
         assert_eq!(kinds, vec![2, 0, 2], "Unique, Repeat, Unique: {regions:?}");
         // The single Repeat covers the tract.
@@ -1059,7 +1084,7 @@ mod tests {
         // (AT)*10 matches at periods 2, 4 and 6 — three overlapping intervals, one Repeat.
         let seq = b"ATATATATATATATATATAT"; // 20 bp
         let regions = regions_of(seq, p(2, 6), &SegmentOptions::default());
-        assert_tiles(&regions, seq.len() as u32);
+        assert_tiles(&regions, seq.len() as u64);
         let repeats: Vec<_> = regions
             .iter()
             .filter_map(|r| match r {
@@ -1090,7 +1115,7 @@ mod tests {
             ..SegmentOptions::default()
         };
         let regions = regions_of(&seq, p(3, 3), &opts);
-        assert_tiles(&regions, seq.len() as u32);
+        assert_tiles(&regions, seq.len() as u64);
         assert_eq!(
             regions.iter().map(|r| triple(r).2).collect::<Vec<_>>(),
             vec![2, 1, 2],
@@ -1113,7 +1138,7 @@ mod tests {
         let off = regions_of(&seq, p(3, 3), &SegmentOptions::default());
         let repeats_off = off.iter().filter(|r| triple(r).2 == 0).count();
         assert_eq!(repeats_off, 2, "without merge_gap, two repeats: {off:?}");
-        assert_tiles(&off, seq.len() as u32);
+        assert_tiles(&off, seq.len() as u64);
         // On: a merge_gap wider than the 12 bp gap coalesces them into one Repeat.
         let opts = SegmentOptions {
             merge_gap: 20,
@@ -1125,7 +1150,7 @@ mod tests {
             1,
             "with merge_gap, one bridged repeat: {on:?}"
         );
-        assert_tiles(&on, seq.len() as u32);
+        assert_tiles(&on, seq.len() as u64);
     }
 
     #[test]
@@ -1153,7 +1178,7 @@ mod tests {
             vec![2],
             "the short repeat is reclassified unique, gaps merged: {on:?}"
         );
-        assert_tiles(&on, seq.len() as u32);
+        assert_tiles(&on, seq.len() as u64);
     }
 
     // ---- scan_windowed (the streamed primitive, B1) -------------------------
@@ -1208,7 +1233,7 @@ mod tests {
     fn scan_windowed_cores_tile_the_contig_exactly() {
         let seq = mixed_contig();
         let (_dir, fetcher) = fetcher_over(&seq);
-        for window_bp in [1u32, 7, 40, 1000, 100_000] {
+        for window_bp in [1u64, 7, 40, 1000, 100_000] {
             let opts = SegmentOptions {
                 window_bp,
                 ..SegmentOptions::default()
@@ -1221,7 +1246,7 @@ mod tests {
             assert_eq!(cores[0].start, 0, "window_bp = {window_bp}: starts at 0");
             assert_eq!(
                 cores.last().unwrap().end,
-                seq.len() as u32,
+                seq.len() as u64,
                 "window_bp = {window_bp}: ends at the contig end"
             );
             for pair in cores.windows(2) {
@@ -1457,8 +1482,8 @@ mod tests {
     /// DUST split-invariance test).
     fn assert_window_invariant(seq: &[u8], periods: PeriodRange, base: &SegmentOptions) {
         let oracle = regions_of(seq, periods, base);
-        assert_tiles(&oracle, seq.len() as u32);
-        for wbp in [seq.len() as u32 + 5, 100, 40, 16, 7, 3] {
+        assert_tiles(&oracle, seq.len() as u64);
+        for wbp in [seq.len() as u64 + 5, 100, 40, 16, 7, 3] {
             let opts = SegmentOptions {
                 window_bp: wbp.max(1),
                 ..*base
@@ -1542,7 +1567,7 @@ mod tests {
             oracle.iter().any(|r| matches!(r, Region::Satellite(_))),
             "the capped contig is a satellite: {oracle:?}"
         );
-        for wbp in [seq.len() as u32 + 5, seq.len() as u32, 150] {
+        for wbp in [seq.len() as u64 + 5, seq.len() as u64, 150] {
             let o = SegmentOptions {
                 window_bp: wbp,
                 ..opts

@@ -20,7 +20,7 @@
 //! differently avoids the "same token, two crates" ambiguity.
 
 use crate::fasta::fetcher::canonicalise;
-use crate::fasta::{ChromRefFetchError, ContigList, ManualEvictChromRefFetcher};
+use crate::fasta::{ChromRefFetchError, ContigEntry, ContigList, ManualEvictChromRefFetcher};
 use crate::ng::types::ContigId;
 use noodles_fasta::Repository;
 use std::cell::RefCell;
@@ -37,9 +37,9 @@ pub enum RefSeqError {
     #[error("fetch [{start}, {end}) past {contig:?} (length {contig_length})")]
     OutOfBounds {
         contig: ContigId,
-        contig_length: u32,
-        start: u32,
-        end: u32,
+        contig_length: u64,
+        start: u64,
+        end: u64,
     },
     /// `start_1based` was 0 — the 1-based coordinate contract was violated.
     #[error("start_1based must be >= 1")]
@@ -70,8 +70,8 @@ pub enum RefSeqError {
 fn validate_window(
     contig: ContigId,
     contig_len: usize,
-    start_1based: u32,
-    length: u32,
+    start_1based: u64,
+    length: u64,
 ) -> Result<Range<usize>, RefSeqError> {
     debug_assert!(
         start_1based >= 1,
@@ -84,7 +84,41 @@ fn validate_window(
         Some(end0) if end0 <= contig_len => Ok(start0..end0),
         _ => Err(RefSeqError::OutOfBounds {
             contig,
-            contig_length: u32::try_from(contig_len).unwrap_or(u32::MAX),
+            // `u64`, so this reports the contig's real length. It used to be
+            // `u32::try_from(contig_len).unwrap_or(u32::MAX)` — a >4 Gb contig
+            // **silently clamped**, in built ng code, and the error then lied about
+            // the very number it existed to report (spec §4). Widening deletes the
+            // clamp rather than guarding it.
+            contig_length: contig_len as u64,
+            start: start_1based,
+            end: start_1based.saturating_add(length),
+        }),
+    }
+}
+
+/// Narrow ng's `u64` request to the `u32` production's `ChromRefFetcher` takes.
+///
+/// **The one place ng's width meets production's, and it fails rather than folds.**
+/// `src/fasta/` is frozen (spec Revision), so ng cannot widen it; but a silent
+/// narrowing here would reintroduce exactly the bug B2 removed a few lines up —
+/// the `unwrap_or(u32::MAX)` that turned a >4 Gb contig into a wrong number with
+/// no error. So a request this fetcher cannot express is `OutOfBounds`, reported
+/// against the contig's real (`u64`) length.
+///
+/// Unreachable on any real assembly — the largest known contig is ~250 Mb, and
+/// `u32` holds 4.29 Gb — which is *why* it must be an error and not an assert: it
+/// is a property of the reference, not a caller bug.
+fn narrow_for_fetcher(
+    contig: ContigId,
+    entry: &ContigEntry,
+    start_1based: u64,
+    length: u64,
+) -> Result<(u32, u32), RefSeqError> {
+    match (u32::try_from(start_1based), u32::try_from(length)) {
+        (Ok(s), Ok(l)) => Ok((s, l)),
+        _ => Err(RefSeqError::OutOfBounds {
+            contig,
+            contig_length: entry.length,
             start: start_1based,
             end: start_1based.saturating_add(length),
         }),
@@ -96,7 +130,7 @@ fn validate_window(
 /// [`RawRefSeq`] capability; buffer eviction is the windowed impl's inherent
 /// `evict_before` — neither is a method here.
 ///
-/// Coordinates are bare `u32` (1-based `start_1based`, `length`) rather than newtypes, to
+/// Coordinates are bare `u64` (1-based `start_1based`, `length`) rather than newtypes, to
 /// match the production `MultiChromRefFetcher::fetch` signature so a winning impl ports
 /// back with no signature change (ref_seq.md, Decision 3).
 pub trait RefSeq {
@@ -106,8 +140,8 @@ pub trait RefSeq {
     fn fetch_into(
         &self,
         contig: ContigId,
-        start_1based: u32,
-        length: u32,
+        start_1based: u64,
+        length: u64,
         dst: &mut Vec<u8>,
     ) -> Result<(), RefSeqError>;
 
@@ -115,8 +149,8 @@ pub trait RefSeq {
     fn fetch(
         &self,
         contig: ContigId,
-        start_1based: u32,
-        length: u32,
+        start_1based: u64,
+        length: u64,
     ) -> Result<Vec<u8>, RefSeqError> {
         // Start empty rather than `with_capacity(length)`: `length` is caller-controlled
         // and only validated inside `fetch_into`, so reserving up front would let an
@@ -143,8 +177,8 @@ pub trait RawRefSeq: RefSeq {
     fn fetch_raw_into(
         &self,
         contig: ContigId,
-        start_1based: u32,
-        length: u32,
+        start_1based: u64,
+        length: u64,
         dst: &mut Vec<u8>,
     ) -> Result<(), RefSeqError>;
 }
@@ -169,8 +203,8 @@ impl InMemoryRefSeq {
     fn resolve_range(
         &self,
         contig: ContigId,
-        start_1based: u32,
-        length: u32,
+        start_1based: u64,
+        length: u64,
     ) -> Result<&[u8], RefSeqError> {
         if start_1based == 0 {
             return Err(RefSeqError::InvalidStart);
@@ -188,8 +222,8 @@ impl RefSeq for InMemoryRefSeq {
     fn fetch_into(
         &self,
         contig: ContigId,
-        start_1based: u32,
-        length: u32,
+        start_1based: u64,
+        length: u64,
         dst: &mut Vec<u8>,
     ) -> Result<(), RefSeqError> {
         let raw = self.resolve_range(contig, start_1based, length)?;
@@ -203,8 +237,8 @@ impl RawRefSeq for InMemoryRefSeq {
     fn fetch_raw_into(
         &self,
         contig: ContigId,
-        start_1based: u32,
-        length: u32,
+        start_1based: u64,
+        length: u64,
         dst: &mut Vec<u8>,
     ) -> Result<(), RefSeqError> {
         let raw = self.resolve_range(contig, start_1based, length)?;
@@ -250,8 +284,8 @@ impl ResidentRefSeq {
     fn with_window<R>(
         &self,
         contig: ContigId,
-        start_1based: u32,
-        length: u32,
+        start_1based: u64,
+        length: u64,
         consume: impl FnOnce(&[u8]) -> R,
     ) -> Result<R, RefSeqError> {
         if start_1based == 0 {
@@ -286,8 +320,8 @@ impl RefSeq for ResidentRefSeq {
     fn fetch_into(
         &self,
         contig: ContigId,
-        start_1based: u32,
-        length: u32,
+        start_1based: u64,
+        length: u64,
         dst: &mut Vec<u8>,
     ) -> Result<(), RefSeqError> {
         self.with_window(contig, start_1based, length, |raw| {
@@ -301,8 +335,8 @@ impl RawRefSeq for ResidentRefSeq {
     fn fetch_raw_into(
         &self,
         contig: ContigId,
-        start_1based: u32,
-        length: u32,
+        start_1based: u64,
+        length: u64,
         dst: &mut Vec<u8>,
     ) -> Result<(), RefSeqError> {
         self.with_window(contig, start_1based, length, |raw| {
@@ -323,9 +357,11 @@ fn map_chrom_error(contig: ContigId, err: ChromRefFetchError) -> RefSeqError {
             ..
         } => RefSeqError::OutOfBounds {
             contig,
-            contig_length: chrom_length,
-            start,
-            end,
+            // Widening from production's `u32` error: lossless, and the only
+            // direction that is.
+            contig_length: u64::from(chrom_length),
+            start: u64::from(start),
+            end: u64::from(end),
         },
         ChromRefFetchError::Io { source, .. } => RefSeqError::Io { contig, source },
         // `OutOfPattern` (streaming-only) and any future variant: the manual-evict fetcher
@@ -379,8 +415,8 @@ impl RefSeq for WindowedRefSeq {
     fn fetch_into(
         &self,
         contig: ContigId,
-        start_1based: u32,
-        length: u32,
+        start_1based: u64,
+        length: u64,
         dst: &mut Vec<u8>,
     ) -> Result<(), RefSeqError> {
         let entry = self
@@ -396,10 +432,18 @@ impl RefSeq for WindowedRefSeq {
             *current = Some((contig, fetcher));
         }
         let (_, fetcher) = current.as_mut().expect("current set above");
+        // **ng speaks `u64`; production's fetcher speaks `u32`** (spec §4 — `src/fasta/`
+        // is frozen, so the narrowing lives here, at the seam, and nowhere else).
+        //
+        // It is an **error, not a clamp**. That distinction is the whole of B2: the
+        // code this replaced wrote `unwrap_or(u32::MAX)` and a >4 Gb contig silently
+        // became a wrong number. ng can now *represent* such a coordinate; this
+        // fetcher simply cannot *serve* it, and saying so is the honest answer.
+        let (start_u32, len_u32) = narrow_for_fetcher(contig, entry, start_1based, length)?;
         // The fetcher returns canonical {A,C,G,T,N} bytes (it reuses `canonicalise` on
         // refill), so they can be copied out verbatim — byte-identical to ResidentRefSeq.
         let bytes = fetcher
-            .fetch(start_1based, length)
+            .fetch(start_u32, len_u32)
             .map_err(|e| map_chrom_error(contig, e))?;
         dst.clear();
         dst.extend_from_slice(bytes);
@@ -426,7 +470,7 @@ mod tests {
     }
 
     /// Convenience: raw bytes as an owned Vec (the trait writes into a caller buffer).
-    fn raw(r: &impl RawRefSeq, contig: ContigId, start: u32, len: u32) -> Vec<u8> {
+    fn raw(r: &impl RawRefSeq, contig: ContigId, start: u64, len: u64) -> Vec<u8> {
         let mut dst = Vec::new();
         r.fetch_raw_into(contig, start, len, &mut dst).unwrap();
         dst
@@ -546,6 +590,42 @@ mod tests {
         }
     }
 
+    /// **B2's payoff: a coordinate past `u32` is reported, not clamped.**
+    ///
+    /// The line this pins used to read
+    /// `contig_length: u32::try_from(contig_len).unwrap_or(u32::MAX)`, so on a
+    /// contig above 4 Gb the error *silently lied about the very number it
+    /// existed to report*, in built ng code. Nothing could catch it, because
+    /// nothing could represent the right answer.
+    ///
+    /// Now `RefSeqError` is `u64` end to end: a request beyond `u32::MAX` comes
+    /// back with its own coordinates intact, so a >4 Gb assembly (they exist:
+    /// lungfish, some conifers) gets a true error rather than a wrong number.
+    /// Unreachable through `InMemoryRefSeq`'s tiny fixture in the *length*, but
+    /// exactly reachable in the *request*, which is the half that used to clamp.
+    #[test]
+    fn a_request_beyond_u32_is_reported_verbatim_not_clamped() {
+        let r = in_memory();
+        let past_u32 = u64::from(u32::MAX) + 1_000;
+        match r.fetch(ContigId(1), past_u32, 10) {
+            Err(RefSeqError::OutOfBounds {
+                contig_length,
+                start,
+                end,
+                ..
+            }) => {
+                // The request survives the round trip at full width — no `u32::MAX`
+                // anywhere.
+                assert_eq!(start, past_u32, "start reported verbatim");
+                assert_eq!(end, past_u32 + 10, "end reported verbatim");
+                assert!(start > u64::from(u32::MAX), "the point of the test");
+                // And the contig's real length, not a clamp of it.
+                assert_eq!(contig_length, 4);
+            }
+            other => panic!("expected OutOfBounds, got {other:?}"),
+        }
+    }
+
     #[test]
     fn one_base_past_the_end_is_out_of_bounds_but_exact_fit_succeeds() {
         let r = in_memory();
@@ -626,15 +706,22 @@ mod tests {
         let production = RepositoryRefFetcher::new(repository_for(&path), contigs);
 
         for (chrom_id, (_name, bases)) in FASTA_CONTIGS.iter().enumerate() {
-            let len = bases.len() as u32;
+            let len = bases.len() as u64;
             for start in 1..=len {
                 for length in 0..=(len - start + 1) {
                     let ours = resident
                         .fetch(ContigId(chrom_id as u32), start, length)
                         .unwrap();
-                    let prod =
-                        MultiChromRefFetcher::fetch(&production, chrom_id as u32, start, length)
-                            .expect("production fetch");
+                    // ng is `u64`, production's fetcher is `u32` (spec §4; `src/fasta/`
+                    // is frozen). Narrowing here is what makes the two comparable at
+                    // all, and the fixture is a few dozen bases.
+                    let prod = MultiChromRefFetcher::fetch(
+                        &production,
+                        chrom_id as u32,
+                        start as u32,
+                        length as u32,
+                    )
+                    .expect("production fetch");
                     assert_eq!(
                         ours, prod,
                         "canonical mismatch chrom {chrom_id} start {start} len {length}"
@@ -651,12 +738,12 @@ mod tests {
         let mut production = RawContigRefCache::new(repository_for(&path), contigs);
 
         for (chrom_id, (_name, bases)) in FASTA_CONTIGS.iter().enumerate() {
-            let len = bases.len() as u32;
+            let len = bases.len() as u64;
             for start in 1..=len {
                 for length in 1..=(len - start + 1) {
                     let ours = raw(&resident, ContigId(chrom_id as u32), start, length);
                     let prod = production
-                        .fetch_raw_slice(chrom_id, start as u64, length)
+                        .fetch_raw_slice(chrom_id, start, length as u32)
                         .expect("production raw slice");
                     assert_eq!(
                         ours.as_slice(),
@@ -676,7 +763,7 @@ mod tests {
 
         for (chrom_id, (_name, bases)) in FASTA_CONTIGS.iter().enumerate() {
             let id = ContigId(chrom_id as u32);
-            let len = bases.len() as u32;
+            let len = bases.len() as u64;
             for start in 1..=len {
                 for length in 1..=(len - start + 1) {
                     assert_eq!(
@@ -779,7 +866,7 @@ mod tests {
         let windowed = WindowedRefSeq::new(path, contigs);
         for (chrom_id, (_name, bases)) in FASTA_CONTIGS.iter().enumerate() {
             let id = ContigId(chrom_id as u32);
-            let len = bases.len() as u32;
+            let len = bases.len() as u64;
             for start in 1..=len {
                 for length in 1..=(len - start + 1) {
                     assert_eq!(
@@ -798,9 +885,9 @@ mod tests {
         let windowed = WindowedRefSeq::new(path.clone(), contigs);
         let streaming = StreamingChromRefFetcher::for_contig(&path, "chr1").unwrap();
         // chr1 = ACGTACGT (len 8); walk 2-base windows forward (monotonic → streaming-legal).
-        for start in 1..=7u32 {
+        for start in 1..=7u64 {
             let ours = windowed.fetch(ContigId(1), start, 2).unwrap();
-            let prod = ChromRefFetcher::fetch(&streaming, start, 2).unwrap();
+            let prod = ChromRefFetcher::fetch(&streaming, start as u32, 2).unwrap();
             assert_eq!(ours, prod, "forward walk start {start}");
         }
     }

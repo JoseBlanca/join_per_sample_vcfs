@@ -53,14 +53,18 @@ impl BaseQual {
 
 /// A length in base pairs — the generic length currency both the SNP/indel and
 /// STR paths speak (only *repeat-unit* quantities carry the `Ssr` prefix). Here
-/// it measures a read's decoded length. Unconstrained — any `u32` is a legal
+/// it measures a read's decoded length. Unconstrained — any `u64` is a legal
 /// value, so the field is public and there is no checked constructor.
+///
+/// `u64` since B2 (spec §4): ng speaks one width, so nothing narrows, nothing is
+/// checked, and no off-by-width bug is possible. Ids stay `u32` — they index a
+/// table, they are not positions.
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-pub struct Bp(pub u32);
+pub struct Bp(pub u64);
 
 impl Bp {
     #[inline]
-    pub fn get(self) -> u32 {
+    pub fn get(self) -> u64 {
         self.0
     }
 }

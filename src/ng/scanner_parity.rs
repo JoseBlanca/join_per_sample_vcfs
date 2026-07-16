@@ -88,7 +88,8 @@ fn catalog_prefilter(intervals: &[RepeatInterval]) -> Vec<RepeatInterval> {
         .iter()
         .copied()
         .filter(|iv| {
-            iv.period >= 2 && (iv.end - iv.start) / u32::from(iv.period) >= copy_floor(iv.period)
+            iv.period >= 2
+                && (iv.end - iv.start) / u64::from(iv.period) >= u64::from(copy_floor(iv.period))
         })
         .collect();
     // Process low periods first so a fundamental tract is kept and its multiples dropped.
@@ -121,9 +122,27 @@ fn scanner_loci(reference: &Path, params: &CatalogParams) -> Vec<Locus> {
         // The catalog scans period 1..=6; the pre-filter and post-filter drop period 1.
         let intervals =
             find_tandem_repeats(seq, PeriodRange::new(1, 6).unwrap(), &ScanParams::default());
+        // **The narrowing that made this file block B2, now on ng's side of the
+        // fence.** `TrfRecord` is trf-mod's parse shape and is `u32`; ng's
+        // `RepeatInterval` is `u64` (spec §4). While this test lived in
+        // `src/ssr/catalog/`, widening ng meant editing frozen production — which is
+        // why it moved here. Now the conversion is ng's own, at ng's own boundary,
+        // and production never notices.
+        //
+        // PANIC-FREE: the synthetic parity fixture is a few kb; a `u32` holds 4.29 Gb.
+        // `expect` over `as` because a truncated coordinate would silently compare the
+        // *wrong tract* against the golden catalog — a green test asserting nothing.
         let recs: Vec<TrfRecord> = catalog_prefilter(&intervals)
             .iter()
-            .map(|iv| TrfRecord::for_test(iv.start, iv.end, u16::from(iv.period), iv.score, b""))
+            .map(|iv| {
+                TrfRecord::for_test(
+                    u32::try_from(iv.start).expect("parity fixture coordinates fit u32"),
+                    u32::try_from(iv.end).expect("parity fixture coordinates fit u32"),
+                    u16::from(iv.period),
+                    iv.score,
+                    b"",
+                )
+            })
             .collect();
         out.extend(build_loci(recs, &name, seq, params));
     }

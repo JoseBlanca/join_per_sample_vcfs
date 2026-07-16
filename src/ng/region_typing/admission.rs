@@ -633,88 +633,29 @@ impl Default for SsrAdmissionParams {
 }
 
 // ---------------------------------------------------------------------
-// The candidate — the four fields the policy reads
+// The candidate — retired at B2
 // ---------------------------------------------------------------------
-
-/// One candidate tract inside the port: exactly the four fields `build_loci`
-/// reads off a `TrfRecord`, widened to ng's `u64`.
-///
-/// It exists so the transcription stays line-comparable with production's while
-/// the input type differs, and so the widening from [`RepeatInterval`]'s `u32`
-/// happens **once, at the entry**, rather than scattering `u64::from` through
-/// the policy. Milestone B2 widens `RepeatInterval` itself, at which point the
-/// conversion becomes an identity — this struct still earns its keep as the
-/// "what admission actually needs" statement.
-///
-/// **Coordinates here are 0-based half-open** — the detector's and the slice's
-/// own space. The conversion to ng's 1-based inclusive happens exactly once, at
-/// [`Locus`] construction in [`finish_locus`], which is the one place the
-/// arithmetic does not cancel (spec §4).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Candidate {
-    /// Tract start, inclusive (0-based).
-    start: u64,
-    /// Tract end, exclusive (0-based).
-    end: u64,
-    /// Repeat period (motif length, bp). `u8`, like [`RepeatInterval::period`]
-    /// and [`PeriodRange`] — A1 chose `u16` to mirror `TrfRecord`'s field, but
-    /// `Candidate` is not a `TrfRecord`, and the width had no source and no sink:
-    /// it only bought a `u16::from` at each gate and an unchecked `as u8` at the
-    /// copy-count lookup.
-    period: u8,
-    /// Detector segment score.
-    score: i32,
-}
-
-impl From<RepeatInterval> for Candidate {
-    fn from(iv: RepeatInterval) -> Self {
-        Self {
-            start: u64::from(iv.start),
-            end: u64::from(iv.end),
-            period: iv.period,
-            score: iv.score,
-        }
-    }
-}
-
-impl From<Candidate> for RepeatInterval {
-    /// Back out, for [`Admitted::bundled`] — the caller's own intervals handed
-    /// back, so they must round-trip exactly.
-    ///
-    /// The narrowing is lossless *because* every `Candidate` came from a
-    /// `RepeatInterval` (`Candidate` has no other constructor), so the values
-    /// still fit. `try_into().expect()` rather than `as`: this is precisely where
-    /// B2's widening of `RepeatInterval` to `u64` would make the reasoning stale,
-    /// and a panic naming the field beats a silently truncated coordinate.
-    // PANIC-FREE: both `try_into`s are infallible in practice — every `Candidate`
-    // is built by `Candidate::from(RepeatInterval)` (the only constructor), so the
-    // values round-trip. `expect` over `as` because this is exactly where B2's
-    // widening of `RepeatInterval` would make that reasoning stale, and a panic
-    // naming the field beats a silently truncated coordinate. The crate sets
-    // `fallible_impl_from = "warn"`; this is the documented exception, and B2
-    // retires the conversion entirely.
-    fn from(c: Candidate) -> Self {
-        // Destructured, not field-read: a new `Candidate` field then fails to
-        // compile here rather than being silently dropped from a value whose whole
-        // contract is to round-trip.
-        let Candidate {
-            start,
-            end,
-            period,
-            score,
-        } = c;
-        Self {
-            start: start
-                .try_into()
-                .expect("Candidate::start came from a RepeatInterval, so it fits"),
-            end: end
-                .try_into()
-                .expect("Candidate::end came from a RepeatInterval, so it fits"),
-            period,
-            score,
-        }
-    }
-}
+//
+// A1 introduced a private `Candidate` — "exactly the four fields `build_loci`
+// reads off a `TrfRecord`, widened to ng's `u64`" — because `RepeatInterval` was
+// `u32` and the port needed one widening site rather than a `u64::from` scattered
+// through the policy. Its doc said B2 would make the conversion an identity but
+// that the type would "still earn its keep as the 'what admission actually needs'
+// statement".
+//
+// **It did not.** With `RepeatInterval` at `u64` (spec §4), `Candidate` was
+// field-for-field identical to it, reachable only through two `From` impls that
+// were both no-ops — and one of them carried a `try_into().expect()` and a
+// `fallible_impl_from` exemption for a narrowing that can no longer narrow. That
+// is ceremony asserting a distinction the types no longer have, so the policy now
+// works on `RepeatInterval` directly. `Admitted::bundled` hands the caller's own
+// intervals back with no conversion at all, which is what "handed back verbatim"
+// should have meant all along.
+//
+// **Coordinates are 0-based half-open throughout the policy** — the detector's and
+// the slice's own space. The conversion to ng's 1-based inclusive happens exactly
+// once, at [`Locus`] construction in [`finish_locus`], which is the one place the
+// arithmetic does not cancel (spec §4).
 
 // ---------------------------------------------------------------------
 // The pre-filter
@@ -736,7 +677,8 @@ impl From<Candidate> for RepeatInterval {
 /// higher-period interval overlapping a divisor-period one is the same tract).
 ///
 /// Ported from the test-only `catalog_prefilter`
-/// ([`crate::ng::scanner_parity`]), which had no production home; here it sits
+/// (`ng::scanner_parity` — `#[cfg(test)]`, so not linkable), which had no
+/// production home; here it sits
 /// beside the policy whose ordering makes it necessary (spec §5.1).
 ///
 /// **It reads the same [`MinCopies`] as [`admit`] — since A2, there is one
@@ -782,8 +724,8 @@ pub fn prefilter(intervals: &[RepeatInterval], params: &SsrAdmissionParams) -> V
             // fn docs), and it is what `admit` independently requires anyway.
             iv.period >= params.periods.min()
                 && iv.end > iv.start
-                && (iv.end - iv.start) / u32::from(iv.period)
-                    >= params.min_copies.for_period(iv.period)
+                && (iv.end - iv.start) / u64::from(iv.period)
+                    >= u64::from(params.min_copies.for_period(iv.period))
         })
         .collect();
     // Process low periods first so a fundamental tract is kept and its multiples
@@ -951,9 +893,8 @@ pub fn admit(
     //    `r.end <= bases.len()` stays a SLICE bound, not a contig bound: `r` is an
     //    offset into `bases`, and this guards the slicing two lines down. The
     //    contig end is a different question, and it is asked in `finish_locus`.
-    let mut kept: Vec<Candidate> = recs
+    let mut kept: Vec<RepeatInterval> = recs
         .into_iter()
-        .map(Candidate::from)
         .filter(|r| {
             r.period >= p.periods.min()
                 && r.period <= p.periods.max()
@@ -989,7 +930,9 @@ pub fn admit(
     }
     Admitted {
         loci,
-        bundled: bundled.into_iter().map(RepeatInterval::from).collect(),
+        // No conversion: since B2 these ARE the caller's own intervals, which is
+        // what `Admitted::bundled`'s "handed back verbatim" always claimed.
+        bundled,
     }
 }
 
@@ -1003,7 +946,7 @@ pub fn admit(
 /// [`Locus`] is built at the bottom, once. Spec §4 predicted exactly this: "the
 /// arithmetic cancels … exactly one site does not".
 fn finish_locus(
-    r: &Candidate,
+    r: &RepeatInterval,
     chrom: &str,
     bases: &[u8],
     bases_start: u64,
@@ -1259,7 +1202,7 @@ fn recompute_purity(tract: &[u8], motif: &[u8]) -> f32 {
 /// Two records are "close" (bundle candidates) if any of their start/end
 /// coordinates are within `thresh` bp (GangSTR `is_close`, `check_motif=False`;
 /// chrom equality is implicit — these are one contig's records).
-fn is_close(a: &Candidate, b: &Candidate, thresh: u64) -> bool {
+fn is_close(a: &RepeatInterval, b: &RepeatInterval, thresh: u64) -> bool {
     a.start.abs_diff(b.start) < thresh
         || a.start.abs_diff(b.end) < thresh
         || b.start.abs_diff(a.end) < thresh
@@ -1281,7 +1224,10 @@ fn is_close(a: &Candidate, b: &Candidate, thresh: u64) -> bool {
 /// No source comment of GangSTR's says why bundles are dropped at all (spec §10);
 /// keeping selection and disposal separable is what lets that question be asked
 /// later, with the evidence in hand.
-fn split_bundles(recs: Vec<Candidate>, thresh: u64) -> (Vec<Candidate>, Vec<Candidate>) {
+fn split_bundles(
+    recs: Vec<RepeatInterval>,
+    thresh: u64,
+) -> (Vec<RepeatInterval>, Vec<RepeatInterval>) {
     let mut isolated = Vec::new();
     let mut bundled = Vec::new();
     let n = recs.len();
@@ -1344,7 +1290,7 @@ mod tests {
     }
 
     /// A 0-based half-open interval, the way the scanner emits one.
-    fn iv(start: u32, end: u32, period: u8, score: i32) -> RepeatInterval {
+    fn iv(start: u64, end: u64, period: u8, score: i32) -> RepeatInterval {
         RepeatInterval {
             start,
             end,
@@ -1536,10 +1482,10 @@ mod tests {
     #[test]
     fn split_bundles_sets_aside_whole_clusters_and_keeps_isolated() {
         let recs = vec![
-            Candidate::from(iv(100, 130, 2, 100)),
-            Candidate::from(iv(150, 180, 3, 100)),
-            Candidate::from(iv(200, 230, 2, 100)),
-            Candidate::from(iv(5000, 5030, 2, 100)),
+            (iv(100, 130, 2, 100)),
+            (iv(150, 180, 3, 100)),
+            (iv(200, 230, 2, 100)),
+            (iv(5000, 5030, 2, 100)),
         ];
         let (isolated, bundled) = split_bundles(recs, 50);
         assert_eq!(isolated.len(), 1, "only the isolated D survives");
@@ -1555,9 +1501,9 @@ mod tests {
     #[test]
     fn split_bundles_keeps_all_when_none_close() {
         let recs = vec![
-            Candidate::from(iv(100, 130, 2, 100)),
-            Candidate::from(iv(1000, 1030, 2, 100)),
-            Candidate::from(iv(2000, 2030, 2, 100)),
+            (iv(100, 130, 2, 100)),
+            (iv(1000, 1030, 2, 100)),
+            (iv(2000, 2030, 2, 100)),
         ];
         let (isolated, bundled) = split_bundles(recs, 50);
         assert_eq!(isolated.len(), 3);
@@ -1740,7 +1686,20 @@ mod tests {
     fn as_trf(intervals: &[RepeatInterval]) -> Vec<TrfRecord> {
         intervals
             .iter()
-            .map(|iv| TrfRecord::for_test(iv.start, iv.end, u16::from(iv.period), iv.score, b""))
+            .map(|iv| {
+                // ng's `RepeatInterval` is `u64` (spec §4 / B2); `TrfRecord` is
+                // production's `u32` parse shape. The differential's whole job is to
+                // compare across that seam, so it narrows here — and `expect`s rather
+                // than casting, because a truncated coordinate would compare the wrong
+                // tract and the test would pass while asserting nothing.
+                TrfRecord::for_test(
+                    u32::try_from(iv.start).expect("fixture coordinates fit u32"),
+                    u32::try_from(iv.end).expect("fixture coordinates fit u32"),
+                    u16::from(iv.period),
+                    iv.score,
+                    b"",
+                )
+            })
             .collect()
     }
 
@@ -2306,7 +2265,7 @@ mod tests {
         let mut contig = vec![b'C'; tract_offset];
         contig.extend_from_slice(b"ATATATATATATATAT"); // 16 bp, 8 copies
         contig.resize(total, b'G');
-        let iv = iv(tract_offset as u32, (tract_offset + 16) as u32, 2, 100);
+        let iv = iv(tract_offset as u64, (tract_offset + 16) as u64, 2, 100);
         (contig, iv)
     }
 
@@ -2947,27 +2906,27 @@ mod tests {
     #[test]
     fn is_close_is_strict_at_the_threshold() {
         // Disjoint: only the gap clause is at the boundary.
-        let a = Candidate::from(iv(100, 130, 2, 100));
-        let gap_exactly = Candidate::from(iv(180, 210, 2, 100));
+        let a = iv(100, 130, 2, 100);
+        let gap_exactly = iv(180, 210, 2, 100);
         assert!(
             !is_close(&a, &gap_exactly, 50),
             "a gap of exactly `thresh` is not close (strict <)"
         );
         assert!(
-            is_close(&a, &Candidate::from(iv(179, 209, 2, 100)), 50),
+            is_close(&a, &(iv(179, 209, 2, 100)), 50),
             "a gap of thresh - 1 is close"
         );
 
         // Overlapping, equal length: start-start, gap, and end-end are ALL exactly
         // `thresh`, so this one fixture pins three clauses at once.
-        let long = Candidate::from(iv(100, 200, 2, 100));
-        let shifted = Candidate::from(iv(150, 250, 2, 100));
+        let long = iv(100, 200, 2, 100);
+        let shifted = iv(150, 250, 2, 100);
         assert!(
             !is_close(&long, &shifted, 50),
             "three clauses sit exactly at `thresh`; strict < keeps them all false"
         );
         assert!(
-            is_close(&long, &Candidate::from(iv(149, 249, 2, 100)), 50),
+            is_close(&long, &(iv(149, 249, 2, 100)), 50),
             "shift one closer and all three fire"
         );
     }

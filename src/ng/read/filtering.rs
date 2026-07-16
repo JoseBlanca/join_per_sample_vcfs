@@ -65,7 +65,10 @@ impl Default for ReadFilterConfig {
     fn default() -> Self {
         Self {
             min_mapq: Some(MapQual(DEFAULT_MIN_MAPQ)),
-            min_read_length: Some(Bp(DEFAULT_MIN_READ_LENGTH)),
+            // `DEFAULT_MIN_READ_LENGTH` is production's (`src/bam/`, frozen) and is
+            // `u32`; ng's `Bp` is `u64` since B2 (spec §4). Widening at ng's own
+            // boundary is lossless, and production does not move.
+            min_read_length: Some(Bp(u64::from(DEFAULT_MIN_READ_LENGTH))),
             drop_qc_fail: true,
             drop_duplicate: true,
             // PANIC-FREE: the default fraction is a known-good in-range constant
@@ -222,7 +225,7 @@ fn verdict_post_decode(
 ) -> Result<FilterVerdict, RefSeqError> {
     // #7 — too short (decoded SEQ length). Cheapest: no CIGAR walk, no reference.
     if let Some(min) = config.min_read_length
-        && (read.seq.len() as u32) < min.get()
+        && (read.seq.len() as u64) < min.get()
     {
         return Ok(FilterVerdict::Drop(DropReason::TooShort));
     }
@@ -238,20 +241,21 @@ fn verdict_post_decode(
     // only post-decode one that allocates work; skipped entirely when disabled.
     if let Some(max) = config.max_read_mismatch_fraction {
         let ref_span = cigar_ref_span(&read.cigar);
-        // PANIC-FREE: reference coordinates are `u32` at the RefSeq boundary
-        // (ref_seq.md, Decision 3). `ref_id` indexes the `u32` contig table and a
-        // mapped read's 1-based position fits `u32` for any real contig
-        // (< 4.29 Gbp), so neither conversion truncates on real input. A value
-        // that did not fit would be a corrupt record — failing loudly is the
-        // intended response under the fatal error model, not a silent `as`
-        // truncation that would fetch the wrong window and mis-verdict the read.
+        // PANIC-FREE: **ids stay `u32`, coordinates are now `u64`** (spec §4 / B2).
+        // `ref_id` indexes the `u32` contig table, so that conversion is the only
+        // one that can fail, and a value that did not fit would be a corrupt
+        // record — failing loudly is the intended response under the fatal error
+        // model, not a silent `as` truncation that would fetch the wrong window and
+        // mis-verdict the read. The position and span now *widen* into the RefSeq
+        // boundary, which cannot fail at all: B2 moved that surface to `u64`, so the
+        // `u32::try_from(read.pos)` this replaced — which could reject a legal
+        // position on a >4 Gb contig — is simply gone.
         let contig = ContigId(u32::try_from(read.ref_id).expect("ref_id fits u32"));
-        let pos = u32::try_from(read.pos).expect("read position fits u32");
         // Reads raw (un-canonicalised) bytes, matching production's
         // `RawContigRefCache` path so the ported filter behaves identically.
         // A zero span yields an empty slice → `read_exceeds_mismatch_fraction`
         // has no comparable bases and keeps the read (same as production).
-        reference.fetch_raw_into(contig, pos, ref_span, ref_buf)?;
+        reference.fetch_raw_into(contig, read.pos, u64::from(ref_span), ref_buf)?;
         if read_exceeds_mismatch_fraction(
             &read.cigar,
             &read.seq,
@@ -695,7 +699,10 @@ mod tests {
     fn default_config_reproduces_the_production_filter_policy() {
         let config = ReadFilterConfig::default();
         assert_eq!(config.min_mapq, Some(MapQual(DEFAULT_MIN_MAPQ)));
-        assert_eq!(config.min_read_length, Some(Bp(DEFAULT_MIN_READ_LENGTH)));
+        assert_eq!(
+            config.min_read_length,
+            Some(Bp(u64::from(DEFAULT_MIN_READ_LENGTH)))
+        );
         assert!(config.drop_qc_fail);
         assert!(config.drop_duplicate);
         assert_eq!(
