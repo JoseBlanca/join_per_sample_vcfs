@@ -451,10 +451,22 @@ holds ng's `Locus` directly, `TypedRegion` already carries the region, and `Read
 ng's `Locus` (`read_preparation_ssr.md` §8). **The workaround was bigger than the fix** — and the fix
 turned out to be cheaper still, since owning the type costs less than rebasing someone else's.
 
-**What ng reuses from `src/ssr/` unchanged.** `Motif` ([ssr/types.rs:36](../../../../src/ssr/types.rs))
-is already `pub(crate)`, carries **no coordinates and no width**, and so has nothing to rebase — the
-Revision's "reuse where it costs production nothing" case exactly. ng uses it as-is. `Locus` is the
-opposite: coordinates and width are all it is.
+**What ng reuses from `src/ssr/` unchanged: nothing in this step, as it turns out.** `Locus` is
+obviously ng's — coordinates and width are all it is. `Motif`
+([ssr/types.rs:36](../../../../src/ssr/types.rs)) looked like the opposite case, and this spec called
+it *"the Revision's 'reuse where it costs production nothing' case exactly"* — it is `pub(crate)`,
+and carries no coordinates and no width, so there is nothing to rebase.
+
+*(Corrected 2026-07-16, A1 review — the premise was true and **the conclusion was wrong**.* `Motif`
+*is `pub(crate)`; ng's `Locus` is `pub` and returns one, which trips rustc's `private_interfaces`
+lint. The escapes were: widen it in `src/ssr/types.rs` — **touching production, forbidden**; demote
+ng's whole admission surface to `pub(crate)` — bends the ng-sibling convention and buys `dead_code`
+warnings for every item until its Milestone-D consumer exists; or port 40 coordinate-free lines. So
+reuse did **not** cost production nothing — it cost a visibility compromise, which is the coupling
+"a fresh ng caller from scratch" exists to avoid. **ng ports `Motif` too.** The dividend: ng's
+`region_typing` now names nothing from `src/ssr/` outside its `#[cfg(test)]` differential. The
+general lesson for the Revision's rule: "costs production nothing" has to be checked against
+**visibility**, not just against coordinates and width.)*
 
 **`TypedRegion` carries its 1-based region as a struct field**, converted once at construction — one
 span, one base, one place. Rejected: repeating it per variant with a `region()` accessor over four,
@@ -531,7 +543,7 @@ meaningful, and what the port-fidelity test pins.
 |---|---|---|
 | purity floor, score gate, flank bp, bundle radius | `CatalogParams` — real parameters | parameters |
 | **period scope** (`MIN_PERIOD` = 2, `MAX_PERIOD` = 6) | **hardcoded `const`** | **parameters** |
-| **copy floor per period** (`copy_number_floor`) | **hardcoded `const fn`** — and the pre-filter has a *second*, disagreeing table (§10) | **one parameter table, reconciled** |
+| **copy floor per period** (`copy_number_floor`) | **hardcoded `const fn`** — and the pre-filter has a *second copy* of it (§10) | **one parameter table** |
 
 **The two dimensions §5.2 wants measured — period and length — are precisely the two the catalog
 hardcodes.** A config that cannot express the question is not a config, so ng's copy makes them
@@ -587,9 +599,16 @@ port-fidelity test, which is itself `#[cfg(test)]`.
 
 **A trap in the inherited defaults:** `CatalogParams::default()` sets `min_score: 0`, and the field's
 comment says why — *"leaves filtering to trf-mod's own `-s 30`"*. There is no `-s 30` in ng, and
-`RepeatInterval::score` is a Ruzzo–Tompa segment total, not a TRF score. So carrying that default over
-ships **no score gate**. Acceptable — the copy and purity floors are the real gates, and the 16/16
-parity ran exactly this way — but it must be known, not inherited by accident. ng's copy states it.
+`RepeatInterval::score` is a Ruzzo–Tompa segment total, not a TRF score — the two are not on the same
+scale, so a threshold carried across from TRF would not mean there what it meant here. So at
+`Default` the gate **never fires**: Ruzzo–Tompa emits only positive-scoring segments (`score = r - l >
+0`), so `score >= 0` cannot reject anything the scanner produces. Acceptable — the copy and purity
+floors are the real gates, and the 16/16 parity ran exactly this way — but it must be known, not
+inherited by accident. ng's copy states it on the field, and pins it with a test.
+
+*(Corrected 2026-07-16, A1 review: this said "ships **no score gate**". It ships `score >= 0`, which
+is a no-op **for scanner output** but is not nothing — a negative score is dropped. The test written
+to prove the original claim disproved it.)*
 
 ### 5.1 Where the pre-filter lives
 
@@ -858,7 +877,7 @@ contig's end abutting one at the next's start (transition arithmetic).
 | the pre-filter | `catalog_prefilter` ([scanner_parity.rs:59](../../../../src/ssr/catalog/scanner_parity.rs)) | **copied into ng**, beside ng's `admit` (§5.1); production keeps its test-only copy |
 | admission knobs | `CatalogParams` ([catalog/mod.rs:42](../../../../src/ssr/catalog/mod.rs)) | **ng's own `SsrAdmissionParams`** — same defaults, plus the hardcoded period scope + copy floors as real knobs; no separate `bundle_threshold` (§2.4) |
 | the STR locus | `ssr::types::Locus` ([types.rs:136](../../../../src/ssr/types.rs)) | **copied into ng**, born 1-based/`u64` (§4). Production's stays 0-based/`u32` |
-| the motif | `ssr::types::Motif` ([types.rs:36](../../../../src/ssr/types.rs)) | **reused as-is** — `pub(crate)`, no coordinates, no width, nothing to change (§4) |
+| the motif | `ssr::types::Motif` ([types.rs:36](../../../../src/ssr/types.rs)) | **copied into ng** — reuse looked free (no coordinates, no width) but production's is `pub(crate)` and would leak through ng's `pub` `Locus` (§4, corrected at the A1 review) |
 | what to walk | `RegionSet`/`Region`/`ContigBounds` ([regions.rs](../../../../src/regions.rs)) | **wrapped, read-only**, by `GenomeRegions` (§2.5); it already parses/coalesces/clamps BED. `regions.rs` does not move |
 | reference bases | `WindowedRefSeq` ([ng/ref_seq.rs](../../../../src/ng/ref_seq.rs)) | + a raw path (§6) and a `contigs()` accessor |
 | the iterator seam | `ReadFilter` ([read_filtering.md](read_filtering.md) §5) | the shape to match |
@@ -899,8 +918,16 @@ still has to be right is ng's port — and §8.0 pins it against production dire
 - **`ssr_catalog.md`** — **no changes.** The earlier draft's three (`u64` widening, dropping
   `bundle_threshold`, hoisting `MIN_PERIOD`/`MAX_PERIOD`/`copy_number_floor` into knobs) all now land
   in ng's own `SsrAdmissionParams` instead (§5). The catalog keeps its hardcoded rules, its `u32`, and
-  its two disagreeing copy-floor tables; ng's copy reconciles them **on ng's side only**. The catalog
+  its two copy-floor tables; ng's copy folds them into one **on ng's side only**. The catalog
   documents production, and production did not move.
+
+  *(Corrected 2026-07-16, A1 review: earlier drafts of this spec called the two tables
+  **disagreeing**, and A1's code inherited the word. They do not disagree — they give the same floor
+  for every period either can reach. Their one numeric difference is period 1 (10 vs 3), and period 1
+  reaches neither: the pre-filter gates `period >= 2` and `MIN_PERIOD` drops it again. The duplication
+  is **structural, not behavioural**, so A2 deletes a copy rather than resolving a conflict — a
+  smaller and better-understood job than this spec had been describing. Pinned by
+  `the_two_copy_floor_tables_agree_on_every_reachable_period`.)*
 - **`ref_seq.md`** — the parked raw-from-windowed YAGNI has fired (§6); `u32` → `u64` (§4). `src/ng/`,
   ours to change.
 - **`ng_step_interfaces.md`** — `CallerRecipe` loses its `router` field (§6). Its

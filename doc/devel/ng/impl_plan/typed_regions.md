@@ -33,9 +33,10 @@ resolved in spec §10, not an interface question.
 > one implementation to itself.
 
 This plan touches **no file outside `src/ng/`.** Production (`src/ssr/`, `src/regions.rs`,
-`Containerfile`) is read-only throughout; the only production items ng names are `ssr::types::Motif`
-(reused as-is), `RegionSet` (wrapped read-only), and — in test code only — `build_loci` +
-`TrfRecord::for_test` + `CatalogReader`, as oracles.
+`Containerfile`) is read-only throughout; the only production items ng names are `RegionSet` (wrapped
+read-only) and — in test code only — `build_loci` + `TrfRecord::for_test` + `CatalogReader`, as
+oracles. (`ssr::types::Motif` was to be reused as-is; A1 found it is `pub(crate)`, so a `pub` ng type
+cannot return it, and ported it instead — spec §4.)
 
 ---
 
@@ -119,10 +120,11 @@ step. **Production does not move.**
 knobs, windowed admission — now landing in ng instead of `src/ssr/`. Production is read-only here;
 it appears **only** in `#[cfg(test)]` code, as the oracle.*
 
-**A1. ng's `Locus` + the faithful transcription of `build_loci`, with the differential that pins it.**  ☐
+**A1. ng's `Locus` + the faithful transcription of `build_loci`, with the differential that pins it.**  ✅
 Scaffold `src/ng/region_typing/` (`mod.rs` + `admission.rs`, wired into `ng/mod.rs`). ng's `Locus`:
-production's fields, **1-based inclusive and `u64`**, private fields + validating `new`, reusing
-`ssr::types::Motif` as-is. Then transcribe `build_loci` → `admit` **at its current shape** —
+production's fields, **1-based inclusive and `u64`**, private fields + validating `new`. (`Motif` was
+to be reused as-is; it is `pub(crate)`, so a `pub` ng `Locus` cannot return it — ported too, spec §4.)
+Then transcribe `build_loci` → `admit` **at its current shape** —
 whole-contig, `Vec<RepeatInterval>` in place of `Vec<TrfRecord>` (it only ever reads
 `start/end/period/score`), `SsrAdmissionParams` starting as a straight copy of `CatalogParams`'s
 fields — carrying `drop_bundles`/`is_close`/`minimal_trim`/purity-recompute/`ref_bytes`-embed
