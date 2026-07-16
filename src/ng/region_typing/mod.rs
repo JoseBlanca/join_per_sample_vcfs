@@ -32,7 +32,7 @@ pub mod admission;
 use std::path::Path;
 
 use crate::ng::ref_seq::RefSeqError;
-use crate::ng::tandem_repeat::{PeriodRange, RepeatInterval, ScanParams};
+use crate::ng::tandem_repeat::{PeriodRange, RepeatInterval, ScanParams, find_tandem_repeats};
 use crate::ng::types::{Bp, ContigId, GenomeRegion, Position};
 use crate::regions::{BedError, ContigBounds, RegionSet};
 use admission::{Locus, SsrAdmissionParams};
@@ -302,6 +302,211 @@ pub struct TypedRegionCounts {
 }
 
 // ---------------------------------------------------------------------
+// The walk — resident (D1)
+// ---------------------------------------------------------------------
+
+/// Cut one whole contig into typed regions, holding it entirely in memory.
+///
+/// **The five steps** (spec §2.1), and the first three are ng's port of the
+/// catalog's implementation (spec §5):
+///
+/// 1. **Detect** — [`find_tandem_repeats`] → raw, overlapping candidates. No policy.
+/// 2. **Clean** — [`admission::prefilter`]: per-period copy floor, then
+///    period-multiple redundancy. **Not optional** (spec §5b).
+/// 3. **Admit** — [`admission::admit`] → the STR loci *and* the tracts it set
+///    aside as bundle members.
+/// 4. **Cap** — merge the cleaned intervals into coverage runs; a run over
+///    `max_repeat_len` is a satellite. Admitted loci inside one are dropped.
+/// 5. **Partition** — emit `SsrLocus` at each surviving tract, `Satellite` at each
+///    run, `Generic` across everything else.
+///
+/// # Why this exists when the windowed walk is what ships
+///
+/// It is **D3's oracle** (impl plan, Milestone D): the windowed walk is proven by
+/// *matching this*, which is exactly the window-invariance spec §2.3 demands.
+/// Simplest implementation first, as the next one's yardstick — so a windowing bug
+/// shows up as a disagreement with a version that has no windows to get wrong.
+///
+/// # Not yet
+///
+/// `SsrBundle` is D2's. Until then the cluster members admission sets aside fall
+/// into `Generic`, which is where a repeat admission turns down for *any* reason
+/// belongs (spec §2.2) — so the partition is already complete and already correct;
+/// D2 only makes it *sharper*, by naming a region `Generic` currently lumps in.
+pub fn partition_resident(
+    chrom: &str,
+    contig: ContigId,
+    bases: &[u8],
+    config: &TypedRegionConfig,
+) -> Vec<TypedRegion> {
+    let contig_len = bases.len() as u64;
+    if contig_len == 0 {
+        // A zero-length contig has no 1-based position to cover, so it has no
+        // regions. `GenomeRegions` drops these before the walk anyway (C3); this
+        // keeps the function total for a direct caller.
+        return Vec::new();
+    }
+
+    // 1. Detect.
+    let raw = find_tandem_repeats(bases, config.periods, &config.scan);
+    // 2. Clean.
+    let cleaned = admission::prefilter(&raw, &config.admission);
+    // 3. Admit — whole-contig is the degenerate window (spec §5a).
+    let admitted = admission::admit(
+        cleaned.clone(),
+        chrom,
+        bases,
+        Position(1),
+        Bp(contig_len),
+        &config.admission,
+    );
+    // 4. Cap: coverage runs over the *cleaned* intervals, then the satellite test.
+    //
+    //    Over the cleaned set, not the raw one (spec §2.4, §8): the raw scanner is
+    //    deliberately permissive, so capping its coverage would let detector noise
+    //    declare a satellite and silently swallow the real loci underneath it.
+    //
+    //    **Known untested.** Mutation says `coverage_runs(&raw)` passes the whole
+    //    suite, including `.cat` parity — because `raw ⊇ cleaned`, the two differ
+    //    only where raw-only coverage runs ≥ `max_repeat_len` *contiguously*, and
+    //    no fixture here produces that (the golden's 534 raw intervals on ctg1 do
+    //    not union past 1 kb, and the crafted fixtures' noise is adjacent to
+    //    nothing). So this ordering rests on inspection and on the spec's argument,
+    //    not on a test — stated because an untested claim that reads like a tested
+    //    one is worse than either. A discriminating fixture wants ≥ 1 kb of
+    //    contiguous low-copy noise abutting a sub-cap array; if the routing
+    //    experiments ever build one, pin it here.
+    let runs = coverage_runs(&cleaned);
+    let max_repeat_len = config.max_repeat_len.get();
+
+    // 5. Partition. Collect the non-generic features in coordinate order, then fill
+    //    every gap with `Generic`.
+    let mut features: Vec<TypedRegion> = Vec::new();
+    for run in &runs {
+        if run.len() > max_repeat_len {
+            features.push(TypedRegion {
+                region: GenomeRegion {
+                    contig,
+                    start: Position(run.start),
+                    end: Position(run.end),
+                },
+                kind: RegionKind::Satellite,
+            });
+        }
+    }
+    for locus in admitted.loci {
+        let span = GenomeRegion {
+            contig,
+            start: Position(locus.start()),
+            end: Position(locus.end()),
+        };
+        // A satellite array is typed as one object, not searched for loci inside
+        // it (spec §2.1) — so an admitted locus swallowed by one is dropped, and
+        // the one-label-per-base rule needs no tie-break.
+        if runs
+            .iter()
+            .any(|r| r.len() > max_repeat_len && r.contains(span.start))
+        {
+            continue;
+        }
+        features.push(TypedRegion {
+            region: span,
+            kind: RegionKind::SsrLocus(locus),
+        });
+    }
+    features.sort_by_key(|f| f.region.start);
+
+    fill_generic_gaps(features, contig, contig_len)
+}
+
+/// A merged run of repeat coverage, 1-based inclusive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CoverageRun {
+    start: u64,
+    end: u64,
+}
+
+impl CoverageRun {
+    fn len(self) -> u64 {
+        self.end - self.start + 1
+    }
+    fn contains(self, pos: Position) -> bool {
+        self.start <= pos.get() && pos.get() <= self.end
+    }
+}
+
+/// Union the intervals into maximal runs of covered bases, 1-based inclusive.
+///
+/// Overlapping **and abutting** runs merge: two tracts that touch cover a
+/// contiguous stretch of repeat, and whether that stretch is a satellite is a
+/// question about the stretch, not about how the detector happened to split it.
+///
+/// Input is `RepeatInterval`'s 0-based half-open; output is ng's 1-based
+/// inclusive, so `[s, e)` becomes `[s + 1, e]` — the same one conversion `admit`
+/// makes (spec §4).
+fn coverage_runs(intervals: &[RepeatInterval]) -> Vec<CoverageRun> {
+    let mut spans: Vec<CoverageRun> = intervals
+        .iter()
+        .filter(|iv| iv.end > iv.start)
+        .map(|iv| CoverageRun {
+            start: iv.start + 1,
+            end: iv.end,
+        })
+        .collect();
+    spans.sort_by_key(|s| (s.start, s.end));
+
+    let mut out: Vec<CoverageRun> = Vec::new();
+    for s in spans {
+        match out.last_mut() {
+            // `s.start <= last.end + 1` merges abutting runs as well as
+            // overlapping ones.
+            Some(last) if s.start <= last.end + 1 => last.end = last.end.max(s.end),
+            _ => out.push(s),
+        }
+    }
+    out
+}
+
+/// Fill every gap between `features` with `Generic`, so the result tiles
+/// `[1, contig_len]` exactly.
+///
+/// **Maximality is a correctness requirement here, not tidiness** (spec §2.3): a
+/// generic region is territory the pileup mints loci *inside*, so its reach is
+/// bounded by the region it was handed. Split a run at *p* and an indel spanning
+/// *p* is callable by neither half — it never appears, and nothing fails. Hence
+/// one `Generic` per gap, however long.
+///
+/// `features` must be coordinate-ordered and non-overlapping.
+fn fill_generic_gaps(
+    features: Vec<TypedRegion>,
+    contig: ContigId,
+    contig_len: u64,
+) -> Vec<TypedRegion> {
+    let generic = |start: u64, end: u64| TypedRegion {
+        region: GenomeRegion {
+            contig,
+            start: Position(start),
+            end: Position(end),
+        },
+        kind: RegionKind::Generic,
+    };
+
+    let mut out = Vec::with_capacity(features.len() * 2 + 1);
+    let mut pos = 1u64;
+    for f in features {
+        if f.region.start.get() > pos {
+            out.push(generic(pos, f.region.start.get() - 1));
+        }
+        pos = f.region.end.get() + 1;
+        out.push(f);
+    }
+    if pos <= contig_len {
+        out.push(generic(pos, contig_len));
+    }
+    out
+}
+
+// ---------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------
 
@@ -504,6 +709,395 @@ mod tests {
         assert_eq!(
             (regions[1].start, regions[1].end),
             (Position(1), Position(5))
+        );
+    }
+
+    // ---- D1: the resident partition -------------------------------------
+
+    /// **The invariant — the acceptance test** (spec §2.3).
+    ///
+    /// Within a walked region the typed regions are **contiguous**
+    /// (`start == prev.end + 1`), **non-overlapping**, **complete** (their union is
+    /// the whole span), and **maximal** (no two consecutive share a kind).
+    ///
+    /// One property: *concatenating the regions reconstructs what was asked for,
+    /// exactly.* Every way this design fails shows up as a violation — a rejected
+    /// repeat left as a hole breaks completeness; a flank counted as ownership
+    /// breaks non-overlap; a generic run split at a window edge breaks maximality.
+    #[track_caller]
+    fn assert_partitions(regions: &[TypedRegion], contig: ContigId, contig_len: u64, case: &str) {
+        assert!(
+            !regions.is_empty(),
+            "{case}: a non-empty contig has regions"
+        );
+        let mut expected_start = 1u64;
+        let mut prev_kind: Option<std::mem::Discriminant<RegionKind>> = None;
+        for r in regions {
+            assert_eq!(r.region.contig, contig, "{case}: contig");
+            assert_eq!(
+                r.region.start.get(),
+                expected_start,
+                "{case}: gap or overlap at {} (expected {expected_start}); regions: {regions:#?}",
+                r.region.start.get()
+            );
+            assert!(
+                r.region.end >= r.region.start,
+                "{case}: empty region {:?}",
+                r.region
+            );
+            let kind = std::mem::discriminant(&r.kind);
+            assert_ne!(
+                Some(kind),
+                prev_kind,
+                "{case}: two consecutive regions share a kind at {} — MAXIMALITY. \
+                 For Generic this is a correctness bug, not untidiness: the pileup \
+                 mints loci inside a Generic region, so a split run makes an indel \
+                 across the join callable by neither half.",
+                r.region.start.get()
+            );
+            prev_kind = Some(kind);
+            expected_start = r.region.end.get() + 1;
+        }
+        assert_eq!(
+            expected_start - 1,
+            contig_len,
+            "{case}: the partition must cover exactly [1, {contig_len}] — COMPLETENESS"
+        );
+    }
+
+    /// A contig with one clean isolated (AT)*8 tract: Generic / SsrLocus / Generic.
+    /// The smallest case that shows the partition doing its job.
+    #[test]
+    fn a_lone_tract_partitions_as_generic_locus_generic() {
+        // 60 bp of unique sequence either side, so the default 50 bp flanks fit.
+        let mut bases = b"CGCACGCACGCACGCACGCACGCACGCACGCACGCACGCACGCACGCACGCACGCACGCA".to_vec();
+        let tract_start_0 = bases.len();
+        bases.extend_from_slice(b"ATATATATATATATAT"); // 8 copies
+        bases.extend_from_slice(b"CGCACGCACGCACGCACGCACGCACGCACGCACGCACGCACGCACGCACGCACGCACGCA");
+        let len = bases.len() as u64;
+
+        let regions =
+            partition_resident("chr1", ContigId(0), &bases, &TypedRegionConfig::default());
+        assert_partitions(&regions, ContigId(0), len, "lone tract");
+
+        let kinds: Vec<_> = regions
+            .iter()
+            .map(|r| match &r.kind {
+                RegionKind::SsrLocus(_) => "locus",
+                RegionKind::SsrBundle { .. } => "bundle",
+                RegionKind::Generic => "generic",
+                RegionKind::Satellite => "satellite",
+            })
+            .collect();
+        assert_eq!(kinds, vec!["generic", "locus", "generic"]);
+
+        // And the locus is where the tract is — 1-based, so 0-based + 1.
+        let RegionKind::SsrLocus(l) = &regions[1].kind else {
+            unreachable!()
+        };
+        assert_eq!(l.start(), tract_start_0 as u64 + 1);
+        assert_eq!(l.motif().as_bytes(), b"AT");
+        assert_eq!(regions[1].region.start.get(), l.start(), "region == tract");
+    }
+
+    /// A 2 kb array is **one** `Satellite`, and the locus inside it is **swallowed**
+    /// — typed as one object, not searched for loci inside (spec §2.1).
+    ///
+    /// **The swallow has to be checked positively**, and this test's first version
+    /// did not: it used `vec![b'C'; 60]` "flanks", which are a period-1 homopolymer
+    /// — so the scanner found one period-2 tract spanning the *whole contig*, which
+    /// starts at base 1, has no left flank, and was dropped. Nothing was swallowed
+    /// because nothing was ever admitted, and the assertion passed for entirely the
+    /// wrong reason (mutation caught it: "don't drop loci inside a satellite"
+    /// survived). The control below is the fix: at the same settings but a cap
+    /// above the array, the same bases DO yield a locus.
+    #[test]
+    fn a_long_array_is_one_satellite_and_swallows_the_locus_inside_it() {
+        let mut bases = filler(60);
+        for _ in 0..1000 {
+            bases.extend_from_slice(b"AT"); // 2 kb, over the 1 kb cap
+        }
+        bases.extend(filler(60));
+        let len = bases.len() as u64;
+        let config = TypedRegionConfig::default();
+
+        let regions = partition_resident("chr1", ContigId(0), &bases, &config);
+        assert_partitions(&regions, ContigId(0), len, "satellite");
+
+        let satellites: Vec<_> = regions
+            .iter()
+            .filter(|r| matches!(r.kind, RegionKind::Satellite))
+            .collect();
+        assert_eq!(satellites.len(), 1, "one array, ONE satellite region");
+        assert!(satellites[0].region.len() >= 2000);
+        assert!(
+            !regions
+                .iter()
+                .any(|r| matches!(r.kind, RegionKind::SsrLocus(_))),
+            "the locus is swallowed by the satellite — the §2.4 cost, made visible"
+        );
+
+        // **The control.** Raise the cap above the array and the SAME bases admit a
+        // locus — so the absence above is the cap doing its job, not admission
+        // quietly rejecting the tract for some unrelated reason. This is also what
+        // makes `max_repeat_len` a parameter rather than a fact of nature (spec §10).
+        let uncapped = TypedRegionConfig {
+            max_repeat_len: Bp(10_000),
+            ..config
+        };
+        let regions = partition_resident("chr1", ContigId(0), &bases, &uncapped);
+        assert_partitions(&regions, ContigId(0), len, "satellite, uncapped");
+        assert_eq!(
+            regions
+                .iter()
+                .filter(|r| matches!(r.kind, RegionKind::SsrLocus(_)))
+                .count(),
+            1,
+            "above the cap the very same tract IS a locus"
+        );
+        assert!(
+            !regions
+                .iter()
+                .any(|r| matches!(r.kind, RegionKind::Satellite)),
+            "and nothing exceeds the raised cap, so no satellite"
+        );
+    }
+
+    /// Coverage runs merge **abutting** tracts, not only overlapping ones: two
+    /// tracts that touch cover a contiguous stretch of repeat, and whether *that*
+    /// is a satellite is a question about the stretch, not about where the detector
+    /// happened to split it.
+    ///
+    /// Untested until mutation said so — no other fixture puts two runs exactly
+    /// end to end.
+    #[test]
+    fn abutting_coverage_runs_merge_into_one() {
+        let iv = |start, end, period| RepeatInterval {
+            start,
+            end,
+            period,
+            score: 1,
+        };
+        // 1-based: [1,10] and [11,20] touch → one run [1,20]. [30,40] is separate.
+        let runs = coverage_runs(&[iv(0, 10, 2), iv(10, 20, 3), iv(29, 40, 2)]);
+        assert_eq!(
+            runs,
+            vec![
+                CoverageRun { start: 1, end: 20 },
+                CoverageRun { start: 30, end: 40 },
+            ],
+            "abutting runs merge; a gap of even one base does not"
+        );
+        assert_eq!(runs[0].len(), 20, "inclusive length");
+
+        // The consequence, and the reason the merge exists: two 600 bp tracts that
+        // touch are a 1200 bp run — a satellite — though neither tract is.
+        let runs = coverage_runs(&[iv(0, 600, 2), iv(600, 1200, 2)]);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(
+            runs[0].len(),
+            1200,
+            "over the 1 kb cap, though neither tract alone is"
+        );
+    }
+
+    /// Aperiodic filler — **not** a homopolymer, and that matters.
+    ///
+    /// A `vec![b'C'; 60]` "flank" is a period-1 tract, and worse: with an `(AT)n`
+    /// array between two of them the scanner finds a **single period-2 tract
+    /// spanning the whole contig**, which then starts at base 1, has no left flank,
+    /// and is dropped — so a test asserting "no locus here" passes for entirely the
+    /// wrong reason. This filler has no repeat at any period 1..=6 (see
+    /// `a_repeat_free_contig_is_one_generic_region`, which is one `Generic` over
+    /// it).
+    fn filler(n: usize) -> Vec<u8> {
+        b"ACGTTGCAAGCTTGCA"
+            .iter()
+            .copied()
+            .cycle()
+            .take(n)
+            .collect()
+    }
+
+    /// A repeat-free contig is exactly one `Generic` region. Maximality: not many.
+    #[test]
+    fn a_repeat_free_contig_is_one_generic_region() {
+        let bases = b"ACGTTGCAAGCTTGCAACGTTGCAAGCTTGCAACGTTGCAAGCTTGCA".repeat(3);
+        let len = bases.len() as u64;
+        let regions =
+            partition_resident("chr1", ContigId(0), &bases, &TypedRegionConfig::default());
+
+        assert_partitions(&regions, ContigId(0), len, "repeat-free");
+        assert_eq!(regions.len(), 1, "one Generic, not a run of them");
+        assert!(matches!(regions[0].kind, RegionKind::Generic));
+        assert_eq!(regions[0].region.start, Position(1));
+        assert_eq!(regions[0].region.end, Position(len));
+    }
+
+    /// **A rejected repeat is generic territory, not a hole** (spec §2.2). A
+    /// low-copy tract admission turns down must still be *covered* — completeness
+    /// is what the invariant is for.
+    #[test]
+    fn a_rejected_repeat_leaves_no_hole() {
+        // (AT)*3 — below the period-2 copy floor of 5.
+        let mut bases = vec![b'C'; 60];
+        bases.extend_from_slice(b"ATATAT");
+        bases.extend(std::iter::repeat_n(b'G', 60));
+        let len = bases.len() as u64;
+
+        let regions =
+            partition_resident("chr1", ContigId(0), &bases, &TypedRegionConfig::default());
+        assert_partitions(&regions, ContigId(0), len, "rejected repeat");
+        assert!(
+            !regions
+                .iter()
+                .any(|r| matches!(r.kind, RegionKind::SsrLocus(_))),
+            "below the copy floor: not a locus"
+        );
+        assert_eq!(
+            regions.len(),
+            1,
+            "and the whole contig is Generic — no hole"
+        );
+    }
+
+    /// A tract at position 1 has no left flank, so it is not genotypeable and lands
+    /// in `Generic` (spec §8's edge list). The partition still tiles from base 1.
+    #[test]
+    fn a_tract_at_position_one_is_generic_and_the_partition_still_starts_at_one() {
+        let mut bases = b"ATATATATATATATAT".to_vec();
+        bases.extend(std::iter::repeat_n(b'C', 80));
+        let len = bases.len() as u64;
+
+        let regions =
+            partition_resident("chr1", ContigId(0), &bases, &TypedRegionConfig::default());
+        assert_partitions(&regions, ContigId(0), len, "tract at base 1");
+        assert_eq!(regions[0].region.start, Position(1));
+        assert!(
+            !regions
+                .iter()
+                .any(|r| matches!(r.kind, RegionKind::SsrLocus(_))),
+            "no left flank to anchor against: not a locus"
+        );
+    }
+
+    #[test]
+    fn an_empty_contig_has_no_regions() {
+        assert!(
+            partition_resident("chr1", ContigId(0), b"", &TypedRegionConfig::default()).is_empty()
+        );
+    }
+
+    /// **`.cat` parity — the oracle, and D1's real bar** (spec §8.1).
+    ///
+    /// The walk at the catalog's settings must reproduce the catalog: every golden
+    /// locus is present, **or absent *and* inside a satellite run**. A strict
+    /// subset, and that shape is *earned* by spec §2.4's ordering — the cap applies
+    /// to the *cleaned* coverage, after admission, so the difference can only go
+    /// one way. Capping raw coverage would make it bidirectional and untestable.
+    ///
+    /// **The oracle is the committed trf-mod-built golden catalog** — a different
+    /// detector, a different code path, nothing ng touched. Its detector difference
+    /// is already characterised (`scanner_parity`: 16/16, 15 exact, one ±1–2 bp
+    /// boundary/phase wobble, one genuine scanner-only locus trf-mod's significance
+    /// model rejected), so it is a yardstick rather than a confound — hence overlap
+    /// matching, inherited from `scanner_parity` for exactly that reason.
+    ///
+    /// What this proves: the plumbing — the scan, the pre-filter, the admission
+    /// call, the coordinate arithmetic. What it does **not** prove: that the
+    /// catalog's settings are *right* (spec §5). A fixed-config regression test,
+    /// pinned to those settings explicitly rather than to whatever `Default` is, or
+    /// it starts failing the first time someone moves a floor and reads a *result*
+    /// as a bug.
+    #[test]
+    fn the_resident_partition_reproduces_the_golden_catalog() {
+        use crate::ssr::catalog::io::CatalogReader;
+        use std::fs::File;
+        use std::io::BufReader;
+        use std::path::Path;
+
+        let fixture = |name: &str| {
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests")
+                .join("data")
+                .join("tandem_repeat")
+                .join(name)
+        };
+
+        // The golden catalog and the settings it was built at — read, never
+        // written (production is frozen).
+        let mut golden_reader =
+            CatalogReader::new(File::open(fixture("golden.ssr_catalog.bed.gz")).unwrap()).unwrap();
+        let cat_params = golden_reader.header().params.clone();
+        let golden = golden_reader.read_all().unwrap();
+        assert!(!golden.is_empty(), "the golden catalog must have loci");
+
+        // ng's walk at the SAME settings, pinned explicitly.
+        let config = TypedRegionConfig {
+            admission: SsrAdmissionParams {
+                min_purity: cat_params.min_purity,
+                min_score: cat_params.min_score,
+                flank_bp: u64::from(cat_params.flank_bp),
+                ..SsrAdmissionParams::default()
+            },
+            ..TypedRegionConfig::default()
+        };
+
+        let file = File::open(fixture("synthetic_ref.fa")).unwrap();
+        let mut reader = noodles_fasta::io::Reader::new(BufReader::new(file));
+        let mut ours: Vec<(String, u64, u64)> = Vec::new();
+        let mut satellites: Vec<(String, u64, u64)> = Vec::new();
+        for (idx, result) in reader.records().enumerate() {
+            let rec = result.unwrap();
+            let name = String::from_utf8_lossy(rec.name()).into_owned();
+            let bases = rec.sequence().as_ref();
+            let regions = partition_resident(&name, ContigId(idx as u32), bases, &config);
+
+            // The partition must hold on REAL sequence, not only the crafted
+            // fixtures above.
+            assert_partitions(
+                &regions,
+                ContigId(idx as u32),
+                bases.len() as u64,
+                &format!("golden contig {name}"),
+            );
+
+            for r in &regions {
+                match &r.kind {
+                    RegionKind::SsrLocus(l) => ours.push((name.clone(), l.start(), l.end())),
+                    RegionKind::Satellite => {
+                        satellites.push((name.clone(), r.region.start.get(), r.region.end.get()))
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert!(!ours.is_empty(), "the walk must find loci");
+
+        // Overlap match. Production's `Locus` is 0-based half-open, ng's is 1-based
+        // inclusive, so production's `[s, e)` is ng's `[s + 1, e]` (spec §4).
+        let overlaps =
+            |a: &(String, u64, u64), b: &(String, u64, u64)| a.0 == b.0 && a.1 <= b.2 && b.1 <= a.2;
+        let mut missed = Vec::new();
+        for g in &golden {
+            let g1 = (
+                g.chrom().to_string(),
+                u64::from(g.start()) + 1,
+                u64::from(g.end()),
+            );
+            if !ours.iter().any(|o| overlaps(&g1, o)) {
+                // Absent is legal ONLY inside a satellite run — the one expected
+                // divergence (the catalog applies no cap; the walk does).
+                if !satellites.iter().any(|s| overlaps(&g1, s)) {
+                    missed.push(format!("{}:{}-{}", g1.0, g1.1, g1.2));
+                }
+            }
+        }
+        assert!(
+            missed.is_empty(),
+            "every golden locus must be present, or absent AND inside a satellite \
+             run. At the catalog's settings a locus missing for any other reason is \
+             a machinery bug. Missing: {missed:#?}"
         );
     }
 

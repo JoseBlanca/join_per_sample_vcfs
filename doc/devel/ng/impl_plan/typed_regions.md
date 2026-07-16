@@ -239,7 +239,12 @@ nothing — `RegionSet` already parses/coalesces/clamps/converts-BED/drops-empty
 
 ### Milestone D — the walk (the heart); resident first as the windowed oracle
 
-**D1. The resident partition — the five steps, whole contig in memory.**  ☐
+**D1. The resident partition — the five steps, whole contig in memory.**  ✅
+*(`SsrBundle` is D2's; until then the cluster members admission sets aside fall into `Generic`, which
+is where a repeat rejected for any reason belongs (spec §2.2) — so the partition is already complete,
+and D2 only makes it sharper. **One known-untested claim recorded in the code**: the cap applies to
+the *cleaned* coverage, not the raw; mutation shows no fixture discriminates the two, because they
+differ only where raw-only coverage runs ≥ `max_repeat_len` contiguously.)*
 `detect → clean → admit → cap → partition` over a contig held resident, producing `Vec<TypedRegion>`
 (no windowing). Uses `find_tandem_repeats` + ng's pre-filter + ng's `admit` (whole-contig form) +
 the coverage merge + satellite cap — all of Milestone A. *Depends:* A, B, C. *Source:* spec §2.1, §2.2,
