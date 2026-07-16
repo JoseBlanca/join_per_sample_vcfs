@@ -71,6 +71,13 @@ These recur across the repo's plans; name the ones that shaped *this* order:
 
 - **A step is one committable unit** — small enough for one implement→review→commit loop, large
   enough to be worth a commit. Pure-scaffold steps may pair with an adjacent step, but say so.
+- **Isolate a step whose failure is *silent*.** Most bugs crash or fail a test; some produce a
+  quietly-wrong answer instead — an off-by-one in a coordinate rebase is a wrong genotype, not a
+  panic. Such a step lands as **its own commit, with its oracle green before *and* after**, never
+  bundled into a neighbour — so a `git bisect` can actually find it if the number moves. The plan
+  must say "own commit, do not bundle" on those steps and name the oracle that guards them. (This is
+  stronger than the default "one committable unit": it is about *isolation for bisectability*, not
+  just size.)
 - **Ordered by dependency, cheapest-firing first where order is free.** Make `Depends` explicit
   so the executor (and a reader) can see the critical path.
 - **Every step cites a `Source`.** A step with no spec/arch section behind it is a design gap —
