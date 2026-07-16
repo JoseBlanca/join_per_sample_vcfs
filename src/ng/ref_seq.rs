@@ -20,7 +20,8 @@
 //! differently avoids the "same token, two crates" ambiguity.
 
 use crate::fasta::fetcher::canonicalise;
-use crate::fasta::{ChromRefFetchError, ContigEntry, ContigList, ManualEvictChromRefFetcher};
+use crate::fasta::{ChromRefFetchError, ContigEntry, ContigList};
+use crate::ng::raw_chrom_reader::RawChromReader;
 use crate::ng::types::ContigId;
 use noodles_fasta::Repository;
 use std::cell::RefCell;
@@ -386,7 +387,22 @@ fn map_chrom_error(contig: ContigId, err: ChromRefFetchError) -> RefSeqError {
 pub struct WindowedRefSeq {
     fasta_path: PathBuf,
     contigs: ContigList,
-    current: RefCell<Option<(ContigId, ManualEvictChromRefFetcher)>>,
+    /// **One reader, holding RAW bases** ([`RawChromReader`]) — ng's copy of
+    /// production's windowed fetcher, minus the canonicalisation.
+    ///
+    /// It used to be `ManualEvictChromRefFetcher`, which canonicalises **into its
+    /// buffer**, so raw bytes were unrecoverable and this impl could not serve
+    /// them (`ref_seq.md` parked exactly that as a YAGNI). The typed-region walk
+    /// needs raw — `Locus` compares by value, so canonical bytes would make every
+    /// IUPAC-carrying locus compare unequal to the catalog's and silently break
+    /// the parity oracle (`typed_regions.md` §6).
+    ///
+    /// **Raw is the buffer and canonical is the view**, not the reverse:
+    /// `canonicalise` is a pure per-byte function, so canonical is derivable from
+    /// raw and raw is not derivable from canonical. And it is **one** buffer, not
+    /// two — `typed_regions.md` §6: *"one reader for the whole run, sliding
+    /// forward, never rebuilt per region — that is what cost 14.6 GB of peak RSS."*
+    current: RefCell<Option<(ContigId, RawChromReader)>>,
 }
 
 impl WindowedRefSeq {
@@ -415,13 +431,59 @@ impl WindowedRefSeq {
     }
 
     /// Release buffered bytes before `pos` on the currently-resident contig — the
-    /// caller-driven memory bound (production's `ManualEvictChromRefFetcher::evict_before`:
-    /// drain `[.., pos)`, keep capacity). No-op when no contig is resident. Correctness is
-    /// preserved: a later fetch of an evicted position simply re-reads it.
+    /// caller-driven memory bound (drain `[.., pos)`, keep capacity). No-op when no
+    /// contig is resident. Correctness is preserved: a later fetch of an evicted
+    /// position simply re-reads it.
     pub fn evict_before(&mut self, pos: u32) {
-        if let Some((_, fetcher)) = self.current.get_mut() {
-            fetcher.evict_before(pos);
+        if let Some((_, reader)) = self.current.get_mut() {
+            reader.evict_before(pos);
         }
+    }
+}
+
+impl WindowedRefSeq {
+    /// Fetch into `dst`, applying `transform` to each raw base.
+    ///
+    /// The shared body of both fetch surfaces, so they cannot drift on which
+    /// contig is resident, where the seam narrows, or how errors are tagged. The
+    /// **only** difference between canonical and raw is `transform` — which is
+    /// the point of holding a raw buffer (see the `current` field).
+    fn fetch_transformed(
+        &self,
+        contig: ContigId,
+        start_1based: u64,
+        length: u64,
+        dst: &mut Vec<u8>,
+        transform: impl Fn(u8) -> u8,
+    ) -> Result<(), RefSeqError> {
+        let entry = self
+            .contigs
+            .entries
+            .get(contig.get() as usize)
+            .ok_or(RefSeqError::UnknownContig(contig))?;
+        let mut current = self.current.borrow_mut();
+        let needs_rebuild = !matches!(&*current, Some((resident, _)) if *resident == contig);
+        if needs_rebuild {
+            let reader = RawChromReader::for_contig(&self.fasta_path, &entry.name)
+                .map_err(|e| map_chrom_error(contig, e))?;
+            *current = Some((contig, reader));
+        }
+        let (_, reader) = current.as_mut().expect("current set above");
+        // **ng speaks `u64`; the reader speaks `u32`** (spec §4). The reader is ng's
+        // own, but it is a faithful copy of production's and keeps its width, so
+        // that a port-back is a move rather than a rewrite.
+        //
+        // It is an **error, not a clamp**. That distinction is the whole of B2: the
+        // code this replaced wrote `unwrap_or(u32::MAX)` and a >4 Gb contig silently
+        // became a wrong number. ng can now *represent* such a coordinate; this
+        // reader simply cannot *serve* it, and saying so is the honest answer.
+        let (start_u32, len_u32) = narrow_for_fetcher(contig, entry, start_1based, length)?;
+        let bytes = reader
+            .fetch(start_u32, len_u32)
+            .map_err(|e| map_chrom_error(contig, e))?;
+        dst.clear();
+        dst.extend(bytes.iter().copied().map(transform));
+        Ok(())
     }
 }
 
@@ -433,35 +495,30 @@ impl RefSeq for WindowedRefSeq {
         length: u64,
         dst: &mut Vec<u8>,
     ) -> Result<(), RefSeqError> {
-        let entry = self
-            .contigs
-            .entries
-            .get(contig.get() as usize)
-            .ok_or(RefSeqError::UnknownContig(contig))?;
-        let mut current = self.current.borrow_mut();
-        let needs_rebuild = !matches!(&*current, Some((resident, _)) if *resident == contig);
-        if needs_rebuild {
-            let fetcher = ManualEvictChromRefFetcher::for_contig(&self.fasta_path, &entry.name)
-                .map_err(|e| map_chrom_error(contig, e))?;
-            *current = Some((contig, fetcher));
-        }
-        let (_, fetcher) = current.as_mut().expect("current set above");
-        // **ng speaks `u64`; production's fetcher speaks `u32`** (spec §4 — `src/fasta/`
-        // is frozen, so the narrowing lives here, at the seam, and nowhere else).
-        //
-        // It is an **error, not a clamp**. That distinction is the whole of B2: the
-        // code this replaced wrote `unwrap_or(u32::MAX)` and a >4 Gb contig silently
-        // became a wrong number. ng can now *represent* such a coordinate; this
-        // fetcher simply cannot *serve* it, and saying so is the honest answer.
-        let (start_u32, len_u32) = narrow_for_fetcher(contig, entry, start_1based, length)?;
-        // The fetcher returns canonical {A,C,G,T,N} bytes (it reuses `canonicalise` on
-        // refill), so they can be copied out verbatim — byte-identical to ResidentRefSeq.
-        let bytes = fetcher
-            .fetch(start_u32, len_u32)
-            .map_err(|e| map_chrom_error(contig, e))?;
-        dst.clear();
-        dst.extend_from_slice(bytes);
-        Ok(())
+        // Canonical is the **derived view**: the buffer is raw, and `canonicalise`
+        // is applied on the way out. Byte-identical to `ResidentRefSeq`'s canonical
+        // path by construction — it is the same `canonicalise`, the production one.
+        self.fetch_transformed(contig, start_1based, length, dst, canonicalise)
+    }
+}
+
+impl RawRefSeq for WindowedRefSeq {
+    /// Raw, verbatim bases — soft-mask and IUPAC codes intact.
+    ///
+    /// `ref_seq.md` parked this as a YAGNI: *"add a `RawRefSeq` impl only if a
+    /// windowed consumer ever actually needs raw bytes."* The typed-region walk is
+    /// that consumer (`typed_regions.md` §6): the STR catalog reads the FASTA
+    /// verbatim, and `Locus` compares **by value**, so canonical bytes would make
+    /// every IUPAC-carrying locus compare unequal to the catalog's and silently
+    /// break the parity oracle. The YAGNI is spent, not violated.
+    fn fetch_raw_into(
+        &self,
+        contig: ContigId,
+        start_1based: u64,
+        length: u64,
+        dst: &mut Vec<u8>,
+    ) -> Result<(), RefSeqError> {
+        self.fetch_transformed(contig, start_1based, length, dst, |b| b)
     }
 }
 
@@ -875,6 +932,80 @@ mod tests {
     fn windowed() -> (tempfile::TempDir, WindowedRefSeq) {
         let (dir, path, contigs) = build_fasta(FASTA_CONTIGS);
         (dir, WindowedRefSeq::new(path, contigs))
+    }
+
+    /// **B3: raw from the windowed impl — the YAGNI `ref_seq.md` parked, now spent.**
+    ///
+    /// The fixture is the point: `chr0` is `acgtNRYK` — soft-mask *and* IUPAC
+    /// ambiguity codes, i.e. exactly the bytes canonicalisation destroys (`a`→`A`,
+    /// `R`/`Y`/`K`→`N`). Raw must hand them back untouched, and match
+    /// `ResidentRefSeq`'s raw path byte for byte, or the two accessors disagree
+    /// about what the reference says.
+    ///
+    /// Why it matters (`typed_regions.md` §6): the STR catalog reads the FASTA
+    /// verbatim and `Locus` compares **by value**, so a canonical byte here makes
+    /// every IUPAC-carrying locus compare unequal to the catalog's — the parity
+    /// oracle breaks silently, on any real assembly carrying them.
+    #[test]
+    fn windowed_raw_returns_verbatim_bytes_matching_resident() {
+        let (_dir, path, contigs) = build_fasta(FASTA_CONTIGS);
+        let windowed = WindowedRefSeq::new(path.clone(), contigs.clone());
+        let resident = ResidentRefSeq::new(repository_for(&path), contigs.clone());
+
+        // Verbatim: the soft-mask and the ambiguity codes survive.
+        let mut dst = Vec::new();
+        windowed
+            .fetch_raw_into(ContigId(0), 1, 8, &mut dst)
+            .unwrap();
+        assert_eq!(
+            dst, b"acgtNRYK",
+            "raw is verbatim: no uppercasing, no N-folding"
+        );
+
+        // And canonical, from the SAME buffer, still folds them — which is the
+        // whole design: raw in the buffer, canonical as the derived view.
+        let canonical = windowed.fetch(ContigId(0), 1, 8).unwrap();
+        assert_eq!(canonical, b"ACGTNNNN", "canonical view of the same bytes");
+
+        // The two impls must agree on raw, at every window of every contig.
+        for (chrom_id, (_, bases)) in FASTA_CONTIGS.iter().enumerate() {
+            let id = ContigId(chrom_id as u32);
+            let len = bases.len() as u64;
+            for start in 1..=len {
+                for length in 1..=(len - start + 1) {
+                    assert_eq!(
+                        raw(&windowed, id, start, length),
+                        raw(&resident, id, start, length),
+                        "raw mismatch chrom {chrom_id} start {start} len {length}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Raw survives the slide: the buffer extends forward, backward, and across an
+    /// eviction without ever canonicalising what it re-reads. Guards the copy's
+    /// three separate refill call sites (`read_into_buffer_at`, `append_forward`,
+    /// `prepend_backward`) — each of which could have kept production's
+    /// `canonicalise` and been missed.
+    #[test]
+    fn windowed_raw_survives_the_slide_and_eviction() {
+        let (_dir, path, contigs) = build_fasta(FASTA_CONTIGS);
+        let mut windowed = WindowedRefSeq::new(path, contigs);
+
+        // Fresh read, then forward slide (append_forward).
+        assert_eq!(raw(&windowed, ContigId(0), 1, 4), b"acgt");
+        assert_eq!(raw(&windowed, ContigId(0), 5, 4), b"NRYK");
+        // Backward extend (prepend_backward) — still verbatim.
+        assert_eq!(raw(&windowed, ContigId(0), 1, 8), b"acgtNRYK");
+
+        // Evict, then re-read what was dropped (read_into_buffer_at again).
+        windowed.evict_before(9);
+        assert_eq!(
+            raw(&windowed, ContigId(0), 1, 8),
+            b"acgtNRYK",
+            "a re-read after eviction is still verbatim"
+        );
     }
 
     /// `contigs()` hands back the reference's own table — the **provenance** the

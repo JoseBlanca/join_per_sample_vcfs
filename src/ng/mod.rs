@@ -17,6 +17,7 @@
 #[cfg(test)]
 mod scanner_parity;
 
+pub mod raw_chrom_reader;
 pub mod read;
 pub mod ref_seq;
 pub mod region_typing;
