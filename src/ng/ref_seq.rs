@@ -400,6 +400,20 @@ impl WindowedRefSeq {
         }
     }
 
+    /// The reference's contig table — names and lengths, in `@SQ` / `.fai` order.
+    ///
+    /// **Provenance, not convenience** (typed_regions.md §2.6, §3). The walk must
+    /// tell `admit` how long a contig *really* is, and that number cannot be
+    /// derived from the window in hand — a slice mistaken for a chromosome is the
+    /// silent bug §2.6 exists to kill. `admit` guards what arithmetic can catch,
+    /// but its check is inherently incomplete: a caller passing the window's own
+    /// end as `contig_len` is arithmetically legal, and only *reading the length
+    /// from here* rules it out. That is why this accessor is part of the walk's
+    /// substrate rather than a getter.
+    pub fn contigs(&self) -> &ContigList {
+        &self.contigs
+    }
+
     /// Release buffered bytes before `pos` on the currently-resident contig — the
     /// caller-driven memory bound (production's `ManualEvictChromRefFetcher::evict_before`:
     /// drain `[.., pos)`, keep capacity). No-op when no contig is resident. Correctness is
@@ -590,6 +604,10 @@ mod tests {
         }
     }
 
+    /// `contigs()` hands back the reference's own table — the **provenance** the
+    /// walk needs to tell `admit` a contig's true length (typed_regions.md §2.6).
+    /// `admit`'s own guard cannot catch a caller who passes the window's end as
+    /// `contig_len`; reading the length from here is what rules that out.
     /// **B2's payoff: a coordinate past `u32` is reported, not clamped.**
     ///
     /// The line this pins used to read
@@ -857,6 +875,26 @@ mod tests {
     fn windowed() -> (tempfile::TempDir, WindowedRefSeq) {
         let (dir, path, contigs) = build_fasta(FASTA_CONTIGS);
         (dir, WindowedRefSeq::new(path, contigs))
+    }
+
+    /// `contigs()` hands back the reference's own table — the **provenance** the
+    /// walk needs to tell `admit` a contig's true length (typed_regions.md §2.6).
+    /// `admit`'s guard cannot catch a caller who passes the *window's* end as
+    /// `contig_len`, because that is arithmetically legal; reading the length from
+    /// here is what rules it out. Hence an accessor on the walk's substrate, not a
+    /// getter for its own sake.
+    #[test]
+    fn windowed_exposes_the_contig_table_as_provenance() {
+        let (_dir, path, contigs) = build_fasta(FASTA_CONTIGS);
+        let windowed = WindowedRefSeq::new(path, contigs.clone());
+
+        assert_eq!(windowed.contigs(), &contigs, "the table, verbatim");
+        // The number the walk actually reaches for — the CONTIG's length, and
+        // never any window's. Already `u64` on production's table: only ng's
+        // *fetch* surface ever narrowed it (the clamp B2 deleted).
+        let entry = &windowed.contigs().entries[0];
+        assert_eq!(entry.length, contigs.entries[0].length);
+        assert!(!windowed.contigs().entries.is_empty());
     }
 
     #[test]
