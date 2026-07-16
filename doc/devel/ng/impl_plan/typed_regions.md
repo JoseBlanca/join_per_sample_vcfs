@@ -221,7 +221,7 @@ only party holding both the reference table (`contigs()`, B3a) and the window.)*
 1-based inclusive, `u64` (`Position(u64)`; `GenomeRegion { contig, start, end }`). The consolidation
 `ng_step_interfaces.md` §6 reserved — this step's first real use. *Source:* arch §types.
 
-**C2. `region_typing/mod.rs` walk types.**  ☐
+**C2. `region_typing/mod.rs` walk types.**  ✅
 The module was scaffolded in A1; this adds the walk's own types. `TypedRegion`, `RegionKind`
 (`SsrLocus(Locus)` — ng's, from `admission.rs` / `SsrBundle` / `Generic` / `Satellite`),
 `TypedRegionConfig` (+`Default` = the catalog's settings, for comparability, holding A2's
