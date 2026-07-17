@@ -777,6 +777,85 @@ pub struct Admitted {
     /// re-bases them when it emits the region's hull, the same way it re-bases
     /// everything else it reads out of a window.
     pub bundled: Vec<RepeatInterval>,
+    /// Every repeat admission turned down, **with the reason** — the breakdown spec §3.1
+    /// needs and that one total cannot give (a purity rejection and a copy-floor one are
+    /// exactly the distinction spec §10's routing question turns on).
+    ///
+    /// **Per record, not a tally, and that is what makes the walk's count
+    /// window-invariant.** `admit` runs over a window's whole fetched slice, margins
+    /// included, so the same repeat is rejected again by every window that can see it. An
+    /// aggregate here would be counted once per window and the total would depend on
+    /// `window_bp` — a memory knob changing a reported number. Handing the records back
+    /// lets the walk attribute each to exactly one core, the same way it attributes
+    /// everything else.
+    ///
+    /// Coordinates are the input's, like [`Self::bundled`]'s.
+    pub rejected: Vec<(RepeatInterval, RejectionReason)>,
+}
+
+/// Why admission turned a repeat down (spec §3.1).
+///
+/// **No `str_bundle`**: since spec §2.4 that is a *route*, not a rejection —
+/// [`Admitted::bundled`] carries those, and they are not here.
+///
+/// **The scope and score gates are not here either**, and that is a real gap rather than
+/// an oversight: a repeat outside `periods` or under `min_score` is not *rejected*, it is
+/// out of the question being asked — and `prefilter` has already dropped most of it before
+/// `admit` sees it (spec §5b). The five below are the gates that turn down a repeat that
+/// was, on the face of it, a candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RejectionReason {
+    /// Fewer whole motif copies than the per-period floor ([`MinCopies`]).
+    CopyFloor,
+    /// Below the purity floor once re-measured against a perfect motif tiling.
+    Purity,
+    /// The motif is itself a repeat (`ATAT` is `AT` twice), so the period is a lie.
+    Compound,
+    /// No whole-motif boundaries to trim to — nothing here tiles.
+    NoCleanTrim,
+    /// A flank clamped to nothing at a **contig** end: the tract abuts base 1 or the last
+    /// base, so there is no unique sequence to anchor reads against (spec §2.6).
+    FlankClamped,
+}
+
+/// Repeat bp turned down, by reason — spec §3.1's breakdown of
+/// `TypedRegionCounts::repeat_bp_with_no_locus`.
+///
+/// **In bp, not per repeat** (spec §3.1): admission trims every survivor, so a repeat that
+/// admits one locus and sheds 200 bp contributes nothing to a per-repeat counter. The bp
+/// charged is the repeat's **detected** length, before trimming.
+///
+/// **It does not partition `repeat_bp_with_no_locus`, and must not be read as if it did.**
+/// Two rejected repeats can overlap — the scanner is deliberately permissive — so their bp
+/// are both charged; and bases with no locus for a reason that is not a *rejection*
+/// (bundled, capped as a satellite, out of scope) are in the total and not here. It is a
+/// diagnosis of admission's gates, not an account of the genome.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RejectionCounts {
+    pub copy_floor: u64,
+    pub purity: u64,
+    pub compound: u64,
+    pub no_clean_trim: u64,
+    pub flank_clamped: u64,
+}
+
+impl RejectionCounts {
+    /// Charge `bp` to `reason`.
+    pub fn add(&mut self, reason: RejectionReason, bp: u64) {
+        let slot = match reason {
+            RejectionReason::CopyFloor => &mut self.copy_floor,
+            RejectionReason::Purity => &mut self.purity,
+            RejectionReason::Compound => &mut self.compound,
+            RejectionReason::NoCleanTrim => &mut self.no_clean_trim,
+            RejectionReason::FlankClamped => &mut self.flank_clamped,
+        };
+        *slot += bp;
+    }
+
+    /// Total bp turned down, over every reason.
+    pub fn total(&self) -> u64 {
+        self.copy_floor + self.purity + self.compound + self.no_clean_trim + self.flank_clamped
+    }
 }
 
 /// Admit detected repeats into start-sorted STR loci — ng's `build_loci`,
@@ -906,26 +985,40 @@ pub fn admit(
     //    `r.end <= bases.len()` stays a SLICE bound, not a contig bound: `r` is an
     //    offset into `bases`, and this guards the slicing two lines down. The
     //    contig end is a different question, and it is asked in `finish_locus`.
-    let mut kept: Vec<RepeatInterval> = recs
-        .into_iter()
-        .filter(|r| {
-            r.period >= p.periods.min()
-                && r.period <= p.periods.max()
-                && r.score >= p.min_score
-                && r.end > r.start
-                && (r.end as usize) <= bases.len()
-        })
-        .filter(|r| {
-            let period = r.period as usize;
-            let tract = &bases[r.start as usize..r.end as usize];
-            // Need at least one full motif to form the prefix.
-            if tract.len() < period {
-                return false;
-            }
-            let motif = upper(&tract[..period]);
-            !is_compound(&motif)
-        })
-        .collect();
+    //
+    //    Two `filter`s until E1e; one loop now, because a rejection has to be *recorded*
+    //    and not merely fall through. Same gates, same order, same outcome — pinned by
+    //    the differential against production's `build_loci`.
+    let mut rejected: Vec<(RepeatInterval, RejectionReason)> = Vec::new();
+    let mut kept: Vec<RepeatInterval> = Vec::new();
+    for r in recs {
+        // Scope, score, and malformed. **Not recorded as rejections** — a repeat outside
+        // the period range or under the score floor is out of the question being asked,
+        // not turned down by it (`RejectionReason`).
+        if r.period < p.periods.min()
+            || r.period > p.periods.max()
+            || r.score < p.min_score
+            || r.end <= r.start
+            || (r.end as usize) > bases.len()
+        {
+            continue;
+        }
+        let period = r.period as usize;
+        let tract = &bases[r.start as usize..r.end as usize];
+        // Need at least one full motif to form the prefix. Charged to the copy floor:
+        // a tract that cannot hold even one whole copy is that floor at its extreme, and
+        // it is the same fact the floor exists to measure.
+        if tract.len() < period {
+            rejected.push((r, RejectionReason::CopyFloor));
+            continue;
+        }
+        let motif = upper(&tract[..period]);
+        if is_compound(&motif) {
+            rejected.push((r, RejectionReason::Compound));
+            continue;
+        }
+        kept.push(r);
+    }
 
     // 3. drop bundles (on the raw, pre-trim coordinates). Records must be
     //    start-sorted for the streaming clustering.
@@ -937,8 +1030,9 @@ pub fn admit(
     // 4-5. per record: end-trim + copy floor, recompute purity + floor, embed.
     let mut loci = Vec::with_capacity(kept.len());
     for r in &kept {
-        if let Some(locus) = finish_locus(r, chrom, bases, bases_start, contig_len, p) {
-            loci.push(locus);
+        match finish_locus(r, chrom, bases, bases_start, contig_len, p) {
+            Ok(locus) => loci.push(locus),
+            Err(reason) => rejected.push((*r, reason)),
         }
     }
     Admitted {
@@ -946,11 +1040,17 @@ pub fn admit(
         // No conversion: since B2 these ARE the caller's own intervals, which is
         // what `Admitted::bundled`'s "handed back verbatim" always claimed.
         bundled,
+        rejected,
     }
 }
 
 /// Steps 4-5 for one record: end-trim, copy-number floor, motif, purity floor,
-/// `ref_bytes` embed. `None` if the record fails any gate.
+/// `ref_bytes` embed. `Err(reason)` if the record fails any gate.
+///
+/// **Every `None` became an `Err(reason)` at E1e**, and nothing else changed. The gates
+/// and their order are exactly as before; what is new is that the caller can now tell a
+/// purity rejection from a copy-floor one, which is the distinction spec §10's routing
+/// question turns on and which one `None` could never carry (spec §3.1).
 ///
 /// **The one place the coordinate base changes**, and (since A3) the one place
 /// the *contig* end is asked about. Everything above works in the detector's
@@ -965,13 +1065,20 @@ fn finish_locus(
     bases_start: u64,
     contig_len: u64,
     p: &SsrAdmissionParams,
-) -> Option<Locus> {
+) -> Result<Locus, RejectionReason> {
     let period = r.period as usize;
     let raw_tract = upper(&bases[r.start as usize..r.end as usize]);
-    let motif_bytes = raw_tract.get(..period)?.to_vec();
+    // A tract too short to hold one motif: the copy floor at its extreme (see `admit`,
+    // which charges the same case the same way). Unreachable from `admit` — its own gate
+    // above rejects `tract.len() < period` first — but this fn is not `admit`'s alone to
+    // reason about.
+    let motif_bytes = raw_tract
+        .get(..period)
+        .ok_or(RejectionReason::CopyFloor)?
+        .to_vec();
 
     // End-trim to clean whole-motif boundaries (GangSTR minimal_trim).
-    let (st, en) = minimal_trim(&raw_tract, &motif_bytes)?;
+    let (st, en) = minimal_trim(&raw_tract, &motif_bytes).ok_or(RejectionReason::NoCleanTrim)?;
     let new_start = r.start + st as u64;
     let new_end = r.start + en as u64;
     let trimmed = &raw_tract[st..en];
@@ -980,7 +1087,7 @@ fn finish_locus(
     // (integer division), as an accept-gate after trimming.
     let ref_copy = (r.end - r.start) / u64::from(r.period);
     if ref_copy < u64::from(p.min_copies.for_period(r.period)) {
-        return None;
+        return Err(RejectionReason::CopyFloor);
     }
 
     // After minimal_trim the tract starts on a motif boundary, so
@@ -990,10 +1097,17 @@ fn finish_locus(
     // the period ceiling was a `const` a static assert held at `<= MAX_MOTIF_LEN`.
     // **A2 made that ceiling a knob and the arm reachable** — set
     // `periods.max() > MAX_MOTIF_LEN` and every widest-period tract clears the
-    // gate, fails here, and vanishes through the same `None` as a legitimate
-    // policy rejection. That is M7's silent failure exactly: the knob appears to
+    // gate, fails here, and vanishes through the same rejection as a legitimate
+    // policy one. That is M7's silent failure exactly: the knob appears to
     // move and does not. So it fails loudly instead (release behaviour unchanged —
-    // still `None`; `admit` debug_asserts the same contract up front).
+    // still a rejection; `admit` asserts the same contract up front).
+    //
+    // E1e: charged to the copy floor when it does happen, for the reason the short-tract
+    // case above is — a motif that cannot be formed is a tract with no whole copies. It
+    // is **unreachable** in any case: `admit` asserts `periods.max() <= MAX_MOTIF_LEN`
+    // (a real assert, in release) and gates `period >= periods.min() >= 1`, so
+    // `motif_bytes.len()` is in `1..=MAX_MOTIF_LEN` and `BadLength` is the only way
+    // `Motif::new` fails. The `debug_assert` is the message that matters if it ever fires.
     let motif = match Motif::new(&motif_bytes) {
         Ok(m) => m,
         Err(e) => {
@@ -1003,14 +1117,14 @@ fn finish_locus(
                  SsrAdmissionParams::periods.max() above MAX_MOTIF_LEN ({MAX_MOTIF_LEN})?",
                 r.period
             );
-            return None;
+            return Err(RejectionReason::CopyFloor);
         }
     };
 
     // Recompute purity from the trimmed tract vs a perfect motif tiling.
     let purity = recompute_purity(trimmed, &motif_bytes);
     if purity < p.min_purity {
-        return None;
+        return Err(RejectionReason::Purity);
     }
 
     // **The window-boundary fix (spec §2.6), and the whole of it.**
@@ -1036,7 +1150,7 @@ fn finish_locus(
     // tract is not genotypeable. These are now genuinely about the contig, so a
     // window edge no longer impersonates one.
     if ref_start == tract_start || ref_end == tract_end {
-        return None;
+        return Err(RejectionReason::FlankClamped);
     }
 
     // Back to slice offsets to actually read the bytes. The caller must have
@@ -1085,7 +1199,7 @@ fn finish_locus(
         ref_bytes.into_boxed_slice(),
         ref_start,
     ) {
-        Ok(locus) => Some(locus),
+        Ok(locus) => Ok(locus),
         // Unreachable: every gate above guarantees the invariants (`minimal_trim`
         // gives `st < en`, the flank-clamp check gives a non-empty `ref_bytes`
         // strictly containing the tract, `recompute_purity` returns `[0, 1]`).
@@ -1094,10 +1208,15 @@ fn finish_locus(
         // `.ok()` here and so discards it; that is faithful but wrong for a port,
         // because this error can now only fire if **the transcription is wrong** —
         // the one failure A1 exists to catch, and one that is otherwise silent (a
-        // bad locus would leave through the same `None` as a routine policy
-        // rejection). `debug_assert` keeps release behaviour byte-identical to
+        // bad locus would leave through the same rejection as a routine policy
+        // one). `debug_assert` keeps release behaviour byte-identical to
         // production while making the differential — which runs in debug — fail
         // loudly instead of quietly disagreeing.
+        //
+        // The reason it carries in release is `NoCleanTrim`: of the five, that is the
+        // one that means "this tract did not turn out to be a well-formed repeat", which
+        // is the closest true thing to say about a locus whose invariants did not hold.
+        // A count is not the point here; the `debug_assert` is.
         Err(e) => {
             debug_assert!(
                 false,
@@ -1105,7 +1224,7 @@ fn finish_locus(
                  (tract [{tract_start}, {tract_end}], ref_bytes [{ref_start}, {ref_end}], \
                   window starts at {bases_start}, contig is {contig_len} long)"
             );
-            None
+            Err(RejectionReason::NoCleanTrim)
         }
     }
 }
@@ -1608,6 +1727,123 @@ mod tests {
         let l = &loci[0];
         assert_eq!(l.ref_bytes_start(), 1, "clamped to the contig's first base");
         assert_eq!(l.left_flank(), b"G", "only 1 bp of left flank available");
+    }
+
+    /// **Every rejection reason, charged to the gate that fires it** (E1e, spec §3.1).
+    ///
+    /// One total cannot separate a purity rejection from a copy-floor one, and that is the
+    /// distinction spec §10's routing question turns on — so each column has to be right,
+    /// not just their sum. Each case below is built to trip **one** gate and to reach it:
+    /// the gates run in a fixed order, so a fixture that trips two tells you nothing about
+    /// the second.
+    ///
+    /// Driven through `admit` directly, without `prefilter`, and that is not a shortcut —
+    /// it is the only place three of these are reachable at all (see
+    /// `the_pre_filter_makes_three_of_admissions_gates_unreachable_from_the_walk`).
+    #[test]
+    fn each_rejection_reason_names_the_gate_that_fired() {
+        let reasons = |recs: Vec<RepeatInterval>, contig: &[u8]| -> Vec<RejectionReason> {
+            admit(
+                recs,
+                "chr1",
+                contig,
+                Position(1),
+                Bp(contig.len() as u64),
+                &params(),
+            )
+            .rejected
+            .into_iter()
+            .map(|(_, reason)| reason)
+            .collect()
+        };
+
+        // CopyFloor: (AT)*3, under the period-2 floor of 5. Flanks either side, so the
+        // flank gate cannot be what fires.
+        let contig = b"CGCGCGCGCGCGCGCGCGCGATATATCGCGCGCGCGCGCGCGCGCG";
+        assert_eq!(
+            reasons(vec![iv(20, 26, 2, 100)], contig),
+            vec![RejectionReason::CopyFloor],
+            "three copies is under the floor of five"
+        );
+
+        // Compound: the motif is itself a repeat (`ATAT` is `AT` twice), so period 4 is a
+        // lie about this tract. Rejected before any of the later gates.
+        let contig = b"CGCGCGCGCGCGCGCGCGCGATATATATATATATATATATCGCGCGCGCGCGCGCGCGCG";
+        assert_eq!(
+            reasons(vec![iv(20, 40, 4, 100)], contig),
+            vec![RejectionReason::Compound],
+            "ATAT is AT twice: the period is a lie"
+        );
+
+        // NoCleanTrim: the prefix motif is `AT`, but there is no `ATAT` within the trim
+        // window, so nothing here tiles and there are no whole-motif boundaries to trim
+        // to. This gate runs BEFORE the copy floor, which is why it is what fires.
+        let contig = b"CGCGCGCGCGCGCGCGCGCGATGGGGGGGGGATATATATCGCGCGCGCGCGCGCGCGCG";
+        assert_eq!(
+            reasons(vec![iv(20, 39, 2, 100)], contig),
+            vec![RejectionReason::NoCleanTrim],
+            "no two consecutive motifs within the trim window"
+        );
+
+        // Purity: clean ends (so it trims) and enough copies (so the floor passes), but
+        // interrupted enough that a re-measure against a perfect tiling falls under 0.8.
+        let contig = b"CGCGCGCGCGCGCGCGCGCGATATATATGGGGGGGGGGATATATATCGCGCGCGCGCGCGCGCGCG";
+        assert_eq!(
+            reasons(vec![iv(20, 46, 2, 100)], contig),
+            vec![RejectionReason::Purity],
+            "trims and clears the floor, but is not pure enough"
+        );
+
+        // FlankClamped: a tract abutting base 1 — a fact about the CONTIG's end (spec
+        // §2.6), not about the tract.
+        let contig = b"ATATATATATATATATCGCGC";
+        assert_eq!(
+            reasons(vec![iv(0, 16, 2, 100)], contig),
+            vec![RejectionReason::FlankClamped],
+            "no left flank to anchor against"
+        );
+    }
+
+    /// **The pre-filter makes three of admission's five gates unreachable from the walk**,
+    /// and a reader of `TypedRegionCounts::rejected_by_reason` has to know it: three of
+    /// those columns are structurally zero there, and "no compound rejections in this
+    /// genome" is a wrong thing to conclude from a zero the pre-filter caused.
+    ///
+    /// Found at E1e by writing the walk-level test for each reason and watching it come
+    /// back all zeroes (spec §5b: `prefilter` is not optional, and it runs first):
+    ///
+    /// - **`CopyFloor`** — `prefilter` applies the **same `MinCopies` table** with the
+    ///   same arithmetic, so nothing under the floor survives to be turned down by it.
+    ///   A2 folded production's two copy-floor tables into one; both *call sites* remain,
+    ///   and this is the visible consequence.
+    /// - **`Compound`** — a compound motif is by definition a period-multiple of a shorter
+    ///   one, which is exactly what redundancy elimination drops.
+    /// - **`NoCleanTrim`** — reachable in principle, but a tract with no motif pair in its
+    ///   trim window scores badly enough that the scanner segments it away first.
+    ///
+    /// `Purity` and `FlankClamped` are the live ones: the scanner's mismatch tolerance
+    /// (≈0.78) is looser than admission's floor (0.80), so tracts land in the gap; and the
+    /// contig's ends are nobody else's business.
+    ///
+    /// This test pins the *reason* those columns are zero, so that if the pre-filter ever
+    /// stops enforcing the floor the failure lands here — where the explanation is —
+    /// rather than as a mystery column that suddenly has numbers in it.
+    #[test]
+    fn the_pre_filter_makes_three_of_admissions_gates_unreachable_from_the_walk() {
+        let p = params();
+        // A tract under the copy floor: `prefilter` drops it, so `admit` never sees it.
+        let low_copy = vec![iv(20, 26, 2, 100)];
+        assert!(
+            prefilter(&low_copy, &p).is_empty(),
+            "the pre-filter enforces the copy floor FIRST, with the same table — which is \
+             why `admit`'s copy-floor gate cannot fire from the walk"
+        );
+
+        // A period-multiple: redundancy elimination drops it, so the compound gate never
+        // sees it either. (Both must be present, as the scanner emits them.)
+        let fundamental_and_multiple = vec![iv(20, 40, 2, 100), iv(20, 40, 4, 100)];
+        let cleaned = prefilter(&fundamental_and_multiple, &p);
+        assert_eq!(cleaned, vec![iv(20, 40, 2, 100)], "the multiple is dropped");
     }
 
     #[test]

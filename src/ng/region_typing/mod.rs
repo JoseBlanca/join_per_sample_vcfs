@@ -38,7 +38,7 @@ use crate::ng::tandem_repeat::{
 };
 use crate::ng::types::{Bp, ContigId, GenomeRegion, Position};
 use crate::regions::{BedError, ContigBounds, RegionSet};
-use admission::{Locus, SsrAdmissionParams};
+use admission::{Locus, RejectionCounts, SsrAdmissionParams};
 
 // ---------------------------------------------------------------------
 // What to walk
@@ -274,17 +274,6 @@ impl Default for TypedRegionConfig {
 /// for. This is the live-caller view of the catalog's measured ~35% STR coverage
 /// gap.
 ///
-/// # The rejection breakdown is not here yet, and that is deliberate
-///
-/// Spec §3.1 asks for one more field — `rejected_by_reason`, splitting the bp below
-/// into copy-floor / purity / compound / no-clean-trim / flank-clamped, which is the
-/// distinction §10's routing question turns on. C2 declared the type; E1 could not
-/// fill it, because **`admit` reports no reasons**: `finish_locus` returns `None`
-/// from five different gates and the caller cannot tell them apart.
-///
-/// So the field is **absent rather than zero**. A zero would read as "nothing was
-/// rejected for that reason" — a wrong answer to §10's question, dressed as a
-/// measured one. It arrives when admission can say why; see the plan's E1 entry.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TypedRegionCounts {
     /// Requested regions walked.
@@ -311,6 +300,15 @@ pub struct TypedRegionCounts {
     /// loci that cancel it are subtracted as they are emitted, a block later. It is
     /// exact once the walk is exhausted, which is what the type promises.
     pub repeat_bp_with_no_locus: u64,
+    /// [`Self::repeat_bp_with_no_locus`] **broken out by admission's reason** — because
+    /// one total cannot separate a purity rejection from a copy-floor one, and that is
+    /// exactly the distinction spec §10's routing question turns on.
+    ///
+    /// **It does not partition the total**, and [`RejectionCounts`] says why: overlapping
+    /// rejected repeats are both charged, and bases with no locus for a reason that is not
+    /// a *rejection* (bundled, capped as a satellite, out of scope) are in the total and
+    /// not here. A diagnosis of admission's gates, not an account of the genome.
+    pub rejected_by_reason: RejectionCounts,
 }
 
 // ---------------------------------------------------------------------
@@ -817,6 +815,15 @@ pub struct TypedRegionIterator<R> {
     done: bool,
 }
 
+/// One window's contribution to the running tally — the parts that cannot be read off the
+/// regions the walk emits, because they are about repeats that never became one.
+struct WindowTally {
+    /// Cleaned repeat coverage this window owns, in bp.
+    repeat_bp: u64,
+    /// Repeat bp this window's core owns that admission turned down, by reason.
+    rejected: RejectionCounts,
+}
+
 /// One span's walk in progress: where the windows are up to, and the block carries.
 struct SpanWalk {
     contig: ContigId,
@@ -940,7 +947,7 @@ impl<R: RawRefSeq + ContigTable + EvictableRefSeq> TypedRegionIterator<R> {
         let state = self.current.as_mut().expect("just checked");
         match state.cursor.next_window() {
             Some(plan) => {
-                let repeat_bp = Self::scan_and_absorb(
+                let tally = Self::scan_and_absorb(
                     &self.reference,
                     &mut self.bases,
                     state,
@@ -950,7 +957,13 @@ impl<R: RawRefSeq + ContigTable + EvictableRefSeq> TypedRegionIterator<R> {
                 // Every base of cleaned repeat coverage this window owns. Clipped to the
                 // core, and cores tile, so no base is counted twice. The loci that cancel
                 // it are subtracted as they are emitted (`tally`).
-                self.counts.repeat_bp_with_no_locus += repeat_bp;
+                self.counts.repeat_bp_with_no_locus += tally.repeat_bp;
+                let r = &mut self.counts.rejected_by_reason;
+                r.copy_floor += tally.rejected.copy_floor;
+                r.purity += tally.rejected.purity;
+                r.compound += tally.rejected.compound;
+                r.no_clean_trim += tally.rejected.no_clean_trim;
+                r.flank_clamped += tally.rejected.flank_clamped;
                 // Release what the walk has passed — it never looks back. This is the
                 // difference between "holds one window" as a claim and as a fact.
                 self.reference.evict_before(plan.fetched.start + 1);
@@ -972,14 +985,15 @@ impl<R: RawRefSeq + ContigTable + EvictableRefSeq> TypedRegionIterator<R> {
     /// An associated function rather than a method, because it needs `&self.reference`
     /// and `&mut self.current` at once — disjoint fields, which the borrow checker will
     /// grant only when they are named separately.
-    /// Returns the window's own cleaned repeat coverage in bp, for the tally.
+    ///
+    /// Returns this window's share of the tally ([`WindowTally`]).
     fn scan_and_absorb(
         reference: &R,
         bases: &mut Vec<u8>,
         state: &mut SpanWalk,
         config: &TypedRegionConfig,
         plan: &WindowPlan,
-    ) -> Result<u64, TypedRegionError> {
+    ) -> Result<WindowTally, TypedRegionError> {
         let flank_bp = config.admission.flank_bp;
         let contig = state.contig;
 
@@ -1023,20 +1037,33 @@ impl<R: RawRefSeq + ContigTable + EvictableRefSeq> TypedRegionIterator<R> {
             &config.admission,
         );
 
-        // The tally's raw material, taken before `absorb` consumes the window: this
-        // window's own share of the repeat coverage (clipped to the core, so cores tile
-        // and nothing is double-counted).
-        let repeat_bp: u64 = window
-            .coverage_in_core(&cleaned)
-            .into_iter()
-            .map(|(s, e)| e - s)
-            .sum();
+        // The tally's raw material, taken before `absorb` consumes the window.
+        let mut tally = WindowTally {
+            // This window's own share of the repeat coverage — clipped to the core, so
+            // cores tile and nothing is double-counted.
+            repeat_bp: window
+                .coverage_in_core(&cleaned)
+                .into_iter()
+                .map(|(s, e)| e - s)
+                .sum(),
+            rejected: RejectionCounts::default(),
+        };
+        // **Rejections are attributed to a core, exactly like everything else.** `admit`
+        // ran over the whole fetched slice, so every window that can see a repeat rejects
+        // it again; counting them all would make the tally depend on `window_bp`, which
+        // is a memory knob. The interval's own start decides whose it is.
+        for (iv, reason) in &admitted.rejected {
+            let start = iv.start + bases_start;
+            if start >= plan.core.start && start < plan.core.end {
+                tally.rejected.add(*reason, iv.end - iv.start);
+            }
+        }
 
         // 4-5. Cap and partition, one block at a time.
         state
             .walk
             .absorb(&window, &cleaned, admitted, bases_start, config);
-        Ok(repeat_bp)
+        Ok(tally)
     }
 
     fn segment_options(&self) -> SegmentOptions {
@@ -2839,6 +2866,65 @@ mod tests {
             counts.repeat_bp_with_no_locus >= counts.ssr_bundle_bp,
             "and the bundled tracts are part of it"
         );
+    }
+
+    /// Walk a fixture and hand back the finished tally.
+    fn counts_over(bases: &[u8], window_bp: u64) -> TypedRegionCounts {
+        let config = TypedRegionConfig {
+            window_bp: Bp(window_bp),
+            ..TypedRegionConfig::default()
+        };
+        let mut iter =
+            TypedRegionIterator::over_contig(reference_over("chr1", bases), ContigId(0), config)
+                .expect("valid contig");
+        for r in iter.by_ref() {
+            r.expect("no read fails");
+        }
+        *iter.counts()
+    }
+
+    /// **The rejection breakdown must not depend on `window_bp`** (E1e).
+    ///
+    /// This is the whole reason `admit` hands rejections back **per record** instead of
+    /// tallying them itself. It runs over a window's entire fetched slice, margins and
+    /// all, so every window that can see a repeat rejects it again; a tally taken inside
+    /// would count one repeat once per window and the number would move with a **memory
+    /// knob**. Attributing each record to the core holding its start is what makes the
+    /// count a fact about the genome instead of about the walk.
+    ///
+    /// The whole tally is compared, not just the breakdown: every count here is a claim
+    /// about the reference, and `window_bp` may not touch any of them (spec §2.3).
+    #[test]
+    fn the_tally_does_not_depend_on_the_window() {
+        // The windowing fixture, plus a tract abutting base 1 — which admission turns
+        // down for having no left flank (spec §2.6). That rejection is what gives the
+        // breakdown something to count: of admission's five gates, the pre-filter makes
+        // three unreachable from the walk and this is the reachable one that a fixture
+        // can be sure of (`admission::the_pre_filter_makes_three_of_admissions_gates_
+        // unreachable_from_the_walk`).
+        let mut bases = windowing_fixture();
+        bases[0..20].copy_from_slice(b"ATATATATATATATATATAT");
+        let baseline = counts_over(&bases, 100_000);
+
+        // Or this compares zeroes — and it would, without the tract above.
+        assert!(
+            baseline.rejected_by_reason.total() > 0,
+            "the fixture must reach a gate: {:?}",
+            baseline.rejected_by_reason
+        );
+        assert!(baseline.ssr_loci > 0 && baseline.satellites > 0);
+
+        for window_bp in [100u64, 333, 700, 1000] {
+            assert_eq!(
+                counts_over(&bases, window_bp),
+                baseline,
+                "window_bp = {window_bp} moved the tally — `window_bp` is a memory knob \
+                 (spec §2.3). A rejection counted once per window that could SEE it is \
+                 exactly how that happens: at window_bp = 100 the tract at base 1 is in \
+                 the fetched slice of the first ten windows, and `admit` turns it down in \
+                 every one of them"
+            );
+        }
     }
 
     /// A reference-read failure mid-walk is **fatal and in-stream**: `Some(Err(_))` once,

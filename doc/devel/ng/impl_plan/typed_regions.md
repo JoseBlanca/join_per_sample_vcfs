@@ -361,12 +361,43 @@ rather than beside it. Four departures from the arch doc, each forced and each r
    tests green). The iterator **owns** its reference, so it cannot hold `scan_windowed`'s iterator,
    which borrows one — that is a self-referential struct. A cursor both can drive keeps §6.1's one
    copy of the geometry.
-4. ***`rejected_by_reason` is absent, not zero.*** `admit` reports no reasons — `finish_locus` returns
-   `None` from five gates and the caller cannot tell them apart — so spec §3.1's breakdown cannot be
-   filled. A zero would read as "nothing rejected for that reason", a wrong answer to §10's question
-   dressed as a measured one. **Next step: teach admission to report its rejections, then restore the
-   field.** `repeat_bp_with_no_locus` *is* filled (coverage minus loci) and pinned exactly against an
+4. ***`rejected_by_reason` was absent, not zero*** — `admit` reported no reasons, so spec §3.1's
+   breakdown could not be filled, and a zero would have read as "nothing rejected for that reason": a
+   wrong answer to §10's question dressed as a measured one. **Closed by E1e** (below).
+   `repeat_bp_with_no_locus` *is* filled (coverage minus loci) and pinned exactly against an
    independent computation.
+
+**E1e. Admission reports its rejections.**  ✅
+`finish_locus` returns `Result<Locus, RejectionReason>` instead of `Option<Locus>`; `admit` returns
+`Admitted.rejected: Vec<(RepeatInterval, RejectionReason)>`; `TypedRegionCounts::rejected_by_reason`
+is restored and filled. Same gates, same order, same outcome — pinned by A1's differential against
+production's `build_loci`, still green. *Source:* spec §3.1.
+
+**Per record, not a tally, and that is the whole design.** `admit` runs over a window's entire fetched
+slice, margins included, so every window that can see a repeat rejects it again; a tally taken inside
+`admit` would be counted once per window and **the number would move with `window_bp`** — a memory
+knob changing a reported number (spec §2.3). Handing the records back lets the walk attribute each to
+the core holding its start, exactly as it does for loci and bundle members. Verified by
+`the_tally_does_not_depend_on_the_window`; mutation-verified (drop the attribution and it fails — at
+`window_bp = 100` the tract at base 1 sits in ten windows' fetched slices).
+
+> **⚠ FINDING — the pre-filter makes three of admission's five gates unreachable from the walk.**
+> Found by writing the per-reason walk test and watching it come back **all zeroes**. `prefilter`
+> runs first and is not optional (spec §5b):
+> - **`CopyFloor`** — `prefilter` applies the **same `MinCopies` table** with the same arithmetic, so
+>   nothing under the floor survives to be turned down by it. A2 folded production's two copy-floor
+>   tables into one; both *call sites* remain, and this is the visible consequence.
+> - **`Compound`** — a compound motif is by definition a period-multiple of a shorter one, which is
+>   exactly what redundancy elimination drops.
+> - **`NoCleanTrim`** — reachable in principle; a tract with no motif pair in its trim window scores
+>   badly enough that the scanner segments it away first.
+>
+> `Purity` and `FlankClamped` are the live ones (the scanner tolerates ≈0.78, admission demands 0.80,
+> so tracts land in the gap; and contig ends are nobody else's business). **Three columns of §3.1's
+> breakdown are therefore structurally zero in the walk** — "no compound rejections in this genome" is
+> a wrong thing to read from them. Each reason is pinned at admission's own level, where all five are
+> reachable, and the *reason* the three are zero is pinned too, so that a pre-filter change fails
+> where the explanation is.
 
 *`EvictableRefSeq` is new and load-bearing: the walk releases what it has passed, without which a
 `WindowedRefSeq`'s buffer grows to the whole contig and "holds one window" is a claim rather than a
