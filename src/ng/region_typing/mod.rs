@@ -208,13 +208,20 @@ pub enum RegionKind {
 pub struct TypedRegionConfig {
     /// The period range the **scanner** looks for.
     ///
-    /// **Not the same knob as [`SsrAdmissionParams::periods`], and the difference
-    /// is load-bearing.** The scanner is deliberately permissive (it scans 1..=6
-    /// and emits every period-multiple of every tract); admission is strict (2..=6
-    /// by default). Collapsing them would either blind the scanner to the
-    /// homopolymers the pre-filter must *see in order to drop them before
-    /// redundancy elimination* — the poly-A cascade (`admission::prefilter`) — or
-    /// silently widen what gets admitted. Two ranges, two jobs.
+    /// **Not the same knob as [`SsrAdmissionParams::periods`], and the floor is where
+    /// the difference bites.** The scanner is deliberately permissive (it scans 1..=6
+    /// and emits every period-multiple of every tract); admission is strict (2..=6 by
+    /// default).
+    ///
+    /// The scanner must reach **period 1 even though nothing admits it**, because
+    /// `admission::prefilter` uses the period-1 interval as the *eliminator* that
+    /// removes a homopolymer's own aliases: `AAAA…` is a perfect `AA`, `AAA` and
+    /// `AAAAA` repeat, and only period 1 divides them all. Scan from 2 and those
+    /// aliases have nothing to eliminate them — a poly-A comes back as three
+    /// "repeats". **An eliminator that was never detected cannot eliminate**, so this
+    /// floor is machinery, not policy; it is not the knob a caller means when it says
+    /// which periods to analyse. See `prefilter`'s docs for the ordering this pairs
+    /// with (fixed 2026-07-17).
     pub periods: PeriodRange,
     /// The scanner's scoring weights.
     pub scan: ScanParams,
@@ -237,13 +244,17 @@ pub struct TypedRegionConfig {
     pub admission: SsrAdmissionParams,
 }
 
-/// The default scan period floor: **1**, wider than admission's.
+/// The scan period floor: **1**, wider than admission's, and it should stay there
+/// whatever admission's floor is set to.
 ///
-/// The scanner must *see* period-1 homopolymers even though nothing admits them,
-/// because `prefilter` drops them **before** redundancy elimination — and period 1
-/// divides every period, so a homopolymer that survives that stage eliminates any
-/// real STR it overlaps (`admission::prefilter`). Not seeing them is not the same
-/// as dropping them.
+/// The scanner must *see* period-1 homopolymers even though nothing admits them:
+/// `prefilter` keeps the period-1 interval through redundancy elimination precisely
+/// so it can eliminate the run's own `AA` / `AAA` / `AAAAA` aliases, and drops it by
+/// the period floor afterwards. **Not seeing them is not the same as dropping them**
+/// — that sentence is true, but not for the reason this doc used to give: the danger
+/// is not a surviving homopolymer, it is a surviving *alias* of one, which is what a
+/// scanner blind to period 1 leaves behind (`admission::prefilter`, fixed
+/// 2026-07-17).
 pub const DEFAULT_SCAN_MIN_PERIOD: u8 = 1;
 
 /// The default scan period ceiling: **6**, the microsatellite ceiling.
@@ -1682,21 +1693,24 @@ mod tests {
 
     /// **The scanner scans wider than admission admits, and that is deliberate.**
     ///
-    /// Two `periods` knobs look redundant until you ask why: `prefilter` must drop
-    /// period-1 homopolymers *before* redundancy elimination, and period 1 divides
-    /// every period — so a homopolymer that is never *scanned* cannot be dropped,
-    /// and one that survives to redundancy elimination takes every real STR it
-    /// overlaps with it (the poly-A cascade). Not seeing them is not the same as
-    /// dropping them.
+    /// Two `periods` knobs look redundant until you ask why: a homopolymer tiles
+    /// under every motif length, so the scanner emits its span at period 2, 3, 4, 5
+    /// and 6 as well as 1 — and **only the period-1 interval divides them all**, so
+    /// only it can eliminate them in `prefilter`. Scan from 2 and those aliases have
+    /// no eliminator: a poly-A enters the partition as three "repeats" (periods 2, 3
+    /// and 5). **An eliminator that was never detected cannot eliminate** — which is
+    /// what "not seeing them is not the same as dropping them" actually means.
     ///
-    /// If these two ever coincide, one of the two jobs has been lost.
+    /// If these two ever coincide at the floor, the aliasing bug of 2026-07-17 is
+    /// back. `a_homopolymer_does_not_survive_as_a_period_two_repeat` is the
+    /// behavioural statement; this is the config-level guard.
     #[test]
     fn the_scan_range_is_wider_than_the_admission_range() {
         let c = TypedRegionConfig::default();
         assert!(
             c.periods.min() < c.admission.periods.min(),
-            "the scanner must SEE period {} so the pre-filter can drop it before \
-             redundancy elimination; admission starts at {}",
+            "the scanner must SEE period {} so the pre-filter has an eliminator for \
+             that run's aliases; admission starts at {}",
             c.periods.min(),
             c.admission.periods.min()
         );
@@ -2111,7 +2125,7 @@ mod tests {
     /// walk: a tract impure enough to fail the 0.80 floor always contains a purer
     /// sub-segment that scores higher, so Ruzzo–Tompa emits *that* instead — measured, not
     /// argued (a 0.79-purity fixture comes back a **locus**, its pure core). See
-    /// `admission::the_walk_reaches_only_two_of_admissions_five_gates`.
+    /// `admission::the_walk_reaches_only_one_of_admissions_five_gates`.
     #[test]
     fn an_impure_tract_is_generic_when_its_pieces_fall_under_the_copy_floor() {
         let mut bases = filler(240);
@@ -2145,22 +2159,20 @@ mod tests {
         );
     }
 
-    /// **A homopolymer is `Generic`** (spec §8's fixture list): nothing admits period 1
-    /// (`SsrAdmissionParams::periods` starts at 2), and the bases are still covered.
+    /// **A homopolymer is `Generic` at periods 2..=6** (spec §8's fixture list): nothing
+    /// admits period 1, and the bases are still covered.
     ///
-    /// It is `prefilter` that drops the period-1 interval, **before** redundancy
-    /// elimination, and that ordering is load-bearing rather than incidental: period 1
-    /// divides every period, so a homopolymer surviving to that stage takes every real STR
-    /// it overlaps with it — the poly-A cascade. This is the walk-level statement of what
-    /// `prefilter_drops_period_one_before_it_can_eliminate_a_real_str` pins at the unit
-    /// level, and the neighbouring tract is what makes the difference visible.
+    /// `prefilter` is what removes it, and **the whole homopolymer, not just its period-1
+    /// label** — the 2026-07-17 ordering fix. A poly-A tiles under `AA`, `AAA`, `AAAAA`, so
+    /// the scanner emits the same span at every period in scope; only the period-1 interval
+    /// divides them all, so it is kept as an eliminator through redundancy elimination and
+    /// dropped by the period floor afterwards. Before that fix, periods 2, 3 and 5 survived
+    /// and one homopolymer entered the partition as three "repeats"
+    /// (`a_homopolymer_does_not_survive_as_a_period_two_repeat` pins it at the unit level).
     ///
-    /// **And it is where admission's `Compound` gate earns its keep** — which E1e got
-    /// wrong. Dropping period 1 by the *floor* leaves the run's **period-2** interval with
-    /// no lower-period interval to eliminate it, so `AAAAAA…` reaches `admit` as motif
-    /// `AA` — a motif that is itself a repeat. `Compound` catches it. The two facts are the
-    /// same decision seen from both ends: dropping period 1 early is what saves the real
-    /// STR *and* what sends the homopolymer to the compound gate.
+    /// The neighbouring tract is the other half: the copy floor drops period-1 specks
+    /// before they can eliminate anything, so a real STR is never taken out by one — the
+    /// poly-A cascade.
     #[test]
     fn a_homopolymer_is_generic_and_does_not_take_its_neighbour_with_it() {
         let mut bases = filler(300);
@@ -2201,15 +2213,18 @@ mod tests {
             "the poly-A run is Generic territory"
         );
 
-        // **And the gate that turned the run down is `Compound`**: period 1 is dropped by
-        // the floor, so the run's period-2 interval survives redundancy elimination with
-        // motif `AA` — a motif that is itself a repeat. This is the walk's only reachable
-        // rejection reason other than `FlankClamped`, and E1e's docs said the opposite
-        // until this fixture was written.
+        // **And it reaches admission not at all** — it is gone by the pre-filter, so it is
+        // turned down by no gate and counted under no reason. That is what "out of scope"
+        // has to mean: before the 2026-07-17 fix this fixture recorded THREE `Compound`
+        // rejections for one homopolymer, because its period-2/3/5 aliases each reached
+        // `admit` separately. A rejection count that moves with the number of divisors of
+        // a run's length is not measuring anything.
         let counts = counts_over(&bases, 100_000);
-        assert!(
-            counts.rejected_by_reason.compound > 0,
-            "a homopolymer reaches admission as a compound motif: {:?}",
+        assert_eq!(
+            counts.rejected_by_reason,
+            RejectionCounts::default(),
+            "the homopolymer is filtered out, not rejected — and the (CAG) tract is \
+             admitted, so nothing here is turned down at all: {:?}",
             counts.rejected_by_reason
         );
     }

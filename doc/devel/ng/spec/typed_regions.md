@@ -9,7 +9,8 @@ shape, and `ReadPreparer::Locus` ([`read_preparation_ssr.md`](read_preparation_s
 retires `locus_router/` from [`../arch/module_layout.md`](../arch/module_layout.md). Amends four
 sibling docs; see §9. Code-facing companion: [`../arch/typed_regions.md`](../arch/typed_regions.md).
 The CLI that drives this walk and writes its output to a file is
-[`typed_regions_cli.md`](typed_regions_cli.md).*
+[`typed_regions_cli.md`](typed_regions_cli.md) — in `pop_var_caller_exp`, a second binary, so ng's
+knobs stay out of the production command.*
 
 *Naming: **STR** in prose, `ssr` in code. **Licensing:** implement from papers, never transliterate
 — TRF-mod is AGPL-3, GangSTR GPL-3, HipSTR GPL-2. Nothing here needs their source.*
@@ -715,6 +716,15 @@ noise and every period-multiple of every real tract. Fed straight in, that noise
 drop — which runs *before* the copy floor — and cascades the real loci away. With the two cleanups
 (`copy floor`, period-multiple redundancy) the scanner reproduces the golden catalog at 16/16.
 
+**The order of the three is load-bearing, and ng's copy fixes an ordering production has wrong**
+(2026-07-17; §5.2's correction has the evidence). It is: **copy floor → period-multiple redundancy →
+period floor.** Production gates `period >= 2` up front, which drops the period-1 interval before
+redundancy elimination can use it — and period 1 is the only period that divides *every* other, so a
+homopolymer's `AA` / `AAA` / `AAAAA` aliases then have nothing to eliminate them and enter the cleaned
+set as real repeats. Putting the period floor last fixes it; putting the **copy** floor first is what
+stops a 2 bp period-1 speck becoming an eliminator and cascading real loci away. Both floors, in that
+order, or one of the two failures is back.
+
 **(c) The port is what opens the door.** Production's `build_loci` takes `Vec<TrfRecord>`, and the
 only bridge from a scanner interval is `TrfRecord::for_test`, which is `#[cfg(test)]` — so non-test ng
 code **could not call it at all**. An earlier draft made this step "blocked on, or co-landing with"
@@ -785,6 +795,56 @@ clears). That ordering is load-bearing: redundancy treats every period as a mult
 period-1 interval reaching it would annihilate every overlapping real tract. The ranges differ only
 in the *partition* — under 1–6 an over-1 kb poly-A becomes `Satellite`. v1 takes 2–6 to keep the
 admitted set equal to the catalog's.
+
+> **The paragraph above describes a bug, which is now fixed — 2026-07-17. The sentence about
+> `Satellite` was a symptom of it, and the ordering it praises was the cause.**
+>
+> **The bug.** A homopolymer tiles under every motif length: `AAAA…` is a perfect period-2 `AA`,
+> period-3 `AAA` and period-5 `AAAAA` repeat, and the scanner emits the same span at all of them.
+> Only the period-1 interval divides them all, so only it can eliminate them — and `prefilter` dropped
+> period 1 **by the period floor, before redundancy elimination ever ran**. The aliases outlived their
+> only eliminator. Measured on a bare 30 bp poly-A in aperiodic filler: the cleaned set came back with
+> **three intervals — periods 2, 3 and 5, identical spans** (4 and 6 died as multiples of 2). They then
+> fed coverage (three copies of one span), the satellite cap, and three separate `Compound` rejections.
+> **`periods.min() == 2` dropped the period-1 *label*, not the homopolymer** — so the parameter did not
+> mean what it said, which is the whole of the bug. That is why an over-1 kb poly-A became a
+> `Satellite`: not by decision, but because its aliases were counted as tandem repeats.
+>
+> **The fix** ([`admission::prefilter`](../../../../src/ng/region_typing/admission.rs)) splits the one
+> filter in two and puts the period floor **last**: copy floor → redundancy elimination → period floor.
+> Period 1 now survives long enough to eliminate its own aliases and is dropped afterwards, so a
+> homopolymer contributes **nothing** at 2..=6 and is admitted as a period-1 tract under its own motif
+> at 1..=6. **The range means what it says in both directions**, which is all a caller asked for.
+>
+> **The copy floor is what makes that safe, and it is why the ordering was as it was.** A surviving
+> period-1 interval eliminates every real STR it overlaps — and aperiodic sequence is full of 2 bp
+> period-1 specks (`GG`, `TT`: 45 of them per 300 bp of the test filler). `MinCopies`' period-1 entry
+> is **10**, so the specks are dropped before they can eliminate anything and only a genuine
+> homopolymer run becomes an eliminator. That entry was **unreachable dead weight** until this
+> ordering — see the A1-review note below, which found the two copy-floor tables differ only at period
+> 1 and that period 1 reached neither. It is now exactly what separates a poly-A from a speck.
+>
+> **What the scanner's floor is actually for**, correcting this section's *reason* rather than its
+> conclusion: **an eliminator that was never detected cannot eliminate.** Scan from 2 and the aliases
+> return, so the scan floor of 1 is load-bearing after all — as machinery, not policy. It is not the
+> knob a caller means by "which periods to analyse", which is why
+> [`typed_regions_cli.md`](typed_regions_cli.md) §2.2 exposes one period range and pins the scan floor
+> at 1.
+>
+> **Evidence.** All 642 ng tests pass, including `.cat` parity against the trf-mod golden catalog
+> (16/16), the port-fidelity differential (§8.0), window-invariance, and the partition invariant over
+> the golden reference — so the fix changed no answer any oracle checks, and removed the aliases. Two
+> tests failed and were rewritten *because they encoded the bug*:
+> `prefilter_drops_period_one_before_it_can_eliminate_a_real_str` asserted the alias should be **kept**
+> (its "real STR" was the poly-A's own period-2 alias, over the identical span), and the walk-level
+> homopolymer fixture asserted the run must reach admission as `Compound`.
+>
+> **Consequence for §3.1's counts.** `Compound` was reachable *only* via this bug — the E1e note in §8
+> below says so in as many words ("the poly-A cascade's fix is what creates this gate's only
+> customer"). With the alias gone, **the walk reaches one of admission's five gates, not two**:
+> `FlankClamped`. E1e's original *reasoning* about `Compound` — that a compound motif is a
+> period-multiple and redundancy drops it — was right all along; it was false only of period 1, and
+> only because of the ordering.
 
 ---
 
@@ -1005,6 +1065,16 @@ contig's end abutting one at the next's start (transition arithmetic).
 > run's period-2 multiple has no eliminator left and arrives as motif `AA`) and `FlankClamped`. See
 > `admission::the_walk_reaches_only_two_of_admissions_five_gates`; §3.1's other three columns are
 > structurally zero.
+>
+> > **Superseded 2026-07-17 — it is ONE gate, `FlankClamped`.** "The run's period-2 multiple has no
+> > eliminator left" *was the bug* (§5.2's correction), and `Compound` had no other customer. With
+> > `prefilter` reordered, a homopolymer never reaches admission, so nothing is turned down and nothing
+> > is counted — the walk-level fixture now asserts `RejectionCounts::default()`. **The zeroes were
+> > never a property of admission**: each is caused by a stage *upstream* of the gate — the scanner's
+> > maximal-scoring segments for `Purity` and `NoCleanTrim`, the pre-filter for `CopyFloor` and now
+> > `Compound` — so the count moves whenever that stage does, and it has now moved twice. **Four of
+> > §3.1's five rejection columns are structurally zero.** The test is renamed
+> > `admission::the_walk_reaches_only_one_of_admissions_five_gates`.
 
 ---
 
@@ -1132,6 +1202,15 @@ still has to be right is ng's port — and §8.0 pins it against production dire
   alone re-arms the annihilation hazard (§5.2). The floors live in `postprocess.rs`, so the answer
   moves the catalog too — a reason to measure before touching, not to leave it inherited. **The
   numbers are GangSTR's; the question is ours; nobody has asked it.**
+
+  *Updated 2026-07-17: **in ng this trap is gone**, and the experiment is now a one-knob change.*
+  *A2 folded the two copy-floor tables into one `MinCopies`, and the pre-filter reorder (§5.2's*
+  *correction) made the remaining gates consistent: the period floor is `periods.min()`, applied*
+  *last, and `MinCopies::for_period(1)` = 10 is applied first. So `periods = 1..=6` is the whole of*
+  *"put period 1 on the STR path" — no second clause to relax, no annihilation hazard to re-arm,*
+  *because the copy floor keeps the specks out. **`copy_number_floor(1)` = 10 is no longer dead:***
+  *it is what the reorder brought to life.* The trap as stated still describes **production**,
+  whose `postprocess.rs` keeps both tables and the up-front gate.
 
 - **What should downstream do with an `SsrBundle`?** The selection and the disposal are settled
   (§2.4); the consumer does not exist. Options, each a real precedent: **treat as generic**;
