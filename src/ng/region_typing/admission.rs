@@ -1813,46 +1813,90 @@ mod tests {
         );
     }
 
-    /// **The pre-filter makes three of admission's five gates unreachable from the walk**,
-    /// and a reader of `TypedRegionCounts::rejected_by_reason` has to know it: three of
-    /// those columns are structurally zero there, and "no compound rejections in this
-    /// genome" is a wrong thing to conclude from a zero the pre-filter caused.
+    /// **The walk reaches only two of admission's five gates** — `Compound` and
+    /// `FlankClamped` — and a reader of `TypedRegionCounts::rejected_by_reason` has to know
+    /// it: the other three columns are structurally zero, and "no impure tracts in this
+    /// genome" is a wrong thing to read from a zero the *scanner* caused.
     ///
-    /// Found at E1e by writing the walk-level test for each reason and watching it come
-    /// back all zeroes (spec §5b: `prefilter` is not optional, and it runs first):
+    /// # E1e got this backwards in both directions, and the fixtures said so
     ///
-    /// - **`CopyFloor`** — `prefilter` applies the **same `MinCopies` table** with the
-    ///   same arithmetic, so nothing under the floor survives to be turned down by it.
-    ///   A2 folded production's two copy-floor tables into one; both *call sites* remain,
-    ///   and this is the visible consequence.
-    /// - **`Compound`** — a compound motif is by definition a period-multiple of a shorter
-    ///   one, which is exactly what redundancy elimination drops.
-    /// - **`NoCleanTrim`** — reachable in principle, but a tract with no motif pair in its
-    ///   trim window scores badly enough that the scanner segments it away first.
+    /// E1e wrote that `Compound` was unreachable and `Purity` live. The walk-level
+    /// fixtures (spec §8's homopolymer and impure-tract cases) showed the reverse. What is
+    /// actually true, and why:
     ///
-    /// `Purity` and `FlankClamped` are the live ones: the scanner's mismatch tolerance
-    /// (≈0.78) is looser than admission's floor (0.80), so tracts land in the gap; and the
-    /// contig's ends are nobody else's business.
+    /// - **`CopyFloor` — unreachable.** `prefilter` applies the **same `MinCopies` table**
+    ///   with the same arithmetic, so nothing under the floor survives to be turned down
+    ///   by it. A2 folded production's two copy-floor tables into one; both *call sites*
+    ///   remain, and this is the visible consequence. *(E1e had this right.)*
+    /// - **`Purity` — unreachable, and this is the interesting one.** Not because of the
+    ///   pre-filter, but because of **Ruzzo–Tompa**: the scanner emits *maximal-scoring*
+    ///   segments, and a tract impure enough to fail the 0.80 floor always contains a purer
+    ///   sub-segment that scores higher — so the scanner emits *that*, and admission is
+    ///   handed the pure core. Measured: a 0.79-purity fixture comes back a **locus**.
+    ///   E1e argued from the two thresholds (scanner ≈0.78 vs admission 0.80) that tracts
+    ///   would land in the gap; they cannot, because the segmenter never hands the gap over.
+    /// - **`NoCleanTrim` — unreachable**, for the same reason: a tract with no motif pair
+    ///   in its trim window is a tract the scanner segments away first.
+    /// - **`Compound` — REACHABLE, and it is the homopolymer gate.** E1e reasoned that a
+    ///   compound motif is a period-multiple and redundancy elimination drops it. True of
+    ///   STR multiples (`ATAT` is eliminated by `AT`) — **false of period 1**, which
+    ///   `prefilter` drops by the *period floor* rather than keeping as an eliminator. So a
+    ///   poly-A run's **period-2** interval survives with nothing to eliminate it, reaches
+    ///   `admit` as motif `AA`, and is turned down here. The poly-A cascade's fix is what
+    ///   creates this gate's only customer.
+    /// - **`FlankClamped` — reachable**: the contig's ends are nobody else's business.
     ///
-    /// This test pins the *reason* those columns are zero, so that if the pre-filter ever
-    /// stops enforcing the floor the failure lands here — where the explanation is —
-    /// rather than as a mystery column that suddenly has numbers in it.
+    /// This test pins the *mechanism* behind each zero, so that a pre-filter or scanner
+    /// change fails here — where the explanation is — rather than as a column that
+    /// mysteriously grows numbers.
     #[test]
-    fn the_pre_filter_makes_three_of_admissions_gates_unreachable_from_the_walk() {
+    fn the_walk_reaches_only_two_of_admissions_five_gates() {
         let p = params();
-        // A tract under the copy floor: `prefilter` drops it, so `admit` never sees it.
+
+        // CopyFloor: `prefilter` enforces the floor FIRST, with the same table.
         let low_copy = vec![iv(20, 26, 2, 100)];
         assert!(
             prefilter(&low_copy, &p).is_empty(),
-            "the pre-filter enforces the copy floor FIRST, with the same table — which is \
-             why `admit`'s copy-floor gate cannot fire from the walk"
+            "the pre-filter enforces the copy floor first, so `admit`'s copy-floor gate \
+             cannot fire from the walk"
         );
 
-        // A period-multiple: redundancy elimination drops it, so the compound gate never
-        // sees it either. (Both must be present, as the scanner emits them.)
+        // Compound, on an STR multiple: redundancy elimination drops it, so THIS compound
+        // never reaches the gate. (Both must be present, as the scanner emits them.)
         let fundamental_and_multiple = vec![iv(20, 40, 2, 100), iv(20, 40, 4, 100)];
-        let cleaned = prefilter(&fundamental_and_multiple, &p);
-        assert_eq!(cleaned, vec![iv(20, 40, 2, 100)], "the multiple is dropped");
+        assert_eq!(
+            prefilter(&fundamental_and_multiple, &p),
+            vec![iv(20, 40, 2, 100)],
+            "a period-multiple of a surviving tract is eliminated"
+        );
+
+        // **But a homopolymer's multiple is not**, because its divisor-period interval is
+        // dropped by the FLOOR rather than kept as an eliminator — so it survives to the
+        // compound gate. This is why `Compound` is reachable and E1e's claim was wrong.
+        let homopolymer_and_multiple = vec![iv(20, 40, 1, 100), iv(20, 40, 2, 100)];
+        assert_eq!(
+            prefilter(&homopolymer_and_multiple, &p),
+            vec![iv(20, 40, 2, 100)],
+            "period 1 is dropped by the period floor, so nothing is left to eliminate the \
+             period-2 interval over the same homopolymer — it survives"
+        );
+        let contig = b"CGCGCGCGCGCGCGCGCGCGAAAAAAAAAAAAAAAAAAAACGCGCGCGCGCGCGCGCGCG";
+        assert_eq!(
+            admit(
+                vec![iv(20, 40, 2, 100)],
+                "chr1",
+                contig,
+                Position(1),
+                Bp(contig.len() as u64),
+                &p,
+            )
+            .rejected
+            .into_iter()
+            .map(|(_, r)| r)
+            .collect::<Vec<_>>(),
+            vec![RejectionReason::Compound],
+            "and `admit` turns it down as compound: its motif `AA` is itself a repeat"
+        );
     }
 
     #[test]

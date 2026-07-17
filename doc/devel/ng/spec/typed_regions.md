@@ -285,9 +285,36 @@ whole-genome run rejects**. Same reference, different calls, because of `--regio
 The BED chooses what you are *shown*, never what things *are*.
 
 **Decision: scan wider than you emit.** Grow each region by `max_repeat_len`, re-coalesce, scan those,
-emit only what overlaps the user's regions. Two sets: **scan** (grown) and **emit** (the user's). The
-residual — a cluster chaining past 1 kb without a 50 bp break — is dense-repeat territory heading for
-`Satellite`; **§8 tests for it directly** rather than trusting the argument.
+emit only what overlaps the user's regions. Two sets: **scan** (grown) and **emit** (the user's).
+
+> **The residual is real, and this section's mitigation of it was false — tested 2026-07-17.**
+>
+> This paragraph used to end: *"The residual — a cluster chaining past 1 kb without a 50 bp break — is
+> dense-repeat territory heading for `Satellite`; §8 tests for it directly rather than trusting the
+> argument."* The test was written. **The argument was wrong.**
+>
+> A `Satellite` is over-cap **coverage**, and coverage runs merge only where they **abut** (§2.4). A
+> chain of 20 bp tracts 30 bp apart running 1.5 kb has no run longer than 20 bp: nothing comes near the
+> 1 kb cap, and the chain is a **bundle**, not a satellite. So the cut is not saved by anything.
+>
+> **What actually happens** (`a_cluster_chaining_past_the_margin_is_cut_by_a_bed_edge`):
+>
+> - **This section's stated property still holds** — *whether a base is STR / bundle / generic /
+>   satellite must not depend on the BED*. A tract inside the requested span has every neighbour within
+>   `flank_bp`, far inside the `max_repeat_len` margin, so its verdict is right. The margin does the job
+>   it was chosen for.
+> - **"A finding is returned whole" does not.** The emitted `SsrBundle` is **truncated** at the scan
+>   edge — hull `1001–2170` where the whole-genome run says `1001–2470`, and 24 member tracts of the
+>   real 30. Silently: a *different object*, whenever a chain runs more than `max_repeat_len` past a
+>   requested edge.
+>
+> **Not fixed, and the choice is the owner's.** The fallback this section already names — *"always scan
+> whole contigs (exact … but makes a 10 kb region pay for a 90 Mb chromosome)"* — is one answer. A
+> cheaper one exists for the **right** edge only: §2.6's own rule ("hold the open cluster, and resolve
+> it when a far-enough repeat arrives — the data tells you when it's over") applies just as well to the
+> scan's end as to a window's, so the walk could keep scanning past the grown edge while a block is
+> open. The **left** edge has no such fix short of scanning from the contig start. Whether real genomes
+> carry chains this long is unmeasured.
 
 > **Corrected at E2, 2026-07-17 — "the walk needs no special logic, because a grown region is just a
 > longer continuous run" is wrong, and the walk says so with a panic.**
@@ -956,7 +983,7 @@ by §2.4's ordering: capping raw coverage would make the difference bidirectiona
 disposal separable is what preserved the oracle.
 
 **The invariant test** (§2.3) over a synthetic **multi-contig** fixture: a clean tract; an impure and
-a low-copy tract (both `Generic` — the §2.2 property); a homopolymer; a 2 kb array (`Satellite`); a
+a low-copy tract (both `Generic` — the §2.2 property, and see the correction below); a homopolymer; a 2 kb array (`Satellite`); a
 real STR *inside* a 2 kb array (swallowed — the §2.4 cost, made visible); **two tracts 10 bp apart**
 (one `SsrBundle` carrying both, *not* two `Generic` regions); **three tracts chained 30 bp apart** (one
 bundle of three — emergent transitivity); **a locus 60 bp from a bundle** (admitted; bundles do not
@@ -978,6 +1005,23 @@ contig's end abutting one at the next's start (transition arithmetic).
   straddling locus comes out whole with both flanks, **and so does a straddling bundle**; generic
   regions stop at the user's edge, not the
   grown scan edge.
+
+> **Two corrections to this section's fixture list, from writing it (2026-07-17).**
+>
+> **"An impure tract → `Generic`" is not one rule.** The *scanner* decides an impure tract's fate long
+> before admission does, because Ruzzo–Tompa returns **maximal-scoring** segments. Three outcomes: a
+> **small** interruption is paid for by the surrounding matches, the tract stays whole and admits — a
+> **locus**; a **large** one splits the segment, and the pure pieces are a **bundle** if they are close
+> (two loci if not); only when the pieces fall under the copy floor is it **`Generic`**. The fixture
+> that pins §2.2's property is the third case, and it says so.
+>
+> **Admission's `Purity` gate is unreachable from the walk** — a tract impure enough to fail the 0.80
+> floor always contains a purer sub-segment that scores higher, so the scanner emits *that*. Measured:
+> a 0.79-purity fixture comes back a **locus**, its pure core. Of admission's five gates the walk
+> reaches exactly two, `Compound` (the homopolymer gate — §5b drops period 1 by the *floor*, so the
+> run's period-2 multiple has no eliminator left and arrives as motif `AA`) and `FlankClamped`. See
+> `admission::the_walk_reaches_only_two_of_admissions_five_gates`; §3.1's other three columns are
+> structurally zero.
 
 ---
 

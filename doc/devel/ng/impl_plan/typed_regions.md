@@ -381,23 +381,31 @@ the core holding its start, exactly as it does for loci and bundle members. Veri
 `the_tally_does_not_depend_on_the_window`; mutation-verified (drop the attribution and it fails — at
 `window_bp = 100` the tract at base 1 sits in ten windows' fetched slices).
 
-> **⚠ FINDING — the pre-filter makes three of admission's five gates unreachable from the walk.**
-> Found by writing the per-reason walk test and watching it come back **all zeroes**. `prefilter`
-> runs first and is not optional (spec §5b):
-> - **`CopyFloor`** — `prefilter` applies the **same `MinCopies` table** with the same arithmetic, so
->   nothing under the floor survives to be turned down by it. A2 folded production's two copy-floor
->   tables into one; both *call sites* remain, and this is the visible consequence.
-> - **`Compound`** — a compound motif is by definition a period-multiple of a shorter one, which is
->   exactly what redundancy elimination drops.
-> - **`NoCleanTrim`** — reachable in principle; a tract with no motif pair in its trim window scores
->   badly enough that the scanner segments it away first.
+> **⚠ FINDING — the walk reaches only two of admission's five gates.** Found by writing the per-reason
+> walk test and watching it come back **all zeroes**; **corrected 2026-07-17**, when E3's follow-up
+> fixtures showed E1e's first account was wrong *in both directions*:
+> - **`CopyFloor` — unreachable.** `prefilter` applies the **same `MinCopies` table** with the same
+>   arithmetic. A2 folded production's two copy-floor tables into one; both *call sites* remain, and
+>   this is the visible consequence. *(E1e had this right.)*
+> - **`Purity` — unreachable, and not because of the pre-filter.** Because of **Ruzzo–Tompa**: the
+>   scanner emits *maximal-scoring* segments, so a tract impure enough to fail the 0.80 floor always
+>   contains a purer sub-segment that scores higher and the scanner emits **that** instead. Measured —
+>   a 0.79-purity fixture comes back a **locus**. E1e argued from the two thresholds (scanner ≈0.78 vs
+>   admission 0.80) that tracts would land in the gap; they cannot, because the segmenter never hands
+>   the gap over.
+> - **`NoCleanTrim` — unreachable**, same mechanism.
+> - **`Compound` — REACHABLE, and it is the homopolymer gate.** E1e reasoned that a compound motif is
+>   a period-multiple and redundancy elimination drops it: true of STR multiples (`ATAT` is eliminated
+>   by `AT`), **false of period 1**, which `prefilter` drops by the *period floor* rather than keeping
+>   as an eliminator. A poly-A run's **period-2** interval therefore survives with nothing to eliminate
+>   it and reaches `admit` as motif `AA`. The poly-A cascade's fix is what creates this gate's only
+>   customer.
+> - **`FlankClamped` — reachable**: contig ends are nobody else's business.
 >
-> `Purity` and `FlankClamped` are the live ones (the scanner tolerates ≈0.78, admission demands 0.80,
-> so tracts land in the gap; and contig ends are nobody else's business). **Three columns of §3.1's
-> breakdown are therefore structurally zero in the walk** — "no compound rejections in this genome" is
-> a wrong thing to read from them. Each reason is pinned at admission's own level, where all five are
-> reachable, and the *reason* the three are zero is pinned too, so that a pre-filter change fails
-> where the explanation is.
+> **Three columns of §3.1's breakdown are structurally zero in the walk** — "no impure tracts in this
+> genome" is a wrong thing to read from them. Each reason is pinned at admission's own level, where all
+> five are reachable, and the *mechanism* behind each zero is pinned too, so a pre-filter or scanner
+> change fails where the explanation is.
 
 *`EvictableRefSeq` is new and load-bearing: the walk releases what it has passed, without which a
 `WindowedRefSeq`'s buffer grows to the whole contig and "holds one window" is a claim rather than a
@@ -468,9 +476,28 @@ control.)*
 > **Checkpoint E — REACHED 2026-07-17.** Step 3 runs end to end; `.cat` parity + all three invariance
 > tests green, through the shipping stack. **Step 3 is complete.** Pause for review.
 >
+> **The last three spec-mandated tests, written 2026-07-17 — and all three found something:**
+> - **§2.5's residual is real and its mitigation was false.** A cluster chaining past `max_repeat_len`
+>   is **not** "dense-repeat territory heading for `Satellite`" — coverage runs merge only where they
+>   abut, so a chain of 20 bp tracts 30 bp apart has no run over 20 bp and stays a **bundle**. The BED
+>   run emits it **truncated at the scan edge** (24 members of 30). §2.5's *stated* property still
+>   holds (a requested base's **kind** is BED-independent, because the margin covers every neighbour of
+>   a requested tract); the owner's "a finding is returned whole" rule does **not**. **Needs a
+>   decision** — §2.5 names "always scan whole contigs" as the fallback; a cheaper fix exists for the
+>   **right** edge only (§2.6's "hold the open cluster" applied to the scan's end); the **left** edge
+>   has none short of scanning from the contig start. Whether real genomes carry such chains is
+>   unmeasured.
+> - **"An impure tract → `Generic`" is not one rule** (§8's fixture list): Ruzzo–Tompa decides an
+>   impure tract's fate first — small interruption → **locus**; large with long pieces → **bundle**;
+>   large with short pieces → **`Generic`**. Only the third pins §2.2's property, and the fixture says
+>   so.
+> - **The homopolymer fixture found E1e's reachability claim backwards** — see the E1e correction
+>   above.
+>
 > **Open, and needing an owner decision:**
 > - ~~`Satellite` clips at a BED edge~~ — **decided (owner, 2026-07-17): it does not.** Every finding
 >   comes back whole; `Generic` alone clips. See E2 above.
+> - **§2.5's residual** (above): accept, fix the right edge, or fall back to whole-contig scans.
 > - **Three of §3.1's five rejection columns are structurally zero in the walk** (E1e), because the
 >   pre-filter gets there first. Not a bug; a thing a reader of the counts must know.
 > - **Still open from Checkpoint A:** a `proptest` property over `assert_agrees` — the strongest

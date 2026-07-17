@@ -2080,6 +2080,20 @@ mod tests {
         );
     }
 
+    /// The kinds, in order — for asserting a partition's shape without spelling out four
+    /// `matches!` arms at every site.
+    fn kinds_of(regions: &[TypedRegion]) -> Vec<&'static str> {
+        regions
+            .iter()
+            .map(|r| match &r.kind {
+                RegionKind::SsrLocus(_) => "locus",
+                RegionKind::SsrBundle { .. } => "bundle",
+                RegionKind::Generic => "generic",
+                RegionKind::Satellite => "satellite",
+            })
+            .collect()
+    }
+
     /// Aperiodic filler — **not** a homopolymer, and that matters.
     ///
     /// A `vec![b'C'; 60]` "flank" is a period-1 tract, and worse: with an `(AT)n`
@@ -2111,6 +2125,130 @@ mod tests {
         assert!(matches!(regions[0].kind, RegionKind::Generic));
         assert_eq!(regions[0].region.start, Position(1));
         assert_eq!(regions[0].region.end, Position(len));
+    }
+
+    /// **An impure tract is `Generic`** (spec §8's fixture list, §2.2) — with the control
+    /// that shows it is the interruption's doing.
+    ///
+    /// # But "impure → Generic" is not one rule, and it took this test to see it
+    ///
+    /// The scanner decides an impure tract's fate long before admission does, because
+    /// Ruzzo–Tompa returns **maximal-scoring** segments. So an interruption has three
+    /// possible outcomes, and only the third is this fixture:
+    ///
+    /// 1. **small** — the surrounding matches pay for it, the tract stays whole, and it is
+    ///    pure enough to admit: a **locus**;
+    /// 2. **large, with long pieces** — the segment splits, and the pure pieces are close
+    ///    together: a **bundle** (or two loci, if far apart);
+    /// 3. **large, with short pieces** — the segment splits and each piece falls under the
+    ///    copy floor: **`Generic`**, which is this fixture (two 8 bp halves = 4 copies,
+    ///    under the floor of 5).
+    ///
+    /// **Admission's purity gate is not what does any of this.** It is unreachable from the
+    /// walk: a tract impure enough to fail the 0.80 floor always contains a purer
+    /// sub-segment that scores higher, so Ruzzo–Tompa emits *that* instead — measured, not
+    /// argued (a 0.79-purity fixture comes back a **locus**, its pure core). See
+    /// `admission::the_walk_reaches_only_two_of_admissions_five_gates`.
+    #[test]
+    fn an_impure_tract_is_generic_when_its_pieces_fall_under_the_copy_floor() {
+        let mut bases = filler(240);
+        bases[100..126].copy_from_slice(b"ATATATATGGGGGGGGGGATATATAT");
+        let len = bases.len() as u64;
+
+        let regions =
+            partition_resident("chr1", ContigId(0), &bases, &TypedRegionConfig::default());
+        assert_partitions(&regions, ContigId(0), len, "impure tract");
+        assert!(
+            !regions
+                .iter()
+                .any(|r| matches!(r.kind, RegionKind::SsrLocus(_))),
+            "an impure tract is not a locus: {:?}",
+            kinds_of(&regions)
+        );
+        // Not a hole either — spec §2.2's property, which is what the fixture is for.
+        assert_eq!(regions.len(), 1, "the whole contig is one Generic region");
+
+        // **The control.** Remove the interruption and the same span at the same settings
+        // IS a locus — so `Generic` above is the interruption's doing, not a tract that was
+        // never admissible (D1's trap).
+        let mut bases = filler(240);
+        bases[100..126].copy_from_slice(b"ATATATATATATATATATATATATAT");
+        let regions =
+            partition_resident("chr1", ContigId(0), &bases, &TypedRegionConfig::default());
+        assert_eq!(
+            kinds_of(&regions),
+            vec!["generic", "locus", "generic"],
+            "pure, the same span is a locus"
+        );
+    }
+
+    /// **A homopolymer is `Generic`** (spec §8's fixture list): nothing admits period 1
+    /// (`SsrAdmissionParams::periods` starts at 2), and the bases are still covered.
+    ///
+    /// It is `prefilter` that drops the period-1 interval, **before** redundancy
+    /// elimination, and that ordering is load-bearing rather than incidental: period 1
+    /// divides every period, so a homopolymer surviving to that stage takes every real STR
+    /// it overlaps with it — the poly-A cascade. This is the walk-level statement of what
+    /// `prefilter_drops_period_one_before_it_can_eliminate_a_real_str` pins at the unit
+    /// level, and the neighbouring tract is what makes the difference visible.
+    ///
+    /// **And it is where admission's `Compound` gate earns its keep** — which E1e got
+    /// wrong. Dropping period 1 by the *floor* leaves the run's **period-2** interval with
+    /// no lower-period interval to eliminate it, so `AAAAAA…` reaches `admit` as motif
+    /// `AA` — a motif that is itself a repeat. `Compound` catches it. The two facts are the
+    /// same decision seen from both ends: dropping period 1 early is what saves the real
+    /// STR *and* what sends the homopolymer to the compound gate.
+    #[test]
+    fn a_homopolymer_is_generic_and_does_not_take_its_neighbour_with_it() {
+        let mut bases = filler(300);
+        // 20 bp of poly-A, then a clean (CAG) tract 60 bp away — far enough not to bundle.
+        bases[100..120].copy_from_slice(&[b'A'; 20]);
+        bases[180..204].copy_from_slice(b"CAGCAGCAGCAGCAGCAGCAGCAG");
+        let len = bases.len() as u64;
+
+        let regions =
+            partition_resident("chr1", ContigId(0), &bases, &TypedRegionConfig::default());
+        assert_partitions(&regions, ContigId(0), len, "homopolymer");
+
+        let loci: Vec<_> = regions
+            .iter()
+            .filter_map(|r| match &r.kind {
+                RegionKind::SsrLocus(l) => Some(l),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            loci.len(),
+            1,
+            "exactly one locus: the (CAG) tract. The homopolymer is not one, and — the \
+             point — it did not eliminate the tract either: {:#?}",
+            kinds_of(&regions)
+        );
+        assert_eq!(loci[0].motif().as_bytes(), b"CAG");
+        assert!(
+            loci[0].start() >= 181 && loci[0].start() <= 185,
+            "and it is the tract at ~181, not something the cascade left behind: {}",
+            loci[0].start()
+        );
+        // The homopolymer's own bases are covered, not a hole (spec §2.2).
+        assert!(
+            regions
+                .iter()
+                .any(|r| r.region.contains(Position(110)) && matches!(r.kind, RegionKind::Generic)),
+            "the poly-A run is Generic territory"
+        );
+
+        // **And the gate that turned the run down is `Compound`**: period 1 is dropped by
+        // the floor, so the run's period-2 interval survives redundancy elimination with
+        // motif `AA` — a motif that is itself a repeat. This is the walk's only reachable
+        // rejection reason other than `FlankClamped`, and E1e's docs said the opposite
+        // until this fixture was written.
+        let counts = counts_over(&bases, 100_000);
+        assert!(
+            counts.rejected_by_reason.compound > 0,
+            "a homopolymer reaches admission as a compound motif: {:?}",
+            counts.rejected_by_reason
+        );
     }
 
     /// **A rejected repeat is generic territory, not a hole** (spec §2.2). A
@@ -2487,6 +2625,112 @@ mod tests {
 
     fn reference_over(chrom: &str, bases: &[u8]) -> InMemoryRefSeq {
         InMemoryRefSeq::from_named_contigs(vec![(chrom.to_string(), bases.to_vec())])
+    }
+
+    /// A **chain**: 20 bp `(AT)` tracts every 50 bp — a 30 bp gap between each, under the
+    /// 50 bp flank — running from 1000 for `span_bp`. Every tract is close to the next, so
+    /// the whole thing is one cluster however long it is.
+    fn chained_cluster(span_bp: usize, total: usize) -> Vec<u8> {
+        let mut bases = filler(total);
+        let mut at = 1000;
+        while at + 20 <= 1000 + span_bp {
+            bases[at..at + 20].copy_from_slice(b"ATATATATATATATATATAT");
+            at += 50;
+        }
+        bases
+    }
+
+    /// **§2.5's residual, tested directly — and its mitigation is false** (the spec asked
+    /// for this test rather than trusting the argument, and it was right to).
+    ///
+    /// §2.5 grows the scan span by `max_repeat_len` so a BED edge cannot cut a decision.
+    /// A **cluster** defeats that, because clustering has no reach: *"bundles chain —
+    /// A–B–C–D each 30 bp apart runs past any margin you choose"* (§2.6). The spec's
+    /// answer was that such a chain is **"dense-repeat territory heading for `Satellite`"**,
+    /// so the cut could not matter.
+    ///
+    /// **It is not.** A satellite is over-cap *coverage*, and coverage runs merge only
+    /// where they **abut** (`coverage_runs`). This fixture chains 30 tracts across 1.5 kb
+    /// with 30 bp gaps: every run is 20 bp, nothing comes near the 1 kb cap, and the chain
+    /// is a **bundle** — cut at the scan edge, 24 members instead of 30.
+    ///
+    /// # What holds, and what does not
+    ///
+    /// - **§2.5's stated property holds**: *whether a base is STR / bundle / generic /
+    ///   satellite must not depend on the BED*. Every requested base is `SsrBundle` either
+    ///   way, and it must be — a tract inside the requested span has all its neighbours
+    ///   within `flank_bp`, which is far inside the `max_repeat_len` margin, so its verdict
+    ///   is right. The margin does the job it was chosen for.
+    /// - **"A finding is returned whole" does not** (owner, 2026-07-17). The bundle comes
+    ///   back **truncated**: hull `1001–2170` against the whole-genome `1001–2470`, and its
+    ///   `tracts` are 24 of the real 30. Silently.
+    ///
+    /// So the emitted `SsrBundle` is a *different object* from the one a whole-genome run
+    /// reports, whenever a chain runs more than `max_repeat_len` past a requested edge.
+    /// Recorded, not fixed: §2.5 already names the fallback ("always scan whole contigs —
+    /// exact, and the fallback if the test fails"), and choosing it is the owner's call,
+    /// not a test's. Whether real genomes carry chains this long is also unmeasured.
+    #[test]
+    fn a_cluster_chaining_past_the_margin_is_cut_by_a_bed_edge() {
+        let bases = chained_cluster(1500, 6000);
+        let config = TypedRegionConfig::default();
+        let whole = partition_resident("chr1", ContigId(0), &bases, &config);
+
+        // The fixture is what it claims: one long chain, and NOT a satellite.
+        let (whole_hull, whole_members) = whole
+            .iter()
+            .find_map(|r| match &r.kind {
+                RegionKind::SsrBundle { tracts } => Some((r.region, tracts.len())),
+                _ => None,
+            })
+            .expect("the chain is one bundle");
+        assert!(
+            whole_hull.len() > 1400,
+            "the chain must run well past max_repeat_len: {whole_hull:?}"
+        );
+        assert!(whole_members >= 25, "and be a long chain: {whole_members}");
+        assert!(
+            !whole
+                .iter()
+                .any(|r| matches!(r.kind, RegionKind::Satellite)),
+            "**THE SPEC'S MITIGATION, REFUTED**: §2.5 says a chain past 1 kb without a \
+             50 bp break is 'dense-repeat territory heading for Satellite'. It is not — a \
+             satellite is over-cap COVERAGE, and coverage runs merge only where they abut. \
+             With 30 bp gaps every run here is 20 bp. The chain stays a bundle: {whole:#?}"
+        );
+
+        // Now cut it with a BED whose edge leaves >1 kb of chain outside the scan span.
+        let got = walk_bed(&bases, &[(900, 1200)], 333);
+        let (bed_hull, bed_members) = got
+            .iter()
+            .find_map(|r| match &r.kind {
+                RegionKind::SsrBundle { tracts } => Some((r.region, tracts.len())),
+                _ => None,
+            })
+            .expect("the chain is still a bundle");
+
+        // What holds: the KIND of every requested base is the BED-free answer.
+        assert_eq!(bed_hull.start, whole_hull.start, "the hull starts the same");
+        for pos in [900u64, 1000, 1100, 1200] {
+            let with = got.iter().find(|r| r.region.contains(Position(pos)));
+            let without = whole.iter().find(|r| r.region.contains(Position(pos)));
+            assert_eq!(
+                with.map(|r| std::mem::discriminant(&r.kind)),
+                without.map(|r| std::mem::discriminant(&r.kind)),
+                "base {pos}: the BED must not change what a base IS (spec §2.5) — and it \
+                 does not, because the margin covers every neighbour of a requested tract"
+            );
+        }
+
+        // **What does not hold**, recorded rather than asserted away: the bundle is a
+        // different object — truncated at the scan edge, silently.
+        assert!(
+            bed_hull.end < whole_hull.end && bed_members < whole_members,
+            "KNOWN DIVERGENCE (§2.5's residual): expected the BED's bundle to be cut. If \
+             this now fails, the residual has been fixed and this test should become a \
+             BED-invariance assertion instead. BED: {bed_hull:?} / {bed_members} members; \
+             whole: {whole_hull:?} / {whole_members}"
+        );
     }
 
     /// A `(CAG)*8` microsatellite `gap` bp from a 1.3 kb `(AT)` array, on either side of
