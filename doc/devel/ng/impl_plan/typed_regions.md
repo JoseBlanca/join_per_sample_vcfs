@@ -433,14 +433,45 @@ locus **or bundle** whole (spec §2.5). *Depends:* E1. *Source:* spec §2.5, §8
 central claim, now a tested one; clipping objects; clipping territory to the scan span instead of to
 each requested span.)*
 
-**E3. Integration anchor.**  ☐
+**E3. Integration anchor.**  ✅
 Walk a real small **multi-contig** reference end to end; assert `.cat` parity (subset by cap), the
 partition invariant, window-invariance, BED-invariance, and the edge cases (a tract at position 1 →
 `Generic`; a repeat-free contig → one `Generic`; a tract at one contig's end abutting one at the next's
 start). *Depends:* E1, E2. *Source:* spec §8. The port anchor.
 
-> **Checkpoint E:** step 3 runs end to end; `.cat` parity + all three invariance tests green. **Step 3
-> is complete.** Pause for review.
+*(Landed 2026-07-17 as `src/ng/region_typing/anchor.rs`. It drives the **shipping stack**: a real
+multi-contig FASTA written to disk with its `.fai`, read through `WindowedRefSeq` — file-backed and
+evicting — through `TypedRegionIterator`, and nothing else. That is what no unit test reaches:
+`RawChromReader`'s windowed reads, the contig table's provenance, eviction, the iterator's ownership,
+the scan/emit split and the walk, at once, on sequence nobody wrote to make a point.*
+
+***In-crate `#[cfg(test)]`, not `tests/`***, *and both reasons are real: the golden catalog's
+`CatalogReader` is `pub(crate)` and production is frozen, so an out-of-crate test cannot open the
+oracle; and this plan must touch **no file outside `src/ng/`** — a `tests/` file would have broken that
+on the last step. It is the `scanner_parity` shape exactly (B2, `d097ebf`), and it still consumes only
+what a caller could.*
+
+***The control is what makes the edge cases mean anything.*** *Three of them assert "not a locus", and
+a tract that was never admissible satisfies all three for free — which is how D1's satellite test once
+passed for the wrong reason. A fifth contig holds the **same** `tract(10)`, flanks either side: it comes
+back a locus, so the absences are the contig ends doing their job.*
+
+*Mutation-verified: passing the window's end as `contig_len` fails the invariance tests (not parity —
+the golden contigs are 2.4 kb, so at the default 100 kb window `core.end == contig_len` and the mistake
+is invisible there, which is itself worth knowing); emitting no loci fails parity, the counts, and the
+control.)*
+
+> **Checkpoint E — REACHED 2026-07-17.** Step 3 runs end to end; `.cat` parity + all three invariance
+> tests green, through the shipping stack. **Step 3 is complete.** Pause for review.
+>
+> **Open, and needing an owner decision:**
+> - **`Satellite` clips at a BED edge** (spec §2.5, E2) — the spec was silent, and the rule was taken
+>   from the type: a region carrying an object cannot be clipped, bare territory can. Worth ruling on,
+>   as the absorption rule was.
+> - **Three of §3.1's five rejection columns are structurally zero in the walk** (E1e), because the
+>   pre-filter gets there first. Not a bug; a thing a reader of the counts must know.
+> - **Still open from Checkpoint A:** a `proptest` property over `assert_agrees` — the strongest
+>   remaining lever on the port.
 
 ---
 

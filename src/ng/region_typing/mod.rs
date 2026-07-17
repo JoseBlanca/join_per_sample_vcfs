@@ -29,6 +29,10 @@
 
 pub mod admission;
 
+/// The E3 port anchor: the whole stack, on a real multi-contig FASTA (`anchor.rs`).
+#[cfg(test)]
+mod anchor;
+
 use std::path::Path;
 
 use crate::ng::ref_seq::{ContigTable, EvictableRefSeq, RawRefSeq, RefSeqError};
