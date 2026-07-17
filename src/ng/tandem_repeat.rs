@@ -627,6 +627,114 @@ impl ScannedWindow {
     }
 }
 
+/// One window's geometry: the core it owns, and the slice that must be read to scan it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowPlan {
+    /// The core, `[start, end)` 0-based — the bases this window is responsible for.
+    pub core: RegionSpan,
+    /// The core plus a `max_repeat_len` margin each side, clamped to the contig.
+    pub fetched: RegionSpan,
+}
+
+/// Walks a range of a contig as windows — **the geometry rule, and the only copy of it.**
+///
+/// # Why this is a separate type from [`scan_windowed`]
+///
+/// Because its two consumers cannot share an iterator. `scan_windowed` yields windows it
+/// fetched through a *borrowed* byte source; [`crate::ng::region_typing::TypedRegionIterator`]
+/// **owns** its reference (it moves onto a producer thread, `typed_regions.md` §7) and so
+/// cannot hold an iterator borrowing it — that is a self-referential struct, which safe
+/// Rust does not have. A cursor it can step by hand is the shape that fits both, and
+/// `typed_regions.md` §6.1 is explicit that the thing not to do is duplicate this
+/// arithmetic ("a subtle invariant that can then drift").
+///
+/// # Cores tile `cores`; margins reach outside it
+///
+/// `cores` is the range to walk and `contig_len` bounds the **margins**, which is not the
+/// same number the moment a caller walks part of a contig (a BED region — spec §2.5): the
+/// window at the range's edge must still read its margin from the sequence *beyond* the
+/// range, or the repeat lying across that edge is measured as a fragment.
+pub struct WindowCursor {
+    cores: RegionSpan,
+    contig_len: u64,
+    window: u64,
+    margin: u64,
+    next_core: u64,
+}
+
+impl WindowCursor {
+    /// Walk `cores` (0-based `[start, end)`) as windows, taking margins from a contig
+    /// `contig_len` long. `window_bp = 0` coerces to 1 — a zero-length core would step
+    /// forever, and a hang is the one failure a `should_panic` test cannot catch.
+    pub fn new(cores: RegionSpan, contig_len: u64, opts: &SegmentOptions) -> Self {
+        Self {
+            cores,
+            contig_len,
+            window: opts.window_bp.max(1),
+            margin: opts.max_repeat_len,
+            next_core: cores.start,
+        }
+    }
+
+    /// The next window, or `None` at the end of the range.
+    pub fn next_window(&mut self) -> Option<WindowPlan> {
+        if self.next_core >= self.cores.end {
+            return None;
+        }
+        let core = RegionSpan {
+            start: self.next_core,
+            end: self
+                .next_core
+                .saturating_add(self.window)
+                .min(self.cores.end),
+        };
+        let fetched = RegionSpan {
+            start: core.start.saturating_sub(self.margin),
+            end: core.end.saturating_add(self.margin).min(self.contig_len),
+        };
+        self.next_core = core.end;
+        Some(WindowPlan { core, fetched })
+    }
+
+    /// Stop the walk: the next [`Self::next_window`] yields `None`. For a caller that has
+    /// hit a fatal error and must not scan on — continuing would scan a hole.
+    pub fn halt(&mut self) {
+        self.next_core = self.cores.end;
+    }
+}
+
+/// Scan one window's already-fetched bases into a [`ScannedWindow`] — **the lift, and the
+/// only copy of it**: detections come out of [`find_tandem_repeats`] as offsets into
+/// `bases`, and everything downstream speaks contig coordinates.
+///
+/// `bases` must be exactly `plan.fetched`, which is [`WindowCursor`]'s to say and not the
+/// caller's to work out.
+pub fn scan_window(
+    plan: &WindowPlan,
+    bases: &[u8],
+    periods: PeriodRange,
+    params: &ScanParams,
+) -> ScannedWindow {
+    debug_assert_eq!(
+        bases.len() as u64,
+        plan.fetched.end - plan.fetched.start,
+        "bases must be exactly the planned slice"
+    );
+    ScannedWindow {
+        core: plan.core,
+        fetched: plan.fetched,
+        detections: find_tandem_repeats(bases, periods, params)
+            .into_iter()
+            .map(|iv| RepeatInterval {
+                start: iv.start + plan.fetched.start,
+                end: iv.end + plan.fetched.start,
+                period: iv.period,
+                score: iv.score,
+            })
+            .collect(),
+    }
+}
+
 /// Scan a contig in windows through a `ChromRefFetcher`, **yielding one
 /// [`ScannedWindow`] at a time** — memory-bounded (peak ≈ `window_bp +
 /// 2·max_repeat_len`, not the contig length; spec §3.6).
@@ -681,28 +789,22 @@ impl ScannedWindow {
 ///
 /// A fetch failure is yielded once as `Some(Err(_))`, and the iterator then stops:
 /// continuing would silently scan a hole, which is the failure this module's
-/// callers are least able to see. The stop is a latch (`core` jumps to the contig
-/// end), **and the returned iterator is `FusedIterator`** — [`ScanError`]'s own doc
+/// callers are least able to see. The stop is a latch ([`WindowCursor::halt`]),
+/// **and the returned iterator is `FusedIterator`** — [`ScanError`]'s own doc
 /// already promises this, and `std::iter::FromFn` does not provide it, so the
 /// promise is declared rather than merely kept. Mirrors the ng sibling
 /// `ReadFilter`, which states the same contract the same way.
 ///
-/// Each window fetches its core `[c, core_end)` plus a `max_repeat_len` margin on **each**
-/// side and runs `find_tandem_repeats` on that slice. From each found interval it derives two
-/// things, which is what makes the result window-invariant:
+/// This function is now a thin loop: [`WindowCursor`] holds the geometry and
+/// [`scan_window`] the lift, so the walk — which cannot use this iterator at all, see
+/// [`WindowCursor`] — still runs the same two rules rather than a second copy of them.
+/// What it adds is the **fetch loop and the failure latch**, and that is the whole of it.
 ///
-/// - **coverage**: the interval **clipped to the core** — so every core contributes its own
-///   repeat coverage and adjacent cores abut, letting the later union rejoin a satellite
-///   (necessarily longer than any one window's fetch) across all the windows it spans; and
-/// - **STR intervals**: the interval **kept whole, if its start is in the core** — an
-///   STR-sized (≤ `max_repeat_len`) repeat is captured in full by the `max_repeat_len`
-///   margins, so it is segmented identically to a whole-contig scan and attributed to exactly
-///   one window. (Long/satellite intervals kept this way are discarded downstream, since a
-///   Satellite span carries no intervals — so their truncation is harmless.)
-///
-/// The `max_repeat_len` margins are load-bearing: Ruzzo–Tompa segmentation is
-/// context-dependent, so a shorter margin would let a window re-segment a long repeat
-/// mid-tract and emit a spurious in-core fragment.
+/// Each window fetches its core plus a `max_repeat_len` margin on **each** side and runs
+/// `find_tandem_repeats` on that slice; the two derivations that make the result
+/// window-invariant are [`ScannedWindow`]'s methods. The margins are load-bearing:
+/// Ruzzo–Tompa segmentation is context-dependent, so a shorter margin would let a window
+/// re-segment a long repeat mid-tract and emit a spurious in-core fragment.
 pub fn scan_windowed<F, E>(
     contig_len: u64,
     periods: PeriodRange,
@@ -716,9 +818,14 @@ where
     // Both config structs are `Copy` and are read out here, so tying the stream to
     // their borrows would constrain it for nothing.
     let params = *params;
-    let window = opts.window_bp.max(1);
-    let margin = opts.max_repeat_len;
-    let mut core = 0u64;
+    let mut cursor = WindowCursor::new(
+        RegionSpan {
+            start: 0,
+            end: contig_len,
+        },
+        contig_len,
+        opts,
+    );
     // One buffer, reused across windows — the caller's `fetch` fills it. This is
     // why `fetch` writes into a `&mut Vec<u8>` rather than returning one: a window
     // is ~102 kb, and re-allocating it per step would be the memory profile the
@@ -726,47 +833,19 @@ where
     let mut bases: Vec<u8> = Vec::new();
 
     let scan = std::iter::from_fn(move || {
-        if core >= contig_len {
-            return None;
-        }
-        let core_end = core.saturating_add(window).min(contig_len);
-        let fetch_start = core.saturating_sub(margin);
-        let fetch_end = core_end.saturating_add(margin).min(contig_len);
+        let plan = cursor.next_window()?;
         // `fetch` is 1-based.
-        if let Err(e) = fetch(fetch_start + 1, fetch_end - fetch_start, &mut bases) {
+        if let Err(e) = fetch(
+            plan.fetched.start + 1,
+            plan.fetched.end - plan.fetched.start,
+            &mut bases,
+        ) {
             // Stop after reporting: a fetch failure is fatal, and continuing would
             // silently scan a hole.
-            core = contig_len;
+            cursor.halt();
             return Some(Err(e));
         }
-        // Every detection in the fetched slice, lifted from slice offsets to contig
-        // coordinates — the raw material. The two derivations that make the scan
-        // window-invariant (clip to the core; attribute by start) are
-        // `ScannedWindow`'s methods, so the consumer applies them to the interval
-        // set *its own policy* selects. See the type's docs.
-        let detections = find_tandem_repeats(&bases, periods, &params)
-            .into_iter()
-            .map(|iv| RepeatInterval {
-                start: iv.start + fetch_start,
-                end: iv.end + fetch_start,
-                period: iv.period,
-                score: iv.score,
-            })
-            .collect();
-
-        let scanned = ScannedWindow {
-            core: RegionSpan {
-                start: core,
-                end: core_end,
-            },
-            fetched: RegionSpan {
-                start: fetch_start,
-                end: fetch_end,
-            },
-            detections,
-        };
-        core = core_end;
-        Some(Ok(scanned))
+        Some(Ok(scan_window(&plan, &bases, periods, &params)))
     });
     scan.fuse()
 }
