@@ -31,10 +31,10 @@ pub mod admission;
 
 use std::path::Path;
 
-use crate::ng::ref_seq::{ContigTable, RawRefSeq, RefSeqError};
+use crate::ng::ref_seq::{ContigTable, EvictableRefSeq, RawRefSeq, RefSeqError};
 use crate::ng::tandem_repeat::{
-    PeriodRange, RepeatInterval, ScanParams, ScannedWindow, SegmentOptions, find_tandem_repeats,
-    scan_windowed,
+    PeriodRange, RegionSpan, RepeatInterval, ScanParams, ScannedWindow, SegmentOptions,
+    WindowCursor, WindowPlan, find_tandem_repeats, scan_window,
 };
 use crate::ng::types::{Bp, ContigId, GenomeRegion, Position};
 use crate::regions::{BedError, ContigBounds, RegionSet};
@@ -267,25 +267,24 @@ impl Default for TypedRegionConfig {
     }
 }
 
-/// Why a repeat did not become a locus. The breakdown spec §3.1 needs, because
-/// one total cannot separate a purity rejection from a copy-floor one — and that
-/// distinction is exactly what spec §10's routing question turns on.
-///
-/// No `str_bundle` variant: since spec §2.4 that is a **route**, not a rejection.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct RejectionCounts {
-    pub copy_floor: u64,
-    pub purity: u64,
-    pub compound: u64,
-    pub no_clean_trim: u64,
-    pub flank_clamped: u64,
-}
-
-/// The walk's running tally — readable mid-walk, complete once exhausted.
+/// The walk's running tally — readable mid-walk, complete once exhausted
+/// ([`TypedRegionIterator::counts`]).
 ///
 /// **"No silent caps"**: a base typed away from the STR path must be accounted
 /// for. This is the live-caller view of the catalog's measured ~35% STR coverage
 /// gap.
+///
+/// # The rejection breakdown is not here yet, and that is deliberate
+///
+/// Spec §3.1 asks for one more field — `rejected_by_reason`, splitting the bp below
+/// into copy-floor / purity / compound / no-clean-trim / flank-clamped, which is the
+/// distinction §10's routing question turns on. C2 declared the type; E1 could not
+/// fill it, because **`admit` reports no reasons**: `finish_locus` returns `None`
+/// from five different gates and the caller cannot tell them apart.
+///
+/// So the field is **absent rather than zero**. A zero would read as "nothing was
+/// rejected for that reason" — a wrong answer to §10's question, dressed as a
+/// measured one. It arrives when admission can say why; see the plan's E1 entry.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TypedRegionCounts {
     /// Requested regions walked.
@@ -299,15 +298,19 @@ pub struct TypedRegionCounts {
     pub generic: u64,
     pub satellites: u64,
     pub satellite_bp: u64,
-    /// Repeat coverage that yielded no locus, **in bp and broken out by reason**
-    /// ([`Self::rejected_by_reason`]).
+    /// Repeat coverage that yielded **no locus**, in bp: every base of cleaned repeat
+    /// coverage the walk did not emit as an `SsrLocus` — because it was bundled,
+    /// capped as a satellite, or rejected by one of admission's gates.
     ///
     /// In bp, not per repeat, because a per-repeat count answers the wrong
     /// question twice: admission trims every survivor, so a repeat that admits one
     /// locus and sheds 200 bp contributes nothing to a per-repeat counter (spec
     /// §3.1).
+    ///
+    /// **Mid-walk this leads**: coverage is counted when a window is scanned, and the
+    /// loci that cancel it are subtracted as they are emitted, a block later. It is
+    /// exact once the walk is exhausted, which is what the type promises.
     pub repeat_bp_with_no_locus: u64,
-    pub rejected_by_reason: RejectionCounts,
 }
 
 // ---------------------------------------------------------------------
@@ -669,9 +672,6 @@ impl CoverageRun {
     fn len(self) -> u64 {
         self.end - self.start + 1
     }
-    fn contains(self, pos: Position) -> bool {
-        self.start <= pos.get() && pos.get() <= self.end
-    }
 }
 
 /// Union the intervals into maximal runs of covered bases, 1-based inclusive.
@@ -755,84 +755,254 @@ fn coverage_runs(intervals: &[RepeatInterval]) -> Vec<CoverageRun> {
 /// the *bases* rather than the *scan* keeps spec §2.6's margin (`max_repeat_len`, what
 /// makes a repeat segment identically) separate from admission's (`flank_bp`, what
 /// makes it readable), which is right: they answer different questions.
+/// **Collected**, so it holds the contig's regions after all — this is the walk's shape
+/// for a test or a small job, and [`TypedRegionIterator`] is the one that ships. It is a
+/// wrapper over that iterator, not a second implementation: every window-invariance test
+/// below runs through this and therefore through it.
 pub fn partition_windowed<R>(
-    reference: &R,
+    reference: R,
     contig: ContigId,
     config: &TypedRegionConfig,
 ) -> Result<Vec<TypedRegion>, TypedRegionError>
 where
-    R: RawRefSeq + ContigTable,
+    R: RawRefSeq + ContigTable + EvictableRefSeq,
 {
-    // **The provenance obligation, discharged** (spec §2.6; see the fn docs). The
-    // contig's length is read from the reference's own table — the one number in the
-    // system that did not come from whatever slice is in hand.
-    let entry = reference
-        .contigs()
-        .entries
-        .get(contig.get() as usize)
-        .ok_or(RefSeqError::UnknownContig(contig))?;
-    let chrom = entry.name.as_str();
-    let contig_len = entry.length;
-    if contig_len == 0 {
-        // No 1-based position to cover, so no regions — `partition_resident`'s rule,
-        // and `GenomeRegions` drops these before the walk anyway (C3).
-        return Ok(Vec::new());
+    TypedRegionIterator::over_contig(reference, contig, config.clone())?.collect()
+}
+
+/// Walks the reference region by region, in genomic order, gap-free — **step 3's public
+/// surface** (arch §interface).
+///
+/// Holds one window plus one block, never a contig, let alone the genome (spec §2.6, §7).
+/// The regions it yields tile the requested spans exactly: contiguous, non-overlapping,
+/// complete, and maximal. Pure function of the reference, the spans, and the config;
+/// `window_bp` changes memory and never the output.
+///
+/// # It owns its inputs
+///
+/// `reference` and `spans` are taken **by value** so the whole iterator can be moved onto
+/// a producer thread (spec §7). That ownership is also what lets it evict: the walk slides
+/// forward and never looks back, so it releases the bases it has passed
+/// ([`EvictableRefSeq`]) — without which a windowed reference's buffer would grow to hold
+/// the contig and the memory bound would be a claim rather than a fact.
+///
+/// # Generic over the reference, and why that is not the arch's "concrete"
+///
+/// The arch doc specified a concrete `WindowedRefSeq`, reasoning that the walk needs raw
+/// bytes and eviction — "impl capabilities, not trait methods". They are trait methods
+/// now ([`RawRefSeq`], [`ContigTable`], [`EvictableRefSeq`]), each added where a capability
+/// had to be *required* rather than assumed. Being generic is what lets **the same walk**
+/// run over an `InMemoryRefSeq` in tests, which is what makes window-invariance against
+/// `partition_resident` testable at all — the strongest check step 3 has.
+///
+/// # Errors are in-stream and fatal
+///
+/// Every window reads the reference. `None` meaning both "done" and "a window failed"
+/// would silently un-call the rest of the genome, so a read failure is yielded once as
+/// `Some(Err(_))` and then the iterator is done — fused, and it says so
+/// ([`std::iter::FusedIterator`]) rather than leaving a caller to find out (spec §8.2).
+pub struct TypedRegionIterator<R> {
+    reference: R,
+    config: TypedRegionConfig,
+    /// The spans still to walk, **reversed** so the next one is a `pop`.
+    remaining: Vec<GenomeRegion>,
+    /// The span being walked, if any.
+    current: Option<SpanWalk>,
+    /// Regions resolved and waiting to be handed out — one block's worth at most.
+    queue: std::collections::VecDeque<TypedRegion>,
+    /// The window's bases, reused across windows (`typed_regions.md` §7).
+    bases: Vec<u8>,
+    counts: TypedRegionCounts,
+    /// Latched by a fatal error or by exhaustion; the fused contract.
+    done: bool,
+}
+
+/// One span's walk in progress: where the windows are up to, and the block carries.
+struct SpanWalk {
+    contig: ContigId,
+    /// The contig's name — from the reference's table, and the name every `Locus` gets.
+    chrom: String,
+    /// The contig's **true** length, from the reference's table (spec §2.6's provenance
+    /// obligation). Not the span's, and never a window's.
+    contig_len: u64,
+    cursor: WindowCursor,
+    walk: BlockWalk,
+}
+
+impl<R: RawRefSeq + ContigTable + EvictableRefSeq> TypedRegionIterator<R> {
+    /// Walk `spans`. **Infallible in the arch doc, fallible here** — and the difference is
+    /// a real one the arch could not have known: `GenomeRegions` validated the spans
+    /// against a contig table, but nothing ties *that* table to the one this reference
+    /// carries, so a span naming a contig the reference does not have is still reachable.
+    /// Checking it up front, once, beats discovering it mid-walk (spec §8.2's whole
+    /// point).
+    pub fn over_regions(
+        reference: R,
+        spans: GenomeRegions,
+        config: TypedRegionConfig,
+    ) -> Result<Self, TypedRegionError> {
+        Self::over_spans(reference, spans.iter().collect(), config)
     }
 
-    let flank_bp = config.admission.flank_bp;
-    // **A swept knob that would silently un-bundle** (spec §10 sweeps both of these,
-    // in release — hence `assert!`). The scan's margin is `max_repeat_len`, so a
-    // window sees every repeat within `max_repeat_len` of its core. The bundle flank
-    // test needs to see every repeat within `flank_bp` of a core repeat. If the margin
-    // were the narrower of the two, a core tract's neighbour could fall outside the
-    // window, go unseen, and the tract would be admitted as a clean locus instead of
-    // bundled — no error, and a different answer for every `window_bp`.
-    assert!(
-        config.max_repeat_len.get() >= flank_bp,
-        "max_repeat_len ({}) is the window's detection margin and must not be narrower \
-         than flank_bp ({flank_bp}), the bundle radius: a window that cannot see a core \
-         tract's neighbours would admit them as loci instead of bundling them",
-        config.max_repeat_len.get()
-    );
+    /// Walk one contig, end to end — the whole-contig case as a span like any other.
+    pub fn over_contig(
+        reference: R,
+        contig: ContigId,
+        config: TypedRegionConfig,
+    ) -> Result<Self, TypedRegionError> {
+        let len = contig_entry(&reference, contig)?.length;
+        // A zero-length contig has no 1-based position to cover, so it contributes no
+        // span — `RegionSet`'s rule (C3), restated here for a direct caller.
+        let spans = if len == 0 {
+            Vec::new()
+        } else {
+            vec![GenomeRegion {
+                contig,
+                start: Position(1),
+                end: Position(len),
+            }]
+        };
+        Self::over_spans(reference, spans, config)
+    }
 
-    let opts = SegmentOptions {
-        // For `scan_windowed` this is the detection margin only — the satellite cap is
-        // this walk's own business (`resolve_features`). Same number, because spec §2.6
-        // says it must be: the margin exists to capture whole any repeat that is not a
-        // satellite.
-        max_repeat_len: config.max_repeat_len.get(),
-        window_bp: config.window_bp.get(),
-        // `RegionScanner`'s smoothing knobs; `scan_windowed` reads neither. Zeroed
-        // rather than defaulted so a reader does not go looking for where this walk
-        // smooths. It does not.
-        merge_gap: 0,
-        min_repeat_len: 0,
-    };
+    fn over_spans(
+        reference: R,
+        mut spans: Vec<GenomeRegion>,
+        config: TypedRegionConfig,
+    ) -> Result<Self, TypedRegionError> {
+        // **A swept knob that would silently un-bundle** (spec §10 sweeps both of these,
+        // in release — hence `assert!`). The scan's margin is `max_repeat_len`, so a
+        // window sees every repeat within `max_repeat_len` of its core. The bundle flank
+        // test needs to see every repeat within `flank_bp` of a core repeat. If the
+        // margin were the narrower of the two, a core tract's neighbour could fall
+        // outside the window, go unseen, and the tract would be admitted as a clean locus
+        // instead of bundled — no error, and a different answer for every `window_bp`.
+        assert!(
+            config.max_repeat_len.get() >= config.admission.flank_bp,
+            "max_repeat_len ({}) is the window's detection margin and must not be narrower \
+             than flank_bp ({}), the bundle radius: a window that cannot see a core tract's \
+             neighbours would admit them as loci instead of bundling them",
+            config.max_repeat_len.get(),
+            config.admission.flank_bp
+        );
+        // Fail now, not in the middle of chromosome 7 (above).
+        for span in &spans {
+            contig_entry(&reference, span.contig)?;
+        }
+        spans.reverse();
+        Ok(Self {
+            reference,
+            config,
+            remaining: spans,
+            current: None,
+            queue: std::collections::VecDeque::new(),
+            bases: Vec::new(),
+            counts: TypedRegionCounts::default(),
+            done: false,
+        })
+    }
 
-    let mut walk = BlockWalk::new(contig, contig_len, config);
-    let mut bases = Vec::new();
+    /// The running tally — readable mid-walk, complete once exhausted (spec §3.1).
+    pub fn counts(&self) -> &TypedRegionCounts {
+        &self.counts
+    }
 
-    let windows = scan_windowed(
-        contig_len,
-        config.periods,
-        &config.scan,
-        &opts,
-        |start, len, dst| reference.fetch_raw_into(contig, start, len, dst),
-    );
+    /// Do one step of work: start a span, scan a window, or finish a span. `Ok(false)`
+    /// when there is nothing left at all.
+    fn advance(&mut self) -> Result<bool, TypedRegionError> {
+        if self.current.is_none() {
+            let Some(span) = self.remaining.pop() else {
+                return Ok(false);
+            };
+            let entry = contig_entry(&self.reference, span.contig)?;
+            let contig_len = entry.length;
+            let chrom = entry.name.clone();
+            self.current = Some(SpanWalk {
+                contig: span.contig,
+                chrom,
+                contig_len,
+                // Cores tile the span; margins come from the whole contig, which is not
+                // the same number once the span is a BED region (`WindowCursor`).
+                cursor: WindowCursor::new(
+                    RegionSpan {
+                        start: span.start.get() - 1,
+                        end: span.end.get(),
+                    },
+                    contig_len,
+                    &self.segment_options(),
+                ),
+                walk: BlockWalk::new(span.contig, span.end.get()),
+            });
+            self.counts.spans += 1;
+            return Ok(true);
+        }
 
-    for window in windows {
-        let window = window?;
+        let state = self.current.as_mut().expect("just checked");
+        match state.cursor.next_window() {
+            Some(plan) => {
+                let repeat_bp = Self::scan_and_absorb(
+                    &self.reference,
+                    &mut self.bases,
+                    state,
+                    &self.config,
+                    &plan,
+                )?;
+                // Every base of cleaned repeat coverage this window owns. Clipped to the
+                // core, and cores tile, so no base is counted twice. The loci that cancel
+                // it are subtracted as they are emitted (`tally`).
+                self.counts.repeat_bp_with_no_locus += repeat_bp;
+                // Release what the walk has passed — it never looks back. This is the
+                // difference between "holds one window" as a claim and as a fact.
+                self.reference.evict_before(plan.fetched.start + 1);
+            }
+            None => {
+                state.walk.finish(&self.config);
+                self.queue.extend(state.walk.out.drain(..));
+                self.current = None;
+            }
+        }
+        if let Some(state) = self.current.as_mut() {
+            self.queue.extend(state.walk.out.drain(..));
+        }
+        Ok(true)
+    }
 
-        // 1-2. Detect (the window did) → clean. **Over the whole fetched slice, margins
-        //      included**, which is what makes the verdict the resident one: redundancy
-        //      elimination is a neighbour rule, and a core interval's neighbours live in
-        //      the margin (`ScannedWindow::detections`).
+    /// One window: detect (the cursor planned it), clean, admit, absorb.
+    ///
+    /// An associated function rather than a method, because it needs `&self.reference`
+    /// and `&mut self.current` at once — disjoint fields, which the borrow checker will
+    /// grant only when they are named separately.
+    /// Returns the window's own cleaned repeat coverage in bp, for the tally.
+    fn scan_and_absorb(
+        reference: &R,
+        bases: &mut Vec<u8>,
+        state: &mut SpanWalk,
+        config: &TypedRegionConfig,
+        plan: &WindowPlan,
+    ) -> Result<u64, TypedRegionError> {
+        let flank_bp = config.admission.flank_bp;
+        let contig = state.contig;
+
+        // 1. Detect. The scanned slice is the cursor's to decide; this reads exactly it.
+        reference.fetch_raw_into(
+            contig,
+            plan.fetched.start + 1,
+            plan.fetched.end - plan.fetched.start,
+            bases,
+        )?;
+        let window = scan_window(plan, bases, config.periods, &config.scan);
+
+        // 2. Clean. **Over the whole fetched slice, margins included**, which is what
+        //    makes the verdict the resident one: redundancy elimination is a neighbour
+        //    rule, and a core interval's neighbours live in the margin.
         let cleaned = admission::prefilter(&window.detections, &config.admission);
 
-        // 3. Admit. The bases are the scanned slice grown by a flank each side (fn docs).
-        let bases_start = window.fetched.start.saturating_sub(flank_bp);
-        let bases_end = (window.fetched.end + flank_bp).min(contig_len);
-        reference.fetch_raw_into(contig, bases_start + 1, bases_end - bases_start, &mut bases)?;
+        // 3. Admit. The bases are the scanned slice grown by a flank each side: `admit`
+        //    panics rather than quietly drop a locus whose flank runs off its slice, and
+        //    a repeat at the slice's own edge has exactly that shape (spec §2.6).
+        let bases_start = plan.fetched.start.saturating_sub(flank_bp);
+        let bases_end = (plan.fetched.end + flank_bp).min(state.contig_len);
+        reference.fetch_raw_into(contig, bases_start + 1, bases_end - bases_start, bases)?;
         let recs = cleaned
             .iter()
             .map(|iv| RepeatInterval {
@@ -843,20 +1013,121 @@ where
             .collect();
         let admitted = admission::admit(
             recs,
-            chrom,
-            &bases,
+            &state.chrom,
+            bases,
             Position(bases_start + 1),
-            // The contig's length, from the table. Never `bases.len()`, never
-            // `window.fetched.end` — see the fn docs.
-            Bp(contig_len),
+            // The contig's length, from the reference's table. Never `bases.len()`, never
+            // the window's end — spec §2.6's provenance obligation, and the mistake no
+            // signature can catch.
+            Bp(state.contig_len),
             &config.admission,
         );
 
+        // The tally's raw material, taken before `absorb` consumes the window: this
+        // window's own share of the repeat coverage (clipped to the core, so cores tile
+        // and nothing is double-counted).
+        let repeat_bp: u64 = window
+            .coverage_in_core(&cleaned)
+            .into_iter()
+            .map(|(s, e)| e - s)
+            .sum();
+
         // 4-5. Cap and partition, one block at a time.
-        walk.absorb(&window, &cleaned, admitted, bases_start);
+        state
+            .walk
+            .absorb(&window, &cleaned, admitted, bases_start, config);
+        Ok(repeat_bp)
     }
 
-    Ok(walk.finish())
+    fn segment_options(&self) -> SegmentOptions {
+        SegmentOptions {
+            // For the scan this is the detection margin only — the satellite cap is the
+            // walk's own business (`resolve_features`). Same number, because spec §2.6
+            // says it must be: the margin exists to capture whole any repeat that is not
+            // a satellite.
+            max_repeat_len: self.config.max_repeat_len.get(),
+            window_bp: self.config.window_bp.get(),
+            // `RegionScanner`'s smoothing knobs; the window rules read neither. Zeroed
+            // rather than defaulted so a reader does not go looking for where this walk
+            // smooths. It does not.
+            merge_gap: 0,
+            min_repeat_len: 0,
+        }
+    }
+
+    fn tally(&mut self, region: &TypedRegion) {
+        let bp = region.region.len();
+        match &region.kind {
+            RegionKind::SsrLocus(_) => {
+                self.counts.ssr_loci += 1;
+                // This repeat coverage DID yield a locus, so it is not part of the gap.
+                // The locus's bases are a subset of the coverage counted when its window
+                // was scanned (a locus is a trimmed tract, and a tract is coverage), so
+                // this cannot underflow.
+                self.counts.repeat_bp_with_no_locus -= bp;
+            }
+            RegionKind::SsrBundle { .. } => {
+                self.counts.ssr_bundles += 1;
+                // **The number spec §10's bundle question needs and has never had** —
+                // production drops these uncounted.
+                self.counts.ssr_bundle_bp += bp;
+            }
+            RegionKind::Generic => self.counts.generic += 1,
+            RegionKind::Satellite => {
+                self.counts.satellites += 1;
+                self.counts.satellite_bp += bp;
+            }
+        }
+    }
+}
+
+impl<R: RawRefSeq + ContigTable + EvictableRefSeq> Iterator for TypedRegionIterator<R> {
+    type Item = Result<TypedRegion, TypedRegionError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(region) = self.queue.pop_front() {
+                self.tally(&region);
+                return Some(Ok(region));
+            }
+            if self.done {
+                return None;
+            }
+            match self.advance() {
+                Ok(true) => continue,
+                Ok(false) => {
+                    self.done = true;
+                    return None;
+                }
+                Err(e) => {
+                    // Fatal: report once, then done. Continuing would scan a hole, and a
+                    // hole in a partition is invisible to everything downstream.
+                    self.done = true;
+                    return Some(Err(e));
+                }
+            }
+        }
+    }
+}
+
+impl<R: RawRefSeq + ContigTable + EvictableRefSeq> std::iter::FusedIterator
+    for TypedRegionIterator<R>
+{
+}
+
+/// The reference's own table entry for `contig` — **the provenance seam** (spec §2.6).
+/// Every contig length and name the walk uses comes through here.
+fn contig_entry<R: ContigTable>(
+    reference: &R,
+    contig: ContigId,
+) -> Result<&crate::fasta::ContigEntry, TypedRegionError> {
+    reference
+        .contigs()
+        .entries
+        .get(contig.get() as usize)
+        .ok_or(TypedRegionError::Reference(RefSeqError::UnknownContig(
+            contig,
+        )))
 }
 
 /// The windowed walk's state: the open block, and the three carries.
@@ -864,8 +1135,7 @@ where
 /// Everything here is bounded by *one block* plus three coordinates — never by the
 /// contig. That is the claim `partition_windowed` exists to make good on, and the
 /// reason the pieces are named as carries rather than accumulators.
-struct BlockWalk<'a> {
-    config: &'a TypedRegionConfig,
+struct BlockWalk {
     contig: ContigId,
     contig_len: u64,
     /// The open block's coverage runs, ascending; the last one is still growing.
@@ -881,7 +1151,10 @@ struct BlockWalk<'a> {
     /// **Carry:** the open generic run — everything up to here is emitted, so the gap
     /// from here to the next feature is generic. One `u64` for a megabase.
     emitted_upto: u64,
-    out: Vec<TypedRegion>,
+    /// Resolved regions waiting to be read out, in genomic order. A queue rather than a
+    /// list because `TypedRegionIterator` drains it as it goes: it holds one block's
+    /// worth, never a contig's (spec §7).
+    out: std::collections::VecDeque<TypedRegion>,
 }
 
 /// One thing a window hands the walk, at a 1-based start. Sorted into a single
@@ -913,17 +1186,16 @@ impl WindowItem {
     }
 }
 
-impl<'a> BlockWalk<'a> {
-    fn new(contig: ContigId, contig_len: u64, config: &'a TypedRegionConfig) -> Self {
+impl BlockWalk {
+    fn new(contig: ContigId, contig_len: u64) -> Self {
         Self {
-            config,
             contig,
             contig_len,
             runs: Vec::new(),
             loci: Vec::new(),
             bundled: Vec::new(),
             emitted_upto: 0,
-            out: Vec::new(),
+            out: std::collections::VecDeque::new(),
         }
     }
 
@@ -945,6 +1217,7 @@ impl<'a> BlockWalk<'a> {
         cleaned: &[RepeatInterval],
         admitted: admission::Admitted,
         bases_start: u64,
+        config: &TypedRegionConfig,
     ) {
         let core = window.core;
         let in_core = |start_0based: u64| start_0based >= core.start && start_0based < core.end;
@@ -991,8 +1264,8 @@ impl<'a> BlockWalk<'a> {
 
         for item in items {
             let start = item.start();
-            if self.block_is_open() && start > self.block_barrier() {
-                self.close_block();
+            if self.block_is_open() && start > self.block_barrier(config) {
+                self.close_block(config);
             }
             match item {
                 WindowItem::Coverage(run) => match self.runs.last_mut() {
@@ -1034,19 +1307,19 @@ impl<'a> BlockWalk<'a> {
     /// The last position that still belongs to the open block: one flank past its
     /// rightmost base. Wider than every radius the partition's rules have — see
     /// [`resolve_features`].
-    fn block_barrier(&self) -> u64 {
+    fn block_barrier(&self, config: &TypedRegionConfig) -> u64 {
         self.runs
             .last()
             .expect("the block is open")
             .end
-            .saturating_add(self.config.admission.flank_bp)
+            .saturating_add(config.admission.flank_bp)
     }
 
     /// Resolve the open block and emit it, with the generic run that preceded it.
-    fn close_block(&mut self) {
+    fn close_block(&mut self, config: &TypedRegionConfig) {
         let loci = std::mem::take(&mut self.loci);
         let bundled = std::mem::take(&mut self.bundled);
-        let features = resolve_features(&self.runs, loci, &bundled, self.contig, self.config);
+        let features = resolve_features(&self.runs, loci, &bundled, self.contig, config);
         self.runs.clear();
 
         for f in features {
@@ -1056,7 +1329,7 @@ impl<'a> BlockWalk<'a> {
             // (spec §2.3, `fill_generic_gaps`).
             if start > self.emitted_upto + 1 {
                 self.out
-                    .push(self.generic(self.emitted_upto + 1, start - 1));
+                    .push_back(self.generic(self.emitted_upto + 1, start - 1));
             }
             // Non-overlap, checked rather than assumed. `partition_resident` leaves this
             // as `fill_generic_gaps`'s unchecked precondition; here the features arrive
@@ -1069,7 +1342,7 @@ impl<'a> BlockWalk<'a> {
                 self.emitted_upto
             );
             self.emitted_upto = f.region.end.get();
-            self.out.push(f);
+            self.out.push_back(f);
         }
     }
 
@@ -1084,16 +1357,21 @@ impl<'a> BlockWalk<'a> {
         }
     }
 
-    /// Close the last block and run the generic carry out to the contig's end.
-    fn finish(mut self) -> Vec<TypedRegion> {
+    /// Close the last block and run the generic carry out to the contig's end, leaving
+    /// everything in [`Self::out`] for the caller to drain.
+    ///
+    /// `&mut self` rather than consuming: `TypedRegionIterator` reaches this while the
+    /// walk is a field it is holding, and it drains the queue afterwards like any other
+    /// step. Idempotent — a second call has no open block and nothing left to reach.
+    fn finish(&mut self, config: &TypedRegionConfig) {
         if self.block_is_open() {
-            self.close_block();
+            self.close_block(config);
         }
         if self.emitted_upto < self.contig_len {
             self.out
-                .push(self.generic(self.emitted_upto + 1, self.contig_len));
+                .push_back(self.generic(self.emitted_upto + 1, self.contig_len));
+            self.emitted_upto = self.contig_len;
         }
-        self.out
     }
 }
 
@@ -1161,7 +1439,7 @@ pub enum TypedRegionError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ng::ref_seq::InMemoryRefSeq;
+    use crate::ng::ref_seq::{InMemoryRefSeq, RefSeq};
 
     /// `Default` is the catalog's settings, for spec §8's comparability — so the
     /// oracle compares like with like. Pinned against the **literals**, not
@@ -1213,7 +1491,7 @@ mod tests {
         assert_eq!(c.spans, 0);
         assert_eq!(c.ssr_loci, 0);
         assert_eq!(c.ssr_bundle_bp, 0);
-        assert_eq!(c.rejected_by_reason, RejectionCounts::default());
+        assert_eq!(c.repeat_bp_with_no_locus, 0);
     }
 
     /// The error is fatal-in-stream and converts from the one thing that can fail
@@ -2046,7 +2324,6 @@ mod tests {
         for micro_left in [true, false] {
             for gap in [20usize, 200] {
                 let bases = micro_near_satellite(micro_left, gap);
-                let reference = reference_over("chr1", &bases);
                 let resident =
                     partition_resident("chr1", ContigId(0), &bases, &TypedRegionConfig::default());
                 for window_bp in [100u64, 700, 1000] {
@@ -2055,7 +2332,8 @@ mod tests {
                         ..TypedRegionConfig::default()
                     };
                     let windowed =
-                        partition_windowed(&reference, ContigId(0), &config).expect("fetch");
+                        partition_windowed(reference_over("chr1", &bases), ContigId(0), &config)
+                            .expect("fetch");
                     assert_eq!(
                         windowed, resident,
                         "micro_left={micro_left} gap={gap} window_bp={window_bp}"
@@ -2143,7 +2421,6 @@ mod tests {
     #[test]
     fn windowed_matches_the_resident_oracle_at_every_window_size() {
         let bases = windowing_fixture();
-        let reference = reference_over("chr1", &bases);
         let base = TypedRegionConfig::default();
         let resident = partition_resident("chr1", ContigId(0), &bases, &base);
         assert_partitions(&resident, ContigId(0), bases.len() as u64, "resident");
@@ -2173,7 +2450,8 @@ mod tests {
                 window_bp: Bp(window_bp),
                 ..base.clone()
             };
-            let windowed = partition_windowed(&reference, ContigId(0), &config).expect("fetch");
+            let windowed = partition_windowed(reference_over("chr1", &bases), ContigId(0), &config)
+                .expect("fetch");
             assert_partitions(
                 &windowed,
                 ContigId(0),
@@ -2218,7 +2496,6 @@ mod tests {
             // One reference per contig, so the id is 0 in each — the walk is
             // per-contig, and `E3` is where a multi-contig reference is walked whole.
             let contig = ContigId(0);
-            let reference = reference_over(&name, &bases);
 
             let resident = partition_resident(&name, contig, &bases, &TypedRegionConfig::default());
             for window_bp in [500u64, 1500] {
@@ -2226,7 +2503,8 @@ mod tests {
                     window_bp: Bp(window_bp),
                     ..TypedRegionConfig::default()
                 };
-                let windowed = partition_windowed(&reference, contig, &config).expect("fetch");
+                let windowed = partition_windowed(reference_over(&name, &bases), contig, &config)
+                    .expect("fetch");
                 assert_eq!(
                     windowed, resident,
                     "{name} at window_bp = {window_bp} diverged from the resident oracle"
@@ -2247,13 +2525,13 @@ mod tests {
     #[test]
     fn a_generic_run_longer_than_a_window_is_one_region() {
         let bases = windowing_fixture();
-        let reference = reference_over("chr1", &bases);
         let window_bp = 100;
         let config = TypedRegionConfig {
             window_bp: Bp(window_bp),
             ..TypedRegionConfig::default()
         };
-        let regions = partition_windowed(&reference, ContigId(0), &config).expect("fetch");
+        let regions = partition_windowed(reference_over("chr1", &bases), ContigId(0), &config)
+            .expect("fetch");
         assert_partitions(&regions, ContigId(0), bases.len() as u64, "maximality");
 
         // The stretch between the tract at 3500 and the array at 4000 is ~480 bp — five
@@ -2287,12 +2565,12 @@ mod tests {
     #[test]
     fn a_locus_astride_a_window_edge_is_not_dropped() {
         let bases = windowing_fixture();
-        let reference = reference_over("chr1", &bases);
         let config = TypedRegionConfig {
             window_bp: Bp(1000),
             ..TypedRegionConfig::default()
         };
-        let regions = partition_windowed(&reference, ContigId(0), &config).expect("fetch");
+        let regions = partition_windowed(reference_over("chr1", &bases), ContigId(0), &config)
+            .expect("fetch");
 
         let loci: Vec<u64> = regions
             .iter()
@@ -2319,13 +2597,13 @@ mod tests {
     #[test]
     fn every_locus_is_emitted_exactly_once() {
         let bases = windowing_fixture();
-        let reference = reference_over("chr1", &bases);
         for window_bp in [100u64, 333, 1000] {
             let config = TypedRegionConfig {
                 window_bp: Bp(window_bp),
                 ..TypedRegionConfig::default()
             };
-            let regions = partition_windowed(&reference, ContigId(0), &config).expect("fetch");
+            let regions = partition_windowed(reference_over("chr1", &bases), ContigId(0), &config)
+                .expect("fetch");
             let mut starts: Vec<u64> = regions
                 .iter()
                 .filter(|r| matches!(r.kind, RegionKind::SsrLocus(_)))
@@ -2345,17 +2623,23 @@ mod tests {
     /// scans a hole (spec §8.2). An unknown contig is the reachable form of that here.
     #[test]
     fn an_unreadable_contig_is_an_error_not_an_empty_partition() {
-        let reference = reference_over("chr1", b"ACGT");
-        let err = partition_windowed(&reference, ContigId(9), &TypedRegionConfig::default())
-            .expect_err("contig 9 does not exist");
+        let err = partition_windowed(
+            reference_over("chr1", b"ACGT"),
+            ContigId(9),
+            &TypedRegionConfig::default(),
+        )
+        .expect_err("contig 9 does not exist");
         assert!(matches!(err, TypedRegionError::Reference(_)));
     }
 
     #[test]
     fn a_zero_length_contig_windows_to_nothing() {
-        let reference = reference_over("empty", b"");
-        let regions =
-            partition_windowed(&reference, ContigId(0), &TypedRegionConfig::default()).unwrap();
+        let regions = partition_windowed(
+            reference_over("empty", b""),
+            ContigId(0),
+            &TypedRegionConfig::default(),
+        )
+        .unwrap();
         assert!(regions.is_empty());
     }
 
@@ -2367,12 +2651,384 @@ mod tests {
     #[test]
     #[should_panic(expected = "must not be narrower than flank_bp")]
     fn a_detection_margin_narrower_than_the_bundle_radius_is_refused() {
-        let reference = reference_over("chr1", &windowing_fixture());
         let config = TypedRegionConfig {
             max_repeat_len: Bp(10),
             ..TypedRegionConfig::default()
         };
-        let _ = partition_windowed(&reference, ContigId(0), &config);
+        let _ = partition_windowed(
+            reference_over("chr1", &windowing_fixture()),
+            ContigId(0),
+            &config,
+        );
+    }
+
+    // ---- E1: the iterator surface ----------------------------------------
+
+    /// `over_regions` walks **every** span, in genomic order, gap-free across contigs —
+    /// and each contig's regions are exactly what walking that contig alone gives.
+    ///
+    /// The multi-contig case is the one the per-contig tests cannot reach: the walk has
+    /// to put down one contig and pick up the next without carrying anything across
+    /// (`emitted_upto` and the block carries are per span, and a leak would show as a
+    /// gap or an overlap at the seam).
+    #[test]
+    fn over_regions_walks_every_contig_in_order() {
+        let a = windowing_fixture();
+        let b = micro_near_satellite(true, 20);
+        let contigs = &[
+            ContigBounds {
+                name: "chrA",
+                length: a.len() as u32,
+            },
+            ContigBounds {
+                name: "chrB",
+                length: b.len() as u32,
+            },
+        ];
+        let reference = InMemoryRefSeq::from_named_contigs(vec![
+            ("chrA".to_string(), a.clone()),
+            ("chrB".to_string(), b.clone()),
+        ]);
+        let config = TypedRegionConfig {
+            window_bp: Bp(700),
+            ..TypedRegionConfig::default()
+        };
+
+        let regions: Vec<TypedRegion> = TypedRegionIterator::over_regions(
+            reference,
+            GenomeRegions::whole_contigs(contigs),
+            config.clone(),
+        )
+        .expect("valid spans")
+        .collect::<Result<_, _>>()
+        .expect("no read fails");
+
+        // Each contig's slice of the output partitions that contig...
+        let (from_a, from_b): (Vec<_>, Vec<_>) = regions
+            .iter()
+            .cloned()
+            .partition(|r| r.region.contig == ContigId(0));
+        assert_partitions(
+            &from_a,
+            ContigId(0),
+            a.len() as u64,
+            "chrA via over_regions",
+        );
+        assert_partitions(
+            &from_b,
+            ContigId(1),
+            b.len() as u64,
+            "chrB via over_regions",
+        );
+
+        // ...and is identical to walking it on its own: nothing carries across the seam.
+        assert_eq!(
+            from_a,
+            partition_resident("chrA", ContigId(0), &a, &config),
+            "chrA"
+        );
+        assert_eq!(
+            from_b,
+            partition_resident("chrB", ContigId(1), &b, &config),
+            "chrB"
+        );
+
+        // Genomic order, contigs in table order.
+        assert!(
+            regions
+                .windows(2)
+                .all(|w| (w[0].region.contig, w[0].region.start)
+                    <= (w[1].region.contig, w[1].region.start)),
+            "regions must come out in genomic order"
+        );
+    }
+
+    /// The **running tally**: readable mid-walk, complete once exhausted (spec §3.1).
+    ///
+    /// Checked against the regions actually yielded rather than against literals — the
+    /// counts are a claim *about the output*, so anything else would be two independent
+    /// guesses at the fixture.
+    #[test]
+    fn counts_tally_the_regions_yielded() {
+        let bases = windowing_fixture();
+        let reference = reference_over("chr1", &bases);
+        let mut iter =
+            TypedRegionIterator::over_contig(reference, ContigId(0), TypedRegionConfig::default())
+                .expect("valid contig");
+
+        assert_eq!(
+            *iter.counts(),
+            TypedRegionCounts::default(),
+            "nothing walked, nothing counted"
+        );
+
+        let mut yielded: Vec<TypedRegion> = Vec::new();
+        // Mid-walk the tally must already describe what has come out so far.
+        for r in iter.by_ref().take(3) {
+            yielded.push(r.expect("no read fails"));
+        }
+        assert_eq!(
+            iter.counts().ssr_loci + iter.counts().generic + iter.counts().satellites,
+            3,
+            "the tally counts what has been HANDED OUT, not what has been scanned"
+        );
+
+        for r in iter.by_ref() {
+            yielded.push(r.expect("no read fails"));
+        }
+        let counts = iter.counts();
+        let kind_count =
+            |f: fn(&RegionKind) -> bool| yielded.iter().filter(|r| f(&r.kind)).count() as u64;
+        assert_eq!(counts.spans, 1);
+        assert_eq!(
+            counts.ssr_loci,
+            kind_count(|k| matches!(k, RegionKind::SsrLocus(_)))
+        );
+        assert_eq!(
+            counts.ssr_bundles,
+            kind_count(|k| matches!(k, RegionKind::SsrBundle { .. }))
+        );
+        assert_eq!(
+            counts.generic,
+            kind_count(|k| matches!(k, RegionKind::Generic))
+        );
+        assert_eq!(
+            counts.satellites,
+            kind_count(|k| matches!(k, RegionKind::Satellite))
+        );
+        assert!(counts.satellites > 0 && counts.ssr_loci > 0 && counts.ssr_bundles > 0);
+
+        let bp_of = |f: fn(&RegionKind) -> bool| -> u64 {
+            yielded
+                .iter()
+                .filter(|r| f(&r.kind))
+                .map(|r| r.region.len())
+                .sum()
+        };
+        assert_eq!(
+            counts.satellite_bp,
+            bp_of(|k| matches!(k, RegionKind::Satellite))
+        );
+        assert_eq!(
+            counts.ssr_bundle_bp,
+            bp_of(|k| matches!(k, RegionKind::SsrBundle { .. }))
+        );
+
+        // **The gap `repeat_bp_with_no_locus` measures**, pinned exactly rather than
+        // bounded: it is the contig's cleaned repeat coverage minus the bases that came
+        // out as loci. Computed here from the resident path — an independent route to the
+        // same number, so this fails if either the accumulate or the subtract is wrong.
+        // (A `>=` bound was the first version, and it left the subtraction untested:
+        // dropping it makes the number bigger, and bigger still satisfies `>=`.)
+        let config = TypedRegionConfig::default();
+        let raw = find_tandem_repeats(&bases, config.periods, &config.scan);
+        let cleaned = admission::prefilter(&raw, &config.admission);
+        let coverage_bp: u64 = coverage_runs(&cleaned).iter().map(|r| r.len()).sum();
+        let locus_bp = bp_of(|k| matches!(k, RegionKind::SsrLocus(_)));
+        assert!(
+            coverage_bp > 0 && locus_bp > 0,
+            "the fixture must have both"
+        );
+        assert_eq!(
+            counts.repeat_bp_with_no_locus,
+            coverage_bp - locus_bp,
+            "repeat coverage ({coverage_bp} bp) that yielded no locus ({locus_bp} bp of \
+             it did)"
+        );
+        assert!(
+            counts.repeat_bp_with_no_locus >= counts.ssr_bundle_bp,
+            "and the bundled tracts are part of it"
+        );
+    }
+
+    /// A reference-read failure mid-walk is **fatal and in-stream**: `Some(Err(_))` once,
+    /// then `None` forever (spec §8.2). `None` meaning both "done" and "chromosome 7
+    /// failed" would silently un-call the rest of the genome.
+    ///
+    /// The failure is injected by a reference that reads a prefix and then refuses, so
+    /// the error lands **mid-walk** — a constructor-time failure would prove nothing
+    /// about the stream.
+    #[test]
+    fn a_read_failure_mid_walk_is_yielded_once_and_then_the_iterator_is_done() {
+        /// Fails every read starting past `fail_from` (1-based).
+        struct FailsLate {
+            inner: InMemoryRefSeq,
+            fail_from: u64,
+        }
+        impl RefSeq for FailsLate {
+            fn fetch_into(
+                &self,
+                contig: ContigId,
+                start: u64,
+                len: u64,
+                dst: &mut Vec<u8>,
+            ) -> Result<(), RefSeqError> {
+                self.inner.fetch_into(contig, start, len, dst)
+            }
+        }
+        impl RawRefSeq for FailsLate {
+            fn fetch_raw_into(
+                &self,
+                contig: ContigId,
+                start: u64,
+                len: u64,
+                dst: &mut Vec<u8>,
+            ) -> Result<(), RefSeqError> {
+                if start > self.fail_from {
+                    return Err(RefSeqError::InvalidStart);
+                }
+                self.inner.fetch_raw_into(contig, start, len, dst)
+            }
+        }
+        impl ContigTable for FailsLate {
+            fn contigs(&self) -> &crate::fasta::ContigList {
+                self.inner.contigs()
+            }
+        }
+        impl EvictableRefSeq for FailsLate {
+            fn evict_before(&mut self, _pos: u64) {}
+        }
+
+        let bases = windowing_fixture();
+        let reference = FailsLate {
+            inner: reference_over("chr1", &bases),
+            fail_from: 2000,
+        };
+        let config = TypedRegionConfig {
+            window_bp: Bp(500),
+            ..TypedRegionConfig::default()
+        };
+        let mut iter = TypedRegionIterator::over_contig(reference, ContigId(0), config)
+            .expect("the contig table is readable; only the BASES fail");
+
+        let mut errors = 0;
+        let mut items = 0;
+        for r in iter.by_ref() {
+            match r {
+                Ok(_) => items += 1,
+                Err(e) => {
+                    assert!(matches!(e, TypedRegionError::Reference(_)));
+                    errors += 1;
+                }
+            }
+        }
+        assert_eq!(errors, 1, "the failure is reported exactly once");
+        assert!(items > 0, "the windows before the failure still yielded");
+
+        // Fused: done means done. A caller polling on is not handed a partial walk that
+        // looks complete.
+        assert!(iter.next().is_none(), "fused: nothing after the error");
+        assert!(iter.next().is_none());
+    }
+
+    /// **The walk releases the bases it has passed** — the difference between "holds one
+    /// window, never a contig" (spec §7) as a claim and as a fact.
+    ///
+    /// Nothing else can catch this. The reference impls the other tests use hold their
+    /// bytes outright, so their eviction is an honest no-op and a walk that never evicted
+    /// would pass every test in this file — while a real `WindowedRefSeq`'s buffer grew to
+    /// the whole contig, silently, which is exactly the memory profile the windowed walk
+    /// exists to avoid. So the reference here records the asks.
+    #[test]
+    fn the_walk_evicts_the_bases_it_has_passed() {
+        struct EvictionSpy {
+            inner: InMemoryRefSeq,
+            evictions: std::rc::Rc<std::cell::RefCell<Vec<u64>>>,
+        }
+        impl RefSeq for EvictionSpy {
+            fn fetch_into(
+                &self,
+                contig: ContigId,
+                start: u64,
+                len: u64,
+                dst: &mut Vec<u8>,
+            ) -> Result<(), RefSeqError> {
+                self.inner.fetch_into(contig, start, len, dst)
+            }
+        }
+        impl RawRefSeq for EvictionSpy {
+            fn fetch_raw_into(
+                &self,
+                contig: ContigId,
+                start: u64,
+                len: u64,
+                dst: &mut Vec<u8>,
+            ) -> Result<(), RefSeqError> {
+                self.inner.fetch_raw_into(contig, start, len, dst)
+            }
+        }
+        impl ContigTable for EvictionSpy {
+            fn contigs(&self) -> &crate::fasta::ContigList {
+                self.inner.contigs()
+            }
+        }
+        impl EvictableRefSeq for EvictionSpy {
+            fn evict_before(&mut self, pos: u64) {
+                self.evictions.borrow_mut().push(pos);
+            }
+        }
+
+        let bases = windowing_fixture();
+        let evictions = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let reference = EvictionSpy {
+            inner: reference_over("chr1", &bases),
+            evictions: std::rc::Rc::clone(&evictions),
+        };
+        let config = TypedRegionConfig {
+            window_bp: Bp(1000),
+            ..TypedRegionConfig::default()
+        };
+        let regions: Vec<TypedRegion> =
+            TypedRegionIterator::over_contig(reference, ContigId(0), config)
+                .expect("valid contig")
+                .collect::<Result<_, _>>()
+                .expect("no read fails");
+        assert!(!regions.is_empty());
+
+        let evictions = evictions.borrow();
+        assert_eq!(
+            evictions.len(),
+            6,
+            "one per window: a 6 kb contig at window_bp = 1000. Evicting once at the end \
+             would bound nothing"
+        );
+        assert!(
+            evictions.windows(2).all(|w| w[0] <= w[1]),
+            "eviction only ever moves forward — the walk never looks back: {evictions:?}"
+        );
+        assert!(
+            *evictions.last().unwrap() > 4000,
+            "and it follows the walk to the end of the contig: {evictions:?}"
+        );
+    }
+
+    /// A span naming a contig the reference does not have fails **at construction**, not
+    /// mid-walk. The arch doc expected this constructor to be infallible because
+    /// `GenomeRegions` validates; it validates against *a* contig table, and nothing ties
+    /// that one to the reference's.
+    #[test]
+    fn a_span_the_reference_does_not_have_is_rejected_up_front() {
+        let contigs = &[
+            ContigBounds {
+                name: "chr1",
+                length: 100,
+            },
+            ContigBounds {
+                name: "chr2",
+                length: 100,
+            },
+        ];
+        // The spans know two contigs; the reference has one.
+        let reference = reference_over("chr1", &filler(100));
+        let result = TypedRegionIterator::over_regions(
+            reference,
+            GenomeRegions::whole_contigs(contigs),
+            TypedRegionConfig::default(),
+        );
+        assert!(
+            matches!(result, Err(TypedRegionError::Reference(_))),
+            "chr2 is not in this reference, and that must be caught before any walk"
+        );
     }
 
     /// Every BED failure is `RegionSet`'s to reject **up front** — which is what

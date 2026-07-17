@@ -25,6 +25,7 @@ pub mod tandem_repeat;
 pub mod types;
 
 pub use ref_seq::{
-    ContigTable, InMemoryRefSeq, RawRefSeq, RefSeq, RefSeqError, ResidentRefSeq, WindowedRefSeq,
+    ContigTable, EvictableRefSeq, InMemoryRefSeq, RawRefSeq, RefSeq, RefSeqError, ResidentRefSeq,
+    WindowedRefSeq,
 };
 pub use types::{BaseQual, Bp, ContigId, DomainError, MapQual, MismatchFraction};

@@ -339,12 +339,39 @@ guard (a locus near a window edge is not dropped).
 
 ### Milestone E — public surface, BED, integration
 
-**E1. `TypedRegionIterator`.**  ☐
-Owns `reference` + `spans` (by value — moves onto a producer thread, spec §7); `over_regions(...)`
-(infallible — `GenomeRegions` validated everything); `Iterator` with `Item = Result<TypedRegion,
-TypedRegionError>`, fused, fatal-in-stream; `counts()` running tally. Wires D3 to the surface. *Depends:*
-D3. *Source:* arch §interface, spec §8.2. Verified: iterate a small reference; `counts` tally; a
-reference-read failure surfaces as `Some(Err(_))` once then `None`.
+**E1. `TypedRegionIterator`.**  ✅
+Owns `reference` + `spans` (by value — moves onto a producer thread, spec §7); `over_regions(...)`;
+`Iterator` with `Item = Result<TypedRegion, TypedRegionError>`, fused, fatal-in-stream; `counts()`
+running tally. Wires D3 to the surface. *Depends:* D3. *Source:* arch §interface, spec §8.2.
+Verified: iterate a small reference; `counts` tally; a reference-read failure surfaces as
+`Some(Err(_))` once then `None`.
+
+*(Landed 2026-07-16. **`partition_windowed` is now this iterator collected**, so D3's whole suite —
+window-invariance, `.cat` parity through the oracle, absorption — runs through the shipping code
+rather than beside it. Four departures from the arch doc, each forced and each recorded:*
+1. ***The constructor is fallible.*** The arch says infallible because `GenomeRegions` validated the
+   spans. It validated them against *a* contig table; nothing ties that one to the reference's, so a
+   span naming a contig this reference lacks is still reachable — caught up front, once.
+2. ***It is generic over the reference, not concrete.*** The arch's reason for concrete was that the
+   walk needs raw bytes and eviction, "impl capabilities not trait methods". They are trait methods
+   now (`RawRefSeq` + `ContigTable` + the new `EvictableRefSeq`), which is what lets **the same walk**
+   run over an `InMemoryRefSeq` in tests — and that is what makes window-invariance against
+   `partition_resident` testable at all.
+3. ***`WindowCursor` + `scan_window` were extracted from `scan_windowed`*** (no behaviour change, B1's
+   tests green). The iterator **owns** its reference, so it cannot hold `scan_windowed`'s iterator,
+   which borrows one — that is a self-referential struct. A cursor both can drive keeps §6.1's one
+   copy of the geometry.
+4. ***`rejected_by_reason` is absent, not zero.*** `admit` reports no reasons — `finish_locus` returns
+   `None` from five gates and the caller cannot tell them apart — so spec §3.1's breakdown cannot be
+   filled. A zero would read as "nothing rejected for that reason", a wrong answer to §10's question
+   dressed as a measured one. **Next step: teach admission to report its rejections, then restore the
+   field.** `repeat_bp_with_no_locus` *is* filled (coverage minus loci) and pinned exactly against an
+   independent computation.
+
+*`EvictableRefSeq` is new and load-bearing: the walk releases what it has passed, without which a
+`WindowedRefSeq`'s buffer grows to the whole contig and "holds one window" is a claim rather than a
+fact. No existing test could catch that — the other impls have nothing to evict — so a recording
+reference pins it.)*
 
 **E2. BED scan-wider-than-emit.**  ☐
 Grow each requested region by `max_repeat_len` and coalesce (the **scan** set); emit only what overlaps

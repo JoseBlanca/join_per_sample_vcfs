@@ -3,8 +3,11 @@
 //! filtering. Design spec: `doc/devel/ng/spec/ref_seq.md`.
 //!
 //! [`RefSeq`] is the **universal** surface: canonical `{A,C,G,T,N}` fetch, which every
-//! implementation provides. Raw bytes are the [`RawRefSeq`] sub-trait; buffer eviction is
-//! an inherent method on the windowed impl ([`WindowedRefSeq`]). Both fetch surfaces write
+//! implementation provides. The rest are capabilities a consumer can *require*: raw bytes
+//! ([`RawRefSeq`]), the contig table ([`ContigTable`]), and releasing what a forward walk
+//! has passed ([`EvictableRefSeq`]). The last two were inherent methods on
+//! [`WindowedRefSeq`] until the typed-region walk needed to demand them of a reference
+//! rather than assume them of one impl. Both fetch surfaces write
 //! into a caller-owned buffer (`&self`, alloc-free when the buffer is reused) rather than
 //! returning a borrowed slice — that keeps every impl `&self`-shareable and avoids the
 //! lazy-load/borrow-escape problem the file-backed impls would otherwise hit.
@@ -127,9 +130,11 @@ fn narrow_for_fetcher(
 }
 
 /// Access to reference-genome bases by (contig, 1-based range). The universal surface
-/// every implementation provides: canonical `{A,C,G,T,N}` fetch. Raw bytes are the
-/// [`RawRefSeq`] capability; buffer eviction is the windowed impl's inherent
-/// `evict_before` — neither is a method here.
+/// every implementation provides: canonical `{A,C,G,T,N}` fetch. Raw bytes
+/// ([`RawRefSeq`]), the contig table ([`ContigTable`]) and eviction
+/// ([`EvictableRefSeq`]) are separate capabilities, so that "this reference cannot do
+/// that" is a compile-time fact rather than a runtime error — and so that a consumer
+/// states what it needs rather than naming a concrete impl.
 ///
 /// Coordinates are bare `u64` (1-based `start_1based`, `length`) rather than newtypes, to
 /// match the production `MultiChromRefFetcher::fetch` signature so a winning impl ports
@@ -208,6 +213,23 @@ pub trait ContigTable {
     /// The contig table — names and lengths, in `@SQ` / `.fai` order, indexed by
     /// [`ContigId`].
     fn contigs(&self) -> &ContigList;
+}
+
+/// A reference that can **release the bases a forward walk has passed**.
+///
+/// The typed-region walk slides forward across a contig and never looks back, so without
+/// this its reader's buffer would grow to hold the whole contig — which is precisely the
+/// memory profile the windowed walk exists to avoid (`typed_regions.md` §7). The walk owns
+/// its reference, so it can be the one to say when.
+///
+/// **Eviction is a hint, never a fact the answer depends on.** An evicted base that is
+/// asked for again is simply re-read. That is what lets an implementation with nothing
+/// buffered — [`InMemoryRefSeq`], [`ResidentRefSeq`] — implement this as a no-op honestly
+/// rather than by pretending: they hold no window to shrink, so "release what I have
+/// passed" is already true of them.
+pub trait EvictableRefSeq {
+    /// Release buffered bases before 1-based `pos` on the currently-resident contig.
+    fn evict_before(&mut self, pos: u64);
 }
 
 /// A synthetic, fully in-memory reference: each contig's bytes held directly, indexed by
@@ -304,6 +326,11 @@ impl ContigTable for InMemoryRefSeq {
     fn contigs(&self) -> &ContigList {
         &self.table
     }
+}
+
+impl EvictableRefSeq for InMemoryRefSeq {
+    /// Nothing to release: the bytes *are* the reference, not a window onto one.
+    fn evict_before(&mut self, _pos: u64) {}
 }
 
 impl RawRefSeq for InMemoryRefSeq {
@@ -410,6 +437,14 @@ impl ContigTable for ResidentRefSeq {
     }
 }
 
+impl EvictableRefSeq for ResidentRefSeq {
+    /// Nothing to release *within* a contig: this impl's unit of residency is the whole
+    /// contig, dropped at a transition by [`Self::clear`]. Shrinking it partway is not a
+    /// thing it can do, and saying so with a no-op is honest — the alternative would be
+    /// `clear()`, which would evict the very bases the walk is about to read next.
+    fn evict_before(&mut self, _pos: u64) {}
+}
+
 impl RawRefSeq for ResidentRefSeq {
     fn fetch_raw_into(
         &self,
@@ -493,14 +528,27 @@ impl WindowedRefSeq {
             current: RefCell::new(None),
         }
     }
+}
 
+impl EvictableRefSeq for WindowedRefSeq {
     /// Release buffered bytes before `pos` on the currently-resident contig — the
     /// caller-driven memory bound (drain `[.., pos)`, keep capacity). No-op when no
     /// contig is resident. Correctness is preserved: a later fetch of an evicted
     /// position simply re-reads it.
-    pub fn evict_before(&mut self, pos: u32) {
+    ///
+    /// **This is the impl the trait exists for** — the only one with a window to shrink.
+    /// It was an inherent method until the walk needed to evict through a generic
+    /// reference; making it the trait impl keeps it one method rather than two that
+    /// differ only in width.
+    ///
+    /// `pos` narrows to the reader's `u32` **saturating**, and that is not the silent
+    /// clamp B2 deleted: a `pos` past 4 Gb evicts everything the reader could possibly
+    /// hold, which is *less* than asked and therefore safe — and a >4 Gb coordinate
+    /// cannot be fetched by this reader in the first place, so it cannot be buffered
+    /// either. Eviction is a hint; a wrong one costs memory, never an answer.
+    fn evict_before(&mut self, pos: u64) {
         if let Some((_, reader)) = self.current.get_mut() {
-            reader.evict_before(pos);
+            reader.evict_before(u32::try_from(pos).unwrap_or(u32::MAX));
         }
     }
 }
