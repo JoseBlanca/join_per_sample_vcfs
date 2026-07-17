@@ -413,9 +413,10 @@ fact. No existing test could catch that — the other impls have nothing to evic
 reference pins it.)*
 
 **E2. BED scan-wider-than-emit.**  ✅
-Grow each requested region by `max_repeat_len` and coalesce (the **scan** set); emit only what overlaps
-the **requested** set; clip `Generic` to the requested edge; grow the effective span to hold a straddling
-locus **or bundle** whole (spec §2.5). *Depends:* E1. *Source:* spec §2.5, §8. Verified:
+**Scan whole contigs** (the **scan** set — owner, 2026-07-17; E2 first grew each region by
+`max_repeat_len` and coalesced, which could not work — below); emit only what overlaps the **requested**
+set; clip `Generic` to the requested edge; grow the effective span to hold a straddling **finding**
+whole (spec §2.5). *Depends:* E1. *Source:* spec §2.5, §8. Verified:
 **BED-invariance** — loci inside a BED region identical to the whole-genome run, with a cluster placed
 **astride the BED edge**; a straddling `SsrLocus` *and* a straddling `SsrBundle` each emitted whole;
 `Generic` clipped at the user's edge.
@@ -494,10 +495,15 @@ control.)*
 > - **The homopolymer fixture found E1e's reachability claim backwards** — see the E1e correction
 >   above.
 >
-> **Open, and needing an owner decision:**
-> - ~~`Satellite` clips at a BED edge~~ — **decided (owner, 2026-07-17): it does not.** Every finding
->   comes back whole; `Generic` alone clips. See E2 above.
-> - **§2.5's residual** (above): accept, fix the right edge, or fall back to whole-contig scans.
+> **Decided by the owner, 2026-07-17 — both closed:**
+> - ~~`Satellite` clips at a BED edge~~ — **it does not.** Every finding comes back whole; `Generic`
+>   alone clips.
+> - ~~§2.5's residual~~ — **the scan set is now whole contigs.** Same reasoning: if a finding overlaps
+>   a BED edge we report it whole, and "whole" is a fact about the feature, so no margin can deliver it
+>   (a satellite is BY DEFINITION longer than `max_repeat_len`, which was the margin). Measured before
+>   changing anything: a 3 kb array came back cut to 1300 bp under a BED. The cost is time, not memory;
+>   the payoff is that BED-invariance is now **object identity**, and the E2 cut-cluster rule and its
+>   weakened assert are **deleted** rather than kept.
 > - **Three of §3.1's five rejection columns are structurally zero in the walk** (E1e), because the
 >   pre-filter gets there first. Not a bug; a thing a reader of the counts must know.
 > - **Still open from Checkpoint A:** a `proptest` property over `assert_agrees` — the strongest

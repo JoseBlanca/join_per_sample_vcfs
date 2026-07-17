@@ -7,7 +7,9 @@ rather than builds: it stands on `RefSeq` ([`ref_seq.md`](ref_seq.md)), the tand
 questions the read-preparation specs deferred to "the router spec" — `LocusWindow`, the `SsrLocus`
 shape, and `ReadPreparer::Locus` ([`read_preparation_ssr.md`](read_preparation_ssr.md) §8) — and
 retires `locus_router/` from [`../arch/module_layout.md`](../arch/module_layout.md). Amends four
-sibling docs; see §9. Code-facing companion: [`../arch/typed_regions.md`](../arch/typed_regions.md).*
+sibling docs; see §9. Code-facing companion: [`../arch/typed_regions.md`](../arch/typed_regions.md).
+The CLI that drives this walk and writes its output to a file is
+[`typed_regions_cli.md`](typed_regions_cli.md).*
 
 *Naming: **STR** in prose, `ssr` in code. **Licensing:** implement from papers, never transliterate
 — TRF-mod is AGPL-3, GangSTR GPL-3, HipSTR GPL-2. Nothing here needs their source.*
@@ -284,62 +286,48 @@ whole-genome run rejects**. Same reference, different calls, because of `--regio
 **The property: whether a base is STR / bundle / generic / satellite must not depend on the BED.**
 The BED chooses what you are *shown*, never what things *are*.
 
-**Decision: scan wider than you emit.** Grow each region by `max_repeat_len`, re-coalesce, scan those,
-emit only what overlaps the user's regions. Two sets: **scan** (grown) and **emit** (the user's).
+**Decision (owner, 2026-07-17): scan whole contigs, emit what was asked for.** The scan set is the
+**whole of every contig the request touches**; the emit set is the user's regions. Two sets still — but
+the scan set is not a guess.
 
-> **The residual is real, and this section's mitigation of it was false — tested 2026-07-17.**
+> **This replaces "grow each region by `max_repeat_len` and re-coalesce" (E2), which could not deliver
+> the emit rule.** The margin was a *guessed reach*, and §2.6 had already said not to guess one:
+> *"bundles chain — A–B–C–D each 30 bp apart runs past any margin you choose… the data tells you when
+> it's over; you don't have to guess a reach."* §2.5 was the odd section out. Two measurements ended
+> it:
 >
-> This paragraph used to end: *"The residual — a cluster chaining past 1 kb without a 50 bp break — is
-> dense-repeat territory heading for `Satellite`; §8 tests for it directly rather than trusting the
-> argument."* The test was written. **The argument was wrong.**
+> - **a 3 kb array under a BED came back `1001–2300` instead of `1001–4001`** — a `Satellite` cut to
+>   1300 bp, silently. This is the **common** case, not an exotic one: a satellite is *by definition*
+>   longer than `max_repeat_len`, and the margin **is** `max_repeat_len`, so no array running past it
+>   could ever be returned whole.
+> - **a 1.5 kb chain came back with 24 of its 30 member tracts.** This section used to wave that away —
+>   *"the residual … is dense-repeat territory heading for `Satellite`; §8 tests for it directly rather
+>   than trusting the argument."* The test was written and the argument was wrong: a satellite is
+>   over-cap **coverage**, coverage runs merge only where they **abut** (§2.4), and every run in that
+>   chain is 20 bp. It stays a bundle.
 >
-> A `Satellite` is over-cap **coverage**, and coverage runs merge only where they **abut** (§2.4). A
-> chain of 20 bp tracts 30 bp apart running 1.5 kb has no run longer than 20 bp: nothing comes near the
-> 1 kb cap, and the chain is a **bundle**, not a satellite. So the cut is not saved by anything.
+> **What it costs is time, not memory.** A 10 kb BED on a 90 Mb chromosome now scans 90 Mb — through
+> the same window, so peak memory is unchanged (§7), and the emit set is as narrow as ever. What it
+> buys is that `--regions` costs nothing in *correctness*: every finding is **the same object** a
+> whole-genome run reports, asserted as equality rather than resemblance
+> (`a_bed_returns_the_same_findings_the_whole_genome_run_does`).
 >
-> **What actually happens** (`a_cluster_chaining_past_the_margin_is_cut_by_a_bed_edge`):
->
-> - **This section's stated property still holds** — *whether a base is STR / bundle / generic /
->   satellite must not depend on the BED*. A tract inside the requested span has every neighbour within
->   `flank_bp`, far inside the `max_repeat_len` margin, so its verdict is right. The margin does the job
->   it was chosen for.
-> - **"A finding is returned whole" does not.** The emitted `SsrBundle` is **truncated** at the scan
->   edge — hull `1001–2170` where the whole-genome run says `1001–2470`, and 24 member tracts of the
->   real 30. Silently: a *different object*, whenever a chain runs more than `max_repeat_len` past a
->   requested edge.
->
-> **Not fixed, and the choice is the owner's.** The fallback this section already names — *"always scan
-> whole contigs (exact … but makes a 10 kb region pay for a 90 Mb chromosome)"* — is one answer. A
-> cheaper one exists for the **right** edge only: §2.6's own rule ("hold the open cluster, and resolve
-> it when a far-enough repeat arrives — the data tells you when it's over") applies just as well to the
-> scan's end as to a window's, so the walk could keep scanning past the grown edge while a block is
-> open. The **left** edge has no such fix short of scanning from the contig start. Whether real genomes
-> carry chains this long is unmeasured.
+> **It also deletes a rule instead of adding one.** With no scan edges but the contig's, a cluster can
+> no longer be cut, so the walk needs no edge case and `bundle_clusters` gets its "a bundle has ≥ 2
+> members" assert back at full strength (E2 had to weaken it).
 
-> **Corrected at E2, 2026-07-17 — "the walk needs no special logic, because a grown region is just a
-> longer continuous run" is wrong, and the walk says so with a panic.**
->
-> A scan span has **edges a whole contig does not**, and a cluster can straddle one. The walk
-> attributes a bundle member to the core holding its start, so a member whose partner lies outside the
-> scan span arrives alone — and `bundle_clusters` re-derives a **one-member cluster**, which is not a
-> bundle by definition (§2.4). Found by writing the BED-invariance test: three of five E2 tests
-> tripped D2's `debug_assert`, on the cluster at 1990–2040 with a scan edge at 2000.
->
-> It needs no *policy*, which is what that sentence was reaching for, but it does need a **rule at the
-> edge**: a cut cluster is dropped, and its bases fall to `Generic` (§2.2 — where a repeat that is not
-> a locus belongs). That is safe precisely because of the margin: the scan span reaches
-> `max_repeat_len` past what was requested, so a cluster reaching the scan edge cannot also reach the
-> emit set — unless it chains the whole way, which is the residual named above.
->
-> The check moved from `bundle_clusters` to the walk, because **only the walk knows the scan span**
-> and so only the walk can tell "cut at the edge" (expected, drop it) from "in the middle of the walk"
-> (a real bug — how D3's truncated member showed up, and still loud).
+Rejected: **scan only the user's region** (the bug above); **grow each region by a margin** (E2 — a
+guessed reach, and no margin can hold a feature defined as longer than it, above).
 
 **Which regions clip, and which come back whole (owner, 2026-07-17).** This section named only a
 straddling locus or bundle, and said **nothing about `Satellite`**. The rule for all of them:
 
 > **Every *finding* that intersects a BED edge is returned whole — microsatellite, bundle and
 > satellite alike. `Generic` alone is clipped.**
+
+The requested span **grows to hold** a straddling finding, and that grown span is the **effective
+region** the invariant is stated over. It terminates in one step: no two findings overlap (§2.4), so at
+most one straddles each edge.
 
 `Generic` clips because it is the only kind that is **not a finding**: *"nothing more specific can be
 said here"* is true of any stretch of a generic run, so a clipped one says exactly what it said. Each
@@ -354,13 +342,8 @@ unit variants, carrying no payload, so clipping them could leave nothing misdesc
 type right and the meaning wrong — **what a region carries is not what it claims**. Recorded because
 the argument is a tempting one and is available to be made again.*
 
-Rejected: scan only the user's region (the bug above); always scan whole contigs (exact, and the
-fallback if the test fails on real data, but makes a 10 kb region pay for a 90 Mb chromosome).
-
-**A STR or STR bundle region straddling an edge is emitted whole, and the region grows to hold it.**
-That grown region is the **effective region** the invariant is stated over. It terminates in one
-step: neither loci nor bundles overlap anything (§2.4), so at most one of them straddles each edge.
-**Generic regions are clipped to the user's region.**
+*This rule is also what condemned E2's grown scan span: "whole" is a fact about the feature, and a
+feature can be longer than any margin — which is where the Decision above came from.*
 
 ### 2.6 Windows have edges; the features don't respect them
 

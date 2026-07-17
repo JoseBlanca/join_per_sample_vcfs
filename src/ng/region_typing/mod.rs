@@ -396,20 +396,7 @@ pub fn partition_resident(
 
     // 5. Partition — the whole contig as **one block** (below), then fill every gap
     //    with `Generic`.
-    let features = resolve_features(
-        &runs,
-        admitted.loci,
-        &admitted.bundled,
-        contig,
-        config,
-        // The whole contig is the scan span here: nothing is cut, which is the degenerate
-        // case of the BED walk and the reason a singleton cluster is a bug rather than an
-        // edge artefact (`resolve_features`).
-        CoverageRun {
-            start: 1,
-            end: contig_len,
-        },
-    );
+    let features = resolve_features(&runs, admitted.loci, &admitted.bundled, contig, config);
 
     fill_generic_gaps(features, contig, contig_len)
 }
@@ -476,7 +463,6 @@ fn resolve_features(
     bundled: &[RepeatInterval],
     contig: ContigId,
     config: &TypedRegionConfig,
-    scan: CoverageRun,
 ) -> Vec<TypedRegion> {
     let max_repeat_len = config.max_repeat_len.get();
     let flank_bp = config.admission.flank_bp;
@@ -561,38 +547,12 @@ fn resolve_features(
     let clusters: Vec<(CoverageRun, Vec<RepeatInterval>)> =
         admission::bundle_clusters(&members, flank_bp)
             .into_iter()
-            .filter_map(|cluster| {
+            .map(|cluster| {
                 let hull = CoverageRun {
                     start: cluster.first().expect("non-empty cluster").start + 1,
                     end: cluster.iter().map(|iv| iv.end).max().expect("non-empty"),
                 };
-                // **A singleton is a cluster the scan span cut** (spec §2.5, E2). A walk
-                // restricted to part of a contig sees `bundled` cut at its edge: the
-                // member is here, its partner was never scanned. Drop it — the scan span
-                // is grown by `max_repeat_len` past what was requested, so a cluster
-                // reaching the edge is out of reach of anything that can be emitted, and
-                // its bases fall to `Generic`, which is where a repeat that is not a
-                // locus belongs (spec §2.2).
-                //
-                // **Anywhere else a singleton is a bug**, loudly: it means `bundled` and
-                // the split that produced it disagree, which is how a truncated member
-                // showed up at D3. `bundle_clusters` used to assert this itself; only
-                // here is the scan span known, so only here can the two be told apart.
-                if cluster.len() < 2 {
-                    assert!(
-                        hull.start <= scan.start + flank_bp || hull.end + flank_bp >= scan.end,
-                        "a one-member bundle at [{}, {}], {} bp inside the scan span \
-                         [{}, {}] — a cluster cut by the scan edge is expected, this is \
-                         not: `bundled` disagrees with the split that produced it",
-                        hull.start,
-                        hull.end,
-                        hull.start - scan.start,
-                        scan.start,
-                        scan.end
-                    );
-                    return None;
-                }
-                Some((hull, cluster))
+                (hull, cluster)
             })
             .collect();
 
@@ -949,7 +909,7 @@ impl<R: RawRefSeq + ContigTable + EvictableRefSeq> TypedRegionIterator<R> {
         for span in &requested {
             contig_entry(&reference, span.contig)?;
         }
-        let mut scan = scan_set(&reference, &requested, config.max_repeat_len.get())?;
+        let mut scan = scan_set(&reference, &requested)?;
         // Reversed so the next span is a `pop`.
         scan.reverse();
         Ok(Self {
@@ -993,16 +953,7 @@ impl<R: RawRefSeq + ContigTable + EvictableRefSeq> TypedRegionIterator<R> {
                     contig_len,
                     &self.segment_options(),
                 ),
-                walk: BlockWalk::new(
-                    span.scan.contig,
-                    span.scan.end.get(),
-                    // The span actually walked, for telling a cluster the scan edge cut
-                    // from one the walk got wrong (`resolve_features`).
-                    CoverageRun {
-                        start: span.scan.start.get(),
-                        end: span.scan.end.get(),
-                    },
-                ),
+                walk: BlockWalk::new(span.scan.contig, span.scan.end.get()),
                 // One span counted per span the **user asked for**, not per span walked:
                 // the scan set is this walk's business, and coalescing two requested
                 // regions into one scan is not the user losing a region.
@@ -1221,68 +1172,75 @@ impl<R: RawRefSeq + ContigTable + EvictableRefSeq> std::iter::FusedIterator
 {
 }
 
-/// One span to **scan**, and the spans inside it the user actually **asked for** (spec
-/// §2.5).
+/// One span to **scan** — a whole contig — and the spans inside it the user actually
+/// **asked for** (spec §2.5).
 ///
 /// Two sets, because a BED edge must not cut a decision in half: a repeat at 999 is
 /// bundled away by a neighbour at 1030, so a walk that never looks past 1000 admits a
 /// locus the whole-genome run rejects — same reference, different calls, because of
-/// `--regions`.
+/// `--regions`. [`scan_set`] says why the scan set is the whole contig and not something
+/// cheaper.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ScanSpan {
-    /// What the walk tiles with cores: a requested span grown by `max_repeat_len` and
-    /// clamped to the contig, coalesced with its neighbours.
+    /// What the walk tiles with cores: **the whole contig** ([`scan_set`]).
     scan: GenomeRegion,
     /// The requested spans inside it, in order — what the walk is allowed to emit.
     /// Non-empty by construction.
     requested: Vec<GenomeRegion>,
 }
 
-/// Grow each requested span by `margin`, clamp to the contig, coalesce, and remember
-/// which requested spans each grown span covers — **the scan set** (spec §2.5).
+/// **The scan set is the whole of every contig the request touches** (spec §2.5, owner
+/// 2026-07-17).
 ///
-/// "Preprocessing on the region set — the walk needs no special logic, because a grown
-/// region is just a longer continuous run."
+/// # Why the whole contig, and not the requested span grown by a margin
 ///
-/// # Why `margin` is `max_repeat_len`, exactly
+/// E2 grew each span by `max_repeat_len` and coalesced, which spec §2.5 chose over
+/// whole-contig scans on cost: *"makes a 10 kb region pay for a 90 Mb chromosome"*. **A
+/// fixed margin cannot deliver the emit rule.** Every finding that intersects a requested
+/// edge is returned **whole** ([`clips_at_a_bed_edge`]) — and "whole" is a fact about the
+/// feature, which does not care what the walk scanned:
 ///
-/// The window's own margin already lets *admission* see a neighbour just outside the
-/// requested span (`WindowCursor` fetches core ± `max_repeat_len`), so bundling is not
-/// what this is for. **The satellite cap is.** A coverage run's length is a fact about the
-/// whole run, and coverage is clipped to cores — so a walk whose cores stop at the BED
-/// edge measures only the part of an array inside it, finds it under the cap, and does not
-/// swallow the loci within (spec §2.4). Growing the cores by exactly the cap means any run
-/// that touches the requested span and is truly over-cap is measured over-cap here too.
+/// - a **satellite** is *by definition* longer than `max_repeat_len`, and the margin **is**
+///   `max_repeat_len` — so an array running past it came back cut. Measured: a 3 kb array
+///   reported `1001–4001` whole-genome and `1001–2300` under a BED, silently.
+/// - a **bundle** chains with no reach at all (spec §2.6: *"A–B–C–D each 30 bp apart runs
+///   past any margin you choose"*), so a fixed margin was never going to hold one.
+///
+/// §2.6 had already settled the principle for *window* edges — *"the data tells you when
+/// it's over; you don't have to guess a reach"* — and a grown span is a guessed reach.
+/// §2.5 was the odd one out.
+///
+/// **The cost is time, not memory.** A 10 kb BED on a 90 Mb chromosome now scans 90 Mb —
+/// but through the same window, so peak memory is unchanged (spec §7), and the emit set is
+/// as narrow as ever. What it buys is that a BED costs the user nothing in *correctness*:
+/// every finding is exactly the one a whole-genome run reports, which
+/// `a_bed_returns_the_same_findings_the_whole_genome_run_does` asserts as object identity
+/// rather than as a resemblance.
+///
+/// It also **deletes** a rule rather than adding one: with no scan edges but the contig's,
+/// a cluster can no longer be cut, so `resolve_features` needs no edge case and
+/// `bundle_clusters` gets its "a bundle has ≥ 2 members" assert back at full strength.
 fn scan_set<R: ContigTable>(
     reference: &R,
     requested: &[GenomeRegion],
-    margin: u64,
 ) -> Result<Vec<ScanSpan>, TypedRegionError> {
     let mut out: Vec<ScanSpan> = Vec::new();
     for &span in requested {
-        let contig_len = contig_entry(reference, span.contig)?.length;
-        let grown = GenomeRegion {
-            contig: span.contig,
-            // 1-based: the contig starts at 1, so that is as far left as a margin reaches.
-            start: Position(span.start.get().saturating_sub(margin).max(1)),
-            end: Position(span.end.get().saturating_add(margin).min(contig_len)),
-        };
         match out.last_mut() {
-            // Coalesce: two grown spans that touch are one continuous run to walk, and
-            // walking them separately would scan the overlap twice and emit it twice.
-            // `RegionSet` gave us the requested spans sorted, non-overlapping and
-            // coalesced already (C3), so only the growth can have made them meet.
-            Some(last)
-                if last.scan.contig == grown.contig
-                    && grown.start.get() <= last.scan.end.get() + 1 =>
-            {
-                last.scan.end = Position(last.scan.end.get().max(grown.end.get()));
-                last.requested.push(span);
+            // `GenomeRegions` hands them over in genomic order (C3), so a contig's spans
+            // are adjacent and one pass groups them.
+            Some(last) if last.scan.contig == span.contig => last.requested.push(span),
+            _ => {
+                let contig_len = contig_entry(reference, span.contig)?.length;
+                out.push(ScanSpan {
+                    scan: GenomeRegion {
+                        contig: span.contig,
+                        start: Position(1),
+                        end: Position(contig_len),
+                    },
+                    requested: vec![span],
+                });
             }
-            _ => out.push(ScanSpan {
-                scan: grown,
-                requested: vec![span],
-            }),
         }
     }
     Ok(out)
@@ -1331,9 +1289,9 @@ fn clips_at_a_bed_edge(kind: &RegionKind) -> bool {
 ///   **whole**, even past the edge: the requested span grows to hold it, and that grown
 ///   span — the *effective* region — is what the partition invariant is stated over.
 /// - **`Generic`** → **clipped** to each requested span it overlaps, which may be more
-///   than one: two requested spans close enough to coalesce share a scan span, and the
-///   generic run across them must come back as two regions with the gap dropped, not one
-///   region covering ground the user did not ask for.
+///   than one: every span on a contig shares that contig's scan, so a generic run across
+///   two of them must come back as two regions with the gap dropped, not one region
+///   covering ground the user did not ask for.
 ///
 /// `emitted_upto` keeps the output non-overlapping when a finding has just been emitted
 /// whole past an edge and the next requested span starts inside it.
@@ -1416,10 +1374,6 @@ struct BlockWalk {
     /// **Carry:** the open generic run — everything up to here is emitted, so the gap
     /// from here to the next feature is generic. One `u64` for a megabase.
     emitted_upto: u64,
-    /// The span this walk tiles, 1-based inclusive — the **scan** span, which is wider
-    /// than what the user asked for (spec §2.5). Needed only to tell a bundle cluster the
-    /// scan edge cut from one the walk got wrong (`resolve_features`).
-    scan: CoverageRun,
     /// Resolved regions waiting to be read out, in genomic order. A queue rather than a
     /// list because `TypedRegionIterator` drains it as it goes: it holds one block's
     /// worth, never a contig's (spec §7).
@@ -1456,11 +1410,10 @@ impl WindowItem {
 }
 
 impl BlockWalk {
-    fn new(contig: ContigId, contig_len: u64, scan: CoverageRun) -> Self {
+    fn new(contig: ContigId, contig_len: u64) -> Self {
         Self {
             contig,
             contig_len,
-            scan,
             runs: Vec::new(),
             loci: Vec::new(),
             bundled: Vec::new(),
@@ -1589,7 +1542,7 @@ impl BlockWalk {
     fn close_block(&mut self, config: &TypedRegionConfig) {
         let loci = std::mem::take(&mut self.loci);
         let bundled = std::mem::take(&mut self.bundled);
-        let features = resolve_features(&self.runs, loci, &bundled, self.contig, config, self.scan);
+        let features = resolve_features(&self.runs, loci, &bundled, self.contig, config);
         self.runs.clear();
 
         for f in features {
@@ -2078,6 +2031,16 @@ mod tests {
             1200,
             "over the 1 kb cap, though neither tract alone is"
         );
+    }
+
+    /// A contig with a **3 kb array** — three times the 1 kb margin, so a walk that scanned
+    /// only a grown BED span could not see the whole of it.
+    fn contig_with_a_long_array() -> Vec<u8> {
+        let mut bases = filler(8000);
+        for i in 0..1500 {
+            bases[1000 + i * 2..1002 + i * 2].copy_from_slice(b"AT");
+        }
+        bases
     }
 
     /// The kinds, in order — for asserting a partition's shape without spelling out four
@@ -2640,96 +2603,90 @@ mod tests {
         bases
     }
 
-    /// **§2.5's residual, tested directly — and its mitigation is false** (the spec asked
-    /// for this test rather than trusting the argument, and it was right to).
+    /// **A BED returns the same findings a whole-genome run does — the same *objects*, not
+    /// merely the same kinds** (spec §2.5, owner 2026-07-17). This is what the whole-contig
+    /// scan set buys, and it is the strongest form of BED-invariance available.
     ///
-    /// §2.5 grows the scan span by `max_repeat_len` so a BED edge cannot cut a decision.
-    /// A **cluster** defeats that, because clustering has no reach: *"bundles chain —
-    /// A–B–C–D each 30 bp apart runs past any margin you choose"* (§2.6). The spec's
-    /// answer was that such a chain is **"dense-repeat territory heading for `Satellite`"**,
-    /// so the cut could not matter.
+    /// # The two fixtures that broke the old design
     ///
-    /// **It is not.** A satellite is over-cap *coverage*, and coverage runs merge only
-    /// where they **abut** (`coverage_runs`). This fixture chains 30 tracts across 1.5 kb
-    /// with 30 bp gaps: every run is 20 bp, nothing comes near the 1 kb cap, and the chain
-    /// is a **bundle** — cut at the scan edge, 24 members instead of 30.
+    /// E2 grew each requested span by `max_repeat_len` and scanned that. Both of these
+    /// defeat a margin, and both are pinned here because they are exactly the shapes a
+    /// margin cannot hold:
     ///
-    /// # What holds, and what does not
-    ///
-    /// - **§2.5's stated property holds**: *whether a base is STR / bundle / generic /
-    ///   satellite must not depend on the BED*. Every requested base is `SsrBundle` either
-    ///   way, and it must be — a tract inside the requested span has all its neighbours
-    ///   within `flank_bp`, which is far inside the `max_repeat_len` margin, so its verdict
-    ///   is right. The margin does the job it was chosen for.
-    /// - **"A finding is returned whole" does not** (owner, 2026-07-17). The bundle comes
-    ///   back **truncated**: hull `1001–2170` against the whole-genome `1001–2470`, and its
-    ///   `tracts` are 24 of the real 30. Silently.
-    ///
-    /// So the emitted `SsrBundle` is a *different object* from the one a whole-genome run
-    /// reports, whenever a chain runs more than `max_repeat_len` past a requested edge.
-    /// Recorded, not fixed: §2.5 already names the fallback ("always scan whole contigs —
-    /// exact, and the fallback if the test fails"), and choosing it is the owner's call,
-    /// not a test's. Whether real genomes carry chains this long is also unmeasured.
+    /// - **a 3 kb array** — a satellite is *by definition* longer than `max_repeat_len`,
+    ///   and the margin **is** `max_repeat_len`. Under the old design a BED reported it as
+    ///   `1001–2300` where the truth is `1001–4001`: a `Satellite` cut to 1300 bp,
+    ///   silently. This is the common case, not an exotic one.
+    /// - **a 1.5 kb chain** of tracts 30 bp apart — clustering has no reach at all (spec
+    ///   §2.6: *"A–B–C–D each 30 bp apart runs past any margin you choose"*). §2.5 hoped
+    ///   such a chain would be *"dense-repeat territory heading for `Satellite`"*; it is
+    ///   not — a satellite is over-cap **coverage**, and coverage runs merge only where
+    ///   they **abut**, so every run in this chain is 20 bp. It stays a bundle, and the old
+    ///   design cut it to 24 members of 30.
     #[test]
-    fn a_cluster_chaining_past_the_margin_is_cut_by_a_bed_edge() {
-        let bases = chained_cluster(1500, 6000);
+    fn a_bed_returns_the_same_findings_the_whole_genome_run_does() {
         let config = TypedRegionConfig::default();
-        let whole = partition_resident("chr1", ContigId(0), &bases, &config);
 
-        // The fixture is what it claims: one long chain, and NOT a satellite.
-        let (whole_hull, whole_members) = whole
+        // --- the 3 kb array: a satellite three times the old margin ---
+        let bases = contig_with_a_long_array();
+        let whole = partition_resident("chr1", ContigId(0), &bases, &config);
+        let truth = whole
+            .iter()
+            .find(|r| matches!(r.kind, RegionKind::Satellite))
+            .expect("the fixture has one array");
+        assert!(
+            truth.region.len() > 3000,
+            "the array must be far longer than max_repeat_len: {:?}",
+            truth.region
+        );
+
+        // Ask about 200 bp of its left end. The satellite comes back WHOLE — all 3 kb,
+        // past both requested edges, identical to the whole-genome region.
+        let got = walk_bed(&bases, &[(1100, 1300)], 333);
+        let sat = got
+            .iter()
+            .find(|r| matches!(r.kind, RegionKind::Satellite))
+            .expect("still a satellite");
+        assert_eq!(
+            sat.region, truth.region,
+            "a BED must not shorten an array: the extent IS the claim, and a margin cannot \
+             hold a feature defined as being longer than it"
+        );
+
+        // --- the 1.5 kb chain: a bundle no margin could hold ---
+        let bases = chained_cluster(1500, 6000);
+        let whole = partition_resident("chr1", ContigId(0), &bases, &config);
+        let (truth_hull, truth_tracts) = whole
             .iter()
             .find_map(|r| match &r.kind {
-                RegionKind::SsrBundle { tracts } => Some((r.region, tracts.len())),
+                RegionKind::SsrBundle { tracts } => Some((r.region, tracts.clone())),
                 _ => None,
             })
             .expect("the chain is one bundle");
         assert!(
-            whole_hull.len() > 1400,
-            "the chain must run well past max_repeat_len: {whole_hull:?}"
+            truth_hull.len() > 1400 && truth_tracts.len() >= 25,
+            "the chain must run well past max_repeat_len: {truth_hull:?}"
         );
-        assert!(whole_members >= 25, "and be a long chain: {whole_members}");
         assert!(
             !whole
                 .iter()
                 .any(|r| matches!(r.kind, RegionKind::Satellite)),
-            "**THE SPEC'S MITIGATION, REFUTED**: §2.5 says a chain past 1 kb without a \
-             50 bp break is 'dense-repeat territory heading for Satellite'. It is not — a \
-             satellite is over-cap COVERAGE, and coverage runs merge only where they abut. \
-             With 30 bp gaps every run here is 20 bp. The chain stays a bundle: {whole:#?}"
+            "and it is NOT a satellite — §2.5 hoped it would be, but coverage runs merge \
+             only where they abut and every run here is 20 bp: {whole:#?}"
         );
 
-        // Now cut it with a BED whose edge leaves >1 kb of chain outside the scan span.
         let got = walk_bed(&bases, &[(900, 1200)], 333);
-        let (bed_hull, bed_members) = got
+        let (hull, tracts) = got
             .iter()
             .find_map(|r| match &r.kind {
-                RegionKind::SsrBundle { tracts } => Some((r.region, tracts.len())),
+                RegionKind::SsrBundle { tracts } => Some((r.region, tracts.clone())),
                 _ => None,
             })
-            .expect("the chain is still a bundle");
-
-        // What holds: the KIND of every requested base is the BED-free answer.
-        assert_eq!(bed_hull.start, whole_hull.start, "the hull starts the same");
-        for pos in [900u64, 1000, 1100, 1200] {
-            let with = got.iter().find(|r| r.region.contains(Position(pos)));
-            let without = whole.iter().find(|r| r.region.contains(Position(pos)));
-            assert_eq!(
-                with.map(|r| std::mem::discriminant(&r.kind)),
-                without.map(|r| std::mem::discriminant(&r.kind)),
-                "base {pos}: the BED must not change what a base IS (spec §2.5) — and it \
-                 does not, because the margin covers every neighbour of a requested tract"
-            );
-        }
-
-        // **What does not hold**, recorded rather than asserted away: the bundle is a
-        // different object — truncated at the scan edge, silently.
-        assert!(
-            bed_hull.end < whole_hull.end && bed_members < whole_members,
-            "KNOWN DIVERGENCE (§2.5's residual): expected the BED's bundle to be cut. If \
-             this now fails, the residual has been fixed and this test should become a \
-             BED-invariance assertion instead. BED: {bed_hull:?} / {bed_members} members; \
-             whole: {whole_hull:?} / {whole_members}"
+            .expect("still a bundle");
+        assert_eq!(hull, truth_hull, "the same hull");
+        assert_eq!(
+            tracts, truth_tracts,
+            "and the same member tracts — all 30, not the 24 inside a grown span"
         );
     }
 
@@ -3833,17 +3790,18 @@ mod tests {
         assert_eq!(locus, truth, "and it is the SAME locus, not a clipped one");
     }
 
-    /// **Two requested spans close enough that their scan spans coalesce**: the walk scans
-    /// them once, and the ground between them — which the user did not ask for — must not
-    /// come back (spec §2.5).
+    /// **Two requested spans on one contig share its scan**: the walk scans the contig
+    /// once, and the ground between them — which the user did not ask for — must not come
+    /// back (spec §2.5).
     ///
-    /// This is the case that makes territory clip against *each* requested span rather
-    /// than against the scan span: one generic run covers both, and it has to come back as
-    /// two regions with the gap dropped.
+    /// This is the case that makes `Generic` clip against *each* requested span rather than
+    /// against the scan span: one generic run covers both, and it has to come back as two
+    /// regions with the gap dropped. Since the scan set became whole contigs it is no
+    /// longer an edge case at all — **every** pair of spans on a contig is this case, which
+    /// is a good reason for the rule to be the general one.
     #[test]
     fn two_spans_sharing_a_scan_span_do_not_leak_the_gap_between_them() {
         let bases = windowing_fixture();
-        // 200 bp apart — far less than 2 x max_repeat_len, so the grown spans coalesce.
         let got = walk_bed(&bases, &[(3000, 3200), (3400, 3600)], 333);
 
         assert!(

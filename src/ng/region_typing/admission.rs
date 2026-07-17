@@ -1357,19 +1357,18 @@ fn is_close(a: &RepeatInterval, b: &RepeatInterval, thresh: u64) -> bool {
 /// `flank_bp` must be the same radius [`admit`] was given, or the grouping will
 /// not match the split.
 ///
-/// # A singleton is possible, and only the caller can say whether it is a bug (E2)
+/// # A singleton is a bug, and the walk is what keeps it that way
 ///
-/// This used to `debug_assert` that every cluster has ≥ 2 members — true by definition
-/// (spec §2.4), and it earned its keep at D3 by catching a truncated member that could not
-/// re-chain. It is **not** true of every caller's input: a walk restricted to part of a
-/// contig (a BED region grown to a scan span, spec §2.5) sees `bundled` **cut at the scan
-/// edge**, and a member whose partner lies outside gets here alone. That is not a
-/// disagreement with the split; it is the split, minus what was never scanned.
+/// Every cluster has ≥ 2 members by definition (spec §2.4), so a singleton means `bundled`
+/// and the split that produced it disagree. The check earned its keep at D3, catching a
+/// truncated member that could not re-chain.
 ///
-/// So the check moves to where the answer is knowable — `region_typing`'s
-/// `resolve_features`, which holds the scan span and so can tell "cut at the edge" (drop
-/// it: the margin puts it out of reach of anything emitted) from "in the middle of the
-/// walk" (a real bug, and still loud).
+/// E2 briefly made it conditional: a walk restricted to *part* of a contig saw `bundled`
+/// cut at the scan edge, and a member whose partner lay outside arrived alone — not a
+/// disagreement, just the split minus what was never scanned. That was a symptom of
+/// scanning less than a contig, and it is gone: the scan set is now **whole contigs**
+/// (spec §2.5, owner 2026-07-17), so the only edges are the contig's, beyond which there
+/// is nothing to have missed. The rule is unconditional again, and the assert with it.
 pub fn bundle_clusters(bundled: &[RepeatInterval], flank_bp: u64) -> Vec<Vec<RepeatInterval>> {
     let mut out: Vec<Vec<RepeatInterval>> = Vec::new();
     for &iv in bundled {
@@ -1380,6 +1379,11 @@ pub fn bundle_clusters(bundled: &[RepeatInterval], flank_bp: u64) -> Vec<Vec<Rep
             _ => out.push(vec![iv]),
         }
     }
+    debug_assert!(
+        out.iter().all(|c| c.len() >= 2),
+        "a bundle has >= 2 members by definition (spec §2.4); a singleton means \
+         the grouping disagrees with the split that produced it"
+    );
     out
 }
 
