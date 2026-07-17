@@ -308,15 +308,24 @@ residual — a cluster chaining past 1 kb without a 50 bp break — is dense-rep
 > and so only the walk can tell "cut at the edge" (expected, drop it) from "in the middle of the walk"
 > (a real bug — how D3's truncated member showed up, and still loud).
 
-**Which regions clip, and which come back whole — the type already knew (E2, 2026-07-17).** This
-section said a straddling locus or bundle is emitted whole and that `Generic` is clipped, and said
-**nothing about `Satellite`**. The rule the two cases share is visible in `RegionKind` itself:
-**a region that carries an object cannot be clipped; bare territory can.** `SsrLocus` carries a
-`Locus` and `SsrBundle` carries its member tracts — clip either and the object is left describing
-bases outside its own region, which is a lie (half a locus is not a locus). `Generic` and `Satellite`
-are unit variants that carry nothing because they *are* just their region (§1.1) — and "these bases
-are array" stays true of any stretch of them. So **`Satellite` clips, with `Generic`.** That is a
-resolution of this section's silence rather than a reading of it.
+**Which regions clip, and which come back whole (owner, 2026-07-17).** This section named only a
+straddling locus or bundle, and said **nothing about `Satellite`**. The rule for all of them:
+
+> **Every *finding* that intersects a BED edge is returned whole — microsatellite, bundle and
+> satellite alike. `Generic` alone is clipped.**
+
+`Generic` clips because it is the only kind that is **not a finding**: *"nothing more specific can be
+said here"* is true of any stretch of a generic run, so a clipped one says exactly what it said. Each
+of the other three is a **claim about its own extent**, and half of it is a different claim — a
+locus's coordinates and copy number describe the whole tract; a bundle's hull has to hold its member
+tracts; and a `Satellite` means *"an array too long to be a microsatellite"*, so clipping a 1.2 kb
+array to a 300 bp request emits a `Satellite` region of 300 bp — **a span that contradicts the
+`max_repeat_len` test that produced the label**.
+
+*E2 first ruled the opposite, reasoning from `RegionKind`'s shape: `Generic` and `Satellite` are the
+unit variants, carrying no payload, so clipping them could leave nothing misdescribed. That read the
+type right and the meaning wrong — **what a region carries is not what it claims**. Recorded because
+the argument is a tempting one and is available to be made again.*
 
 Rejected: scan only the user's region (the bug above); always scan whole contigs (exact, and the
 fallback if the test fails on real data, but makes a 10 kb region pay for a 90 Mb chromosome).

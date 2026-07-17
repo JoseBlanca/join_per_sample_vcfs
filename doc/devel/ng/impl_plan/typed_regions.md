@@ -423,11 +423,15 @@ locus **or bundle** whole (spec §2.5). *Depends:* E1. *Source:* spec §2.5, §8
    moved from `bundle_clusters` to the walk, because only the walk holds the scan span and so only the
    walk can tell an edge artefact (drop) from a real disagreement (panic — how D3's truncated member
    showed up).
-2. ***§2.5 never said what `Satellite` does at an edge.*** The type does: a region that **carries an
-   object** (`SsrLocus`'s `Locus`, `SsrBundle`'s tracts) cannot be clipped without leaving the object
-   describing bases outside it; `Generic` and `Satellite` are unit variants that carry nothing (§1.1),
-   and "these bases are array" stays true of any stretch of them. **`Satellite` clips.** Recorded in
-   §2.5 as a resolution of its silence, not a reading of it.
+2. ***§2.5 never said what `Satellite` does at an edge.*** E2 ruled that it clips, reasoning from
+   `RegionKind`'s shape (`Generic` and `Satellite` carry no payload, so clipping could misdescribe
+   nothing). **Owner, 2026-07-17: wrong — every *finding* comes back whole; `Generic` alone clips.**
+   A `Satellite` means *"an array too long to be a microsatellite"*, so the extent **is** the claim:
+   clipping the fixture's 1.2 kb array to a 300 bp request emits a `Satellite` of 300 bp, a span that
+   contradicts the `max_repeat_len` test that produced the label. The E2 argument read the type right
+   and the meaning wrong — *what a region carries is not what it claims* — and is recorded in §2.5
+   because it is tempting and available to make again. `Generic` clips because it is the only kind
+   that is not a finding: "nothing more specific can be said" survives clipping intact.
 
 *Mutation-verified: scanning only what is emitted (margin 0) changes what things ARE — the spec's
 central claim, now a tested one; clipping objects; clipping territory to the scan span instead of to
@@ -465,9 +469,8 @@ control.)*
 > tests green, through the shipping stack. **Step 3 is complete.** Pause for review.
 >
 > **Open, and needing an owner decision:**
-> - **`Satellite` clips at a BED edge** (spec §2.5, E2) — the spec was silent, and the rule was taken
->   from the type: a region carrying an object cannot be clipped, bare territory can. Worth ruling on,
->   as the absorption rule was.
+> - ~~`Satellite` clips at a BED edge~~ — **decided (owner, 2026-07-17): it does not.** Every finding
+>   comes back whole; `Generic` alone clips. See E2 above.
 > - **Three of §3.1's five rejection columns are structurally zero in the walk** (E1e), because the
 >   pre-filter gets there first. Not a bug; a thing a reader of the counts must know.
 > - **Still open from Checkpoint A:** a `proptest` property over `assert_agrees` — the strongest

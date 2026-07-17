@@ -1288,27 +1288,37 @@ fn scan_set<R: ContigTable>(
     Ok(out)
 }
 
-/// Whether a typed region **carries an object**, and so cannot be clipped to a BED edge.
+/// Whether a typed region is **clipped** to the user's BED edge — and only `Generic` is
+/// (spec §2.5).
 ///
-/// # The spec did not say, and the type does (E2)
+/// # Every *finding* comes back whole; only the default clips
 ///
-/// Spec §2.5 says a straddling locus or bundle is emitted **whole** and that `Generic` is
-/// **clipped** — and says nothing at all about `Satellite`. The distinction it is reaching
-/// for is visible in [`RegionKind`] itself: `SsrLocus` and `SsrBundle` carry something (a
-/// `Locus`; the member tracts), and the other two are unit variants that carry nothing
-/// because they **are** just their region (§1.1).
+/// **Owner's rule, 2026-07-17:** a microsatellite, a bundle *or a satellite* that
+/// intersects a BED edge is returned whole. `Generic` alone is clipped, because it is the
+/// only kind that is not a finding — *"nothing more specific can be said here"* stays true
+/// of any stretch of a generic run, so a clipped one still says exactly what it said.
 ///
-/// Clip a region that carries an object and the object is left describing bases outside
-/// it — half a locus is not a locus, and a bundle whose hull no longer holds its own
-/// tracts is a lie. Clip bare territory and nothing is misdescribed: "these bases are
-/// array" stays true of any stretch of them. So `Satellite` clips, with `Generic`.
+/// Each of the other three is a **claim about its own extent**, and half of it is a
+/// different claim:
 ///
-/// That is a resolution of the spec's silence, not a reading of it: recorded in §2.5 and
-/// flagged for the owner.
-fn carries_an_object(kind: &RegionKind) -> bool {
+/// - `SsrLocus` — a genetic object. Half a locus is not a locus: its coordinates, its
+///   copy number and its embedded bases all describe the whole tract.
+/// - `SsrBundle` — carries its member tracts; clip the hull and the members describe bases
+///   outside their own region.
+/// - `Satellite` — **the case E2 first got wrong.** The label means *"an array too long to
+///   be a microsatellite"*, so the extent is the claim and `max_repeat_len` is what makes
+///   it. Clip the fixture's 1.2 kb array to a 300 bp request and the result is a
+///   `Satellite` region of 300 bp — a span that contradicts the very cap that produced the
+///   label. E2 argued the opposite from `RegionKind`'s shape (`Satellite` carries no
+///   payload, so nothing could be left misdescribed); that read the *type* correctly and
+///   the *meaning* wrongly. What a region carries is not what it claims.
+///
+/// Spec §2.5 named only loci and bundles and was silent on satellites; it now states this
+/// rule.
+fn clips_at_a_bed_edge(kind: &RegionKind) -> bool {
     match kind {
-        RegionKind::SsrLocus(_) | RegionKind::SsrBundle { .. } => true,
-        RegionKind::Generic | RegionKind::Satellite => false,
+        RegionKind::Generic => true,
+        RegionKind::SsrLocus(_) | RegionKind::SsrBundle { .. } | RegionKind::Satellite => false,
     }
 }
 
@@ -1317,15 +1327,15 @@ fn carries_an_object(kind: &RegionKind) -> bool {
 ///
 /// - **Outside every requested span** → dropped. It was scanned so that the regions inside
 ///   would be *right*, not to be shown.
-/// - **Carries an object** ([`carries_an_object`]) → emitted **whole**, even past the
-///   edge: the requested span grows to hold it, and that grown span — the *effective*
-///   region — is what the partition invariant is stated over.
-/// - **Territory** → **clipped** to each requested span it overlaps, which may be more
+/// - **A finding** — locus, bundle or satellite ([`clips_at_a_bed_edge`]) → emitted
+///   **whole**, even past the edge: the requested span grows to hold it, and that grown
+///   span — the *effective* region — is what the partition invariant is stated over.
+/// - **`Generic`** → **clipped** to each requested span it overlaps, which may be more
 ///   than one: two requested spans close enough to coalesce share a scan span, and the
 ///   generic run across them must come back as two regions with the gap dropped, not one
 ///   region covering ground the user did not ask for.
 ///
-/// `emitted_upto` keeps the output non-overlapping when an object has just been emitted
+/// `emitted_upto` keeps the output non-overlapping when a finding has just been emitted
 /// whole past an edge and the next requested span starts inside it.
 fn emit_into(
     queue: &mut std::collections::VecDeque<TypedRegion>,
@@ -1339,7 +1349,7 @@ fn emit_into(
             && region.region.start.get() <= r.end.get()
     };
 
-    if carries_an_object(&region.kind) {
+    if !clips_at_a_bed_edge(&region.kind) {
         if requested.iter().any(overlaps) {
             *emitted_upto = region.region.end.get();
             queue.push_back(region);
@@ -3474,11 +3484,11 @@ mod tests {
         }
     }
 
-    /// **`Generic` is clipped to the user's edge; an object straddling it comes back
-    /// whole** (spec §2.5) — and `Satellite` clips, which the spec did not say
-    /// ([`carries_an_object`]).
+    /// **`Generic` is clipped to the user's edge; every *finding* straddling it comes back
+    /// whole** — locus, bundle **and satellite** (spec §2.5, owner 2026-07-17;
+    /// [`clips_at_a_bed_edge`]).
     #[test]
-    fn territory_clips_at_the_edge_and_objects_come_back_whole() {
+    fn generic_clips_at_the_edge_and_findings_come_back_whole() {
         let bases = windowing_fixture();
 
         // A span whose edges fall in plain generic sequence: nothing straddles, so the
@@ -3492,16 +3502,35 @@ mod tests {
         assert!(matches!(got[0].kind, RegionKind::Generic));
         assert_eq!(got.last().unwrap().region.end, Position(3600));
 
-        // A span ending mid-satellite: the array is territory, so it clips too — the
-        // region says "these bases are array", which stays true of a stretch of them.
+        // A span wholly INSIDE the 1.2 kb array: the satellite comes back whole, reaching
+        // past both requested edges.
+        //
+        // **Clipping it would produce a `Satellite` region of 301 bp** — a span that
+        // contradicts the `max_repeat_len` (1 kb) test that produced the label. The extent
+        // is the claim: "an array too long to be a microsatellite". That is what E2 got
+        // wrong by reasoning from the type (`Satellite` carries no payload, so nothing
+        // could be left misdescribed) instead of from the meaning.
         let got = walk_bed(&bases, &[(4500, 4800)], 333);
         assert_eq!(got.len(), 1, "the whole span is inside the array: {got:#?}");
         assert!(matches!(got[0].kind, RegionKind::Satellite));
-        assert_eq!(
-            (got[0].region.start, got[0].region.end),
-            (Position(4500), Position(4800)),
-            "a Satellite clips at the user's edges — it carries no object to misdescribe"
+        assert!(
+            got[0].region.start.get() < 4500 && got[0].region.end.get() > 4800,
+            "the Satellite is emitted WHOLE, past both edges: {:?}",
+            got[0].region
         );
+        assert!(
+            got[0].region.len() > 1000,
+            "and its span is over the cap that made it a satellite — which a clipped one \
+             ({} bp of request) could not be",
+            4800 - 4500 + 1
+        );
+        // The same region the whole-genome run reports, not a version of it.
+        let whole = partition_resident("chr1", ContigId(0), &bases, &TypedRegionConfig::default());
+        let truth = whole
+            .iter()
+            .find(|r| matches!(r.kind, RegionKind::Satellite))
+            .expect("the fixture has one");
+        assert_eq!(got[0].region, truth.region, "the SAME satellite");
 
         // A span cutting into the bundle's cluster: the bundle carries its member tracts,
         // so clipping it would leave them outside their own region. It comes back whole,
