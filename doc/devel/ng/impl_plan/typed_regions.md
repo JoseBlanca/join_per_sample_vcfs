@@ -404,13 +404,34 @@ the core holding its start, exactly as it does for loci and bundle members. Veri
 fact. No existing test could catch that — the other impls have nothing to evict — so a recording
 reference pins it.)*
 
-**E2. BED scan-wider-than-emit.**  ☐
+**E2. BED scan-wider-than-emit.**  ✅
 Grow each requested region by `max_repeat_len` and coalesce (the **scan** set); emit only what overlaps
 the **requested** set; clip `Generic` to the requested edge; grow the effective span to hold a straddling
 locus **or bundle** whole (spec §2.5). *Depends:* E1. *Source:* spec §2.5, §8. Verified:
 **BED-invariance** — loci inside a BED region identical to the whole-genome run, with a cluster placed
 **astride the BED edge**; a straddling `SsrLocus` *and* a straddling `SsrBundle` each emitted whole;
 `Generic` clipped at the user's edge.
+
+*(Landed 2026-07-17. Two spec corrections, both found by writing the acceptance test.*
+1. ***"The walk needs no special logic, because a grown region is just a longer continuous run" is
+   wrong.*** A scan span has **edges a whole contig does not**, and a cluster can straddle one: the
+   member inside is attributed, its partner outside never is, and `bundle_clusters` re-derives a
+   **one-member cluster**. Three of five E2 tests tripped D2's `debug_assert` on it. It needs no
+   *policy*, but it does need a **rule at the edge** — a cut cluster is dropped and its bases fall to
+   `Generic` (§2.2), which is safe *because* of the margin: a cluster reaching the scan edge cannot
+   also reach the emit set, short of the chain-the-whole-way residual §2.5 already names. The check
+   moved from `bundle_clusters` to the walk, because only the walk holds the scan span and so only the
+   walk can tell an edge artefact (drop) from a real disagreement (panic — how D3's truncated member
+   showed up).
+2. ***§2.5 never said what `Satellite` does at an edge.*** The type does: a region that **carries an
+   object** (`SsrLocus`'s `Locus`, `SsrBundle`'s tracts) cannot be clipped without leaving the object
+   describing bases outside it; `Generic` and `Satellite` are unit variants that carry nothing (§1.1),
+   and "these bases are array" stays true of any stretch of them. **`Satellite` clips.** Recorded in
+   §2.5 as a resolution of its silence, not a reading of it.
+
+*Mutation-verified: scanning only what is emitted (margin 0) changes what things ARE — the spec's
+central claim, now a tested one; clipping objects; clipping territory to the scan span instead of to
+each requested span.)*
 
 **E3. Integration anchor.**  ☐
 Walk a real small **multi-contig** reference end to end; assert `.cat` parity (subset by cap), the

@@ -285,10 +285,38 @@ whole-genome run rejects**. Same reference, different calls, because of `--regio
 The BED chooses what you are *shown*, never what things *are*.
 
 **Decision: scan wider than you emit.** Grow each region by `max_repeat_len`, re-coalesce, scan those,
-emit only what overlaps the user's regions. Preprocessing on the region set — the walk needs no special
-logic, because a grown region is just a longer continuous run. Two sets: **scan** (grown) and **emit**
-(the user's). The residual — a cluster chaining past 1 kb without a 50 bp break — is dense-repeat
-territory heading for `Satellite`; **§8 tests for it directly** rather than trusting the argument.
+emit only what overlaps the user's regions. Two sets: **scan** (grown) and **emit** (the user's). The
+residual — a cluster chaining past 1 kb without a 50 bp break — is dense-repeat territory heading for
+`Satellite`; **§8 tests for it directly** rather than trusting the argument.
+
+> **Corrected at E2, 2026-07-17 — "the walk needs no special logic, because a grown region is just a
+> longer continuous run" is wrong, and the walk says so with a panic.**
+>
+> A scan span has **edges a whole contig does not**, and a cluster can straddle one. The walk
+> attributes a bundle member to the core holding its start, so a member whose partner lies outside the
+> scan span arrives alone — and `bundle_clusters` re-derives a **one-member cluster**, which is not a
+> bundle by definition (§2.4). Found by writing the BED-invariance test: three of five E2 tests
+> tripped D2's `debug_assert`, on the cluster at 1990–2040 with a scan edge at 2000.
+>
+> It needs no *policy*, which is what that sentence was reaching for, but it does need a **rule at the
+> edge**: a cut cluster is dropped, and its bases fall to `Generic` (§2.2 — where a repeat that is not
+> a locus belongs). That is safe precisely because of the margin: the scan span reaches
+> `max_repeat_len` past what was requested, so a cluster reaching the scan edge cannot also reach the
+> emit set — unless it chains the whole way, which is the residual named above.
+>
+> The check moved from `bundle_clusters` to the walk, because **only the walk knows the scan span**
+> and so only the walk can tell "cut at the edge" (expected, drop it) from "in the middle of the walk"
+> (a real bug — how D3's truncated member showed up, and still loud).
+
+**Which regions clip, and which come back whole — the type already knew (E2, 2026-07-17).** This
+section said a straddling locus or bundle is emitted whole and that `Generic` is clipped, and said
+**nothing about `Satellite`**. The rule the two cases share is visible in `RegionKind` itself:
+**a region that carries an object cannot be clipped; bare territory can.** `SsrLocus` carries a
+`Locus` and `SsrBundle` carries its member tracts — clip either and the object is left describing
+bases outside its own region, which is a lie (half a locus is not a locus). `Generic` and `Satellite`
+are unit variants that carry nothing because they *are* just their region (§1.1) — and "these bases
+are array" stays true of any stretch of them. So **`Satellite` clips, with `Generic`.** That is a
+resolution of this section's silence rather than a reading of it.
 
 Rejected: scan only the user's region (the bug above); always scan whole contigs (exact, and the
 fallback if the test fails on real data, but makes a 10 kb region pay for a 90 Mb chromosome).

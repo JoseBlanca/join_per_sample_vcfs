@@ -392,7 +392,20 @@ pub fn partition_resident(
 
     // 5. Partition — the whole contig as **one block** (below), then fill every gap
     //    with `Generic`.
-    let features = resolve_features(&runs, admitted.loci, &admitted.bundled, contig, config);
+    let features = resolve_features(
+        &runs,
+        admitted.loci,
+        &admitted.bundled,
+        contig,
+        config,
+        // The whole contig is the scan span here: nothing is cut, which is the degenerate
+        // case of the BED walk and the reason a singleton cluster is a bug rather than an
+        // edge artefact (`resolve_features`).
+        CoverageRun {
+            start: 1,
+            end: contig_len,
+        },
+    );
 
     fill_generic_gaps(features, contig, contig_len)
 }
@@ -459,6 +472,7 @@ fn resolve_features(
     bundled: &[RepeatInterval],
     contig: ContigId,
     config: &TypedRegionConfig,
+    scan: CoverageRun,
 ) -> Vec<TypedRegion> {
     let max_repeat_len = config.max_repeat_len.get();
     let flank_bp = config.admission.flank_bp;
@@ -543,12 +557,38 @@ fn resolve_features(
     let clusters: Vec<(CoverageRun, Vec<RepeatInterval>)> =
         admission::bundle_clusters(&members, flank_bp)
             .into_iter()
-            .map(|cluster| {
+            .filter_map(|cluster| {
                 let hull = CoverageRun {
                     start: cluster.first().expect("non-empty cluster").start + 1,
                     end: cluster.iter().map(|iv| iv.end).max().expect("non-empty"),
                 };
-                (hull, cluster)
+                // **A singleton is a cluster the scan span cut** (spec §2.5, E2). A walk
+                // restricted to part of a contig sees `bundled` cut at its edge: the
+                // member is here, its partner was never scanned. Drop it — the scan span
+                // is grown by `max_repeat_len` past what was requested, so a cluster
+                // reaching the edge is out of reach of anything that can be emitted, and
+                // its bases fall to `Generic`, which is where a repeat that is not a
+                // locus belongs (spec §2.2).
+                //
+                // **Anywhere else a singleton is a bug**, loudly: it means `bundled` and
+                // the split that produced it disagree, which is how a truncated member
+                // showed up at D3. `bundle_clusters` used to assert this itself; only
+                // here is the scan span known, so only here can the two be told apart.
+                if cluster.len() < 2 {
+                    assert!(
+                        hull.start <= scan.start + flank_bp || hull.end + flank_bp >= scan.end,
+                        "a one-member bundle at [{}, {}], {} bp inside the scan span \
+                         [{}, {}] — a cluster cut by the scan edge is expected, this is \
+                         not: `bundled` disagrees with the split that produced it",
+                        hull.start,
+                        hull.end,
+                        hull.start - scan.start,
+                        scan.start,
+                        scan.end
+                    );
+                    return None;
+                }
+                Some((hull, cluster))
             })
             .collect();
 
@@ -802,8 +842,9 @@ where
 pub struct TypedRegionIterator<R> {
     reference: R,
     config: TypedRegionConfig,
-    /// The spans still to walk, **reversed** so the next one is a `pop`.
-    remaining: Vec<GenomeRegion>,
+    /// The **scan** spans still to walk, each carrying the requested spans inside it,
+    /// **reversed** so the next one is a `pop` (spec §2.5).
+    remaining: Vec<ScanSpan>,
     /// The span being walked, if any.
     current: Option<SpanWalk>,
     /// Regions resolved and waiting to be handed out — one block's worth at most.
@@ -834,6 +875,14 @@ struct SpanWalk {
     contig_len: u64,
     cursor: WindowCursor,
     walk: BlockWalk,
+    /// What the user asked for inside this scan span — the **emit** set (spec §2.5). The
+    /// walk types the whole scan span; only what overlaps these comes out, and territory
+    /// is clipped to them ([`emit_into`]).
+    requested: Vec<GenomeRegion>,
+    /// The last base **emitted**, for keeping the output non-overlapping when an object
+    /// is emitted whole past a requested edge. Distinct from `BlockWalk::emitted_upto`,
+    /// which tracks the walk's own generic carry across the *scan* span.
+    emitted_upto: u64,
 }
 
 impl<R: RawRefSeq + ContigTable + EvictableRefSeq> TypedRegionIterator<R> {
@@ -874,7 +923,7 @@ impl<R: RawRefSeq + ContigTable + EvictableRefSeq> TypedRegionIterator<R> {
 
     fn over_spans(
         reference: R,
-        mut spans: Vec<GenomeRegion>,
+        requested: Vec<GenomeRegion>,
         config: TypedRegionConfig,
     ) -> Result<Self, TypedRegionError> {
         // **A swept knob that would silently un-bundle** (spec §10 sweeps both of these,
@@ -893,14 +942,16 @@ impl<R: RawRefSeq + ContigTable + EvictableRefSeq> TypedRegionIterator<R> {
             config.admission.flank_bp
         );
         // Fail now, not in the middle of chromosome 7 (above).
-        for span in &spans {
+        for span in &requested {
             contig_entry(&reference, span.contig)?;
         }
-        spans.reverse();
+        let mut scan = scan_set(&reference, &requested, config.max_repeat_len.get())?;
+        // Reversed so the next span is a `pop`.
+        scan.reverse();
         Ok(Self {
             reference,
             config,
-            remaining: spans,
+            remaining: scan,
             current: None,
             queue: std::collections::VecDeque::new(),
             bases: Vec::new(),
@@ -921,31 +972,45 @@ impl<R: RawRefSeq + ContigTable + EvictableRefSeq> TypedRegionIterator<R> {
             let Some(span) = self.remaining.pop() else {
                 return Ok(false);
             };
-            let entry = contig_entry(&self.reference, span.contig)?;
+            let entry = contig_entry(&self.reference, span.scan.contig)?;
             let contig_len = entry.length;
             let chrom = entry.name.clone();
             self.current = Some(SpanWalk {
-                contig: span.contig,
+                contig: span.scan.contig,
                 chrom,
                 contig_len,
-                // Cores tile the span; margins come from the whole contig, which is not
-                // the same number once the span is a BED region (`WindowCursor`).
+                // Cores tile the **scan** span; margins come from the whole contig, which
+                // is not the same number once the span is a BED region (`WindowCursor`).
                 cursor: WindowCursor::new(
                     RegionSpan {
-                        start: span.start.get() - 1,
-                        end: span.end.get(),
+                        start: span.scan.start.get() - 1,
+                        end: span.scan.end.get(),
                     },
                     contig_len,
                     &self.segment_options(),
                 ),
-                walk: BlockWalk::new(span.contig, span.end.get()),
+                walk: BlockWalk::new(
+                    span.scan.contig,
+                    span.scan.end.get(),
+                    // The span actually walked, for telling a cluster the scan edge cut
+                    // from one the walk got wrong (`resolve_features`).
+                    CoverageRun {
+                        start: span.scan.start.get(),
+                        end: span.scan.end.get(),
+                    },
+                ),
+                // One span counted per span the **user asked for**, not per span walked:
+                // the scan set is this walk's business, and coalescing two requested
+                // regions into one scan is not the user losing a region.
+                requested: span.requested,
+                emitted_upto: 0,
             });
-            self.counts.spans += 1;
+            self.counts.spans += self.current.as_ref().expect("just set").requested.len() as u64;
             return Ok(true);
         }
 
         let state = self.current.as_mut().expect("just checked");
-        match state.cursor.next_window() {
+        let span_done = match state.cursor.next_window() {
             Some(plan) => {
                 let tally = Self::scan_and_absorb(
                     &self.reference,
@@ -967,15 +1032,25 @@ impl<R: RawRefSeq + ContigTable + EvictableRefSeq> TypedRegionIterator<R> {
                 // Release what the walk has passed — it never looks back. This is the
                 // difference between "holds one window" as a claim and as a fact.
                 self.reference.evict_before(plan.fetched.start + 1);
+                false
             }
             None => {
                 state.walk.finish(&self.config);
-                self.queue.extend(state.walk.out.drain(..));
-                self.current = None;
+                true
             }
+        };
+
+        // Drain whatever the walk resolved through the emit policy (spec §2.5): the walk
+        // types the whole **scan** span, and only what the user asked for comes out.
+        // `&mut self.queue` and `self.current` are disjoint fields, which is why they are
+        // borrowed by name rather than through a method.
+        let queue = &mut self.queue;
+        let state = self.current.as_mut().expect("still walking");
+        while let Some(region) = state.walk.out.pop_front() {
+            emit_into(queue, region, &state.requested, &mut state.emitted_upto);
         }
-        if let Some(state) = self.current.as_mut() {
-            self.queue.extend(state.walk.out.drain(..));
+        if span_done {
+            self.current = None;
         }
         Ok(true)
     }
@@ -1142,6 +1217,155 @@ impl<R: RawRefSeq + ContigTable + EvictableRefSeq> std::iter::FusedIterator
 {
 }
 
+/// One span to **scan**, and the spans inside it the user actually **asked for** (spec
+/// §2.5).
+///
+/// Two sets, because a BED edge must not cut a decision in half: a repeat at 999 is
+/// bundled away by a neighbour at 1030, so a walk that never looks past 1000 admits a
+/// locus the whole-genome run rejects — same reference, different calls, because of
+/// `--regions`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ScanSpan {
+    /// What the walk tiles with cores: a requested span grown by `max_repeat_len` and
+    /// clamped to the contig, coalesced with its neighbours.
+    scan: GenomeRegion,
+    /// The requested spans inside it, in order — what the walk is allowed to emit.
+    /// Non-empty by construction.
+    requested: Vec<GenomeRegion>,
+}
+
+/// Grow each requested span by `margin`, clamp to the contig, coalesce, and remember
+/// which requested spans each grown span covers — **the scan set** (spec §2.5).
+///
+/// "Preprocessing on the region set — the walk needs no special logic, because a grown
+/// region is just a longer continuous run."
+///
+/// # Why `margin` is `max_repeat_len`, exactly
+///
+/// The window's own margin already lets *admission* see a neighbour just outside the
+/// requested span (`WindowCursor` fetches core ± `max_repeat_len`), so bundling is not
+/// what this is for. **The satellite cap is.** A coverage run's length is a fact about the
+/// whole run, and coverage is clipped to cores — so a walk whose cores stop at the BED
+/// edge measures only the part of an array inside it, finds it under the cap, and does not
+/// swallow the loci within (spec §2.4). Growing the cores by exactly the cap means any run
+/// that touches the requested span and is truly over-cap is measured over-cap here too.
+fn scan_set<R: ContigTable>(
+    reference: &R,
+    requested: &[GenomeRegion],
+    margin: u64,
+) -> Result<Vec<ScanSpan>, TypedRegionError> {
+    let mut out: Vec<ScanSpan> = Vec::new();
+    for &span in requested {
+        let contig_len = contig_entry(reference, span.contig)?.length;
+        let grown = GenomeRegion {
+            contig: span.contig,
+            // 1-based: the contig starts at 1, so that is as far left as a margin reaches.
+            start: Position(span.start.get().saturating_sub(margin).max(1)),
+            end: Position(span.end.get().saturating_add(margin).min(contig_len)),
+        };
+        match out.last_mut() {
+            // Coalesce: two grown spans that touch are one continuous run to walk, and
+            // walking them separately would scan the overlap twice and emit it twice.
+            // `RegionSet` gave us the requested spans sorted, non-overlapping and
+            // coalesced already (C3), so only the growth can have made them meet.
+            Some(last)
+                if last.scan.contig == grown.contig
+                    && grown.start.get() <= last.scan.end.get() + 1 =>
+            {
+                last.scan.end = Position(last.scan.end.get().max(grown.end.get()));
+                last.requested.push(span);
+            }
+            _ => out.push(ScanSpan {
+                scan: grown,
+                requested: vec![span],
+            }),
+        }
+    }
+    Ok(out)
+}
+
+/// Whether a typed region **carries an object**, and so cannot be clipped to a BED edge.
+///
+/// # The spec did not say, and the type does (E2)
+///
+/// Spec §2.5 says a straddling locus or bundle is emitted **whole** and that `Generic` is
+/// **clipped** — and says nothing at all about `Satellite`. The distinction it is reaching
+/// for is visible in [`RegionKind`] itself: `SsrLocus` and `SsrBundle` carry something (a
+/// `Locus`; the member tracts), and the other two are unit variants that carry nothing
+/// because they **are** just their region (§1.1).
+///
+/// Clip a region that carries an object and the object is left describing bases outside
+/// it — half a locus is not a locus, and a bundle whose hull no longer holds its own
+/// tracts is a lie. Clip bare territory and nothing is misdescribed: "these bases are
+/// array" stays true of any stretch of them. So `Satellite` clips, with `Generic`.
+///
+/// That is a resolution of the spec's silence, not a reading of it: recorded in §2.5 and
+/// flagged for the owner.
+fn carries_an_object(kind: &RegionKind) -> bool {
+    match kind {
+        RegionKind::SsrLocus(_) | RegionKind::SsrBundle { .. } => true,
+        RegionKind::Generic | RegionKind::Satellite => false,
+    }
+}
+
+/// Narrow one walked region to what the user asked for, and queue what survives (spec
+/// §2.5).
+///
+/// - **Outside every requested span** → dropped. It was scanned so that the regions inside
+///   would be *right*, not to be shown.
+/// - **Carries an object** ([`carries_an_object`]) → emitted **whole**, even past the
+///   edge: the requested span grows to hold it, and that grown span — the *effective*
+///   region — is what the partition invariant is stated over.
+/// - **Territory** → **clipped** to each requested span it overlaps, which may be more
+///   than one: two requested spans close enough to coalesce share a scan span, and the
+///   generic run across them must come back as two regions with the gap dropped, not one
+///   region covering ground the user did not ask for.
+///
+/// `emitted_upto` keeps the output non-overlapping when an object has just been emitted
+/// whole past an edge and the next requested span starts inside it.
+fn emit_into(
+    queue: &mut std::collections::VecDeque<TypedRegion>,
+    region: TypedRegion,
+    requested: &[GenomeRegion],
+    emitted_upto: &mut u64,
+) {
+    let overlaps = |r: &GenomeRegion| {
+        r.contig == region.region.contig
+            && r.start.get() <= region.region.end.get()
+            && region.region.start.get() <= r.end.get()
+    };
+
+    if carries_an_object(&region.kind) {
+        if requested.iter().any(overlaps) {
+            *emitted_upto = region.region.end.get();
+            queue.push_back(region);
+        }
+        return;
+    }
+
+    for r in requested.iter().filter(|r| overlaps(r)) {
+        let start = region
+            .region
+            .start
+            .get()
+            .max(r.start.get())
+            .max(*emitted_upto + 1);
+        let end = region.region.end.get().min(r.end.get());
+        if start > end {
+            continue;
+        }
+        *emitted_upto = end;
+        queue.push_back(TypedRegion {
+            region: GenomeRegion {
+                contig: region.region.contig,
+                start: Position(start),
+                end: Position(end),
+            },
+            kind: region.kind.clone(),
+        });
+    }
+}
+
 /// The reference's own table entry for `contig` — **the provenance seam** (spec §2.6).
 /// Every contig length and name the walk uses comes through here.
 fn contig_entry<R: ContigTable>(
@@ -1178,6 +1402,10 @@ struct BlockWalk {
     /// **Carry:** the open generic run — everything up to here is emitted, so the gap
     /// from here to the next feature is generic. One `u64` for a megabase.
     emitted_upto: u64,
+    /// The span this walk tiles, 1-based inclusive — the **scan** span, which is wider
+    /// than what the user asked for (spec §2.5). Needed only to tell a bundle cluster the
+    /// scan edge cut from one the walk got wrong (`resolve_features`).
+    scan: CoverageRun,
     /// Resolved regions waiting to be read out, in genomic order. A queue rather than a
     /// list because `TypedRegionIterator` drains it as it goes: it holds one block's
     /// worth, never a contig's (spec §7).
@@ -1214,10 +1442,11 @@ impl WindowItem {
 }
 
 impl BlockWalk {
-    fn new(contig: ContigId, contig_len: u64) -> Self {
+    fn new(contig: ContigId, contig_len: u64, scan: CoverageRun) -> Self {
         Self {
             contig,
             contig_len,
+            scan,
             runs: Vec::new(),
             loci: Vec::new(),
             bundled: Vec::new(),
@@ -1346,7 +1575,7 @@ impl BlockWalk {
     fn close_block(&mut self, config: &TypedRegionConfig) {
         let loci = std::mem::take(&mut self.loci);
         let bundled = std::mem::take(&mut self.bundled);
-        let features = resolve_features(&self.runs, loci, &bundled, self.contig, config);
+        let features = resolve_features(&self.runs, loci, &bundled, self.contig, config, self.scan);
         self.runs.clear();
 
         for f in features {
@@ -3114,6 +3343,244 @@ mod tests {
         assert!(
             matches!(result, Err(TypedRegionError::Reference(_))),
             "chr2 is not in this reference, and that must be caught before any walk"
+        );
+    }
+
+    // ---- E2: scan wider than you emit ------------------------------------
+
+    /// Walk `bases` restricted to the 1-based inclusive spans `want`.
+    fn walk_bed(bases: &[u8], want: &[(u64, u64)], window_bp: u64) -> Vec<TypedRegion> {
+        let requested: Vec<GenomeRegion> = want
+            .iter()
+            .map(|&(s, e)| GenomeRegion {
+                contig: ContigId(0),
+                start: Position(s),
+                end: Position(e),
+            })
+            .collect();
+        let config = TypedRegionConfig {
+            window_bp: Bp(window_bp),
+            ..TypedRegionConfig::default()
+        };
+        TypedRegionIterator::over_spans(reference_over("chr1", bases), requested, config)
+            .expect("valid spans")
+            .collect::<Result<_, _>>()
+            .expect("no read fails")
+    }
+
+    /// **BED-invariance — the acceptance test** (spec §2.5): *"whether a base is STR /
+    /// bundle / generic / satellite must not depend on the BED. The BED chooses what you
+    /// are shown, never what things are."*
+    ///
+    /// Every requested span is compared against the **whole-genome** run restricted to the
+    /// same coordinates. The spans are chosen to cut through everything the fixture has —
+    /// a BED edge 5 bp inside the bundle's cluster, one mid-satellite, one splitting a
+    /// generic run — because an edge in the middle of nowhere tests nothing.
+    ///
+    /// This is what "scan wider than you emit" buys, and it is not free: the naive walk
+    /// (scan only what was asked for) gets the *bundle* wrong, because the neighbour that
+    /// makes it a bundle sits outside the span.
+    #[test]
+    fn a_bed_does_not_change_what_things_are() {
+        let bases = windowing_fixture();
+        let whole = partition_resident("chr1", ContigId(0), &bases, &TypedRegionConfig::default());
+
+        // Spans that cut through real structure: across the tract at 990; across the
+        // bundle at 1990..2040; inside the satellite at 4000..5200; and a plain interior.
+        for want in [
+            (900u64, 1100u64),
+            (1995, 2100),
+            (4500, 4800),
+            (3000, 3600),
+            (1, 6000),
+        ] {
+            for window_bp in [333u64, 1000] {
+                let got = walk_bed(&bases, &[want], window_bp);
+
+                // What the whole-genome run says about those same bases.
+                for r in &got {
+                    for pos in [r.region.start.get(), r.region.end.get()] {
+                        // Only ask about bases the user actually requested: an object
+                        // emitted whole reaches past the edge, which is the point.
+                        if pos < want.0 || pos > want.1 {
+                            continue;
+                        }
+                        let truth = whole
+                            .iter()
+                            .find(|w| w.region.contains(Position(pos)))
+                            .unwrap_or_else(|| panic!("the whole-genome run covers {pos}"));
+                        assert_eq!(
+                            std::mem::discriminant(&r.kind),
+                            std::mem::discriminant(&truth.kind),
+                            "BED {want:?} at window_bp = {window_bp}: base {pos} is {:?} \
+                             with the BED and {:?} without it — the BED changed what a \
+                             base IS (spec §2.5)",
+                            r.kind,
+                            truth.kind
+                        );
+                    }
+                }
+
+                // And the loci are the same objects, not merely the same kind.
+                let loci_in = |rs: &[TypedRegion]| -> Vec<(u64, u64)> {
+                    rs.iter()
+                        .filter(|r| matches!(r.kind, RegionKind::SsrLocus(_)))
+                        .map(|r| (r.region.start.get(), r.region.end.get()))
+                        .filter(|(s, _)| *s >= want.0 && *s <= want.1)
+                        .collect()
+                };
+                assert_eq!(
+                    loci_in(&got),
+                    loci_in(&whole),
+                    "BED {want:?} at window_bp = {window_bp}: the loci starting inside the \
+                     span must be exactly the whole-genome run's"
+                );
+            }
+        }
+    }
+
+    /// The requested span is **tiled exactly** — the partition invariant, restated where
+    /// it belongs once a BED is involved: over the *effective* region, which is what the
+    /// user asked for grown to hold a straddling object whole (spec §2.5).
+    #[test]
+    fn a_bed_span_is_tiled_by_what_comes_back() {
+        let bases = windowing_fixture();
+        for want in [(900u64, 1100u64), (1995, 2100), (3000, 3600)] {
+            let got = walk_bed(&bases, &[want], 333);
+            assert!(!got.is_empty());
+
+            // Contiguous and non-overlapping, and covering every requested base. The
+            // effective region may start before / end after the request (an object
+            // straddling the edge), so the *bounds* are asserted as reaching at least the
+            // request, not equalling it.
+            assert!(got[0].region.start.get() <= want.0);
+            assert!(got.last().unwrap().region.end.get() >= want.1);
+            for pair in got.windows(2) {
+                assert_eq!(
+                    pair[1].region.start.get(),
+                    pair[0].region.end.get() + 1,
+                    "gap or overlap inside a BED span: {want:?}"
+                );
+                assert_ne!(
+                    std::mem::discriminant(&pair[0].kind),
+                    std::mem::discriminant(&pair[1].kind),
+                    "two consecutive regions share a kind — MAXIMALITY (spec §2.3)"
+                );
+            }
+        }
+    }
+
+    /// **`Generic` is clipped to the user's edge; an object straddling it comes back
+    /// whole** (spec §2.5) — and `Satellite` clips, which the spec did not say
+    /// ([`carries_an_object`]).
+    #[test]
+    fn territory_clips_at_the_edge_and_objects_come_back_whole() {
+        let bases = windowing_fixture();
+
+        // A span whose edges fall in plain generic sequence: nothing straddles, so the
+        // partition starts and ends exactly where the user asked.
+        let got = walk_bed(&bases, &[(3000, 3600)], 333);
+        assert_eq!(
+            got[0].region.start,
+            Position(3000),
+            "Generic is clipped to the user's edge, not grown to the scan span"
+        );
+        assert!(matches!(got[0].kind, RegionKind::Generic));
+        assert_eq!(got.last().unwrap().region.end, Position(3600));
+
+        // A span ending mid-satellite: the array is territory, so it clips too — the
+        // region says "these bases are array", which stays true of a stretch of them.
+        let got = walk_bed(&bases, &[(4500, 4800)], 333);
+        assert_eq!(got.len(), 1, "the whole span is inside the array: {got:#?}");
+        assert!(matches!(got[0].kind, RegionKind::Satellite));
+        assert_eq!(
+            (got[0].region.start, got[0].region.end),
+            (Position(4500), Position(4800)),
+            "a Satellite clips at the user's edges — it carries no object to misdescribe"
+        );
+
+        // A span cutting into the bundle's cluster: the bundle carries its member tracts,
+        // so clipping it would leave them outside their own region. It comes back whole,
+        // and the effective region grows to hold it.
+        let got = walk_bed(&bases, &[(1995, 2100)], 333);
+        let bundle = got
+            .iter()
+            .find(|r| matches!(r.kind, RegionKind::SsrBundle { .. }))
+            .expect("the cluster at 1990..2040 straddles this edge");
+        assert!(
+            bundle.region.start.get() < 1995,
+            "the bundle is emitted WHOLE, reaching back past the requested edge to {} \
+             (the effective region grows to hold it)",
+            bundle.region.start.get()
+        );
+        let RegionKind::SsrBundle { tracts } = &bundle.kind else {
+            unreachable!()
+        };
+        assert!(
+            tracts
+                .iter()
+                .all(|t| t.start + 1 >= bundle.region.start.get()
+                    && t.end <= bundle.region.end.get()),
+            "every member tract is inside the hull — which is what clipping would break"
+        );
+    }
+
+    /// A locus straddling the edge likewise comes back **whole**, with its bases intact —
+    /// half a locus is not a locus.
+    #[test]
+    fn a_locus_straddling_the_bed_edge_is_emitted_whole() {
+        let bases = windowing_fixture();
+        // The tract at 990..1010 (1-based 991..1010); ask for a span ending inside it.
+        let got = walk_bed(&bases, &[(900, 1000)], 333);
+        let locus = got
+            .iter()
+            .find_map(|r| match &r.kind {
+                RegionKind::SsrLocus(l) => Some(l),
+                _ => None,
+            })
+            .expect("the tract at ~991 straddles the requested edge at 1000");
+        assert!(
+            locus.end() > 1000,
+            "the locus reaches past the user's edge ({}), whole",
+            locus.end()
+        );
+        // The same object the whole-genome run builds, bases and all.
+        let whole = partition_resident("chr1", ContigId(0), &bases, &TypedRegionConfig::default());
+        let truth = whole
+            .iter()
+            .find_map(|r| match &r.kind {
+                RegionKind::SsrLocus(l) if l.start() == locus.start() => Some(l),
+                _ => None,
+            })
+            .expect("the same locus exists in the whole-genome run");
+        assert_eq!(locus, truth, "and it is the SAME locus, not a clipped one");
+    }
+
+    /// **Two requested spans close enough that their scan spans coalesce**: the walk scans
+    /// them once, and the ground between them — which the user did not ask for — must not
+    /// come back (spec §2.5).
+    ///
+    /// This is the case that makes territory clip against *each* requested span rather
+    /// than against the scan span: one generic run covers both, and it has to come back as
+    /// two regions with the gap dropped.
+    #[test]
+    fn two_spans_sharing_a_scan_span_do_not_leak_the_gap_between_them() {
+        let bases = windowing_fixture();
+        // 200 bp apart — far less than 2 x max_repeat_len, so the grown spans coalesce.
+        let got = walk_bed(&bases, &[(3000, 3200), (3400, 3600)], 333);
+
+        assert!(
+            got.iter()
+                .all(|r| (3000..=3200).contains(&r.region.start.get())
+                    || (3400..=3600).contains(&r.region.start.get())),
+            "nothing may start in the gap the user did not ask for: {got:#?}"
+        );
+        let covered: u64 = got.iter().map(|r| r.region.len()).sum();
+        assert_eq!(
+            covered,
+            201 + 201,
+            "exactly the two requested spans come back — the gap between them is scanned \
+             (they share a scan span) and not emitted"
         );
     }
 
