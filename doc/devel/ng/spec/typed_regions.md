@@ -130,12 +130,17 @@ it walks and produces); **finding loci in generic regions** (the pileup's job, f
 discovery** (deferred by `ng_proposal.md` §step-3's own decision rule); **a bake-off** (§6);
 **parallelising the walk** (§7 — a rejection, not a deferral).
 
-**A typed region carries coordinates, not sequence** — with one exception, and the reason is *size, not
-need*. Every consumer needs reference bases; the pileup fetches its own. The difference is how much:
-a generic region is unbounded, an STR locus's bases are capped at ~1.1 kb by the satellite cap and are
-typically ~200 bytes. So `Generic`/`Satellite` carry only their region, `SsrLocus` embeds its tract+flanks,
-and an **open generic run costs 8 bytes however many megabases it spans** — which is what makes
-§2.1's emission rule affordable.
+**A typed region carries coordinates, not sequence — no exceptions** (owner, 2026-07-17). This module
+says what each stretch of the genome *is*; the bases are in the reference, and every consumer has it
+open, because it had to in order to ask. An earlier draft made `SsrLocus` embed its tract+flanks on
+the grounds that they are small (~200 bytes, capped at ~1.1 kb by the satellite cap) — which was an
+argument that the payload was *affordable*, never that it was *needed*, and nothing in ng ever read
+it. What it cost is in §2.6: a second reference fetch per window and a second margin to make the
+embed reachable. **The flank stays as a typing criterion** (§2.4) — it just never needed the bases to
+answer.
+
+So every kind carries its region and nothing else but its own description, and an **open generic run
+costs 8 bytes however many megabases it spans** — which is what makes §2.1's emission rule affordable.
 
 ---
 
@@ -174,11 +179,12 @@ an array, not a microsatellite — and `max_repeat_len` is its parameter, not a 
 
 The generic path is the **default**; the other three, STR, STR bundle, and satellite are exceptions carved out of it.
 
-**Flanks reach across borders; ownership does not.** An STR locus embeds ±50 bp of flank, which lies
-in generic territory. The partition is over **ownership** — who calls variants at a base — not over
-what sequence a span reads. The STR locus emits only tract alleles; the neighbouring `Generic` spans
-own and call the flank bases. After §2.4 this is true by definition: a locus is admitted only if no
-other repeat lies within `flank_bp` of it.
+**A locus's flank is generic territory, and that is not a conflict.** An STR locus *requires* ±50 bp
+of clean sequence either side (§2.4), and those bases belong to the neighbouring `Generic` regions,
+which own and call them; the locus's span is its tract alone. The partition is over **ownership** —
+who calls variants at a base — and the flank requirement is a *test the locus had to pass*, not
+territory it claims. (An earlier draft had the locus embed those bases, which is what made this look
+like a conflict worth explaining. It no longer carries them — §1.2.)
 
 ### 2.3 The invariant — the acceptance test
 
@@ -218,7 +224,7 @@ Algorithm notes:
 - **The threshold is `flank_bp`, and there was never a reason for two knobs.** They are two
   histories, not two designs. `bundle_threshold` is GangSTR's `THRESH=50` (`2_trim.sh`), ported —
   and GangSTR's panel build has **no flank concept at all**, so over there the number relates to
-  nothing. `flank_bp` is ours: the margin we embed in `ref_bytes`. Both landed on 50 independently,
+  nothing. `flank_bp` is ours: the clean sequence a locus must have either side. Both landed on 50 independently,
   and the documented `bundle_threshold >= flank_bp` invariant records that coincidence rather than
   resolving it. Collapse them — **the flank requirement is the primitive, bundle-ness is derived** —
   so when we explore what flank the delimiter actually needs (§10), the bundle definition follows
@@ -385,20 +391,18 @@ covers it — and anything longer is a satellite, handled in 3).
 > Attribution is the last step, not the first. (Mutation-verified: pre-filtering the core-attributed
 > set alone fails `windowed_matches_the_resident_oracle_at_every_window_size`.)
 >
-> **(b) "It also covers admission for free … 1 kb is a lot more than 50" — it does not, and admission
-> says so with a panic rather than a wrong answer.** Admission is handed every repeat in the slice
-> (see (a)), including ones at the *slice's* own edges, which have no margin of their own; and a
-> satellite is truncated at the slice edge, so it ends exactly there. `admit` reads
-> `[tract_start - 50, tract_end + 50]` out of the bases it was given and **panics** if that runs off
-> them — deliberately, because the quiet alternative is dropping the locus, which is the bug this
-> whole section exists to kill. 1 kb of margin does not help: the offending tracts are at the
-> margin's own edge.
+> **(b) "It also covers admission for free … 1 kb is a lot more than 50" — true, and for a reason
+> this paragraph did not have.** There is **one margin**: the scan's `max_repeat_len`. Admission runs
+> over the slice the scan already read, needs each tract's own bases (motif, purity) — which are in
+> that slice by construction — and answers the flank question by **arithmetic** against `contig_len`,
+> which no slice could answer anyway.
 >
-> The fix keeps the two margins apart, because they answer different questions: the **scan** gets
-> the core ± `max_repeat_len` (what makes a repeat *segment* identically), and the **bases handed to
-> admission** are that slice grown by a further `flank_bp` each side, clamped to the contig (what
-> makes a repeat *readable*). One extra `flank_bp` at each end of a window, and no filtering, no
-> divergence, no panic.
+> *D3 answered this differently and it is worth one line, because the fix that replaced it deleted
+> code rather than adding it. `Locus` used to embed `tract ± flank_bp` of bases, so `admit` read past
+> the tract and **panicked** for tracts at the slice's own edge. D3 gave admission a second, wider
+> slice — a `flank_bp` margin on top of the `max_repeat_len` one, fetched separately, every window —
+> and called them "two margins, two questions". Dropping the payload (§1.2) dropped the second margin,
+> the second fetch, and both panics: there was only ever one question.*
 
 **2. Tell admission where the contig actually ends.**
 
@@ -448,10 +452,12 @@ pub struct TypedRegion { pub region: GenomeRegion, pub kind: RegionKind }
 /// Exactly one of the four is a genetic object; the other three are physical (§1.1).
 /// `Generic` and `Satellite` carry nothing because they *are* just spans.
 pub enum RegionKind {
-    /// ng's own `Locus` — motif, borders, purity, and the embedded flank+tract+flank bases. A
-    /// port of the catalog's, born 1-based/`u64` (§4, §5); production's stays 0-based/`u32`. No
-    /// wrapper: it is 1-based like everything else in ng, and `TypedRegion` already carries the
-    /// region. It is `ReadPreparer::Locus`, closing `read_preparation_ssr.md` §8.
+    /// ng's own `Locus` — motif, borders, purity. **Coordinates, no bases** (§1.2). Ported from
+    /// the catalog's, born 1-based/`u64` (§4, §5) and without its `ref_bytes`; production's stays
+    /// 0-based/`u32` and keeps them. No wrapper: it is 1-based like everything else in ng, and
+    /// `TypedRegion` already carries the region. It is `ReadPreparer::Locus`, closing
+    /// `read_preparation_ssr.md` §8 — which will need the tract's bases, and will fetch them from
+    /// the reference it opens to gather reads.
     SsrLocus(Locus),                               // Locus = ng's, NOT ssr::types::Locus
     /// A cluster of repeats none of which has clean flanks (§2.4). Carries the tracts as
     /// coordinates — enough to see the structure (each interval has its period) without this step
@@ -643,9 +649,14 @@ earlier draft of this spec collapsed them into a goal ("reuse the catalog's admi
 which was backwards. `postprocess::build_loci`
 ([postprocess.rs:69](../../../../src/ssr/catalog/postprocess.rs)) is a working, tested
 implementation of the whole rule set — period scope, score gate, compound-motif drop, bundle drop,
-minimal trim, copy floor, purity floor, flank embed, contig-edge drop — and **re-deriving that rule
-set from scratch would be daft**. So ng takes the code. **v1 starts at its settings for one reason
-only: comparability** (§8). The catalog is a yardstick, not an authority.
+minimal trim, copy floor, purity floor, contig-edge drop — and **re-deriving that rule set from
+scratch would be daft**. So ng takes the code. **v1 starts at its settings for one reason only:
+comparability** (§8). The catalog is a yardstick, not an authority.
+
+**One of its steps ng does not take: the flank embed** (§1.2). `build_loci` stores each tract's bases
+plus a flank each side; ng's copy stores neither, because this module types regions and a payload
+nobody here reads is not part of that. Every *decision* is transcribed unchanged, the flank
+*requirement* included — that is what keeps §8's oracles meaningful.
 
 **Copied into ng, not reshaped in place (Revision 2026-07-16).** An earlier draft had ng call
 `build_loci` directly, which meant editing it — windowing it, widening it, rebasing it, and prising
@@ -968,9 +979,13 @@ in this crate, so the test needs nothing new from production — `TrfRecord::for
 2. Feed ng's `admit` directly; feed production's `build_loci` the same intervals bridged through
    `TrfRecord::for_test`, at the **whole-contig degenerate case** (§5a) and the catalog's settings.
 3. Assert the `Locus` sets are identical **modulo the coordinate base** — ng's 1-based inclusive
-   `[start, end]` is production's 0-based half-open `[start, end)` shifted by exactly one on `start`
-   (and on `ref_bytes_start`), with `end` and `ref_bytes` unchanged. Compare through one conversion
-   helper, stated once, so the test pins the arithmetic rather than restating the bug.
+   `[start, end]` is production's 0-based half-open `[start, end)` shifted by exactly one on `start`,
+   with `end` unchanged. Compare through one conversion helper, stated once, so the test pins the
+   arithmetic rather than restating the bug.
+4. **Do not compare `ref_bytes` or the flanks**: production has them, ng does not (§1.2), and that is
+   a divergence rather than drift. What the differential pins is every *decision* — which tracts
+   admit, at what span, motif, period and purity — which is what "faithful" has to mean once the
+   payload is gone.
 
 **What it proves and what it does not.** It proves the transcription is faithful *at the catalog's
 settings, whole-contig*. It does **not** cover the windowed path (§8's window-invariance does) or any
@@ -1085,11 +1100,11 @@ contig's end abutting one at the next's start (transition arithmetic).
 | the windowed scan (core + margin, coverage clipped, intervals by start) | `collect_windowed` ([tandem_repeat.rs:530](../../../../src/ng/tandem_repeat.rs)) | **the primitive this is built on** — must be promoted and streamed (§6.1) |
 | repeat detection | `find_tandem_repeats` ([tandem_repeat.rs:354](../../../../src/ng/tandem_repeat.rs)) | called per window by the above |
 | the region tiling | `RegionScanner` ([tandem_repeat.rs:586](../../../../src/ng/tandem_repeat.rs)) | **not reused** — merges before policy (§6.1) |
-| the admission policy | `build_loci` ([postprocess.rs:69](../../../../src/ssr/catalog/postprocess.rs)) | **copied into ng** — logic transcribed unchanged; windowed, `RepeatInterval`-taking, 1-based/`u64`, all-knobs, returns `Admitted` (§5a). Production's stays as it is |
+| the admission policy | `build_loci` ([postprocess.rs:69](../../../../src/ssr/catalog/postprocess.rs)) | **copied into ng** — every decision transcribed unchanged; windowed, `RepeatInterval`-taking, 1-based/`u64`, all-knobs, returns `Admitted` (§5a), and **without the flank embed** (§1.2). Production's stays as it is |
 | the bundle selection | `drop_bundles`/`is_close` ([postprocess.rs:274](../../../../src/ssr/catalog/postprocess.rs)) | **copied with it** — selection kept, disposal not; re-associated to stream (§2.4, §2.6) |
 | the pre-filter | `catalog_prefilter` ([ng/scanner_parity.rs](../../../../src/ng/scanner_parity.rs)) | **copied into ng**, beside ng's `admit` (§5.1); the parity test keeps its own frozen copy, and B2 moved that test out of `src/ssr/` too (§9) |
 | admission knobs | `CatalogParams` ([catalog/mod.rs:42](../../../../src/ssr/catalog/mod.rs)) | **ng's own `SsrAdmissionParams`** — same defaults, plus the hardcoded period scope + copy floors as real knobs; no separate `bundle_threshold` (§2.4) |
-| the STR locus | `ssr::types::Locus` ([types.rs:136](../../../../src/ssr/types.rs)) | **copied into ng**, born 1-based/`u64` (§4). Production's stays 0-based/`u32` |
+| the STR locus | `ssr::types::Locus` ([types.rs:136](../../../../src/ssr/types.rs)) | **copied into ng**, born 1-based/`u64` (§4) and **without `ref_bytes`** (§1.2). Production's keeps them, 0-based/`u32` |
 | the motif | `ssr::types::Motif` ([types.rs:36](../../../../src/ssr/types.rs)) | **copied into ng** — reuse looked free (no coordinates, no width) but production's is `pub(crate)` and would leak through ng's `pub` `Locus` (§4, corrected at the A1 review) |
 | what to walk | `RegionSet`/`Region`/`ContigBounds` ([regions.rs](../../../../src/regions.rs)) | **wrapped, read-only**, by `GenomeRegions` (§2.5); it already parses/coalesces/clamps BED. `regions.rs` does not move |
 | reference bases | `WindowedRefSeq` ([ng/ref_seq.rs](../../../../src/ng/ref_seq.rs)) | + a raw path (§6) and a `contigs()` accessor |

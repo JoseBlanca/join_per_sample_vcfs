@@ -59,13 +59,16 @@ pub enum RegionKind {
 **`SsrLocus` wraps nothing — it holds ng's own `Locus` directly.** `Locus` is a port of
 `ssr::types::Locus` (spec §5), born 1-based/`u64` where production's is 0-based/`u32`; production's is
 left alone (spec Revision). With no coordinate mismatch to hide, the earlier `ng::SsrLocus` wrapper
-has no job. It carries motif, borders, purity, and the embedded flank+tract+flank bases, and is
-`ReadPreparer::Locus` (closes `read_preparation_ssr.md` §8).
+has no job. It carries motif, borders and purity — **coordinates, no bases** (spec §1.2): production
+embeds tract+flanks because its consumer genotypes without a FASTA open, and this module types
+regions. It is `ReadPreparer::Locus` (closes `read_preparation_ssr.md` §8), and that consumer fetches
+the tract from the reference it already opens.
 
 ```rust
-/// ng's port of the catalog's Locus — same fields, 1-based inclusive, u64. Private fields + a
-/// validating `new`, exactly as production's. (spec §4, §5)
-pub struct Locus { /* chrom, start, end, motif: Motif, purity_fraction, ref_bytes, ref_bytes_start */ }
+/// ng's port of the catalog's Locus, minus its `ref_bytes` — 1-based inclusive, u64. Private
+/// fields + a validating `new`, whose invariant is now just `1 <= start <= end` plus a finite
+/// purity. (spec §4, §5, §1.2)
+pub struct Locus { /* chrom, start, end, motif: Motif, purity_fraction */ }
 
 /// Ported too, though spec §4 expected `ssr::types::Motif` reused: production's is `pub(crate)`, so
 /// a `pub` ng `Locus` returning one trips `private_interfaces` — and widening it is a production

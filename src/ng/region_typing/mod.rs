@@ -168,9 +168,10 @@ pub struct TypedRegion {
 /// affordable.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RegionKind {
-    /// ng's own [`Locus`] — motif, borders, purity, and the embedded
-    /// flank+tract+flank bases. No wrapper: it is 1-based like the rest of ng
-    /// (spec §4), and [`TypedRegion`] already carries the region.
+    /// ng's own [`Locus`] — motif, borders, purity. **Coordinates, no bases**: the
+    /// bases are in the reference the caller already has open (see [`Locus`]). No
+    /// wrapper: it is 1-based like the rest of ng (spec §4), and [`TypedRegion`]
+    /// already carries the region.
     SsrLocus(Locus),
     /// A cluster of repeats none of which has clean flanks (spec §2.4). Carries
     /// the tracts as coordinates — enough to see the structure (each interval has
@@ -752,22 +753,18 @@ fn coverage_runs(intervals: &[RepeatInterval]) -> Vec<CoverageRun> {
 ///   canonical bytes would make every IUPAC-carrying locus unequal to the catalog's
 ///   (spec §6).
 ///
-/// # Why it fetches the window's bases a second time
+/// # One fetch per window, and one margin
 ///
-/// [`scan_windowed`] fetches to scan and does not hand the bytes back (it reuses one
-/// buffer — the memory discipline that is the point of streaming). Admission needs the
-/// sequence, so the walk reads it again, from the **same** reader: for `WindowedRefSeq`
-/// that is a copy out of a buffer already holding those bases, not a second file read,
-/// and emphatically not a second reader (spec §6's 14.6 GB lesson). One `memcpy` per
-/// window, against a scan that touched every base six times.
+/// Admission runs over **the slice the scan already read**. It needs each tract's own
+/// bases (motif, purity), which are in that slice by construction — the interval came
+/// from scanning it — and it answers the flank question by arithmetic against
+/// `contig_len`, which no slice could answer anyway.
 ///
-/// The re-read is **`fetched` grown by `flank_bp` each side**, and that margin-on-the-
-/// margin is load-bearing: `admit` panics rather than quietly drop a locus whose flank
-/// falls outside the slice it was handed, and a repeat detected at the very edge of the
-/// scanned slice — a satellite truncated there, say — has exactly that shape. Growing
-/// the *bases* rather than the *scan* keeps spec §2.6's margin (`max_repeat_len`, what
-/// makes a repeat segment identically) separate from admission's (`flank_bp`, what
-/// makes it readable), which is right: they answer different questions.
+/// So there is one margin, spec §2.6's: `max_repeat_len`, what makes a repeat *segment*
+/// identically. Until 2026-07-17 there was a second — `flank_bp` on top of it — and a
+/// second fetch of every window to get it, because `Locus` embedded `tract ± flank_bp`
+/// of bases and a tract at the slice's own edge could not supply them. Removing the
+/// payload removed the margin, the re-fetch, and the two panics that policed it.
 /// **Collected**, so it holds the contig's regions after all — this is the walk's shape
 /// for a test or a small job, and [`TypedRegionIterator`] is the one that ships. It is a
 /// wrapper over that iterator, not a second implementation: every window-invariance test
@@ -901,21 +898,24 @@ impl<R: RawRefSeq + ContigTable + EvictableRefSeq> TypedRegionIterator<R> {
         requested: Vec<GenomeRegion>,
         config: TypedRegionConfig,
     ) -> Result<Self, TypedRegionError> {
-        // **A swept knob that would silently un-bundle** (spec §10 sweeps both of these,
-        // in release — hence `assert!`). The scan's margin is `max_repeat_len`, so a
-        // window sees every repeat within `max_repeat_len` of its core. The bundle flank
-        // test needs to see every repeat within `flank_bp` of a core repeat. If the
-        // margin were the narrower of the two, a core tract's neighbour could fall
-        // outside the window, go unseen, and the tract would be admitted as a clean locus
-        // instead of bundled — no error, and a different answer for every `window_bp`.
-        assert!(
-            config.max_repeat_len.get() >= config.admission.flank_bp,
-            "max_repeat_len ({}) is the window's detection margin and must not be narrower \
-             than flank_bp ({}), the bundle radius: a window that cannot see a core tract's \
-             neighbours would admit them as loci instead of bundling them",
-            config.max_repeat_len.get(),
-            config.admission.flank_bp
-        );
+        // **A swept knob that would silently un-bundle** (spec §10 sweeps both of these).
+        // The scan's margin is `max_repeat_len`, so a window sees every repeat within
+        // `max_repeat_len` of its core. The bundle flank test needs to see every repeat
+        // within `flank_bp` of a core repeat. If the margin were the narrower of the two,
+        // a core tract's neighbour could fall outside the window, go unseen, and the tract
+        // would be admitted as a clean locus instead of bundled — no error, and a
+        // different answer for every `window_bp`.
+        //
+        // **An error, not an `assert!`.** Both knobs are on the command line, so this is
+        // reachable from a typo — and user input must not panic. The reason it was an
+        // `assert!` still holds and is served better here: A2's rule is that a swept
+        // knob's guard must survive `--release`, and a `Result` does, unconditionally.
+        if config.max_repeat_len.get() < config.admission.flank_bp {
+            return Err(TypedRegionError::MarginNarrowerThanFlank {
+                max_repeat_len: config.max_repeat_len.get(),
+                flank_bp: config.admission.flank_bp,
+            });
+        }
         // Fail now, not in the middle of chromosome 7 (above).
         for span in &requested {
             contig_entry(&reference, span.contig)?;
@@ -1035,7 +1035,6 @@ impl<R: RawRefSeq + ContigTable + EvictableRefSeq> TypedRegionIterator<R> {
         config: &TypedRegionConfig,
         plan: &WindowPlan,
     ) -> Result<WindowTally, TypedRegionError> {
-        let flank_bp = config.admission.flank_bp;
         let contig = state.contig;
 
         // 1. Detect. The scanned slice is the cursor's to decide; this reads exactly it.
@@ -1052,12 +1051,13 @@ impl<R: RawRefSeq + ContigTable + EvictableRefSeq> TypedRegionIterator<R> {
         //    rule, and a core interval's neighbours live in the margin.
         let cleaned = admission::prefilter(&window.detections, &config.admission);
 
-        // 3. Admit. The bases are the scanned slice grown by a flank each side: `admit`
-        //    panics rather than quietly drop a locus whose flank runs off its slice, and
-        //    a repeat at the slice's own edge has exactly that shape (spec §2.6).
-        let bases_start = plan.fetched.start.saturating_sub(flank_bp);
-        let bases_end = (plan.fetched.end + flank_bp).min(state.contig_len);
-        reference.fetch_raw_into(contig, bases_start + 1, bases_end - bases_start, bases)?;
+        // 3. Admit, over **the slice we already scanned** — no second fetch, no second
+        //    margin. Admission reads each tract's own bases (motif, purity) and answers
+        //    the flank question by arithmetic against `contig_len`, so the scan slice is
+        //    exactly what it needs. Until 2026-07-17 `Locus` embedded tract ± flank_bp of
+        //    bases, which a tract at the slice's own edge could not supply; that cost a
+        //    wider re-fetch of every window, and the payload had no consumer.
+        let bases_start = plan.fetched.start;
         let recs = cleaned
             .iter()
             .map(|iv| RepeatInterval {
@@ -1271,7 +1271,7 @@ fn scan_set<R: ContigTable>(
 /// different claim:
 ///
 /// - `SsrLocus` — a genetic object. Half a locus is not a locus: its coordinates, its
-///   copy number and its embedded bases all describe the whole tract.
+///   motif and its copy number all describe the whole tract.
 /// - `SsrBundle` — carries its member tracts; clip the hull and the members describe bases
 ///   outside their own region.
 /// - `Satellite` — **the case E2 first got wrong.** The label means *"an array too long to
@@ -1668,6 +1668,17 @@ pub enum TypedRegionError {
     /// failed" would **silently un-call the rest of the genome** (spec §8.2).
     #[error("reference read failed during the walk")]
     Reference(#[from] RefSeqError),
+    /// The config's detection margin is narrower than its bundle radius, which
+    /// would make the answer depend on `window_bp` (see [`TypedRegionConfig`]).
+    ///
+    /// Raised by the constructor, before any work: both knobs are on the command
+    /// line, so this is what a typo looks like, and a typo must not panic.
+    #[error(
+        "max_repeat_len ({max_repeat_len}) is the window's detection margin and must not \
+         be narrower than flank_bp ({flank_bp}), the bundle radius: a window that cannot \
+         see a core tract's neighbours would admit them as loci instead of bundling them"
+    )]
+    MarginNarrowerThanFlank { max_repeat_len: u64, flank_bp: u64 },
 }
 
 #[cfg(test)]
@@ -3130,21 +3141,40 @@ mod tests {
     }
 
     /// **A margin narrower than the bundle radius silently un-bundles**, so the walk
-    /// refuses it — in release, because spec §10 sweeps both knobs and sweeps run in
-    /// release. Without the guard, a core tract whose neighbour fell outside the window
-    /// would be admitted as a clean locus: no error, and a different answer for every
-    /// `window_bp`.
+    /// refuses it — with an **error**, and before any work. Without the guard, a core
+    /// tract whose neighbour fell outside the window would be admitted as a clean locus:
+    /// no error, and a different answer for every `window_bp`.
+    ///
+    /// It is a `Result`, not an `assert!`, because both knobs are command-line flags
+    /// (`typed_regions_cli.md` §2.1) and a typo must not panic. A2's rule — a swept knob's
+    /// guard must survive `--release` — is what a `debug_assert` would have broken, and a
+    /// `Result` keeps unconditionally.
     #[test]
-    #[should_panic(expected = "must not be narrower than flank_bp")]
     fn a_detection_margin_narrower_than_the_bundle_radius_is_refused() {
         let config = TypedRegionConfig {
             max_repeat_len: Bp(10),
             ..TypedRegionConfig::default()
         };
-        let _ = partition_windowed(
+        let err = partition_windowed(
             reference_over("chr1", &windowing_fixture()),
             ContigId(0),
             &config,
+        )
+        .expect_err("a margin narrower than flank_bp is refused");
+        assert!(
+            matches!(
+                err,
+                TypedRegionError::MarginNarrowerThanFlank {
+                    max_repeat_len: 10,
+                    flank_bp: 50
+                }
+            ),
+            "and it names both numbers, so the message says which flag to move: {err}"
+        );
+        assert!(
+            err.to_string()
+                .contains("must not be narrower than flank_bp"),
+            "the operator-facing message survives: {err}"
         );
     }
 

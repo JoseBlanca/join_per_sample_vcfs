@@ -1,11 +1,19 @@
 //! ng's STR admission policy — which detected repeats become STR loci.
 //!
-//! **This is a port of [`crate::ssr::catalog::postprocess`], not a rewrite.**
+//! **This began as a port of [`crate::ssr::catalog::postprocess`], not a rewrite.**
 //! The rule set (period scope, score gate, compound-motif drop, bundle drop,
-//! minimal trim, copy floor, purity floor, flank embed, contig-edge drop) is a
-//! working, tested implementation — itself a faithful port of GangSTR's
-//! `minimal_trim.py` / `remove_bundles.py` — and re-deriving it would be daft
-//! (spec §5). So the **logic is transcribed unchanged**; only the shape is ng's.
+//! minimal trim, copy floor, purity floor, contig-edge drop) is a working, tested
+//! implementation — itself a faithful port of GangSTR's `minimal_trim.py` /
+//! `remove_bundles.py` — and re-deriving it would be daft (spec §5). So the
+//! **decisions are transcribed unchanged**; the shape is ng's.
+//!
+//! **One rule is deliberately not ported: the flank embed.** Production's
+//! `build_loci` stores each tract's bases plus a flank each side, because its
+//! consumer genotypes loci without a FASTA open. This module's job is to say what
+//! each stretch of the genome *is*, and a payload nobody here reads is not part of
+//! that (owner, 2026-07-17 — see [`Locus`]). The **flank requirement stays**: a
+//! tract without clean sequence either side is not an STR, which is a question
+//! about distances, not bases.
 //!
 //! ## Why a copy and not a call
 //!
@@ -63,11 +71,11 @@
 //!    *disposal* in A3 — spec §2.4 — but A1 transcribes it as-is.)
 //! 4. **End-trim** to whole-motif boundaries, then the per-period copy floor.
 //! 5. **Recompute purity** from the trimmed tract, then the purity floor.
-//! 6. **Embed `ref_bytes`** (tract + flank each side, clamped at contig ends) and
-//!    drop any locus whose flank clamped to zero — a tract with no anchor.
+//! 6. **The flank check**: clamp `tract ± flank_bp` at the *contig's* ends and drop
+//!    any locus whose flank clamped to zero — a tract with no anchor. Arithmetic
+//!    only; production embeds the bases here, and ng does not (above).
 
 use std::fmt;
-use std::ops::Range;
 
 use crate::ng::tandem_repeat::{PeriodRange, RepeatInterval};
 use crate::ng::types::{Bp, Position};
@@ -187,53 +195,39 @@ impl fmt::Debug for Motif {
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 #[non_exhaustive]
 pub enum LocusError {
-    /// Coordinates are not ordered `1 <= ref_bytes_start <= start <= end`.
-    /// The `1 <=` is ng's: these are 1-based, so `0` is not a position.
-    #[error(
-        "locus coordinates out of order: require 1 <= ref_bytes_start ({ref_bytes_start}) \
-         <= start ({start}) <= end ({end})"
-    )]
-    BadCoordinates {
-        ref_bytes_start: u64,
-        start: u64,
-        end: u64,
-    },
-    /// The tract `end` runs past the embedded reference span.
-    #[error(
-        "tract end ({end}) exceeds embedded reference span \
-         [{ref_bytes_start}, {ref_bytes_end}]"
-    )]
-    TractBeyondRefBytes {
-        end: u64,
-        ref_bytes_start: u64,
-        ref_bytes_end: u64,
-    },
-    /// `ref_bytes` is empty. A 1-based **inclusive** span cannot represent an
-    /// empty range (unlike production's half-open one), and a locus with no
-    /// embedded reference is meaningless regardless.
-    #[error("locus has empty ref_bytes")]
-    EmptyRefBytes,
+    /// Coordinates are not ordered `1 <= start <= end`. The `1 <=` is ng's:
+    /// these are 1-based, so `0` is not a position.
+    #[error("locus coordinates out of order: require 1 <= start ({start}) <= end ({end})")]
+    BadCoordinates { start: u64, end: u64 },
     /// `purity_fraction` is not a finite value in `[0.0, 1.0]`.
     #[error("purity fraction {purity_fraction} is not finite in [0.0, 1.0]")]
     BadPurity { purity_fraction: f32 },
 }
 
-/// One STR locus — a single repeat, carrying its own local reference bases.
+/// One STR locus — where a repeat is, and what it is.
 ///
-/// ng's port of [`crate::ssr::types::Locus`]. Same fields, same meaning, two
-/// differences (spec §4): coordinates are **1-based inclusive** and **`u64`**.
-/// Production's stays 0-based/`u32`; neither converts to the other outside
-/// [`self`]'s differential test.
+/// **It carries no reference bases, and that is the module boundary** (owner,
+/// 2026-07-17). This module's job is to say what each stretch of the genome *is*;
+/// the bases are already in the reference, and whoever wants them has it open. An
+/// earlier version embedded the tract plus a flank each side — production's
+/// catalog does, because its consumer genotypes loci without a FASTA in hand — and
+/// nothing in ng ever read them. What that payload cost is in [`finish_locus`] and
+/// in the walk: a second reference fetch per window, a second margin on top of the
+/// scan's, and two panics for the tracts that fell off its edge.
 ///
-/// `ref_bytes` spans `[ref_bytes_start, ref_bytes_start + ref_bytes.len() - 1]`
-/// — the tract `[start, end]` plus a flank margin each side (clamped at contig
-/// ends), upper-cased. `chrom` is the contig **name**, matching the project's
-/// name-based contig model.
+/// The **flank is still a typing criterion** — a tract needs clean sequence either
+/// side or it is not an STR (spec §2.4, and [`RejectionReason::FlankClamped`]) —
+/// but that is a question about *distances*, which coordinates answer. Only the
+/// payload is gone.
 ///
-/// The fields are private and the invariant
-/// `1 <= ref_bytes_start <= start <= end <= ref_bytes_start + ref_bytes.len() - 1`
-/// (plus `purity_fraction` finite ∈ `[0.0, 1.0]`, `ref_bytes` non-empty) is
-/// enforced by [`Locus::new`], so the accessors are infallible by construction.
+/// ng's port of [`crate::ssr::types::Locus`], now divergent by more than the two
+/// differences spec §4 records (**1-based inclusive** and **`u64`**, against
+/// production's 0-based/`u32`).
+///
+/// `chrom` is the contig **name**, matching the project's name-based contig model.
+/// The fields are private and the invariant `1 <= start <= end` (plus
+/// `purity_fraction` finite ∈ `[0.0, 1.0]`) is enforced by [`Locus::new`], so the
+/// accessors are infallible by construction.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Locus {
     /// Contig name.
@@ -247,17 +241,11 @@ pub struct Locus {
     /// Fraction of the tract matching a perfect motif tiling, in `[0.0, 1.0]`.
     /// A *degree*, not a flag — see [`Self::is_perfect`].
     purity_fraction: f32,
-    /// Embedded reference bases: the tract plus a flank margin each side,
-    /// upper-cased, clamped at contig ends.
-    ref_bytes: Box<[u8]>,
-    /// Genomic coordinate (1-based) of `ref_bytes[0]`.
-    ref_bytes_start: u64,
 }
 
 impl Locus {
     /// Build a locus, validating its coordinate and purity invariants.
     ///
-    /// Mirrors `ssr::types::Locus::new`, rephrased for 1-based inclusive spans.
     /// The checks are not ceremony: [`admit`] derives these coordinates by
     /// arithmetic on detector output, and an off-by-one here is a *wrong locus,
     /// not a crash*.
@@ -267,27 +255,9 @@ impl Locus {
         end: u64,
         motif: Motif,
         purity_fraction: f32,
-        ref_bytes: Box<[u8]>,
-        ref_bytes_start: u64,
     ) -> Result<Self, LocusError> {
-        if ref_bytes.is_empty() {
-            return Err(LocusError::EmptyRefBytes);
-        }
-        if !(1 <= ref_bytes_start && ref_bytes_start <= start && start <= end) {
-            return Err(LocusError::BadCoordinates {
-                ref_bytes_start,
-                start,
-                end,
-            });
-        }
-        // Inclusive: the last embedded base is at `ref_bytes_start + len - 1`.
-        let ref_bytes_end = ref_bytes_start + ref_bytes.len() as u64 - 1;
-        if end > ref_bytes_end {
-            return Err(LocusError::TractBeyondRefBytes {
-                end,
-                ref_bytes_start,
-                ref_bytes_end,
-            });
+        if !(1 <= start && start <= end) {
+            return Err(LocusError::BadCoordinates { start, end });
         }
         if !purity_fraction.is_finite() || !(0.0..=1.0).contains(&purity_fraction) {
             return Err(LocusError::BadPurity { purity_fraction });
@@ -298,8 +268,6 @@ impl Locus {
             end,
             motif,
             purity_fraction,
-            ref_bytes,
-            ref_bytes_start,
         })
     }
 
@@ -333,18 +301,6 @@ impl Locus {
         self.purity_fraction
     }
 
-    /// Embedded reference bases (tract plus flank margins, upper-cased).
-    #[inline]
-    pub fn ref_bytes(&self) -> &[u8] {
-        &self.ref_bytes
-    }
-
-    /// Genomic coordinate (1-based) of `ref_bytes()[0]`.
-    #[inline]
-    pub fn ref_bytes_start(&self) -> u64 {
-        self.ref_bytes_start
-    }
-
     /// The period (motif length, in bases).
     #[inline]
     pub fn period(&self) -> usize {
@@ -363,33 +319,6 @@ impl Locus {
     #[inline]
     pub fn is_perfect(&self) -> bool {
         self.purity_fraction == 1.0
-    }
-
-    /// The tract's byte range within `ref_bytes`. Both bounds hold by
-    /// construction ([`Locus::new`]).
-    #[inline]
-    fn tract_range(&self) -> Range<usize> {
-        debug_assert!(
-            self.ref_bytes_start <= self.start,
-            "ref_bytes precedes tract start"
-        );
-        let offset = (self.start - self.ref_bytes_start) as usize;
-        offset..offset + self.tract_len() as usize
-    }
-
-    /// The reference tract bytes — the REF allele's sequence.
-    pub fn ref_tract(&self) -> &[u8] {
-        &self.ref_bytes[self.tract_range()]
-    }
-
-    /// The left flank: embedded reference bases before the tract.
-    pub fn left_flank(&self) -> &[u8] {
-        &self.ref_bytes[..self.tract_range().start]
-    }
-
-    /// The right flank: embedded reference bases after the tract.
-    pub fn right_flank(&self) -> &[u8] {
-        &self.ref_bytes[self.tract_range().end..]
     }
 }
 
@@ -537,7 +466,7 @@ impl Default for MinCopies {
 /// (spec §2.4). They are two histories, not two designs: `bundle_threshold` is
 /// GangSTR's `THRESH=50`, ported from a panel builder with **no flank concept at
 /// all**, so over there the number related to nothing; `flank_bp` is ours, the
-/// margin embedded in `ref_bytes`. Both landed on 50 independently, and
+/// clean sequence a locus must have either side. Both landed on 50 independently, and
 /// production's documented `bundle_threshold >= flank_bp` invariant records that
 /// coincidence rather than resolving it. **The flank requirement is the
 /// primitive and bundle-ness is derived from it** — a repeat is bundled exactly
@@ -596,14 +525,19 @@ pub struct SsrAdmissionParams {
     /// parity ran exactly this way. Inherited knowingly, not by accident;
     /// `admit_at_default_never_rejects_a_score_the_scanner_can_emit` pins it.
     pub min_score: i32,
-    /// Flank margin (bp) embedded each side of the tract in `ref_bytes` — **and,
-    /// since A2, the bundle radius too** (spec §2.4; see the type's docs).
+    /// How much clean sequence (bp) a tract must have either side to be a locus —
+    /// **and, since A2, the bundle radius too** (spec §2.4; see the type's docs).
     /// Default: [`DEFAULT_FLANK_BP`].
     ///
     /// One number, two jobs, because they are the same requirement seen twice: a
     /// locus needs `flank_bp` of clean sequence each side to anchor reads, so a
     /// repeat with another repeat inside `flank_bp` cannot have one — which is
-    /// what makes it a bundle member rather than a locus.
+    /// what makes it a bundle member rather than a locus. The contig's own end is
+    /// the third face of it ([`RejectionReason::FlankClamped`]).
+    ///
+    /// **It is a distance, and nothing here reads the bases it measures** — the
+    /// flank is a test a tract passes, not something a [`Locus`] carries (spec
+    /// §1.2).
     pub flank_bp: u64,
 }
 
@@ -901,9 +835,10 @@ impl RejectionCounts {
 /// **windowed**.
 ///
 /// `chrom` is the contig name. `bases` is a slice of that contig (any case — the
-/// tract, motif, and `ref_bytes` are upper-cased here for case-stable identity);
-/// `recs` are offsets into `bases`. Feed it [`prefilter`]ed intervals, never raw
-/// scanner output (spec §5b).
+/// tract and motif are upper-cased here for case-stable identity); `recs` are
+/// offsets into `bases`. **No base outside a tract is read**, so the slice needs no
+/// margin of its own — hand it exactly what was scanned (spec §2.6). Feed it
+/// [`prefilter`]ed intervals, never raw scanner output (spec §5b).
 ///
 /// # The two facts a bare slice cannot tell you (spec §2.6)
 ///
@@ -1083,8 +1018,8 @@ pub fn admit(
     }
 }
 
-/// Steps 4-5 for one record: end-trim, copy-number floor, motif, purity floor,
-/// `ref_bytes` embed. `Err(reason)` if the record fails any gate.
+/// Steps 4-6 for one record: end-trim, copy-number floor, motif, purity floor, the
+/// flank check. `Err(reason)` if the record fails any gate.
 ///
 /// **Every `None` became an `Err(reason)` at E1e**, and nothing else changed. The gates
 /// and their order are exactly as before; what is new is that the caller can now tell a
@@ -1174,60 +1109,33 @@ fn finish_locus(
     let tract_start = bases_start + new_start;
     let tract_end = bases_start + new_end - 1;
 
-    // Clamp the flanks at the CONTIG's ends — 1 and `contig_len` — never at the
-    // slice's. Production writes `.min(contig_seq.len())` because for it the two
-    // are the same thing; for a window they are not, and believing the chromosome
-    // stops at the window edge is what silently eats every locus near every
-    // boundary.
+    // **The flank is a typing criterion, and it is a question about distances.**
+    // A tract needs clean sequence either side or it is not an STR (spec §2.4) —
+    // and whether that sequence exists is answered by coordinates and the contig's
+    // length, not by reading any of it. Clamp at the CONTIG's ends — 1 and
+    // `contig_len` — never at the slice's. Production writes
+    // `.min(contig_seq.len())` because for it the two are the same thing; for a
+    // window they are not, and believing the chromosome stops at the window edge is
+    // what silently eats every locus near every boundary.
     let ref_start = tract_start.saturating_sub(p.flank_bp).max(1);
     let ref_end = (tract_end + p.flank_bp).min(contig_len);
 
     // Drop a locus whose flank clamped to nothing on either side — a tract
     // abutting base 1 of the contig (empty left flank) or ending on its last base
-    // (empty right flank). The delimiter anchors the repeat region on *both* flank
-    // junctions; a zero-length flank leaves nothing to anchor against, so the
-    // tract is not genotypeable. These are now genuinely about the contig, so a
-    // window edge no longer impersonates one.
+    // (empty right flank). Nothing can be anchored against a zero-length flank, so
+    // the tract is not an STR. These are genuinely about the contig, so a window
+    // edge no longer impersonates one.
     if ref_start == tract_start || ref_end == tract_end {
         return Err(RejectionReason::FlankClamped);
     }
 
-    // Back to slice offsets to actually read the bytes. The caller must have
-    // supplied the margin (spec §2.6 fetches core ± max_repeat_len = 1 kb against
-    // a 50 bp flank), so failing here is a caller bug — and a loud one, because
-    // the quiet alternative is dropping the locus, which is the bug this whole
-    // signature exists to kill.
-    //
-    // The two messages are deliberately **distinct**: `should_panic` matches a
-    // substring, so a shared phrase would let the left-edge test be satisfied by a
-    // right-edge panic. Both name `flank_bp`, because "grow the window" is the
-    // actionable fix and the number is how much by.
-    let ref_range = {
-        let lo = ref_start.checked_sub(bases_start).unwrap_or_else(|| {
-            panic!(
-                "flank runs LEFT of the window: locus at {tract_start} needs bases from \
-                 {ref_start} (flank_bp = {}), but the window starts at {bases_start} — \
-                 the caller windowed without a left margin",
-                p.flank_bp
-            )
-        });
-        // Checked, so a wrong `contig_len` cannot wrap this into a plausible-looking
-        // count and make the assert below report the wrong diagnosis.
-        let hi = ref_end
-            .checked_sub(bases_start)
-            .and_then(|h| h.checked_add(1))
-            .expect("ref_end precedes the window start, which the clamps forbid");
-        assert!(
-            hi as usize <= bases.len(),
-            "flank runs RIGHT of the window: locus at {tract_end} needs bases to \
-             {ref_end} (flank_bp = {}), i.e. {hi} bytes, but the window holds {} — \
-             the caller windowed without a right margin",
-            p.flank_bp,
-            bases.len()
-        );
-        lo as usize..hi as usize
-    };
-    let ref_bytes = upper(&bases[ref_range]);
+    // **No bases are read past the tract**, which is what lets the caller hand over
+    // exactly the slice it scanned. The flank test above is arithmetic, and the
+    // tract's own bytes are in the slice by construction — the interval came from
+    // scanning it. Until 2026-07-17 this read `[tract - flank_bp, tract + flank_bp]`
+    // to embed in the locus, and a tract at the slice's own edge has no such margin:
+    // hence two panics here, a second margin on the caller's fetch, and a second
+    // reference read per window. All of it served a payload nothing consumed.
 
     match Locus::new(
         chrom.to_string().into_boxed_str(),
@@ -1235,22 +1143,17 @@ fn finish_locus(
         tract_end,
         motif,
         purity,
-        ref_bytes.into_boxed_slice(),
-        ref_start,
     ) {
         Ok(locus) => Ok(locus),
         // Unreachable: every gate above guarantees the invariants (`minimal_trim`
-        // gives `st < en`, the flank-clamp check gives a non-empty `ref_bytes`
-        // strictly containing the tract, `recompute_purity` returns `[0, 1]`).
+        // gives `st < en`, so `tract_start <= tract_end`; `recompute_purity` returns
+        // `[0, 1]`).
         //
-        // Which is exactly why the verdict is worth keeping. Production writes
-        // `.ok()` here and so discards it; that is faithful but wrong for a port,
-        // because this error can now only fire if **the transcription is wrong** —
-        // the one failure A1 exists to catch, and one that is otherwise silent (a
-        // bad locus would leave through the same rejection as a routine policy
-        // one). `debug_assert` keeps release behaviour byte-identical to
-        // production while making the differential — which runs in debug — fail
-        // loudly instead of quietly disagreeing.
+        // Which is exactly why the verdict is worth keeping: this error can now only
+        // fire if **the arithmetic is wrong**, and that is otherwise silent (a bad
+        // locus would leave through the same rejection as a routine policy one).
+        // `debug_assert` makes the differential — which runs in debug — fail loudly
+        // instead of quietly disagreeing.
         //
         // The reason it carries in release is `NoCleanTrim`: of the five, that is the
         // one that means "this tract did not turn out to be a well-formed repeat", which
@@ -1259,9 +1162,9 @@ fn finish_locus(
         Err(e) => {
             debug_assert!(
                 false,
-                "admit built an invalid locus, so the port's arithmetic is wrong: {e} \
-                 (tract [{tract_start}, {tract_end}], ref_bytes [{ref_start}, {ref_end}], \
-                  window starts at {bases_start}, contig is {contig_len} long)"
+                "admit built an invalid locus, so the arithmetic is wrong: {e} \
+                 (tract [{tract_start}, {tract_end}], window starts at {bases_start}, \
+                  contig is {contig_len} long)"
             );
             Err(RejectionReason::NoCleanTrim)
         }
@@ -1574,28 +1477,12 @@ mod tests {
     // ---- the locus type ----------------------------------------------------
 
     #[test]
-    fn locus_accessors_split_ref_bytes_into_flanks_and_tract() {
-        // Built by concatenation so the coordinates cannot drift from the bytes.
-        // 1-based: ref_bytes covers [1, 26]; the tract is [6, 21] = 16 bases.
-        let left = b"CGCGC";
-        let tract = b"ATATATATATATATAT"; // 8 copies of AT
-        let right = b"GCGCG";
-        let ref_bytes = [left.as_ref(), tract.as_ref(), right.as_ref()].concat();
-        let l = Locus::new(
-            "chr1".into(),
-            left.len() as u64 + 1,
-            (left.len() + tract.len()) as u64,
-            Motif::new(b"AT").unwrap(),
-            1.0,
-            ref_bytes.into_boxed_slice(),
-            1,
-        )
-        .expect("valid locus");
+    fn locus_reports_its_span_period_and_purity() {
+        // 1-based inclusive: [6, 21] is 16 bases, 8 copies of AT.
+        let l =
+            Locus::new("chr1".into(), 6, 21, Motif::new(b"AT").unwrap(), 1.0).expect("valid locus");
         assert_eq!(l.start(), 6);
         assert_eq!(l.end(), 21);
-        assert_eq!(l.left_flank(), left);
-        assert_eq!(l.ref_tract(), tract);
-        assert_eq!(l.right_flank(), right);
         assert_eq!(l.tract_len(), 16, "inclusive: end - start + 1");
         assert_eq!(l.period(), 2);
         assert!(l.is_perfect());
@@ -1603,62 +1490,28 @@ mod tests {
 
     #[test]
     fn locus_rejects_position_zero_because_it_is_one_based() {
-        let err = Locus::new(
-            "chr1".into(),
-            0,
-            5,
-            Motif::new(b"AT").unwrap(),
-            1.0,
-            (*b"ATATAT").into(),
-            0,
-        )
-        .expect_err("0 is not a 1-based position");
-        assert!(matches!(err, LocusError::BadCoordinates { .. }));
+        let err = Locus::new("chr1".into(), 0, 5, Motif::new(b"AT").unwrap(), 1.0)
+            .expect_err("0 is not a 1-based position");
+        assert!(matches!(
+            err,
+            LocusError::BadCoordinates { start: 0, end: 5 }
+        ));
     }
 
     #[test]
-    fn locus_rejects_empty_ref_bytes() {
-        let err = Locus::new(
-            "chr1".into(),
-            1,
-            1,
-            Motif::new(b"AT").unwrap(),
-            1.0,
-            [].into(),
-            1,
-        )
-        .expect_err("an inclusive span cannot be empty");
-        assert!(matches!(err, LocusError::EmptyRefBytes));
-    }
-
-    #[test]
-    fn locus_rejects_tract_past_ref_bytes() {
-        // ref_bytes covers [1, 6]; a tract ending at 7 runs past it.
-        let err = Locus::new(
-            "chr1".into(),
-            2,
-            7,
-            Motif::new(b"AT").unwrap(),
-            1.0,
-            (*b"ATATAT").into(),
-            1,
-        )
-        .expect_err("tract must fit inside ref_bytes");
-        assert!(matches!(err, LocusError::TractBeyondRefBytes { .. }));
+    fn locus_rejects_an_inverted_span() {
+        let err = Locus::new("chr1".into(), 9, 4, Motif::new(b"AT").unwrap(), 1.0)
+            .expect_err("end precedes start");
+        assert!(matches!(
+            err,
+            LocusError::BadCoordinates { start: 9, end: 4 }
+        ));
     }
 
     #[test]
     fn locus_rejects_non_finite_purity() {
-        let err = Locus::new(
-            "chr1".into(),
-            1,
-            6,
-            Motif::new(b"AT").unwrap(),
-            f32::NAN,
-            (*b"ATATAT").into(),
-            1,
-        )
-        .expect_err("NaN purity");
+        let err = Locus::new("chr1".into(), 1, 6, Motif::new(b"AT").unwrap(), f32::NAN)
+            .expect_err("NaN purity");
         assert!(matches!(err, LocusError::BadPurity { .. }));
     }
 
@@ -1732,7 +1585,7 @@ mod tests {
     /// The rebase's headline case: production asserts `start() == 5` on these
     /// exact bytes; ng must say **6**, and the tract bytes must be identical.
     #[test]
-    fn admit_emits_a_clean_locus_with_flanks_one_based() {
+    fn admit_emits_a_clean_locus_one_based() {
         let left = b"CGCGC"; // 5 bp left flank
         let tract = b"ATATATATATATATAT"; // 16 bp = 8 copies of AT
         let right = b"GCGCG"; // 5 bp right flank
@@ -1747,10 +1600,9 @@ mod tests {
         assert_eq!(l.tract_len(), 16);
         assert_eq!(l.motif().as_bytes(), b"AT");
         assert_eq!(l.purity_fraction(), 1.0);
-        assert_eq!(l.ref_tract(), tract);
-        assert_eq!(l.left_flank(), left);
-        assert_eq!(l.right_flank(), right);
-        assert_eq!(l.ref_bytes_start(), 1, "ref_bytes start at contig base 1");
+        // The flanks are why this locus was admitted, and they are not in it: a
+        // locus says where a repeat is and what it is. The bases are in the
+        // reference, which the caller has open (see `Locus`).
     }
 
     #[test]
@@ -1770,15 +1622,18 @@ mod tests {
     }
 
     #[test]
-    fn admit_clamps_flanks_at_contig_ends() {
-        // Tract (AT)*8 starts at 0-based 1; the 5 bp left flank clamps to 1 bp.
-        // A 1 bp flank is still a (weak) anchor, so the locus is kept.
+    fn admit_keeps_a_locus_whose_flank_clamps_to_one_base() {
+        // Tract (AT)*8 starts at 0-based 1, so only 1 bp of the 50 bp left flank
+        // exists. A 1 bp flank is still a (weak) anchor, so the locus is kept — the
+        // gate is "clamped to NOTHING", not "clamped".
         let contig = b"GATATATATATATATATCGCGCGCGCG";
         let loci = admit_whole_contig(vec![iv(1, 17, 2, 100)], "chr1", contig, &params());
         assert_eq!(loci.len(), 1);
-        let l = &loci[0];
-        assert_eq!(l.ref_bytes_start(), 1, "clamped to the contig's first base");
-        assert_eq!(l.left_flank(), b"G", "only 1 bp of left flank available");
+        assert_eq!(
+            loci[0].start(),
+            2,
+            "the tract begins at the contig's 2nd base"
+        );
     }
 
     /// **Every rejection reason, charged to the gate that fires it** (E1e, spec §3.1).
@@ -2096,9 +1951,9 @@ mod tests {
 
     /// **The conversion, stated once.** ng's 1-based inclusive `[start, end]` is
     /// production's 0-based half-open `[start, end)` shifted by exactly one on
-    /// `start` and `ref_bytes_start`; `end`, `ref_bytes`, `motif`, and `purity`
-    /// do not move. Stating it in one place is what makes this test pin the
-    /// arithmetic rather than restate a bug in both directions.
+    /// `start`; `end`, `motif` and `purity` do not move. Stating it in one place is
+    /// what makes this test pin the arithmetic rather than restate a bug in both
+    /// directions.
     #[track_caller]
     fn assert_same_locus(ng: &Locus, prod: &ProdLocus) {
         assert_eq!(ng.chrom(), prod.chrom(), "chrom");
@@ -2112,15 +1967,14 @@ mod tests {
             u64::from(prod.end()),
             "end: inclusive == exclusive ({ng})"
         );
-        assert_eq!(
-            ng.ref_bytes_start(),
-            u64::from(prod.ref_bytes_start()) + 1,
-            "ref_bytes_start ({ng})"
-        );
-        assert_eq!(ng.ref_bytes(), prod.ref_bytes(), "ref_bytes ({ng})");
-        assert_eq!(ng.ref_tract(), prod.ref_tract(), "ref_tract ({ng})");
-        assert_eq!(ng.left_flank(), prod.left_flank(), "left_flank ({ng})");
-        assert_eq!(ng.right_flank(), prod.right_flank(), "right_flank ({ng})");
+        // **`ref_bytes` and the flanks are not compared, because ng no longer has
+        // them** (2026-07-17). Production embeds the tract's bases plus a flank each
+        // side; ng deliberately does not — a locus says where a repeat is and what it
+        // is, and the bases are in the reference (see `Locus`). This is a divergence,
+        // not drift, so the differential does not chase it. What it still pins is
+        // every decision production makes: which tracts admit, and at what span, motif,
+        // period and purity — which is what "the port is faithful" has to mean once the
+        // payload is gone.
         // By bytes: the two `Motif`s are now distinct types (see `Motif`'s docs
         // — production's is `pub(crate)`, ng's is ported). Comparing the bytes is
         // also what would catch the ported type drifting from production's.
@@ -2285,17 +2139,22 @@ mod tests {
     ///
     /// The gap this closes: every other fixture is an upper-case literal, and the
     /// synthetic reference's only lower-case bytes are its contig *names*. So the
-    /// three `upper()` calls in `admit`/`finish_locus` were identity functions in
-    /// 100% of the suite — including both differentials — and deleting them would
-    /// have gone unnoticed.
+    /// `upper()` calls in `admit`/`finish_locus` were identity functions in 100% of
+    /// the suite — including both differentials — and deleting them would have gone
+    /// unnoticed.
     ///
     /// This is not an exotic input. Real references **soft-mask repeats**, which
     /// is precisely the sequence this module exists to process, so lower case is
     /// the mainstream case. And the failure is silent: `Locus` compares by value,
-    /// so a lower-case motif or `ref_bytes` reaching Milestone D simply fails to
-    /// match the catalog's — a wrong locus, not a crash.
+    /// so a lower-case motif reaching Milestone D simply fails to match the
+    /// catalog's — a wrong locus, not a crash.
+    ///
+    /// *Two `upper()` calls now, not three: the third folded `ref_bytes`, which
+    /// `Locus` no longer carries. The two that remain are the motif and the tract
+    /// purity is computed against, which is the whole of a locus's case-sensitive
+    /// surface.*
     #[test]
-    fn admit_upper_cases_a_soft_masked_tract_and_its_flanks() {
+    fn admit_upper_cases_a_soft_masked_tracts_motif() {
         let left = b"cgcgc";
         let tract = b"atatatatatatatat"; // 8 copies, soft-masked
         let right = b"gcgcg";
@@ -2305,9 +2164,6 @@ mod tests {
         assert_eq!(loci.len(), 1, "a soft-masked tract is still a locus");
         let l = &loci[0];
         assert_eq!(l.motif().as_bytes(), b"AT", "motif upper-cased");
-        assert_eq!(l.ref_tract(), b"ATATATATATATATAT", "tract upper-cased");
-        assert_eq!(l.left_flank(), b"CGCGC", "left flank upper-cased");
-        assert_eq!(l.right_flank(), b"GCGCG", "right flank upper-cased");
         assert_eq!(l.purity_fraction(), 1.0, "purity is case-insensitive");
 
         // And the case-folding matches production's, bytes included.
@@ -2356,7 +2212,11 @@ mod tests {
             "trimmed start: 0-based 5 (detected) + 3 (st) + 1 (1-based), NOT 6"
         );
         assert_eq!(l.end(), 20, "end unmoved");
-        assert_eq!(l.ref_tract(), tract, "the clean tract, junk trimmed off");
+        assert_eq!(
+            l.tract_len(),
+            tract.len() as u64,
+            "the span covers the clean tract, junk trimmed off"
+        );
         assert_eq!(l.motif().as_bytes(), b"AT");
 
         // And production agrees, which is what pins `+ st` against the original.
@@ -2670,14 +2530,18 @@ mod tests {
     /// really ends is the entire fix.
     #[test]
     fn admit_keeps_a_locus_the_window_edge_would_have_eaten() {
-        // Contig: 10 kb. Tract at offset 1000..1016. Window: [901, 1026] 1-based —
-        // i.e. bases[900..1026] — so the tract sits 10 bp from the window's right
-        // edge, with only 10 of its 50 bp right flank inside the window... which is
-        // a caller bug (no margin), so build the window with a real margin instead:
-        // [901, 1076], leaving 60 bp past the tract — more than `flank_bp` = 50.
+        // Contig: 10 kb. Tract at 0-based 1000..1016. The window is bases[900..1026]
+        // = 1-based [901, 1026], so the tract ends **10 bp from the window's right
+        // edge** — far less than the 50 bp flank.
+        //
+        // That window used to be illegal: `finish_locus` read the tract ± flank_bp to
+        // embed it, so it panicked and the caller had to fetch a wider slice. Since
+        // the locus stopped carrying bases (2026-07-17) the flank is a question about
+        // `contig_len`, which the window cannot contradict — so this is exactly the
+        // case that must work, and the tight window is the point of the fixture.
         let (contig, tract) = contig_with_one_tract_at(1000, 10_000);
         let win_start_1 = 901u64;
-        let win = &contig[900..1076];
+        let win = &contig[900..1026];
         // Re-base the interval onto the window slice.
         let in_window = iv(100, 116, 2, 100); // 1000-900 .. 1016-900
 
@@ -2692,17 +2556,14 @@ mod tests {
         assert_eq!(
             admitted.loci.len(),
             1,
-            "the contig continues past the window, so the flank is real and the \
-             locus must survive"
+            "the contig continues 9 kb past the window, so the flank is real and the \
+             locus must survive — even though the window holds only 10 bp of it"
         );
         let l = &admitted.loci[0];
         // Genomic 1-based, NOT window-relative: the window must not appear in the
         // output (spec §2.3).
         assert_eq!(l.start(), 1001, "genomic, not window-relative");
         assert_eq!(l.end(), 1016);
-        assert_eq!(l.ref_bytes_start(), 951, "1001 - 50 bp of flank");
-        assert_eq!(l.left_flank().len(), 50);
-        assert_eq!(l.right_flank().len(), 50);
 
         // And it is the SAME locus the whole-contig call produces — the window is a
         // memory knob, never an answer (spec §2.3).
@@ -2738,44 +2599,56 @@ mod tests {
         );
     }
 
-    /// A window without a margin is a caller bug, and it fails loudly — because
-    /// the quiet alternative is dropping the locus, which is the §2.6 bug wearing
-    /// a different hat.
+    /// **A tract flush against the window's own edge is still a locus** — the clamps
+    /// are `.max(1)` and `.min(contig_len)`, the *contig's* ends, and the window has
+    /// no vote.
     ///
-    /// **The left edge needs its own test, and mutation is what said so.** The
-    /// clamp is `.max(1)` — the contig's start. Writing `.max(bases_start)` — the
-    /// *window's* start — is indistinguishable whenever the caller left a margin
-    /// (both give `tract_start - flank_bp`), so no legitimate case can tell them
-    /// apart. They differ only here: `.max(1)` reaches for bytes left of the
-    /// window and panics; `.max(bases_start)` silently emits a locus with a
-    /// **truncated left flank** — a wrong locus, no error. Exactly the §2.6 class
-    /// of failure, on the other side.
+    /// **Mutation is what says these two tests are needed, and the fixture has to be
+    /// flush.** The live mutants are `.max(1)` → `.max(bases_start)` and
+    /// `.min(contig_len)` → `.min(bases_end)`: the window's ends instead of the
+    /// contig's. Whenever a tract sits *anywhere inside* its window, both forms agree
+    /// (`tract_start - flank_bp` either way), so no ordinary fixture can tell them
+    /// apart. They diverge only when the clamp actually bites — a tract starting
+    /// exactly at `bases_start`, or ending exactly at `bases_end` — where the mutant
+    /// makes `ref_start == tract_start` and reports `FlankClamped`: **the locus
+    /// silently vanishes because of where a memory knob fell**, which is spec §2.6's
+    /// bug exactly.
+    ///
+    /// These two replace a pair of `should_panic` tests. Until 2026-07-17 admission
+    /// *read* the flank to embed it, so this window was a caller bug that panicked;
+    /// now the flank is arithmetic, the window is legal, and the assertion is about
+    /// the answer rather than the crash.
     #[test]
-    #[should_panic(expected = "flank runs LEFT of the window")]
-    fn admit_panics_when_the_window_cannot_supply_the_left_flank() {
+    fn a_tract_at_the_windows_left_edge_keeps_its_flank_from_the_contig() {
         let (contig, _) = contig_with_one_tract_at(1000, 10_000);
-        // Window starts 10 bp before the tract, but flank_bp is 50 — and the
-        // contig has 990 bp more to the left, so the flank is real and reachable,
-        // just not in this window.
-        let win = &contig[990..1076];
-        let _ = admit(
-            vec![iv(10, 26, 2, 100)],
+        // The window STARTS at the tract: bases[1000..1076] = 1-based [1001, 1076].
+        // Not one base of the 50 bp left flank is inside it — and the contig has
+        // 1000 bp of it, so the locus stands.
+        let win = &contig[1000..1076];
+        let admitted = admit(
+            vec![iv(0, 16, 2, 100)],
             "chr1",
             win,
-            Position(991),
+            Position(1001),
             Bp(contig.len() as u64),
             &SsrAdmissionParams::default(),
         );
+        assert_eq!(
+            admitted.loci.len(),
+            1,
+            "the left flank is 1000 bp of contig the window cannot see: \
+             {:?}",
+            admitted.rejected
+        );
+        assert_eq!(admitted.loci[0].start(), 1001);
     }
 
     #[test]
-    #[should_panic(expected = "flank runs RIGHT of the window")]
-    fn admit_panics_when_the_window_cannot_supply_the_right_flank() {
+    fn a_tract_at_the_windows_right_edge_keeps_its_flank_from_the_contig() {
         let (contig, _) = contig_with_one_tract_at(1000, 10_000);
-        // Window ends 10 bp past the tract, but flank_bp is 50, and the contig
-        // says there are 9 kb more to read.
-        let win = &contig[900..1026];
-        let _ = admit(
+        // The window ENDS at the tract: bases[900..1016] = 1-based [901, 1016].
+        let win = &contig[900..1016];
+        let admitted = admit(
             vec![iv(100, 116, 2, 100)],
             "chr1",
             win,
@@ -2783,6 +2656,13 @@ mod tests {
             Bp(contig.len() as u64),
             &SsrAdmissionParams::default(),
         );
+        assert_eq!(
+            admitted.loci.len(),
+            1,
+            "the right flank is 9 kb of contig the window cannot see: {:?}",
+            admitted.rejected
+        );
+        assert_eq!(admitted.loci[0].end(), 1016);
     }
 
     /// **`bundled` is in the INPUT's coordinate space, not genomic.**
