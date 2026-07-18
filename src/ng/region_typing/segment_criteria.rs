@@ -1,4 +1,12 @@
-//! ng's STR admission policy — which detected repeats become STR loci.
+//! ng's STR **segment criteria** — which detected tandem repeats become an STR
+//! segment (an [`SsrSegment`], or a bundle member), and which are rejected.
+//!
+//! **A segment, not a locus.** [`classify`] returns physical typings, not genetic
+//! markers: an [`SsrSegment`] is a stretch of DNA carrying a tandem repeat, and it
+//! becomes a *locus* only if it turns out to be variable — which is a downstream
+//! decision, not this module's. The word "criteria" is deliberate: these are the
+//! tests a detected repeat passes to be *typed* as an STR segment, not a policy for
+//! routing it to a caller (owner, 2026-07-18).
 //!
 //! **This began as a port of [`crate::ssr::catalog::postprocess`], not a rewrite.**
 //! The rule set (period scope, score gate, compound-motif drop, bundle drop,
@@ -11,13 +19,13 @@
 //! `build_loci` stores each tract's bases plus a flank each side, because its
 //! consumer genotypes loci without a FASTA open. This module's job is to say what
 //! each stretch of the genome *is*, and a payload nobody here reads is not part of
-//! that (owner, 2026-07-17 — see [`Locus`]). The **flank requirement stays**: a
+//! that (owner, 2026-07-17 — see [`SsrSegment`]). The **flank requirement stays**: a
 //! tract without clean sequence either side is not an STR, which is a question
 //! about distances, not bases.
 //!
 //! ## Why a copy and not a call
 //!
-//! Step 3 needs admission windowed, 1-based/`u64`, `RepeatInterval`-driven,
+//! Step 3 needs classification windowed, 1-based/`u64`, `RepeatInterval`-driven,
 //! all-knobs, and handing bundle members back rather than dropping them. That is
 //! five changes to `build_loci`, which is not "a small tweak" — and production is
 //! frozen (spec Revision 2026-07-16, owner): `src/ssr/` stays exactly as it is,
@@ -44,7 +52,7 @@
 //!
 //! ## Divergences from production, and they are the whole list
 //!
-//! 1. **Coordinates are 1-based inclusive** ([`Locus`]), where production's are
+//! 1. **Coordinates are 1-based inclusive** ([`SsrSegment`]), where production's are
 //!    0-based half-open (spec §4). ng is 1-based end to end; production is not
 //!    asked to move.
 //! 2. **`u64`** coordinates and lengths, where production is `u32` (spec §4).
@@ -120,11 +128,11 @@ pub enum MotifError {
 /// 'reuse where it costs production nothing' case exactly."* The first half is
 /// true; **the conclusion was wrong**, and the compiler said so.
 ///
-/// `ssr::types::Motif` is `pub(crate)`. ng's [`Locus`] is `pub` (the ng-sibling
+/// `ssr::types::Motif` is `pub(crate)`. ng's [`SsrSegment`] is `pub` (the ng-sibling
 /// convention) and returns a motif, so reusing it trips rustc's
 /// `private_interfaces` lint — a `pub` item leaking a `pub(crate)` type. The
 /// three ways out: widen `Motif` in `src/ssr/types.rs` (**touching production —
-/// forbidden**); demote ng's whole admission surface to `pub(crate)` (bends ng's
+/// forbidden**); demote ng's whole classification surface to `pub(crate)` (bends ng's
 /// convention *and* buys `dead_code` warnings for every item until its Milestone
 /// D consumer exists); or port the 40 lines. So reuse did **not** cost
 /// production nothing — it cost a visibility compromise, which is precisely the
@@ -188,13 +196,13 @@ impl fmt::Debug for Motif {
 // The locus — ng's own, born 1-based
 // ---------------------------------------------------------------------
 
-/// A [`Locus`] could not be built because its inputs broke a documented invariant.
+/// A [`SsrSegment`] could not be built because its inputs broke a documented invariant.
 ///
 /// `PartialEq` but not `Eq`: `BadPurity` carries the offending `f32` verbatim
 /// (including the `NaN` that may have caused the rejection), and `NaN != NaN`.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 #[non_exhaustive]
-pub enum LocusError {
+pub enum SsrSegmentError {
     /// Coordinates are not ordered `1 <= start <= end`. The `1 <=` is ng's:
     /// these are 1-based, so `0` is not a position.
     #[error("locus coordinates out of order: require 1 <= start ({start}) <= end ({end})")]
@@ -226,10 +234,10 @@ pub enum LocusError {
 ///
 /// `chrom` is the contig **name**, matching the project's name-based contig model.
 /// The fields are private and the invariant `1 <= start <= end` (plus
-/// `purity_fraction` finite ∈ `[0.0, 1.0]`) is enforced by [`Locus::new`], so the
+/// `purity_fraction` finite ∈ `[0.0, 1.0]`) is enforced by [`SsrSegment::new`], so the
 /// accessors are infallible by construction.
 #[derive(Clone, Debug, PartialEq)]
-pub struct Locus {
+pub struct SsrSegment {
     /// Contig name.
     chrom: Box<str>,
     /// Tract start (1-based, inclusive).
@@ -243,10 +251,10 @@ pub struct Locus {
     purity_fraction: f32,
 }
 
-impl Locus {
+impl SsrSegment {
     /// Build a locus, validating its coordinate and purity invariants.
     ///
-    /// The checks are not ceremony: [`admit`] derives these coordinates by
+    /// The checks are not ceremony: [`classify`] derives these coordinates by
     /// arithmetic on detector output, and an off-by-one here is a *wrong locus,
     /// not a crash*.
     pub fn new(
@@ -255,12 +263,12 @@ impl Locus {
         end: u64,
         motif: Motif,
         purity_fraction: f32,
-    ) -> Result<Self, LocusError> {
+    ) -> Result<Self, SsrSegmentError> {
         if !(1 <= start && start <= end) {
-            return Err(LocusError::BadCoordinates { start, end });
+            return Err(SsrSegmentError::BadCoordinates { start, end });
         }
         if !purity_fraction.is_finite() || !(0.0..=1.0).contains(&purity_fraction) {
-            return Err(LocusError::BadPurity { purity_fraction });
+            return Err(SsrSegmentError::BadPurity { purity_fraction });
         }
         Ok(Self {
             chrom,
@@ -330,8 +338,8 @@ impl Locus {
 /// tiling is rejected. The catalog's value.
 pub const DEFAULT_MIN_PURITY: f32 = 0.8;
 
-/// Score floor: zero, which **admits everything the scanner can emit** — see
-/// [`SsrAdmissionParams::min_score`] for why that is deliberate and what it
+/// Score floor: zero, which **classifies everything the scanner can emit** — see
+/// [`SsrSegmentCriteria::min_score`] for why that is deliberate and what it
 /// costs. The catalog's value.
 pub const DEFAULT_MIN_SCORE: i32 = 0;
 
@@ -339,26 +347,26 @@ pub const DEFAULT_MIN_SCORE: i32 = 0;
 /// (spec §2.4) also the bundle radius.
 pub const DEFAULT_FLANK_BP: u64 = 50;
 
-/// The narrowest period admitted by default: **2**, excluding period-1
+/// The narrowest period classified by default: **2**, excluding period-1
 /// homopolymers. The standard GangSTR/HipSTR drop — error-prone for STR
 /// genotyping, and not the di/tri/tetra-nucleotide target. Dropping them
 /// *before* bundling is load-bearing: it stops a long poly-A/T run from
 /// bundle-dropping an adjacent real STR.
 pub const DEFAULT_MIN_PERIOD: u8 = 2;
 
-/// The widest period admitted by default: **6**, the microsatellite ceiling.
+/// The widest period classified by default: **6**, the microsatellite ceiling.
 pub const DEFAULT_MAX_PERIOD: u8 = 6;
 
 /// A period ceiling above [`MAX_MOTIF_LEN`] cannot work — [`Motif`] could not
 /// hold the motif. The default must satisfy it; a *configured*
-/// [`SsrAdmissionParams::periods`] is checked at [`admit`] instead, since A2
-/// makes it a knob (see [`SsrAdmissionParams::periods`]).
+/// [`SsrSegmentCriteria::periods`] is checked at [`classify`] instead, since A2
+/// makes it a knob (see [`SsrSegmentCriteria::periods`]).
 const _: () = assert!(
     DEFAULT_MAX_PERIOD as usize <= MAX_MOTIF_LEN,
     "the default period ceiling must fit in a Motif"
 );
 const _: () = assert!(DEFAULT_MIN_PERIOD <= DEFAULT_MAX_PERIOD);
-/// `PeriodRange::new` rejects a zero floor, so `SsrAdmissionParams::default`'s
+/// `PeriodRange::new` rejects a zero floor, so `SsrSegmentCriteria::default`'s
 /// `expect` rests on this. Not idle: §10's period experiment is precisely about
 /// moving this floor toward 1, and 0 is one step further.
 const _: () = assert!(
@@ -366,7 +374,7 @@ const _: () = assert!(
     "PeriodRange::new rejects a zero period floor"
 );
 
-/// The fewest motif copies a tract must have, per period, to be admitted.
+/// The fewest motif copies a tract must have, per period, to be classified.
 ///
 /// **The "length" half of the period × length routing frontier** the experiments
 /// exist to measure (spec §5.2, §10) — requiring *n* copies at period *p* is
@@ -383,12 +391,12 @@ const _: () = assert!(
 /// for the geneticist reader it would point at the wrong concept entirely.
 ///
 /// **This is the single table.** A1 carried two copies — `copy_number_floor`
-/// (admission's) and a nested `copy_floor` inside [`prefilter`] — because
+/// (classification's) and a nested `copy_floor` inside [`prefilter`] — because
 /// production has two: the pre-filter's cleanup has to apply the floor *before*
-/// the bundle drop (which runs before admission's own floor), so the number was
+/// the bundle drop (which runs before classification's own floor), so the number was
 /// written twice. They were **duplicates, not rivals**: identical for every
 /// period either could reach. A2 folds them into this one value, which both
-/// [`prefilter`] and [`admit`] read — so a swept floor moves both, which is the
+/// [`prefilter`] and [`classify`] read — so a swept floor moves both, which is the
 /// whole point.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MinCopies {
@@ -399,9 +407,9 @@ pub struct MinCopies {
     ///
     /// Faithful to production's `_ => 3` arm, and it earns its keep: [`prefilter`]
     /// sees **raw detector output**, so an interval wider than [`MAX_MOTIF_LEN`]
-    /// (the detector's range is the caller's choice, not admission's) must be
+    /// (the detector's range is the caller's choice, not classification's) must be
     /// gated on its copy count exactly as production gates it — not indexed out
-    /// of bounds, and not silently admitted.
+    /// of bounds, and not silently classified.
     for_wider_periods: u32,
 }
 
@@ -479,10 +487,10 @@ impl Default for MinCopies {
 /// an endorsement (spec §5.2).
 ///
 /// The fields are `pub` and unvalidated, as production's `CatalogParams` is;
-/// [`admit`] `debug_assert`s the contracts that are otherwise only prose.
+/// [`classify`] `debug_assert`s the contracts that are otherwise only prose.
 #[derive(Debug, Clone, PartialEq)]
-pub struct SsrAdmissionParams {
-    /// The period range admitted, inclusive. Default:
+pub struct SsrSegmentCriteria {
+    /// The period range classified, inclusive. Default:
     /// [`DEFAULT_MIN_PERIOD`]`..=`[`DEFAULT_MAX_PERIOD`] (2..=6) — production's
     /// hardcoded consts, now a knob (spec §5).
     ///
@@ -495,19 +503,19 @@ pub struct SsrAdmissionParams {
     /// longer unit, so a wider tract would clear this gate and then be discarded
     /// at `Motif::new` — the knob would *appear* to move and would not. A1 caught
     /// that as a static assert; a knob cannot be checked at compile time, so
-    /// [`admit`] `debug_assert`s it and [`finish_locus`] fails loudly rather than
+    /// [`classify`] `debug_assert`s it and [`finish_locus`] fails loudly rather than
     /// dropping the locus quietly.
     pub periods: PeriodRange,
     /// The fewest motif copies a tract needs, per period — the "length" half of
     /// the routing frontier. Default: [`MinCopies::default`]. Read by **both**
-    /// [`prefilter`] and [`admit`], so a swept minimum moves both (spec §5.2).
+    /// [`prefilter`] and [`classify`], so a swept minimum moves both (spec §5.2).
     pub min_copies: MinCopies,
     /// Purity floor applied after recomputation (a degeneracy cutoff in
     /// `[0, 1]`); imperfect-but-above-floor loci are kept. Default:
     /// [`DEFAULT_MIN_PURITY`].
     pub min_purity: f32,
     /// Early accept-gate on the detector's `score`: records **below** it are
-    /// dropped (`score >= min_score` is admitted).
+    /// dropped (`score >= min_score` is classified).
     ///
     /// **At [`DEFAULT_MIN_SCORE`] (`0`) this gate never fires, deliberately — and
     /// that is a trap worth knowing** (spec §5c). The catalog can afford a `0`
@@ -523,7 +531,7 @@ pub struct SsrAdmissionParams {
     /// gate": a negative score would be dropped, and nothing emits one. The
     /// copy-number and purity floors are the real gates, and the 16/16 scanner
     /// parity ran exactly this way. Inherited knowingly, not by accident;
-    /// `admit_at_default_never_rejects_a_score_the_scanner_can_emit` pins it.
+    /// `classify_at_default_never_rejects_a_score_the_scanner_can_emit` pins it.
     pub min_score: i32,
     /// How much clean sequence (bp) a tract must have either side to be a locus —
     /// **and, since A2, the bundle radius too** (spec §2.4; see the type's docs).
@@ -536,12 +544,12 @@ pub struct SsrAdmissionParams {
     /// the third face of it ([`RejectionReason::FlankClamped`]).
     ///
     /// **It is a distance, and nothing here reads the bases it measures** — the
-    /// flank is a test a tract passes, not something a [`Locus`] carries (spec
+    /// flank is a test a tract passes, not something a [`SsrSegment`] carries (spec
     /// §1.2).
     pub flank_bp: u64,
 }
 
-impl Default for SsrAdmissionParams {
+impl Default for SsrSegmentCriteria {
     /// The catalog's pinned Stage-0 defaults, field for field.
     ///
     /// **This must equal `CatalogParams::default()`**, and that is not decoration
@@ -575,7 +583,7 @@ impl Default for SsrAdmissionParams {
 // reads off a `TrfRecord`, widened to ng's `u64`" — because `RepeatInterval` was
 // `u32` and the port needed one widening site rather than a `u64::from` scattered
 // through the policy. Its doc said B2 would make the conversion an identity but
-// that the type would "still earn its keep as the 'what admission actually needs'
+// that the type would "still earn its keep as the 'what classification actually needs'
 // statement".
 //
 // **It did not.** With `RepeatInterval` at `u64` (spec §4), `Candidate` was
@@ -583,20 +591,20 @@ impl Default for SsrAdmissionParams {
 // were both no-ops — and one of them carried a `try_into().expect()` and a
 // `fallible_impl_from` exemption for a narrowing that can no longer narrow. That
 // is ceremony asserting a distinction the types no longer have, so the policy now
-// works on `RepeatInterval` directly. `Admitted::bundled` hands the caller's own
+// works on `RepeatInterval` directly. `Classified::bundled` hands the caller's own
 // intervals back with no conversion at all, which is what "handed back verbatim"
 // should have meant all along.
 //
 // **Coordinates are 0-based half-open throughout the policy** — the detector's and
 // the slice's own space. The conversion to ng's 1-based inclusive happens exactly
-// once, at [`Locus`] construction in [`finish_locus`], which is the one place the
+// once, at [`SsrSegment`] construction in [`finish_locus`], which is the one place the
 // arithmetic does not cancel (spec §4).
 
 // ---------------------------------------------------------------------
 // The pre-filter
 // ---------------------------------------------------------------------
 
-/// Clean raw scanner intervals before [`admit`] — **not optional** (spec §5b).
+/// Clean raw scanner intervals before [`classify`] — **not optional** (spec §5b).
 ///
 /// A validated finding, not a guess (`scanner_parity`, Milestone D of the
 /// scanner plan). trf-mod hands `build_loci` a *clean* candidate set:
@@ -616,7 +624,7 @@ impl Default for SsrAdmissionParams {
 /// production home; here it sits
 /// beside the policy whose ordering makes it necessary (spec §5.1).
 ///
-/// **It reads the same [`MinCopies`] as [`admit`] — since A2, there is one
+/// **It reads the same [`MinCopies`] as [`classify`] — since A2, there is one
 /// table.** A1 carried production's two copies verbatim (see
 /// [`MinCopies`]); folding them is what makes a swept floor actually move
 /// the whole policy, rather than half of it. `p.periods.min()` likewise replaces
@@ -633,7 +641,7 @@ impl Default for SsrAdmissionParams {
 /// eliminate which" — it cannot, because `floored` sorts ascending by period, so
 /// an out-of-scope interval only ever sorts after in-scope ones and can only be a
 /// victim of redundancy elimination, never an eliminator; every interval it could
-/// eliminate is its own multiple, which [`admit`]'s ceiling drops regardless. And
+/// eliminate is its own multiple, which [`classify`]'s ceiling drops regardless. And
 /// (2) that "the differential would catch it otherwise" — it cannot, and the
 /// paragraph above says so.*
 ///
@@ -662,14 +670,14 @@ impl Default for SsrAdmissionParams {
 ///   `the_two_copy_floor_tables_agree_on_every_reachable_period`); it is now exactly
 ///   what separates a poly-A from a speck.
 ///
-/// **The scanner must therefore scan period 1 even when nothing admits it**
+/// **The scanner must therefore scan period 1 even when nothing classifies it**
 /// (`TypedRegionConfig::periods`, which is why it is a separate knob from
-/// `SsrAdmissionParams::periods`): an eliminator that was never detected cannot
+/// `SsrSegmentCriteria::periods`): an eliminator that was never detected cannot
 /// eliminate. Not seeing a homopolymer and dropping one are *not* the same, and
 /// this ordering is what makes that sentence true.
 ///
 /// The result is that **the period range means what it says**: at `2..=6` a
-/// homopolymer contributes nothing at all, and at `1..=6` it is admitted as a
+/// homopolymer contributes nothing at all, and at `1..=6` it is classified as a
 /// period-1 tract under its own motif. Which of those is wanted is the caller's
 /// parameter, not this function's opinion.
 ///
@@ -681,7 +689,7 @@ impl Default for SsrAdmissionParams {
 /// through the very floor this filter exists to apply. So the ordering is checked
 /// rather than assumed. Well-formed intervals are unaffected, so the port stays
 /// faithful.
-pub fn prefilter(intervals: &[RepeatInterval], params: &SsrAdmissionParams) -> Vec<RepeatInterval> {
+pub fn prefilter(intervals: &[RepeatInterval], params: &SsrSegmentCriteria) -> Vec<RepeatInterval> {
     // The COPY floor only. The period floor is deliberately not here — it runs
     // last, once redundancy elimination has had the period-1 intervals it needs
     // (see the fn docs). The copy floor is what stops a 2 bp `GG` speck being an
@@ -691,7 +699,7 @@ pub fn prefilter(intervals: &[RepeatInterval], params: &SsrAdmissionParams) -> V
         .copied()
         .filter(|iv| {
             // `iv.end > iv.start` first: it guards the subtraction below (see the
-            // fn docs), and it is what `admit` independently requires anyway.
+            // fn docs), and it is what `classify` independently requires anyway.
             iv.end > iv.start
                 && (iv.end - iv.start) / u64::from(iv.period)
                     >= u64::from(params.min_copies.for_period(iv.period))
@@ -724,7 +732,7 @@ pub fn prefilter(intervals: &[RepeatInterval], params: &SsrAdmissionParams) -> V
 // Admission
 // ---------------------------------------------------------------------
 
-/// What [`admit`] made of one window's candidates.
+/// What [`classify`] made of one window's candidates.
 ///
 /// **`bundled` is the A3 change of substance** (spec §2.4, §6a). Production's
 /// `build_loci` *deletes* the members of a too-close cluster: they are neither
@@ -738,9 +746,9 @@ pub fn prefilter(intervals: &[RepeatInterval], params: &SsrAdmissionParams) -> V
 /// oracle: the *selection* is unchanged, so ng's locus set stays comparable with
 /// production's (a bundle member is not a locus in either system).
 #[derive(Debug, Clone, PartialEq)]
-pub struct Admitted {
-    /// The admitted STR loci, start-sorted. Exactly what `build_loci` returns.
-    pub loci: Vec<Locus>,
+pub struct Classified {
+    /// The classified STR loci, start-sorted. Exactly what `build_loci` returns.
+    pub loci: Vec<SsrSegment>,
     /// The cluster members `build_loci` silently drops — every repeat that
     /// cleared the period/score/compound gates but sits within `flank_bp` of
     /// another, so no clean flank can be built around it (spec §2.4).
@@ -750,12 +758,12 @@ pub struct Admitted {
     /// re-bases them when it emits the region's hull, the same way it re-bases
     /// everything else it reads out of a window.
     pub bundled: Vec<RepeatInterval>,
-    /// Every repeat admission turned down, **with the reason** — the breakdown spec §3.1
+    /// Every repeat classification turned down, **with the reason** — the breakdown spec §3.1
     /// needs and that one total cannot give (a purity rejection and a copy-floor one are
     /// exactly the distinction spec §10's routing question turns on).
     ///
     /// **Per record, not a tally, and that is what makes the walk's count
-    /// window-invariant.** `admit` runs over a window's whole fetched slice, margins
+    /// window-invariant.** `classify` runs over a window's whole fetched slice, margins
     /// included, so the same repeat is rejected again by every window that can see it. An
     /// aggregate here would be counted once per window and the total would depend on
     /// `window_bp` — a memory knob changing a reported number. Handing the records back
@@ -766,15 +774,15 @@ pub struct Admitted {
     pub rejected: Vec<(RepeatInterval, RejectionReason)>,
 }
 
-/// Why admission turned a repeat down (spec §3.1).
+/// Why classification turned a repeat down (spec §3.1).
 ///
 /// **No `str_bundle`**: since spec §2.4 that is a *route*, not a rejection —
-/// [`Admitted::bundled`] carries those, and they are not here.
+/// [`Classified::bundled`] carries those, and they are not here.
 ///
 /// **The scope and score gates are not here either**, and that is a real gap rather than
 /// an oversight: a repeat outside `periods` or under `min_score` is not *rejected*, it is
 /// out of the question being asked — and `prefilter` has already dropped most of it before
-/// `admit` sees it (spec §5b). The five below are the gates that turn down a repeat that
+/// `classify` sees it (spec §5b). The five below are the gates that turn down a repeat that
 /// was, on the face of it, a candidate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RejectionReason {
@@ -794,15 +802,15 @@ pub enum RejectionReason {
 /// Repeat bp turned down, by reason — spec §3.1's breakdown of
 /// `TypedRegionCounts::repeat_bp_with_no_locus`.
 ///
-/// **In bp, not per repeat** (spec §3.1): admission trims every survivor, so a repeat that
-/// admits one locus and sheds 200 bp contributes nothing to a per-repeat counter. The bp
+/// **In bp, not per repeat** (spec §3.1): classification trims every survivor, so a repeat that
+/// classifies one locus and sheds 200 bp contributes nothing to a per-repeat counter. The bp
 /// charged is the repeat's **detected** length, before trimming.
 ///
 /// **It does not partition `repeat_bp_with_no_locus`, and must not be read as if it did.**
 /// Two rejected repeats can overlap — the scanner is deliberately permissive — so their bp
 /// are both charged; and bases with no locus for a reason that is not a *rejection*
 /// (bundled, capped as a satellite, out of scope) are in the total and not here. It is a
-/// diagnosis of admission's gates, not an account of the genome.
+/// diagnosis of classification's gates, not an account of the genome.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RejectionCounts {
     pub copy_floor: u64,
@@ -859,7 +867,7 @@ impl RejectionCounts {
 /// production's, unchanged — which is what keeps
 /// `differential_vs_production_build_loci_*` a valid oracle for the windowed code
 /// (spec §5a). Every window-only path is therefore proved *by* the degenerate
-/// case staying green, plus `admit_keeps_a_locus_the_window_edge_would_have_eaten`.
+/// case staying green, plus `classify_keeps_a_locus_the_window_edge_would_have_eaten`.
 ///
 /// # Panics
 ///
@@ -868,16 +876,16 @@ impl RejectionCounts {
 /// more than the 50 bp of flank). Loudly, because the alternative is dropping the
 /// locus quietly, which is the very bug this signature exists to kill.
 ///
-/// Output coordinates are **1-based inclusive genomic** ([`Locus`]); the input's
+/// Output coordinates are **1-based inclusive genomic** ([`SsrSegment`]); the input's
 /// are 0-based half-open offsets into `bases`.
-pub fn admit(
+pub fn classify(
     recs: Vec<RepeatInterval>,
     chrom: &str,
     bases: &[u8],
     bases_start: Position,
     contig_len: Bp,
-    p: &SsrAdmissionParams,
-) -> Admitted {
+    p: &SsrSegmentCriteria,
+) -> Classified {
     // **Newtypes, not two bare `u64`s** (A3 review). They were adjacent, same-typed,
     // and silently transposable — and the guard below catches a transposition only
     // sometimes. `Position` and `Bp` are different types, so the compiler catches it
@@ -894,10 +902,10 @@ pub fn admit(
     // and the `ref_end == tract_end` test still passes — so a locus comes out with
     // a **silently truncated right flank**, or vanishes. That is spec §2.6's bug
     // reappearing inside the code written to kill it, and §10's flank and routing
-    // sweeps drive this path in release. Once per `admit` call.
+    // sweeps drive this path in release. Once per `classify` call.
     //
     // **It is inherently incomplete, and that is worth stating rather than
-    // trusting.** `<=` admits equality, so a caller passing *the window's own end*
+    // trusting.** `<=` classifies equality, so a caller passing *the window's own end*
     // as `contig_len` — production's exact mistake — is arithmetically legal and
     // no check here can catch it. The other half needs **provenance**: a
     // `contig_len` read from the reference's contig table, not derived from
@@ -905,7 +913,7 @@ pub fn admit(
     //
     // `WindowedRefSeq::contigs()` (B3) is that table, and reading from it is the
     // **walk's** obligation (Milestone D) — it is the only party that holds both
-    // the reference and the window. Nothing `admit` can be handed proves where the
+    // the reference and the window. Nothing `classify` can be handed proves where the
     // number came from, so this is a contract stated here and discharged there,
     // not a check that was forgotten.
     assert!(
@@ -914,7 +922,7 @@ pub fn admit(
          contig_len must be the CONTIG's length, never the window's",
         bases_start + bases.len() as u64 - 1
     );
-    // `flank_bp = 0` admits nothing at all, from any input: every tract's own flank
+    // `flank_bp = 0` classifies nothing at all, from any input: every tract's own flank
     // test (`ref_start == tract_start`) fires, so every locus is dropped and
     // nothing is even bundled — an empty result, no error, from a knob spec §10
     // plans to sweep. The M7 shape again: the knob appears to move, and instead
@@ -922,13 +930,13 @@ pub fn admit(
     assert!(
         p.flank_bp >= 1,
         "flank_bp must be at least 1: at 0 every locus fails its own flank test \
-         and admit silently returns nothing"
+         and classify silently returns nothing"
     );
     // A NaN `min_purity` bites quietly: every `purity < p.min_purity` comparison
     // below is then false, so the purity gate passes **everything** rather than
     // failing. `assert!` for the same reason as its neighbours — the purity floor
     // is a swept knob (spec §10), sweeps run in release, and a release sweep that
-    // silently admitted every tract would report a finding about the data that is
+    // silently classified every tract would report a finding about the data that is
     // really a fact about a `NaN`.
     assert!(
         p.min_purity.is_finite() && (0.0..=1.0).contains(&p.min_purity),
@@ -943,8 +951,8 @@ pub fn admit(
     // neither end, so `PeriodRange::new(2, 7)` is legal and this is reachable. The
     // point of the knob is to be **swept by the §5.2 routing experiment, and
     // sweeps run in release**: a debug-only check would let that experiment record
-    // "period 7 admits nothing" when the code never tried, which is a wrong
-    // *result*, not a missing panic. Once per `admit` call — free next to the scan
+    // "period 7 classifies nothing" when the code never tried, which is a wrong
+    // *result*, not a missing panic. Once per `classify` call — free next to the scan
     // it guards.
     assert!(
         p.periods.max() as usize <= MAX_MOTIF_LEN,
@@ -997,8 +1005,8 @@ pub fn admit(
     // 3. drop bundles (on the raw, pre-trim coordinates). Records must be
     //    start-sorted for the streaming clustering.
     kept.sort_by_key(|r| (r.start, r.end));
-    // `flank_bp` IS the bundle radius (spec §2.4) — see `SsrAdmissionParams`.
-    // A3: the cluster members come back rather than being deleted (`Admitted`).
+    // `flank_bp` IS the bundle radius (spec §2.4) — see `SsrSegmentCriteria`.
+    // A3: the cluster members come back rather than being deleted (`Classified`).
     let (kept, bundled) = split_bundles(kept, p.flank_bp);
 
     // 4-5. per record: end-trim + copy floor, recompute purity + floor, embed.
@@ -1009,10 +1017,10 @@ pub fn admit(
             Err(reason) => rejected.push((*r, reason)),
         }
     }
-    Admitted {
+    Classified {
         loci,
         // No conversion: since B2 these ARE the caller's own intervals, which is
-        // what `Admitted::bundled`'s "handed back verbatim" always claimed.
+        // what `Classified::bundled`'s "handed back verbatim" always claimed.
         bundled,
         rejected,
     }
@@ -1030,7 +1038,7 @@ pub fn admit(
 /// the *contig* end is asked about. Everything above works in the detector's
 /// 0-based half-open offsets into `bases` — which is also the slice's own space,
 /// so the arithmetic stays production's unchanged. The 1-based inclusive genomic
-/// [`Locus`] is built at the bottom, once. Spec §4 predicted exactly this: "the
+/// [`SsrSegment`] is built at the bottom, once. Spec §4 predicted exactly this: "the
 /// arithmetic cancels … exactly one site does not".
 fn finish_locus(
     r: &RepeatInterval,
@@ -1038,13 +1046,13 @@ fn finish_locus(
     bases: &[u8],
     bases_start: u64,
     contig_len: u64,
-    p: &SsrAdmissionParams,
-) -> Result<Locus, RejectionReason> {
+    p: &SsrSegmentCriteria,
+) -> Result<SsrSegment, RejectionReason> {
     let period = r.period as usize;
     let raw_tract = upper(&bases[r.start as usize..r.end as usize]);
-    // A tract too short to hold one motif: the copy floor at its extreme (see `admit`,
-    // which charges the same case the same way). Unreachable from `admit` — its own gate
-    // above rejects `tract.len() < period` first — but this fn is not `admit`'s alone to
+    // A tract too short to hold one motif: the copy floor at its extreme (see `classify`,
+    // which charges the same case the same way). Unreachable from `classify` — its own gate
+    // above rejects `tract.len() < period` first — but this fn is not `classify`'s alone to
     // reason about.
     let motif_bytes = raw_tract
         .get(..period)
@@ -1074,11 +1082,11 @@ fn finish_locus(
     // gate, fails here, and vanishes through the same rejection as a legitimate
     // policy one. That is M7's silent failure exactly: the knob appears to
     // move and does not. So it fails loudly instead (release behaviour unchanged —
-    // still a rejection; `admit` asserts the same contract up front).
+    // still a rejection; `classify` asserts the same contract up front).
     //
     // E1e: charged to the copy floor when it does happen, for the reason the short-tract
     // case above is — a motif that cannot be formed is a tract with no whole copies. It
-    // is **unreachable** in any case: `admit` asserts `periods.max() <= MAX_MOTIF_LEN`
+    // is **unreachable** in any case: `classify` asserts `periods.max() <= MAX_MOTIF_LEN`
     // (a real assert, in release) and gates `period >= periods.min() >= 1`, so
     // `motif_bytes.len()` is in `1..=MAX_MOTIF_LEN` and `BadLength` is the only way
     // `Motif::new` fails. The `debug_assert` is the message that matters if it ever fires.
@@ -1087,8 +1095,8 @@ fn finish_locus(
         Err(e) => {
             debug_assert!(
                 false,
-                "period {} admitted but has no valid Motif ({e}) — is \
-                 SsrAdmissionParams::periods.max() above MAX_MOTIF_LEN ({MAX_MOTIF_LEN})?",
+                "period {} classified but has no valid Motif ({e}) — is \
+                 SsrSegmentCriteria::periods.max() above MAX_MOTIF_LEN ({MAX_MOTIF_LEN})?",
                 r.period
             );
             return Err(RejectionReason::CopyFloor);
@@ -1137,7 +1145,7 @@ fn finish_locus(
     // hence two panics here, a second margin on the caller's fetch, and a second
     // reference read per window. All of it served a payload nothing consumed.
 
-    match Locus::new(
+    match SsrSegment::new(
         chrom.to_string().into_boxed_str(),
         tract_start,
         tract_end,
@@ -1162,7 +1170,7 @@ fn finish_locus(
         Err(e) => {
             debug_assert!(
                 false,
-                "admit built an invalid locus, so the arithmetic is wrong: {e} \
+                "classify built an invalid locus, so the arithmetic is wrong: {e} \
                  (tract [{tract_start}, {tract_end}], window starts at {bases_start}, \
                   contig is {contig_len} long)"
             );
@@ -1283,9 +1291,9 @@ fn is_close(a: &RepeatInterval, b: &RepeatInterval, thresh: u64) -> bool {
         || b.end.abs_diff(a.end) < thresh
 }
 
-/// Group [`Admitted::bundled`] back into its clusters — one `Vec` per bundle.
+/// Group [`Classified::bundled`] back into its clusters — one `Vec` per bundle.
 ///
-/// [`admit`] returns the members flattened (spec §5a's shape), but the walk emits
+/// [`classify`] returns the members flattened (spec §5a's shape), but the walk emits
 /// **one region per cluster**, so it needs the grouping back. Re-deriving it is
 /// exact rather than approximate: `bundled` is the concatenation of the clusters
 /// in coordinate order, and two *adjacent* clusters are by definition not close
@@ -1293,10 +1301,10 @@ fn is_close(a: &RepeatInterval, b: &RepeatInterval, thresh: u64) -> bool {
 /// reproduces exactly the grouping [`split_bundles`] found.
 ///
 /// It lives here, beside the flank test, rather than in the walk: **the cluster
-/// rule is admission's**, and a second copy of `is_close` is how the two would
+/// rule is classification's**, and a second copy of `is_close` is how the two would
 /// drift.
 ///
-/// `flank_bp` must be the same radius [`admit`] was given, or the grouping will
+/// `flank_bp` must be the same radius [`classify`] was given, or the grouping will
 /// not match the split.
 ///
 /// # A singleton is a bug, and the walk is what keeps it that way
@@ -1369,7 +1377,7 @@ fn split_bundles(
     (isolated, bundled)
 }
 
-impl fmt::Display for Locus {
+impl fmt::Display for SsrSegment {
     /// `chrom:start-end motif` — a readable identity for test diffs.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
@@ -1388,11 +1396,11 @@ mod tests {
     use super::*;
 
     /// The catalog's settings with a 5 bp flank, so the fixtures can be small.
-    fn params() -> SsrAdmissionParams {
+    fn params() -> SsrSegmentCriteria {
         matched_params(0.8, 0, 5).0
     }
 
-    /// `admit` over a whole contig — spec §5a's **degenerate case**:
+    /// `classify` over a whole contig — spec §5a's **degenerate case**:
     /// `bases_start = 1`, `contig_len = bases.len()`, so the window IS the contig
     /// and the two roles `contig_seq.len()` used to play coincide again.
     ///
@@ -1400,13 +1408,13 @@ mod tests {
     /// code: production only ever ran whole-contig, so it is the only
     /// configuration the two can be compared at — and every window-only path is
     /// proved by this staying green plus the direct edge tests.
-    fn admit_whole_contig(
+    fn classify_whole_contig(
         recs: Vec<RepeatInterval>,
         chrom: &str,
         contig: &[u8],
-        p: &SsrAdmissionParams,
-    ) -> Vec<Locus> {
-        admit(recs, chrom, contig, Position(1), Bp(contig.len() as u64), p).loci
+        p: &SsrSegmentCriteria,
+    ) -> Vec<SsrSegment> {
+        classify(recs, chrom, contig, Position(1), Bp(contig.len() as u64), p).loci
     }
 
     /// A 0-based half-open interval, the way the scanner emits one.
@@ -1479,8 +1487,8 @@ mod tests {
     #[test]
     fn locus_reports_its_span_period_and_purity() {
         // 1-based inclusive: [6, 21] is 16 bases, 8 copies of AT.
-        let l =
-            Locus::new("chr1".into(), 6, 21, Motif::new(b"AT").unwrap(), 1.0).expect("valid locus");
+        let l = SsrSegment::new("chr1".into(), 6, 21, Motif::new(b"AT").unwrap(), 1.0)
+            .expect("valid locus");
         assert_eq!(l.start(), 6);
         assert_eq!(l.end(), 21);
         assert_eq!(l.tract_len(), 16, "inclusive: end - start + 1");
@@ -1490,29 +1498,29 @@ mod tests {
 
     #[test]
     fn locus_rejects_position_zero_because_it_is_one_based() {
-        let err = Locus::new("chr1".into(), 0, 5, Motif::new(b"AT").unwrap(), 1.0)
+        let err = SsrSegment::new("chr1".into(), 0, 5, Motif::new(b"AT").unwrap(), 1.0)
             .expect_err("0 is not a 1-based position");
         assert!(matches!(
             err,
-            LocusError::BadCoordinates { start: 0, end: 5 }
+            SsrSegmentError::BadCoordinates { start: 0, end: 5 }
         ));
     }
 
     #[test]
     fn locus_rejects_an_inverted_span() {
-        let err = Locus::new("chr1".into(), 9, 4, Motif::new(b"AT").unwrap(), 1.0)
+        let err = SsrSegment::new("chr1".into(), 9, 4, Motif::new(b"AT").unwrap(), 1.0)
             .expect_err("end precedes start");
         assert!(matches!(
             err,
-            LocusError::BadCoordinates { start: 9, end: 4 }
+            SsrSegmentError::BadCoordinates { start: 9, end: 4 }
         ));
     }
 
     #[test]
     fn locus_rejects_non_finite_purity() {
-        let err = Locus::new("chr1".into(), 1, 6, Motif::new(b"AT").unwrap(), f32::NAN)
+        let err = SsrSegment::new("chr1".into(), 1, 6, Motif::new(b"AT").unwrap(), f32::NAN)
             .expect_err("NaN purity");
-        assert!(matches!(err, LocusError::BadPurity { .. }));
+        assert!(matches!(err, SsrSegmentError::BadPurity { .. }));
     }
 
     // ---- the ported helpers (production's own cases) ------------------------
@@ -1580,17 +1588,17 @@ mod tests {
         assert!(bundled.is_empty(), "nothing close, nothing set aside");
     }
 
-    // ---- admit end-to-end, in ng's 1-based coordinates ----------------------
+    // ---- classify end-to-end, in ng's 1-based coordinates ----------------------
 
     /// The rebase's headline case: production asserts `start() == 5` on these
     /// exact bytes; ng must say **6**, and the tract bytes must be identical.
     #[test]
-    fn admit_emits_a_clean_locus_one_based() {
+    fn classify_emits_a_clean_locus_one_based() {
         let left = b"CGCGC"; // 5 bp left flank
         let tract = b"ATATATATATATATAT"; // 16 bp = 8 copies of AT
         let right = b"GCGCG"; // 5 bp right flank
         let contig = [left.as_ref(), tract.as_ref(), right.as_ref()].concat();
-        let loci = admit_whole_contig(vec![iv(5, 21, 2, 100)], "chr1", &contig, &params());
+        let loci = classify_whole_contig(vec![iv(5, 21, 2, 100)], "chr1", &contig, &params());
 
         assert_eq!(loci.len(), 1);
         let l = &loci[0];
@@ -1600,34 +1608,36 @@ mod tests {
         assert_eq!(l.tract_len(), 16);
         assert_eq!(l.motif().as_bytes(), b"AT");
         assert_eq!(l.purity_fraction(), 1.0);
-        // The flanks are why this locus was admitted, and they are not in it: a
+        // The flanks are why this locus was classified, and they are not in it: a
         // locus says where a repeat is and what it is. The bases are in the
-        // reference, which the caller has open (see `Locus`).
+        // reference, which the caller has open (see `SsrSegment`).
     }
 
     #[test]
-    fn admit_drops_period_over_six_and_compound() {
+    fn classify_drops_period_over_six_and_compound() {
         let contig = b"AAAACGATATATATATATATCCCC";
         let too_long = iv(0, 14, 7, 100); // period 7 > MAX_PERIOD
         let compound = iv(6, 20, 4, 100); // ATAT = (AT)^2
-        let loci = admit_whole_contig(vec![too_long, compound], "chr1", contig, &params());
+        let loci = classify_whole_contig(vec![too_long, compound], "chr1", contig, &params());
         assert!(loci.is_empty(), "both records are dropped, got {loci:?}");
     }
 
     #[test]
-    fn admit_drops_below_copy_number_floor() {
+    fn classify_drops_below_copy_number_floor() {
         // period 2 needs >= 5 copies; (AT)*3 is only 3 → dropped.
         let contig = b"CCCCCATATATCCCCC";
-        assert!(admit_whole_contig(vec![iv(5, 11, 2, 100)], "chr1", contig, &params()).is_empty());
+        assert!(
+            classify_whole_contig(vec![iv(5, 11, 2, 100)], "chr1", contig, &params()).is_empty()
+        );
     }
 
     #[test]
-    fn admit_keeps_a_locus_whose_flank_clamps_to_one_base() {
+    fn classify_keeps_a_locus_whose_flank_clamps_to_one_base() {
         // Tract (AT)*8 starts at 0-based 1, so only 1 bp of the 50 bp left flank
         // exists. A 1 bp flank is still a (weak) anchor, so the locus is kept — the
         // gate is "clamped to NOTHING", not "clamped".
         let contig = b"GATATATATATATATATCGCGCGCGCG";
-        let loci = admit_whole_contig(vec![iv(1, 17, 2, 100)], "chr1", contig, &params());
+        let loci = classify_whole_contig(vec![iv(1, 17, 2, 100)], "chr1", contig, &params());
         assert_eq!(loci.len(), 1);
         assert_eq!(
             loci[0].start(),
@@ -1644,13 +1654,13 @@ mod tests {
     /// the gates run in a fixed order, so a fixture that trips two tells you nothing about
     /// the second.
     ///
-    /// Driven through `admit` directly, without `prefilter`, and that is not a shortcut —
+    /// Driven through `classify` directly, without `prefilter`, and that is not a shortcut —
     /// it is the only place three of these are reachable at all (see
-    /// `the_pre_filter_makes_three_of_admissions_gates_unreachable_from_the_walk`).
+    /// `the_pre_filter_makes_three_of_classifications_gates_unreachable_from_the_walk`).
     #[test]
     fn each_rejection_reason_names_the_gate_that_fired() {
         let reasons = |recs: Vec<RepeatInterval>, contig: &[u8]| -> Vec<RejectionReason> {
-            admit(
+            classify(
                 recs,
                 "chr1",
                 contig,
@@ -1711,7 +1721,7 @@ mod tests {
         );
     }
 
-    /// **The walk reaches only ONE of admission's five gates** — `FlankClamped`. The other
+    /// **The walk reaches only ONE of classification's five gates** — `FlankClamped`. The other
     /// four columns of `TypedRegionCounts::rejected_by_reason` are structurally zero, and a
     /// reader has to know it: "no impure tracts in this genome" is a wrong thing to read
     /// from a zero the *scanner* caused.
@@ -1723,7 +1733,7 @@ mod tests {
     /// became two. Then the 2026-07-17 pre-filter ordering fix removed `Compound`'s only
     /// customer — the homopolymer alias — and the count is one. The lesson worth keeping is
     /// that **every one of these zeroes is caused by a stage upstream of the gate**, so the
-    /// answer moves whenever that stage does; it is not a property of admission at all.
+    /// answer moves whenever that stage does; it is not a property of classification at all.
     ///
     /// What is true now, and why:
     ///
@@ -1734,9 +1744,9 @@ mod tests {
     /// - **`Purity` — unreachable, and this is the interesting one.** Not because of the
     ///   pre-filter, but because of **Ruzzo–Tompa**: the scanner emits *maximal-scoring*
     ///   segments, and a tract impure enough to fail the 0.80 floor always contains a purer
-    ///   sub-segment that scores higher — so the scanner emits *that*, and admission is
+    ///   sub-segment that scores higher — so the scanner emits *that*, and classification is
     ///   handed the pure core. Measured: a 0.79-purity fixture comes back a **locus**.
-    ///   E1e argued from the two thresholds (scanner ≈0.78 vs admission 0.80) that tracts
+    ///   E1e argued from the two thresholds (scanner ≈0.78 vs classification 0.80) that tracts
     ///   would land in the gap; they cannot, because the segmenter never hands the gap over.
     /// - **`NoCleanTrim` — unreachable**, for the same reason: a tract with no motif pair
     ///   in its trim window is a tract the scanner segments away first.
@@ -1744,10 +1754,10 @@ mod tests {
     ///   along — a compound motif is a period-multiple, and redundancy elimination drops it
     ///   (`ATAT` is eliminated by `AT`) — but it was **false of period 1**, which
     ///   `prefilter` used to drop by the period floor *before* it could eliminate anything.
-    ///   That let a poly-A's period-2 alias reach `admit` as motif `AA`, and made this the
+    ///   That let a poly-A's period-2 alias reach `classify` as motif `AA`, and made this the
     ///   homopolymer gate. The ordering fix gives period 1 its eliminating pass, so the
     ///   alias never survives and E1e's reasoning holds for every period. The gate stays as
-    ///   [`admit`]'s own guard — it fires for a caller that skips the pre-filter — but the
+    ///   [`classify`]'s own guard — it fires for a caller that skips the pre-filter — but the
     ///   walk no longer reaches it.
     /// - **`FlankClamped` — reachable**: the contig's ends are nobody else's business.
     ///
@@ -1755,14 +1765,14 @@ mod tests {
     /// change fails here — where the explanation is — rather than as a column that
     /// mysteriously grows numbers. It did exactly that on 2026-07-17.
     #[test]
-    fn the_walk_reaches_only_one_of_admissions_five_gates() {
+    fn the_walk_reaches_only_one_of_classifications_five_gates() {
         let p = params();
 
         // CopyFloor: `prefilter` enforces the floor FIRST, with the same table.
         let low_copy = vec![iv(20, 26, 2, 100)];
         assert!(
             prefilter(&low_copy, &p).is_empty(),
-            "the pre-filter enforces the copy floor first, so `admit`'s copy-floor gate \
+            "the pre-filter enforces the copy floor first, so `classify`'s copy-floor gate \
              cannot fire from the walk"
         );
 
@@ -1788,11 +1798,11 @@ mod tests {
 
         // Compound is therefore unreachable from the walk: every compound motif is a
         // period-multiple of a shorter one, and redundancy elimination now reaches all of
-        // them — period 1 included. It stays as `admit`'s own guard, for a caller handing
+        // them — period 1 included. It stays as `classify`'s own guard, for a caller handing
         // in intervals the pre-filter never saw.
         let contig = b"CGCGCGCGCGCGCGCGCGCGAAAAAAAAAAAAAAAAAAAACGCGCGCGCGCGCGCGCGCG";
         assert_eq!(
-            admit(
+            classify(
                 vec![iv(20, 40, 2, 100)],
                 "chr1",
                 contig,
@@ -1811,32 +1821,32 @@ mod tests {
     }
 
     #[test]
-    fn admit_drops_locus_with_empty_left_flank() {
+    fn classify_drops_locus_with_empty_left_flank() {
         // Tract abuts 0-based position 0 — no left flank, nothing to anchor.
         let contig = b"ATATATATATATATATCGCGC";
         assert!(
-            admit_whole_contig(vec![iv(0, 16, 2, 100)], "chr1", contig, &params()).is_empty(),
+            classify_whole_contig(vec![iv(0, 16, 2, 100)], "chr1", contig, &params()).is_empty(),
             "a tract at contig position 0 has no left flank and is not genotypeable"
         );
     }
 
     #[test]
-    fn admit_drops_locus_with_empty_right_flank() {
+    fn classify_drops_locus_with_empty_right_flank() {
         let contig = b"CGCGCATATATATATATATAT";
         assert!(
-            admit_whole_contig(vec![iv(5, 21, 2, 100)], "chr1", contig, &params()).is_empty(),
+            classify_whole_contig(vec![iv(5, 21, 2, 100)], "chr1", contig, &params()).is_empty(),
             "a tract ending on the contig's last base has no right flank"
         );
     }
 
     #[test]
-    fn admit_drops_period_one_homopolymer_and_spares_the_neighbour_ssr() {
+    fn classify_drops_period_one_homopolymer_and_spares_the_neighbour_ssr() {
         let mut contig = vec![b'A'; 20];
         for _ in 0..10 {
             contig.extend_from_slice(b"CAG");
         }
         contig.extend_from_slice(b"TTTTT");
-        let loci = admit_whole_contig(
+        let loci = classify_whole_contig(
             vec![iv(0, 20, 1, 100), iv(20, 50, 3, 100)],
             "chr1",
             &contig,
@@ -1875,11 +1885,11 @@ mod tests {
 
     // ---- spec §8.0: the port-fidelity differential --------------------------
     //
-    // The oracle the Revision made necessary. ng's `admit` and production's
+    // The oracle the Revision made necessary. ng's `classify` and production's
     // `build_loci` are two copies of one policy; this drives both from the same
     // intervals and asserts they still agree. It is the tripwire on silent
     // drift, and it is expected to be re-pinned the day an experiment
-    // deliberately moves ng's admission away from the catalog's rules.
+    // deliberately moves ng's classification away from the catalog's rules.
 
     use crate::ssr::catalog::CatalogParams;
     use crate::ssr::catalog::postprocess::build_loci;
@@ -1905,9 +1915,9 @@ mod tests {
         min_purity: f32,
         min_score: i32,
         flank_bp: u32,
-    ) -> (SsrAdmissionParams, CatalogParams) {
+    ) -> (SsrSegmentCriteria, CatalogParams) {
         (
-            SsrAdmissionParams {
+            SsrSegmentCriteria {
                 min_purity,
                 min_score,
                 flank_bp: u64::from(flank_bp),
@@ -1915,7 +1925,7 @@ mod tests {
                 // which is what makes them comparable with production's hardcoded
                 // ones at all. A2's knobs are exercised by the tests that set them
                 // explicitly, never by a silent default drifting in here.
-                ..SsrAdmissionParams::default()
+                ..SsrSegmentCriteria::default()
             },
             CatalogParams {
                 min_purity,
@@ -1955,7 +1965,7 @@ mod tests {
     /// what makes this test pin the arithmetic rather than restate a bug in both
     /// directions.
     #[track_caller]
-    fn assert_same_locus(ng: &Locus, prod: &ProdLocus) {
+    fn assert_same_locus(ng: &SsrSegment, prod: &ProdLocus) {
         assert_eq!(ng.chrom(), prod.chrom(), "chrom");
         assert_eq!(
             ng.start(),
@@ -1970,9 +1980,9 @@ mod tests {
         // **`ref_bytes` and the flanks are not compared, because ng no longer has
         // them** (2026-07-17). Production embeds the tract's bases plus a flank each
         // side; ng deliberately does not — a locus says where a repeat is and what it
-        // is, and the bases are in the reference (see `Locus`). This is a divergence,
+        // is, and the bases are in the reference (see `SsrSegment`). This is a divergence,
         // not drift, so the differential does not chase it. What it still pins is
-        // every decision production makes: which tracts admit, and at what span, motif,
+        // every decision production makes: which tracts classify, and at what span, motif,
         // period and purity — which is what "the port is faithful" has to mean once the
         // payload is gone.
         // By bytes: the two `Motif`s are now distinct types (see `Motif`'s docs
@@ -2015,21 +2025,21 @@ mod tests {
     /// driven here at a floor that actually bites.
     #[track_caller]
     fn assert_agrees_at(
-        ng_p: &SsrAdmissionParams,
+        ng_p: &SsrSegmentCriteria,
         prod_p: &CatalogParams,
         intervals: &[RepeatInterval],
         chrom: &str,
         seq: &[u8],
         case: &str,
     ) {
-        let ours = admit_whole_contig(intervals.to_vec(), chrom, seq, ng_p);
+        let ours = classify_whole_contig(intervals.to_vec(), chrom, seq, ng_p);
         let theirs = build_loci(as_trf(intervals), chrom, seq, prod_p);
 
         assert_eq!(
             ours.len(),
             theirs.len(),
             "{case}: locus count differs — ng {:?} vs production {:?}",
-            ours.iter().map(Locus::to_string).collect::<Vec<_>>(),
+            ours.iter().map(SsrSegment::to_string).collect::<Vec<_>>(),
             theirs
                 .iter()
                 .map(|l| format!("{}:{}-{}", l.chrom(), l.start(), l.end()))
@@ -2106,7 +2116,7 @@ mod tests {
         // at a radius of 5 nothing bundles and the case silently stops testing the
         // bundle drop. It kept passing because *both sides moved together*: the
         // exact "wrong together, still green" blindness the differential has by
-        // construction. Pinned by `admit_bundles_at_the_flank_radius` below.
+        // construction. Pinned by `classify_bundles_at_the_flank_radius` below.
         let (ng_p, prod_p) = matched_params(0.8, 0, 50);
         assert_agrees_at(
             &ng_p,
@@ -2139,28 +2149,28 @@ mod tests {
     ///
     /// The gap this closes: every other fixture is an upper-case literal, and the
     /// synthetic reference's only lower-case bytes are its contig *names*. So the
-    /// `upper()` calls in `admit`/`finish_locus` were identity functions in 100% of
+    /// `upper()` calls in `classify`/`finish_locus` were identity functions in 100% of
     /// the suite — including both differentials — and deleting them would have gone
     /// unnoticed.
     ///
     /// This is not an exotic input. Real references **soft-mask repeats**, which
     /// is precisely the sequence this module exists to process, so lower case is
-    /// the mainstream case. And the failure is silent: `Locus` compares by value,
+    /// the mainstream case. And the failure is silent: `SsrSegment` compares by value,
     /// so a lower-case motif reaching Milestone D simply fails to match the
     /// catalog's — a wrong locus, not a crash.
     ///
     /// *Two `upper()` calls now, not three: the third folded `ref_bytes`, which
-    /// `Locus` no longer carries. The two that remain are the motif and the tract
+    /// `SsrSegment` no longer carries. The two that remain are the motif and the tract
     /// purity is computed against, which is the whole of a locus's case-sensitive
     /// surface.*
     #[test]
-    fn admit_upper_cases_a_soft_masked_tracts_motif() {
+    fn classify_upper_cases_a_soft_masked_tracts_motif() {
         let left = b"cgcgc";
         let tract = b"atatatatatatatat"; // 8 copies, soft-masked
         let right = b"gcgcg";
         let contig = [left.as_ref(), tract.as_ref(), right.as_ref()].concat();
 
-        let loci = admit_whole_contig(vec![iv(5, 21, 2, 100)], "chr1", &contig, &params());
+        let loci = classify_whole_contig(vec![iv(5, 21, 2, 100)], "chr1", &contig, &params());
         assert_eq!(loci.len(), 1, "a soft-masked tract is still a locus");
         let l = &loci[0];
         assert_eq!(l.motif().as_bytes(), b"AT", "motif upper-cased");
@@ -2178,7 +2188,7 @@ mod tests {
             b"GCGCG".as_ref(),
         ]
         .concat();
-        let mixed_loci = admit_whole_contig(vec![iv(5, 21, 2, 100)], "chr1", &mixed, &params());
+        let mixed_loci = classify_whole_contig(vec![iv(5, 21, 2, 100)], "chr1", &mixed, &params());
         assert_eq!(mixed_loci, loci, "case must not change the locus");
         assert_agrees(&[iv(5, 21, 2, 100)], "chr1", &mixed, "mixed-case contig");
     }
@@ -2194,7 +2204,7 @@ mod tests {
     /// first clean `ATAT` boundary: `st = 3`, and the emitted start is the
     /// *trimmed* one, not the detector's.
     #[test]
-    fn admit_reports_the_trimmed_start_not_the_detected_one() {
+    fn classify_reports_the_trimmed_start_not_the_detected_one() {
         let left = b"CGCGC"; // 5 bp flank
         let junk = b"ATC"; // trimmed away: no clean motif boundary
         let tract = b"ATATATATATAT"; // 6 clean copies of AT
@@ -2203,7 +2213,7 @@ mod tests {
         // The detector reports the whole junk+tract span, as detectors do.
         let detected = iv(5, 20, 2, 100);
 
-        let loci = admit_whole_contig(vec![detected], "chr1", &contig, &params());
+        let loci = classify_whole_contig(vec![detected], "chr1", &contig, &params());
         assert_eq!(loci.len(), 1);
         let l = &loci[0];
         assert_eq!(
@@ -2232,7 +2242,7 @@ mod tests {
     ///
     /// Both sides of the floor, driven through the differential.
     #[test]
-    fn admit_keeps_an_imperfect_tract_above_the_floor_and_drops_one_below() {
+    fn classify_keeps_an_imperfect_tract_above_the_floor_and_drops_one_below() {
         // (AT)*8 with one substitution: 15/16 = 0.9375, above a 0.8 floor.
         let left = b"CGCGC";
         let impure = b"ATATATATATCTATAT"; // one C where a A belongs
@@ -2241,7 +2251,7 @@ mod tests {
         let detected = iv(5, 21, 2, 100);
 
         let (ng_p, prod_p) = matched_params(0.8, 0, 5);
-        let loci = admit_whole_contig(vec![detected], "chr1", &contig, &ng_p);
+        let loci = classify_whole_contig(vec![detected], "chr1", &contig, &ng_p);
         assert_eq!(loci.len(), 1, "imperfect but above the floor: KEPT");
         assert!(
             !loci[0].is_perfect() && loci[0].purity_fraction() > 0.8,
@@ -2262,7 +2272,7 @@ mod tests {
         // is compared against production at all.
         let (ng_hi, prod_hi) = matched_params(0.99, 0, 5);
         assert!(
-            admit_whole_contig(vec![detected], "chr1", &contig, &ng_hi).is_empty(),
+            classify_whole_contig(vec![detected], "chr1", &contig, &ng_hi).is_empty(),
             "purity below the floor: DROPPED"
         );
         assert_agrees_at(
@@ -2283,16 +2293,16 @@ mod tests {
     /// `min_score: 0`, so a mis-transcription would have survived A1 *and* A2 and
     /// first bitten an experiment that set a real floor.
     #[test]
-    fn admit_applies_the_score_gate_when_the_floor_actually_bites() {
+    fn classify_applies_the_score_gate_when_the_floor_actually_bites() {
         let left = b"CGCGC";
         let tract = b"ATATATATATATATAT";
         let right = b"GCGCG";
         let contig = [left.as_ref(), tract.as_ref(), right.as_ref()].concat();
 
         let (ng_p, prod_p) = matched_params(0.8, 50, 5);
-        // Above the floor: admitted.
+        // Above the floor: classified.
         assert_eq!(
-            admit_whole_contig(vec![iv(5, 21, 2, 100)], "chr1", &contig, &ng_p).len(),
+            classify_whole_contig(vec![iv(5, 21, 2, 100)], "chr1", &contig, &ng_p).len(),
             1,
             "score 100 >= floor 50"
         );
@@ -2308,7 +2318,7 @@ mod tests {
         // Below the floor: dropped. This is the assertion that makes deleting the
         // gate fail.
         assert!(
-            admit_whole_contig(vec![iv(5, 21, 2, 49)], "chr1", &contig, &ng_p).is_empty(),
+            classify_whole_contig(vec![iv(5, 21, 2, 49)], "chr1", &contig, &ng_p).is_empty(),
             "score 49 < floor 50 must be dropped"
         );
         assert_agrees_at(
@@ -2322,9 +2332,9 @@ mod tests {
 
         // Exactly at the floor: `>=`, kept. Pins the boundary direction.
         assert_eq!(
-            admit_whole_contig(vec![iv(5, 21, 2, 50)], "chr1", &contig, &ng_p).len(),
+            classify_whole_contig(vec![iv(5, 21, 2, 50)], "chr1", &contig, &ng_p).len(),
             1,
-            "the gate is `score >= min_score`, so equality is admitted"
+            "the gate is `score >= min_score`, so equality is classified"
         );
     }
 
@@ -2342,17 +2352,17 @@ mod tests {
     /// Ruzzo–Tompa emits only positive-scoring segments (`score = r - l > 0`,
     /// `tandem_repeat.rs`), so the floor is unreachable **for scanner output**.
     #[test]
-    fn admit_at_default_never_rejects_a_score_the_scanner_can_emit() {
+    fn classify_at_default_never_rejects_a_score_the_scanner_can_emit() {
         let mut contig = b"CGCGC".to_vec();
         contig.resize(60, b'C'); // room for the 50 bp default flank
         contig.extend_from_slice(b"ATATATATATATATAT");
         contig.resize(140, b'G');
         let at_default = |score| {
-            admit_whole_contig(
+            classify_whole_contig(
                 vec![iv(60, 76, 2, score)],
                 "chr1",
                 &contig,
-                &SsrAdmissionParams::default(),
+                &SsrSegmentCriteria::default(),
             )
         };
 
@@ -2361,11 +2371,11 @@ mod tests {
         assert_eq!(
             at_default(1).len(),
             1,
-            "the lowest emittable RT score is admitted"
+            "the lowest emittable RT score is classified"
         );
         assert_eq!(at_default(100).len(), 1);
 
-        // The literal boundary, for the record: `>=` admits 0, and a negative
+        // The literal boundary, for the record: `>=` classifies 0, and a negative
         // score would be dropped. Neither is reachable from the scanner — which is
         // exactly why "no score gate at all" was the wrong way to say this.
         assert_eq!(at_default(0).len(), 1, "the gate is `>=`");
@@ -2384,7 +2394,7 @@ mod tests {
     /// in the tree** and no field of it was pinned by anything.
     #[test]
     fn default_matches_the_frozen_catalog_params() {
-        let ours = SsrAdmissionParams::default();
+        let ours = SsrSegmentCriteria::default();
         let theirs = CatalogParams::default();
         assert_eq!(ours.min_purity, theirs.min_purity, "min_purity");
         assert_eq!(ours.min_score, theirs.min_score, "min_score");
@@ -2448,8 +2458,8 @@ mod tests {
     /// can reach. That is why A2 is a *deletion*, not a reconciliation.
     #[test]
     fn the_folded_copy_floor_table_reproduces_both_of_productions() {
-        // `postprocess::copy_number_floor` — admission's, verbatim.
-        fn productions_admission_floor(period: usize) -> u64 {
+        // `postprocess::copy_number_floor` — classification's, verbatim.
+        fn productions_copy_floor(period: usize) -> u64 {
             match period {
                 1 => 10,
                 2 => 5,
@@ -2471,12 +2481,12 @@ mod tests {
         }
 
         let folded = MinCopies::default();
-        let defaults = SsrAdmissionParams::default();
+        let defaults = SsrSegmentCriteria::default();
 
         for period in defaults.periods.min()..=defaults.periods.max() {
             assert_eq!(
                 u64::from(folded.for_period(period)),
-                productions_admission_floor(period as usize),
+                productions_copy_floor(period as usize),
                 "folded table must match production's ADMISSION floor at period {period}"
             );
             assert_eq!(
@@ -2488,16 +2498,13 @@ mod tests {
 
         // The `_ => 3` arm both originals carry, for a period wider than the table.
         assert_eq!(folded.for_period(7), productions_prefilter_floor(7));
-        assert_eq!(
-            u64::from(folded.for_period(7)),
-            productions_admission_floor(7)
-        );
+        assert_eq!(u64::from(folded.for_period(7)), productions_copy_floor(7));
 
         // Period 1 is the ONLY value the two originals differ on (10 vs 3), and it
         // is unreachable: the default period floor is 2. That unreachability is
         // exactly why "disagreeing" was the wrong word for them.
         assert_ne!(
-            productions_admission_floor(1),
+            productions_copy_floor(1),
             u64::from(productions_prefilter_floor(1)),
             "period 1 is the one value the two originals differ on"
         );
@@ -2508,7 +2515,7 @@ mod tests {
         );
     }
 
-    // ---- A3: windowing, and what admission sets aside ------------------------
+    // ---- A3: windowing, and what classification sets aside ------------------------
 
     /// A contig with one clean, isolated (AT)*8 tract at a known offset, padded so
     /// a window can be cut around it with room for flanks either side.
@@ -2526,10 +2533,10 @@ mod tests {
     /// Production's rule clamps the flank at `contig_seq.len()`, so handed this
     /// window it believes the chromosome stops at the edge, clamps the right flank
     /// to nothing, and drops the locus — **and a different set of loci for every
-    /// `window_bp` you pick, with no error**. Telling `admit` where the contig
+    /// `window_bp` you pick, with no error**. Telling `classify` where the contig
     /// really ends is the entire fix.
     #[test]
-    fn admit_keeps_a_locus_the_window_edge_would_have_eaten() {
+    fn classify_keeps_a_locus_the_window_edge_would_have_eaten() {
         // Contig: 10 kb. Tract at 0-based 1000..1016. The window is bases[900..1026]
         // = 1-based [901, 1026], so the tract ends **10 bp from the window's right
         // edge** — far less than the 50 bp flank.
@@ -2545,21 +2552,21 @@ mod tests {
         // Re-base the interval onto the window slice.
         let in_window = iv(100, 116, 2, 100); // 1000-900 .. 1016-900
 
-        let admitted = admit(
+        let classified = classify(
             vec![in_window],
             "chr1",
             win,
             Position(win_start_1),
             Bp(contig.len() as u64),
-            &SsrAdmissionParams::default(), // flank_bp = 50
+            &SsrSegmentCriteria::default(), // flank_bp = 50
         );
         assert_eq!(
-            admitted.loci.len(),
+            classified.loci.len(),
             1,
             "the contig continues 9 kb past the window, so the flank is real and the \
              locus must survive — even though the window holds only 10 bp of it"
         );
-        let l = &admitted.loci[0];
+        let l = &classified.loci[0];
         // Genomic 1-based, NOT window-relative: the window must not appear in the
         // output (spec §2.3).
         assert_eq!(l.start(), 1001, "genomic, not window-relative");
@@ -2568,10 +2575,10 @@ mod tests {
         // And it is the SAME locus the whole-contig call produces — the window is a
         // memory knob, never an answer (spec §2.3).
         let whole =
-            admit_whole_contig(vec![tract], "chr1", &contig, &SsrAdmissionParams::default());
+            classify_whole_contig(vec![tract], "chr1", &contig, &SsrSegmentCriteria::default());
         assert_eq!(whole.len(), 1);
         assert_eq!(
-            &admitted.loci, &whole,
+            &classified.loci, &whole,
             "windowed output must equal whole-contig output, byte for byte"
         );
     }
@@ -2580,21 +2587,21 @@ mod tests {
     /// its flank and is still dropped. `contig_len` must be believed when it says
     /// "this really is the end", not only when it says "keep going".
     #[test]
-    fn admit_still_drops_a_locus_at_the_real_contig_end() {
+    fn classify_still_drops_a_locus_at_the_real_contig_end() {
         // Tract runs to the last base of a 1016 bp contig, viewed through a window
         // that starts at 901.
         let (contig, _) = contig_with_one_tract_at(1000, 1016);
         let win = &contig[900..1016];
-        let admitted = admit(
+        let classified = classify(
             vec![iv(100, 116, 2, 100)],
             "chr1",
             win,
             Position(901),
             Bp(contig.len() as u64),
-            &SsrAdmissionParams::default(),
+            &SsrSegmentCriteria::default(),
         );
         assert!(
-            admitted.loci.is_empty(),
+            classified.loci.is_empty(),
             "no right flank exists at the true contig end: not genotypeable"
         );
     }
@@ -2614,7 +2621,7 @@ mod tests {
     /// silently vanishes because of where a memory knob fell**, which is spec §2.6's
     /// bug exactly.
     ///
-    /// These two replace a pair of `should_panic` tests. Until 2026-07-17 admission
+    /// These two replace a pair of `should_panic` tests. Until 2026-07-17 classification
     /// *read* the flank to embed it, so this window was a caller bug that panicked;
     /// now the flank is arithmetic, the window is legal, and the assertion is about
     /// the answer rather than the crash.
@@ -2625,22 +2632,22 @@ mod tests {
         // Not one base of the 50 bp left flank is inside it — and the contig has
         // 1000 bp of it, so the locus stands.
         let win = &contig[1000..1076];
-        let admitted = admit(
+        let classified = classify(
             vec![iv(0, 16, 2, 100)],
             "chr1",
             win,
             Position(1001),
             Bp(contig.len() as u64),
-            &SsrAdmissionParams::default(),
+            &SsrSegmentCriteria::default(),
         );
         assert_eq!(
-            admitted.loci.len(),
+            classified.loci.len(),
             1,
             "the left flank is 1000 bp of contig the window cannot see: \
              {:?}",
-            admitted.rejected
+            classified.rejected
         );
-        assert_eq!(admitted.loci[0].start(), 1001);
+        assert_eq!(classified.loci[0].start(), 1001);
     }
 
     #[test]
@@ -2648,21 +2655,21 @@ mod tests {
         let (contig, _) = contig_with_one_tract_at(1000, 10_000);
         // The window ENDS at the tract: bases[900..1016] = 1-based [901, 1016].
         let win = &contig[900..1016];
-        let admitted = admit(
+        let classified = classify(
             vec![iv(100, 116, 2, 100)],
             "chr1",
             win,
             Position(901),
             Bp(contig.len() as u64),
-            &SsrAdmissionParams::default(),
+            &SsrSegmentCriteria::default(),
         );
         assert_eq!(
-            admitted.loci.len(),
+            classified.loci.len(),
             1,
             "the right flank is 9 kb of contig the window cannot see: {:?}",
-            admitted.rejected
+            classified.rejected
         );
-        assert_eq!(admitted.loci[0].end(), 1016);
+        assert_eq!(classified.loci[0].end(), 1016);
     }
 
     /// **`bundled` is in the INPUT's coordinate space, not genomic.**
@@ -2688,20 +2695,20 @@ mod tests {
         let a = iv(100, 120, 2, 100);
         let b = iv(150, 170, 2, 100);
 
-        let admitted = admit(
+        let classified = classify(
             vec![a, b],
             "chr1",
             win,
             Position(901),
             Bp(contig.len() as u64),
-            &SsrAdmissionParams::default(),
+            &SsrSegmentCriteria::default(),
         );
         assert!(
-            admitted.loci.is_empty(),
+            classified.loci.is_empty(),
             "30 bp apart: both are bundle members"
         );
         assert_eq!(
-            admitted.bundled,
+            classified.bundled,
             vec![a, b],
             "handed back verbatim in the caller's own space — NOT genomic \
              (which would read 1001/1051 here)"
@@ -2709,7 +2716,7 @@ mod tests {
         // Said the other way, so the intent survives a careless edit: the genomic
         // positions do NOT appear.
         assert!(
-            !admitted
+            !classified
                 .bundled
                 .iter()
                 .any(|iv| iv.start == 1000 || iv.start == 1050),
@@ -2721,14 +2728,14 @@ mod tests {
     /// review caught it.
     #[test]
     #[should_panic(expected = "bases_start is 1-based")]
-    fn admit_rejects_a_zero_bases_start() {
+    fn classify_rejects_a_zero_bases_start() {
         let contig = [
             b"CGCGC".as_ref(),
             b"ATATATATATATATAT".as_ref(),
             b"GCGCG".as_ref(),
         ]
         .concat();
-        let _ = admit(
+        let _ = classify(
             vec![iv(5, 21, 2, 100)],
             "chr1",
             &contig,
@@ -2744,16 +2751,16 @@ mod tests {
     /// Caught in release, not just debug — §10's sweeps run the walk in release.
     #[test]
     #[should_panic(expected = "contig_len must be the CONTIG's length")]
-    fn admit_rejects_a_contig_len_that_understates_the_contig() {
+    fn classify_rejects_a_contig_len_that_understates_the_contig() {
         let (contig, _) = contig_with_one_tract_at(1000, 10_000);
         let win = &contig[900..1076]; // genomic [901, 1076]
-        let _ = admit(
+        let _ = classify(
             vec![iv(100, 116, 2, 100)],
             "chr1",
             win,
             Position(901),
             Bp(1000), // a lie: the window itself already reaches 1076
-            &SsrAdmissionParams::default(),
+            &SsrSegmentCriteria::default(),
         );
     }
 
@@ -2762,18 +2769,18 @@ mod tests {
     /// appears to move and instead silently returns nothing.
     #[test]
     #[should_panic(expected = "flank_bp must be at least 1")]
-    fn admit_rejects_a_zero_flank() {
+    fn classify_rejects_a_zero_flank() {
         let contig = [
             b"CGCGC".as_ref(),
             b"ATATATATATATATAT".as_ref(),
             b"GCGCG".as_ref(),
         ]
         .concat();
-        let no_flank = SsrAdmissionParams {
+        let no_flank = SsrSegmentCriteria {
             flank_bp: 0,
             ..params()
         };
-        let _ = admit_whole_contig(vec![iv(5, 21, 2, 100)], "chr1", &contig, &no_flank);
+        let _ = classify_whole_contig(vec![iv(5, 21, 2, 100)], "chr1", &contig, &no_flank);
     }
 
     /// **A3 — the bundle members come back** (spec §2.4, §6a).
@@ -2784,7 +2791,7 @@ mod tests {
     /// worth?" question be asked at all — the answer was previously deleted
     /// uncounted.
     #[test]
-    fn admit_hands_back_the_bundle_members_it_sets_aside() {
+    fn classify_hands_back_the_bundle_members_it_sets_aside() {
         // Two tracts 30 bp apart (inside a 50 bp flank radius) plus one isolated
         // far away.
         let mut contig = vec![b'C'; 100];
@@ -2798,19 +2805,23 @@ mod tests {
         let b = iv(150, 170, 2, 100);
         let lone = iv(5000, 5020, 2, 100);
 
-        let admitted = admit(
+        let classified = classify(
             vec![a, b, lone],
             "chr1",
             &contig,
             Position(1),
             Bp(contig.len() as u64),
-            &SsrAdmissionParams::default(),
+            &SsrSegmentCriteria::default(),
         );
 
-        assert_eq!(admitted.loci.len(), 1, "only the isolated tract is a locus");
-        assert_eq!(admitted.loci[0].start(), 5001);
         assert_eq!(
-            admitted.bundled,
+            classified.loci.len(),
+            1,
+            "only the isolated tract is a locus"
+        );
+        assert_eq!(classified.loci[0].start(), 5001);
+        assert_eq!(
+            classified.bundled,
             vec![a, b],
             "the cluster is handed back, verbatim and in coordinate order — \
              production would have deleted it"
@@ -2831,11 +2842,11 @@ mod tests {
     }
 
     /// Nothing is set aside when nothing clusters — `bundled` is not a dumping
-    /// ground for every rejection. A repeat admission turns down for any *other*
+    /// ground for every rejection. A repeat classification turns down for any *other*
     /// reason (impure, low-copy, compound) is the walk's `Generic` territory, not
     /// a bundle (spec §2.2), and must not appear here.
     #[test]
-    fn admit_bundles_only_what_the_flank_test_rejects() {
+    fn classify_bundles_only_what_the_flank_test_rejects() {
         let contig = [
             b"CGCGC".as_ref(),
             b"ATATATATATATATAT".as_ref(),
@@ -2844,7 +2855,7 @@ mod tests {
         .concat();
 
         // A clean isolated tract: a locus, nothing bundled.
-        let admitted = admit(
+        let classified = classify(
             vec![iv(5, 21, 2, 100)],
             "chr1",
             &contig,
@@ -2852,15 +2863,15 @@ mod tests {
             Bp(contig.len() as u64),
             &params(),
         );
-        assert_eq!(admitted.loci.len(), 1);
+        assert_eq!(classified.loci.len(), 1);
         assert!(
-            admitted.bundled.is_empty(),
+            classified.bundled.is_empty(),
             "nothing close, nothing bundled"
         );
 
         // A tract rejected by the copy floor: neither a locus NOR a bundle member.
         let short = b"CCCCCATATATCCCCC";
-        let admitted = admit(
+        let classified = classify(
             vec![iv(5, 11, 2, 100)],
             "chr1",
             short,
@@ -2868,21 +2879,21 @@ mod tests {
             Bp(short.len() as u64),
             &params(),
         );
-        assert!(admitted.loci.is_empty(), "below the copy floor");
+        assert!(classified.loci.is_empty(), "below the copy floor");
         assert!(
-            admitted.bundled.is_empty(),
+            classified.bundled.is_empty(),
             "a copy-floor rejection is Generic territory, not a bundle (spec §2.2)"
         );
     }
 
-    /// **A2 — the period scope is a knob, and moving it moves the admitted set.**
+    /// **A2 — the period scope is a knob, and moving it moves the classified set.**
     ///
     /// Spec §5.2's routing frontier is *"for which (period, tract length) cells does
     /// the STR path beat the generic one?"*. Production cannot be asked: its period
     /// scope is a `const`. This is the test that says ng can.
     #[test]
     fn narrowing_the_period_scope_changes_what_is_admitted() {
-        // A (CAG)*10 tract — period 3, admitted at the default 2..=6 scope.
+        // A (CAG)*10 tract — period 3, classified at the default 2..=6 scope.
         let mut contig = b"TTTTT".to_vec();
         for _ in 0..10 {
             contig.extend_from_slice(b"CAG");
@@ -2891,18 +2902,18 @@ mod tests {
         let cag = iv(5, 35, 3, 100);
 
         assert_eq!(
-            admit_whole_contig(vec![cag], "chr1", &contig, &params()).len(),
+            classify_whole_contig(vec![cag], "chr1", &contig, &params()).len(),
             1,
             "period 3 is inside the default 2..=6 scope"
         );
 
         // Take period 3 off the STR path: same tract, no locus.
-        let dinucs_only = SsrAdmissionParams {
+        let dinucs_only = SsrSegmentCriteria {
             periods: PeriodRange::new(2, 2).unwrap(),
             ..params()
         };
         assert!(
-            admit_whole_contig(vec![cag], "chr1", &contig, &dinucs_only).is_empty(),
+            classify_whole_contig(vec![cag], "chr1", &contig, &dinucs_only).is_empty(),
             "a 2..=2 scope must exclude the period-3 tract — the knob has to bite"
         );
 
@@ -2912,17 +2923,17 @@ mod tests {
         poly.extend_from_slice(b"TTTTT");
         let homopolymer = iv(5, 35, 1, 100);
         assert!(
-            admit_whole_contig(vec![homopolymer], "chr1", &poly, &params()).is_empty(),
+            classify_whole_contig(vec![homopolymer], "chr1", &poly, &params()).is_empty(),
             "period-1 homopolymers are off the STR path by default"
         );
-        let with_homopolymers = SsrAdmissionParams {
+        let with_homopolymers = SsrSegmentCriteria {
             periods: PeriodRange::new(1, 6).unwrap(),
             ..params()
         };
         assert_eq!(
-            admit_whole_contig(vec![homopolymer], "chr1", &poly, &with_homopolymers).len(),
+            classify_whole_contig(vec![homopolymer], "chr1", &poly, &with_homopolymers).len(),
             1,
-            "a 1..=6 scope admits it — the question spec §10 wants asked"
+            "a 1..=6 scope classifies it — the question spec §10 wants asked"
         );
     }
 
@@ -2930,9 +2941,9 @@ mod tests {
     ///
     /// The collapse's live wire: `drop_bundles(kept, p.flank_bp)`. Deleting that
     /// argument's link to `flank_bp` — or the bundle drop entirely — must not pass.
-    /// Two tracts 30 bp apart: bundled at a 50 bp radius, both admitted at 5.
+    /// Two tracts 30 bp apart: bundled at a 50 bp radius, both classified at 5.
     #[test]
-    fn admit_bundles_at_the_flank_radius() {
+    fn classify_bundles_at_the_flank_radius() {
         // Two (AT) tracts with a 30 bp gap, each with room for a 50 bp flank.
         let mut contig = vec![b'C'; 100];
         contig.extend_from_slice(b"ATATATATATATATATATAT"); // 100..120
@@ -2944,14 +2955,14 @@ mod tests {
         // Radius 50: the 30 bp gap is inside it → one cluster → both dropped.
         let wide = matched_params(0.8, 0, 50).0;
         assert!(
-            admit_whole_contig(pair.to_vec(), "chr1", &contig, &wide).is_empty(),
+            classify_whole_contig(pair.to_vec(), "chr1", &contig, &wide).is_empty(),
             "30 bp apart is inside a 50 bp flank radius: both are bundle members"
         );
 
-        // Radius 5: the gap clears it → neither is bundled → both admitted.
+        // Radius 5: the gap clears it → neither is bundled → both classified.
         let narrow = matched_params(0.8, 0, 5).0;
         assert_eq!(
-            admit_whole_contig(pair.to_vec(), "chr1", &contig, &narrow).len(),
+            classify_whole_contig(pair.to_vec(), "chr1", &contig, &narrow).len(),
             2,
             "30 bp apart clears a 5 bp flank radius: both are loci"
         );
@@ -3000,14 +3011,14 @@ mod tests {
         let di = iv(20, 36, 2, 100);
         let tri = iv(200, 230, 3, 100);
 
-        // A table that admits the period-3 tract and rejects the period-2 one —
+        // A table that classifies the period-3 tract and rejects the period-2 one —
         // so a lookup ignoring the period cannot produce this answer.
         //          period:  1  2   3  4  5  6
-        let picky = SsrAdmissionParams {
+        let picky = SsrSegmentCriteria {
             min_copies: MinCopies::new([10, 9, 4, 3, 3, 3], 3),
             ..params()
         };
-        let loci = admit_whole_contig(vec![di, tri], "chr1", &contig, &picky);
+        let loci = classify_whole_contig(vec![di, tri], "chr1", &contig, &picky);
         assert_eq!(
             loci.len(),
             1,
@@ -3018,11 +3029,11 @@ mod tests {
 
         // Mirror it: swap which period is picky, and the surviving locus swaps.
         //           period:  1  2  3   4  5  6
-        let mirrored = SsrAdmissionParams {
+        let mirrored = SsrSegmentCriteria {
             min_copies: MinCopies::new([10, 5, 11, 3, 3, 3], 3),
             ..params()
         };
-        let loci = admit_whole_contig(vec![di, tri], "chr1", &contig, &mirrored);
+        let loci = classify_whole_contig(vec![di, tri], "chr1", &contig, &mirrored);
         assert_eq!(loci.len(), 1, "now only the period-2 tract clears its own");
         assert_eq!(loci[0].motif().as_bytes(), b"AT");
 
@@ -3070,40 +3081,40 @@ mod tests {
     /// and this is reachable. It is an `assert!` rather than a `debug_assert!`
     /// because the knob exists to be **swept by the §5.2 experiment, and sweeps
     /// run in release** — a debug-only guard would let the experiment record
-    /// "period 7 admits nothing" when the code never tried. That is a wrong
+    /// "period 7 classifies nothing" when the code never tried. That is a wrong
     /// result, not a missing panic.
     #[test]
     #[should_panic(expected = "exceeds MAX_MOTIF_LEN")]
-    fn admit_rejects_a_period_ceiling_no_motif_can_hold() {
+    fn classify_rejects_a_period_ceiling_no_motif_can_hold() {
         let contig = [
             b"CGCGC".as_ref(),
             b"ATATATATATATATAT".as_ref(),
             b"GCGCG".as_ref(),
         ]
         .concat();
-        let too_wide = SsrAdmissionParams {
+        let too_wide = SsrSegmentCriteria {
             periods: PeriodRange::new(2, (MAX_MOTIF_LEN + 1) as u8).unwrap(),
             ..params()
         };
-        let _ = admit_whole_contig(vec![iv(5, 21, 2, 100)], "chr1", &contig, &too_wide);
+        let _ = classify_whole_contig(vec![iv(5, 21, 2, 100)], "chr1", &contig, &too_wide);
     }
 
-    /// The `min_purity` contract `admit` guards: a `NaN` floor would make every
+    /// The `min_purity` contract `classify` guards: a `NaN` floor would make every
     /// `purity < p.min_purity` false, silently passing everything.
     #[test]
     #[should_panic(expected = "min_purity")]
-    fn admit_rejects_a_nan_purity_floor() {
+    fn classify_rejects_a_nan_purity_floor() {
         let contig = [
             b"CGCGC".as_ref(),
             b"ATATATATATATATAT".as_ref(),
             b"GCGCG".as_ref(),
         ]
         .concat();
-        let nan = SsrAdmissionParams {
+        let nan = SsrSegmentCriteria {
             min_purity: f32::NAN,
             ..params()
         };
-        let _ = admit_whole_contig(vec![iv(5, 21, 2, 100)], "chr1", &contig, &nan);
+        let _ = classify_whole_contig(vec![iv(5, 21, 2, 100)], "chr1", &contig, &nan);
     }
 
     /// **A2 — the copy floor is a knob, and it is the "length" axis.**
@@ -3123,18 +3134,18 @@ mod tests {
         let tract = iv(5, 21, 2, 100);
 
         assert_eq!(
-            admit_whole_contig(vec![tract], "chr1", &contig, &params()).len(),
+            classify_whole_contig(vec![tract], "chr1", &contig, &params()).len(),
             1,
             "8 copies clears the default floor of 5"
         );
 
         // Raise the floor above the tract: dropped.
-        let strict = SsrAdmissionParams {
+        let strict = SsrSegmentCriteria {
             min_copies: MinCopies::uniform(9),
             ..params()
         };
         assert!(
-            admit_whole_contig(vec![tract], "chr1", &contig, &strict).is_empty(),
+            classify_whole_contig(vec![tract], "chr1", &contig, &strict).is_empty(),
             "8 copies is below a floor of 9"
         );
 
@@ -3160,7 +3171,7 @@ mod tests {
     ///
     /// **`is_close` is four `abs_diff` comparisons, and they mask each other**, so
     /// which fixture you pick decides which clauses you actually pin. Callers hold
-    /// `a.start <= b.start` (`admit` sorts before `drop_bundles`), and that
+    /// `a.start <= b.start` (`classify` sorts before `drop_bundles`), and that
     /// constrains what is reachable:
     ///
     /// - **Disjoint tracts** put only the *gap* clause (`b.start - a.end`) on the
@@ -3233,7 +3244,7 @@ mod tests {
         // And the range means what it says in the other direction too: put period 1
         // in scope and the homopolymer is a period-1 tract under its own motif —
         // one interval, not six.
-        let with_homopolymers = SsrAdmissionParams {
+        let with_homopolymers = SsrSegmentCriteria {
             periods: PeriodRange::new(1, 6).unwrap(),
             ..params()
         };
@@ -3267,7 +3278,7 @@ mod tests {
 
         // The floor is a knob, not a constant: drop it and the speck does eliminate
         // the real tract. That is the cascade, and it is what the 10 buys.
-        let no_floor = SsrAdmissionParams {
+        let no_floor = SsrSegmentCriteria {
             min_copies: MinCopies::uniform(1),
             ..params()
         };
@@ -3326,20 +3337,20 @@ mod tests {
             let name = String::from_utf8_lossy(rec.name()).into_owned();
             let seq = rec.sequence().as_ref();
 
-            // The catalog scans period 1..=6; the pre-filter and admission both
+            // The catalog scans period 1..=6; the pre-filter and classification both
             // drop period 1 (`scanner_parity`'s configuration).
             let intervals =
                 find_tandem_repeats(seq, PeriodRange::new(1, 6).unwrap(), &ScanParams::default());
             let cleaned = prefilter(&intervals, &params());
             assert_agrees(&cleaned, &name, seq, &format!("scanner output on {name}"));
 
-            total_loci += admit_whole_contig(cleaned.clone(), &name, seq, &params()).len();
+            total_loci += classify_whole_contig(cleaned.clone(), &name, seq, &params()).len();
             contigs += 1;
         }
         assert!(contigs > 0, "the fixture must have contigs");
         assert!(
             total_loci > 0,
-            "the fixture must admit loci — a differential over two empty sets proves nothing"
+            "the fixture must classify loci — a differential over two empty sets proves nothing"
         );
     }
 }

@@ -14,22 +14,22 @@ Naming: **STR** in prose, `ssr` in code.*
 
 Tracks the spec's Revision of the same date: **production (`src/ssr/`, `src/regions.rs`) is frozen**;
 ng copies what it needs rather than reshaping production in place, and ng must not depend on trf-mod.
-What changed in this doc: the module is a folder; `SsrLocus` holds **ng's** `Locus`, not
+What changed in this doc: the module is a folder; `SsrSegment` holds **ng's** `SsrSegment`, not
 `ssr::types::Locus`; `TypedRegionConfig.catalog: CatalogParams` becomes
-`admission: SsrAdmissionParams` (ng's own); and the reconciliation table's "use directly / reuse,
+`criteria: SsrSegmentCriteria` (ng's own); and the reconciliation table's "use directly / reuse,
 widened" rows become "copy into ng". The interface, the iterator contract, and every decision below
 them are unaffected — none of them ever depended on where the code lived.
 
 ## Module home
 
 `src/ng/region_typing/` — a folder, though **not** because of a bake-off (there is none; spec §6):
-it carries the ~500-line port of the admission policy alongside the walk, and those are two concerns
+it carries the ~500-line port of the classification policy alongside the walk, and those are two concerns
 with two test suites.
 
 - `region_typing/mod.rs` — `TypedRegion`, `RegionKind`, `TypedRegionConfig`, `TypedRegionCounts`,
   `TypedRegionError`, `GenomeRegions`, `TypedRegionIterator`, the walk.
-- `region_typing/admission.rs` — ng's port (spec §5): `Motif`, `Locus`, `SsrAdmissionParams`,
-  `Admitted`, the pre-filter, `admit`, and the differential test against production's `build_loci`
+- `region_typing/segment_criteria.rs` — ng's port (spec §5): `Motif`, `SsrSegment`, `SsrSegmentCriteria`,
+  `Classified`, the pre-filter, `classify`, and the differential test against production's `build_loci`
   (spec §8.0).
 
 It is a **step** module, so it sits in the step layer of the `src/ng/` tree, replacing the
@@ -46,42 +46,43 @@ The final shapes. Contracts are stated below each; the *why* is the cross-ref.
 /// is the one place ng's 1-based base is stated. (spec §3, §4)
 pub struct TypedRegion { pub region: GenomeRegion, pub kind: RegionKind }
 
-/// Exactly one kind is a genetic object (a locus); the other three are physical regions.
-/// `Generic`/`Satellite` carry nothing — they *are* just their region. (spec §1.1)
+/// All four kinds are physical regions — this module produces no genetic locus (spec §1.1).
+/// An `SsrSegment` is a stretch carrying an STR; it becomes a locus only if variable, downstream.
+/// `Generic`/`Satellite` carry nothing — they *are* just their region.
 pub enum RegionKind {
-    SsrLocus(Locus),                               // ng's own Locus (admission.rs) — see below
+    SsrSegment(SsrSegment),                               // ng's own SsrSegment (segment_criteria.rs) — see below
     SsrBundle { tracts: Box<[RepeatInterval]> },   // >= 2, coordinate-ordered; hull = TypedRegion.region
     Generic,
     Satellite,
 }
 ```
 
-**`SsrLocus` wraps nothing — it holds ng's own `Locus` directly.** `Locus` is a port of
+**`SsrSegment` wraps nothing — it holds ng's own `SsrSegment` directly.** `SsrSegment` is a port of
 `ssr::types::Locus` (spec §5), born 1-based/`u64` where production's is 0-based/`u32`; production's is
-left alone (spec Revision). With no coordinate mismatch to hide, the earlier `ng::SsrLocus` wrapper
+left alone (spec Revision). With no coordinate mismatch to hide, the earlier `ng::SsrSegment` wrapper
 has no job. It carries motif, borders and purity — **coordinates, no bases** (spec §1.2): production
 embeds tract+flanks because its consumer genotypes without a FASTA open, and this module types
 regions. It is `ReadPreparer::Locus` (closes `read_preparation_ssr.md` §8), and that consumer fetches
 the tract from the reference it already opens.
 
 ```rust
-/// ng's port of the catalog's Locus, minus its `ref_bytes` — 1-based inclusive, u64. Private
+/// ng's port of the catalog's `Locus`, minus its `ref_bytes` — 1-based inclusive, u64. Private
 /// fields + a validating `new`, whose invariant is now just `1 <= start <= end` plus a finite
 /// purity. (spec §4, §5, §1.2)
-pub struct Locus { /* chrom, start, end, motif: Motif, purity_fraction */ }
+pub struct SsrSegment { /* chrom, start, end, motif: Motif, purity_fraction */ }
 
 /// Ported too, though spec §4 expected `ssr::types::Motif` reused: production's is `pub(crate)`, so
-/// a `pub` ng `Locus` returning one trips `private_interfaces` — and widening it is a production
+/// a `pub` ng `SsrSegment` returning one trips `private_interfaces` — and widening it is a production
 /// edit. Coordinate-free, so the port is 40 lines. (spec §4, corrected at the A1 review)
 pub struct Motif { /* buf: [u8; MAX_MOTIF_LEN], len: u8 */ }
 
-/// ng's admission policy — the port of `postprocess::build_loci`, windowed and all-knobs. (spec §5a)
-pub fn admit(recs: Vec<RepeatInterval>, chrom: &str,
+/// ng's classification policy — the port of `postprocess::build_loci`, windowed and all-knobs. (spec §5a)
+pub fn classify(recs: Vec<RepeatInterval>, chrom: &str,
              bases: &[u8], bases_start: u64, contig_len: u64,
-             p: &SsrAdmissionParams) -> Admitted;
+             p: &SsrSegmentCriteria) -> Classified;
 
-pub struct Admitted {
-    pub loci: Vec<Locus>,                 // what build_loci returns today
+pub struct Classified {
+    pub loci: Vec<SsrSegment>,                 // what build_loci returns today
     pub bundled: Vec<RepeatInterval>,     // what it silently drops today (spec §2.4, §6a)
 }
 ```
@@ -104,7 +105,7 @@ pub struct TypedRegionConfig {
     pub scan: ScanParams,
     pub max_repeat_len: Bp,       // the satellite cap AND the detection margin — one field (spec §2.6)
     pub window_bp: Bp,            // memory knob; must not change the output (spec §2.3)
-    pub admission: SsrAdmissionParams,  // ng's own (admission.rs), NOT ssr's CatalogParams: same
+    pub criteria: SsrSegmentCriteria,  // ng's own (segment_criteria.rs), NOT ssr's CatalogParams: same
                                   // defaults + the hardcoded period scope and copy floors as real
                                   // knobs; no separate `bundle_threshold` (spec §2.4, §5)
 }
@@ -163,10 +164,10 @@ output. The queue that fans work out to analysis workers is the pipeline's, not 
 
 ## Decisions — one line each, *why* in the spec
 
-- **`SsrLocus(Locus)`, no wrapper** — ng's `Locus` is born 1-based, so there is nothing to wrap
+- **`SsrSegment(SsrSegment)`, no wrapper** — ng's `SsrSegment` is born 1-based, so there is nothing to wrap
   (spec §4).
-- **ng copies; production is frozen** — the admission policy, the pre-filter, `Locus`, `Motif`, and
-  the admission knobs are ng's own (spec Revision, §5). Only `RegionSet` is reused as-is, because
+- **ng copies; production is frozen** — the classification policy, the pre-filter, `SsrSegment`, `Motif`, and
+  the classification knobs are ng's own (spec Revision, §5). Only `RegionSet` is reused as-is, because
   wrapping it read-only costs production nothing. `Motif` was expected to reuse and does not: it is
   `pub(crate)`, so a `pub` ng type cannot return it (spec §4).
 - **Concrete iterator, no trait** — no bake-off; `LocusRouter`/`LocusSource`/`RefWindow` retire
@@ -187,29 +188,29 @@ Every row read at the cited line (2026-07-16). Convergence, not new types.
 |---|---|---|
 | `GenomeRegion` | `regions::Region` ([regions.rs:38](../../../../src/regions.rs)), `ContigInterval` ([bam/alignment_input.rs:544](../../../../src/bam/alignment_input.rs)) | the consolidation `ng_step_interfaces.md` §6 reserved — this step is its first use (1-based, `u64`) |
 | `GenomeRegions` | `RegionSet` ([regions.rs:74](../../../../src/regions.rs)) | **wrap read-only**, not reimplement — it already sorts/coalesces/clamps/converts-BED; wrapper adds ng's width + base + name. `regions.rs` does not move |
-| `SsrLocus`'s payload | `ssr::types::Locus` ([ssr/types.rs:136](../../../../src/ssr/types.rs)) | **copy into ng**, born 1-based/`u64` (spec §4, §5); production's untouched |
-| ng `Locus`'s motif | `ssr::types::Motif` ([ssr/types.rs:36](../../../../src/ssr/types.rs)) | **copy into ng** — no coordinates/width to rebase, but production's is `pub(crate)` and leaks through ng's `pub` `Locus` (spec §4, corrected at the A1 review) |
+| `SsrSegment`'s payload | `ssr::types::Locus` ([ssr/types.rs:136](../../../../src/ssr/types.rs)) | **copy into ng**, born 1-based/`u64` (spec §4, §5); production's untouched |
+| ng `SsrSegment`'s motif | `ssr::types::Motif` ([ssr/types.rs:36](../../../../src/ssr/types.rs)) | **copy into ng** — no coordinates/width to rebase, but production's is `pub(crate)` and leaks through ng's `pub` `SsrSegment` (spec §4, corrected at the A1 review) |
 | `RegionKind::SsrBundle` tracts | `RepeatInterval` ([ng/tandem_repeat.rs:186](../../../../src/ng/tandem_repeat.rs)) | reuse; widened to `u64` (ng's own code, spec §4) |
-| `TypedRegionConfig.admission` | `CatalogParams` ([ssr/catalog/mod.rs:42](../../../../src/ssr/catalog/mod.rs)) | **copy into ng** as `SsrAdmissionParams`: same defaults, no `bundle_threshold`, gains the hardcoded period/floor knobs (spec §5) |
-| `admission::admit` | `build_loci` ([ssr/catalog/postprocess.rs:69](../../../../src/ssr/catalog/postprocess.rs)) | **copy into ng** — logic transcribed unchanged; takes `RepeatInterval`, windowed, returns `Admitted { loci, bundled }` (spec §5a). Production's `build_loci` and `TrfRecord` stay |
-| the pre-filter | `catalog_prefilter` ([ng/scanner_parity.rs](../../../../src/ng/scanner_parity.rs), moved out of `src/ssr/` at B2) | **copy into ng**, beside `admit` (spec §5.1) |
+| `TypedRegionConfig.criteria` | `CatalogParams` ([ssr/catalog/mod.rs:42](../../../../src/ssr/catalog/mod.rs)) | **copy into ng** as `SsrSegmentCriteria`: same defaults, no `bundle_threshold`, gains the hardcoded period/floor knobs (spec §5) |
+| `segment_criteria::classify` | `build_loci` ([ssr/catalog/postprocess.rs:69](../../../../src/ssr/catalog/postprocess.rs)) | **copy into ng** — logic transcribed unchanged; takes `RepeatInterval`, windowed, returns `Classified { loci, bundled }` (spec §5a). Production's `build_loci` and `TrfRecord` stay |
+| the pre-filter | `catalog_prefilter` ([ng/scanner_parity.rs](../../../../src/ng/scanner_parity.rs), moved out of `src/ssr/` at B2) | **copy into ng**, beside `classify` (spec §5.1) |
 | the windowed scan | `collect_windowed` ([ng/tandem_repeat.rs:530](../../../../src/ng/tandem_repeat.rs)) | promote (private → crate) and stream (spec §6.1) |
 | reference access | `WindowedRefSeq` ([ng/ref_seq.rs](../../../../src/ng/ref_seq.rs)) | + a raw-bytes path (`ref_seq.md` YAGNI now spent) + a `contigs()` accessor |
 | `TypedRegionError` | new (`thiserror`, `#[non_exhaustive]`) | one variant; mirrors `ReadFilterError`'s in-stream-fatal shape |
 
 **Two oracles, both in spec §8:**
 
-- **Port fidelity** (spec §8.0) — ng's `admit` vs production's `build_loci` on the same intervals,
-  whole-contig, at the catalog's settings; `Locus` sets identical modulo the coordinate base. The
+- **Port fidelity** (spec §8.0) — ng's `classify` vs production's `build_loci` on the same intervals,
+  whole-contig, at the catalog's settings; `SsrSegment` sets identical modulo the coordinate base. The
   bridge is `TrfRecord::for_test` (`#[cfg(test)] pub(crate)`, same crate). This is what the Revision
   bought: what was once true by construction is now a test.
 - **`.cat` parity** (spec §8.1) — the committed **trf-mod-built** golden catalog on the same
-  reference; the `SsrLocus` set is a strict subset (differs only by the satellite cap), with
+  reference; the `SsrSegment` set is a strict subset (differs only by the satellite cap), with
   `scanner_parity`'s overlap tolerance for detector wobble.
 
 ## Test & bench shape
 
 Tests beside the code in `region_typing/` — the walk's in `mod.rs`, the port's (including spec §8.0's
-differential) in `admission.rs`. No `bench/` — no competing impls (spec §6). The regression anchors
+differential) in `segment_criteria.rs`. No `bench/` — no competing impls (spec §6). The regression anchors
 are the two oracles above and the invariant tests (partition, window-invariance, BED-invariance)
 detailed in spec §8; the arch doc adds no test surface of its own.

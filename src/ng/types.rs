@@ -227,7 +227,11 @@ mod tests {
     fn region_len_counts_both_ends() {
         assert_eq!(region(1, 1).len(), 1, "a single base is length 1, not 0");
         assert_eq!(region(1, 10).len(), 10);
-        assert_eq!(region(6, 21).len(), 16, "the admission fixture's tract");
+        assert_eq!(
+            region(6, 21).len(),
+            16,
+            "the classification fixture's tract"
+        );
         assert!(!region(1, 1).is_empty());
     }
 
@@ -254,7 +258,7 @@ mod tests {
     /// begin at one. Recorded rather than enforced: `Position` is unconstrained,
     /// as `MapQual` and `Bp` are, and every place where a 0 is a *bug* rejects it
     /// itself — `RefSeq::fetch_into` with `InvalidStart`, `Locus::new` with
-    /// `BadCoordinates`, `admit` with an assert.
+    /// `BadCoordinates`, `classify` with an assert.
     #[test]
     fn position_zero_is_representable_and_rejected_where_it_matters() {
         assert_eq!(Position(0).get(), 0);

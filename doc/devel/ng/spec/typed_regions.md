@@ -4,7 +4,7 @@
 [`ng_proposal.md`](ng_proposal.md) (§1 step 3, *The locus stream*), and the first that **integrates**
 rather than builds: it stands on `RefSeq` ([`ref_seq.md`](ref_seq.md)), the tandem-repeat scanner
 ([`ssr_repeat_scanner.md`](ssr_repeat_scanner.md)), and the STR catalog. It closes the three
-questions the read-preparation specs deferred to "the router spec" — `LocusWindow`, the `SsrLocus`
+questions the read-preparation specs deferred to "the router spec" — `LocusWindow`, the `SsrSegment`
 shape, and `ReadPreparer::Locus` ([`read_preparation_ssr.md`](read_preparation_ssr.md) §8) — and
 retires `locus_router/` from [`../arch/module_layout.md`](../arch/module_layout.md). Amends four
 sibling docs; see §9. Code-facing companion: [`../arch/typed_regions.md`](../arch/typed_regions.md).
@@ -45,12 +45,12 @@ production's catalog detector and may serve as a *comparison oracle*, never as a
 `ssr_repeat_scanner.md` §6–§7 production detector swap is **not** happening.
 
 **What this rewrites below:** §4 (ng's coordinates are ng's; nothing in `src/ssr/` rebases), §5 and
-§5.1 (ng **ports** the admission policy rather than reusing and reshaping it in place), §8 (parity
+§5.1 (ng **ports** the classification policy rather than reusing and reshaping it in place), §8 (parity
 gains a port-fidelity check — what used to be true by construction is now a test), and §9 (the "what
 this breaks elsewhere" list largely evaporates, because ng now breaks nothing elsewhere). §1–§3 and
 §6–§7 — the walk itself — are unaffected: the algorithm never depended on where the code lived.
 
-**What it costs.** Two copies of the admission policy, which §5.1 rightly warned can silently
+**What it costs.** Two copies of the classification policy, which §5.1 rightly warned can silently
 diverge. The mitigation is that divergence is now *tested* rather than *prevented*: §8's port-fidelity
 oracle pins ng's port against production's `build_loci` on shared inputs. That is a weaker guarantee
 than sharing one function, and it is the price of a production tree that cannot be destabilised by an
@@ -82,22 +82,28 @@ concept, each naming what the value *is*:
 | **region** | a **physical** piece of DNA: contig + 1-based inclusive range, no genetic claim | `GenomeRegion` |
 | **typed region** | a region **+ what the sequence there is** | `TypedRegion { region, kind }` |
 | **region kind** | that "what" — one of four | `RegionKind` |
-| **locus** | a **genetic** object: has alleles, segregates, gets genotyped | `Locus` (ng's own, 1-based — §4) |
-| **tract** | the repeat's own extent inside an STR locus | `Locus::ref_tract()` |
+| **segment** | a physical stretch typed by what it contains — here, an STR | `SsrSegment` (ng's own, 1-based — §4) |
+| **tract** | the repeat's own extent — an `SsrSegment`'s whole span, since it carries no flanks (§1.2) | `SsrSegment::start()..end()` |
+| **locus** | a **genetic** object: has alleles, segregates, gets genotyped. **Not produced here** | — (a downstream concept) |
 | **window** | the walk's memory unit. Never appears in output (§2.3) | `window_bp` |
 
-**Locus (genetic) vs region (physical) is the split that explains the design**, not just a
-convention. Exactly one of the four kinds is genetic:
+**All four kinds are physical — this module produces no genetic object** (owner, 2026-07-18). It
+types the genome by *what the sequence is*, and "this stretch carries an STR" is a physical statement,
+exactly like "this is a satellite array" or "nothing more specific can be said". A segment becomes a
+**locus** — a genetic marker — only if it turns out to be *variable*, which is decided downstream from
+the data, not here from the reference:
 
 | kind | is | why |
 |---|---|---|
-| `SsrLocus` | **locus** | the only kind the reference alone hands you as a genetic object |
-| `SsrBundle` | region | real repeats, none with clean flanks, so no locus can be named (§2.4) |
+| `SsrSegment` | region | a stretch carrying a tandem repeat with clean flanks — a candidate STR, not yet a locus |
+| `SsrBundle` | region | real repeats, none with clean flanks, so none is a usable STR segment (§2.4) |
 | `Generic` | region | nothing more specific can be said from the reference alone |
 | `Satellite` | region | a tandem array too long to be a microsatellite |
 
-That is why the STR kind is special, in one line. It also vindicates `ng::tandem_repeat::Region`:
-`Repeat`/`Satellite`/`Unique` are physical classifications, so `Region` was the right word there.
+*(An earlier draft made `SsrSegment` "the one genetic kind, a locus". That leaked a downstream,
+data-dependent concept into a reference-only typing step — corrected here.)* It also vindicates
+`ng::tandem_repeat::Region`: `Repeat`/`Satellite`/`Unique` are physical classifications, so `Region`
+was the right word there.
 
 Every typed region is a region of DNA. it is what `ng_step_interfaces.md` §1 already reserved, and it consolidates
 `regions::Region` and `bam::ContigInterval` as that doc intended.
@@ -132,7 +138,7 @@ discovery** (deferred by `ng_proposal.md` §step-3's own decision rule); **a bak
 
 **A typed region carries coordinates, not sequence — no exceptions** (owner, 2026-07-17). This module
 says what each stretch of the genome *is*; the bases are in the reference, and every consumer has it
-open, because it had to in order to ask. An earlier draft made `SsrLocus` embed its tract+flanks on
+open, because it had to in order to ask. An earlier draft made `SsrSegment` embed its tract+flanks on
 the grounds that they are small (~200 bytes, capped at ~1.1 kb by the satellite cap) — which was an
 argument that the payload was *affordable*, never that it was *needed*, and nothing in ng ever read
 it. What it cost is in §2.6: a second reference fetch per window and a second margin to make the
@@ -156,11 +162,11 @@ by whatever settings the config carries — running them at the catalog's own se
    intervals (coordinates, period, score). No policy.
 2. **Clean** — the ported pre-filter: per-period copy floor, then period-multiple redundancy
    (one tract is re-detected at every multiple of its period). **Not optional** (§5).
-3. **Admit** — ng's `admit` (the ported `build_loci`) → the STR loci *and* the tracts it set aside as
+3. **Classify** — ng's `classify` (the ported `build_loci`) → the STR loci *and* the tracts it set aside as
    bundle members (§5).
 4. **Cap** — merge cleaned intervals into coverage runs; a run over `max_repeat_len` (1 kb) is
-   satellite. Drop admitted loci *and bundles* inside one.
-5. **Partition** — emit `SsrLocus` at each surviving tract, `SsrBundle` across each surviving
+   satellite. Drop classified loci *and bundles* inside one.
+5. **Partition** — emit `SsrSegment` at each surviving tract, `SsrBundle` across each surviving
    cluster's hull, `Satellite` at each run, `Generic` across the rest.
 
 **Emission lags decision.** A generic run is decided when a repeat ends it; a locus when the walk
@@ -170,7 +176,7 @@ it takes. A generic region flushed at a window edge is a split run, and an indel
 callable by neither half (§2.3). The window must never appear in the output.
 
 **A satellite array is typed as one object, not searched for loci inside it.** Satellite runs are
-excluded from admission's input, so nothing admitted can land inside one and the one-label-per-base
+excluded from classification's input, so nothing classified can land inside one and the one-label-per-base
 rule needs no tie-break. That is a **typing** claim — past `max_repeat_len` the tandem structure is
 an array, not a microsatellite — and `max_repeat_len` is its parameter, not a constant of nature
 (§10 asks whether 1 kb is right). Whether anyone calls a satellite region is their business.
@@ -206,9 +212,9 @@ generic regions legitimately stop and must **not** merge: the end of a requested
 transition.
 
 **And the partition must not depend on `window_bp`** — the window is a memory knob. This is the
-scanner's window-count-invariance gate, extended over admission, and §2.6 earns it.
+scanner's window-count-invariance gate, extended over classification, and §2.6 earns it.
 
-Nothing overlaps: an admitted locus has clean flanks, so the next repeat either way is ≥ `flank_bp`
+Nothing overlaps: an classified locus has clean flanks, so the next repeat either way is ≥ `flank_bp`
 off; within a bundle the tracts are *closer* than that, which is why the cluster is one region. A
 bundle's span is the hull of its tracts. Zero-length contigs never reach the walk (`GenomeRegions`
 drops them).
@@ -229,7 +235,7 @@ Algorithm notes:
   resolving it. Collapse them — **the flank requirement is the primitive, bundle-ness is derived** —
   so when we explore what flank the delimiter actually needs (§10), the bundle definition follows
   for free. It also gives us a reason GangSTR never had: no source comment of theirs says why
-  bundles are dropped at all (§10). The collapse happens in **ng's** `SsrAdmissionParams` (§5); the
+  bundles are dropped at all (§10). The collapse happens in **ng's** `SsrSegmentCriteria` (§5); the
   catalog keeps both knobs, because production does not move (Revision).
 - **Membership is a local test:** a repeat is a bundle member iff another repeat lies within
   `flank_bp` on either side. The cluster falls out of that — there is no separate transitive rule to
@@ -254,10 +260,10 @@ rule rather than a second one.
 the array: the flank on that side *is* array. Two independent routes get you there, which is why the
 rule is stated over regions rather than over bundling:
 
-- the array's tract clears admission's gates, so §2.4's flank test bundles the two — and the
+- the array's tract clears classification's gates, so §2.4's flank test bundles the two — and the
   cluster's hull then covers the same bases as the `Satellite`; or
 - it does **not** clear them (score, compound motif), so nothing bundles — but the satellite is built
-  from *coverage*, which does not care, so a lone `SsrLocus` ends up 20 bp from an array.
+  from *coverage*, which does not care, so a lone `SsrSegment` ends up 20 bp from an array.
 
 **Why the satellite wins.** It is already the type that says *"an array, not a microsatellite — do
 not look for loci in here"* (§2.1). A repeat stuck to an array is unusable for the array's reason, so
@@ -287,7 +293,7 @@ case — it is the region set whose every region covers an entire contig."*
 
 **The problem, which production does not have.** We compute
 during the walk, so a BED edge can cut a decision in half: a repeat at 999 is discarded if a
-neighbour sits at 1,030, but with a BED of `[1, 1000]` we never see 1,030 and **admit a locus the
+neighbour sits at 1,030, but with a BED of `[1, 1000]` we never see 1,030 and **classify a locus the
 whole-genome run rejects**. Same reference, different calls, because of `--regions`.
 
 **The property: whether a base is STR / bundle / generic / satellite must not depend on the BED.**
@@ -379,32 +385,32 @@ covers it — and anything longer is a satellite, handled in 3).
 > found by writing the test meant to confirm them.**
 >
 > **(a) "Keep only the repeats whose start lands in the core" — not before the policy runs.** Where
-> that sentence sits, it reads as: filter to the core, then admit. Do that and the answer stops being
-> window-invariant. Admission's rules are **neighbour** rules — the bundle flank test asks whether
+> that sentence sits, it reads as: filter to the core, then classify. Do that and the answer stops being
+> window-invariant. Classification's rules are **neighbour** rules — the bundle flank test asks whether
 > another repeat is within 50 bp, and the pre-filter's redundancy elimination asks whether an
 > overlapping lower-period interval survived. A core tract's neighbour can sit 10 bp beyond the core
-> edge, in the margin. Filter first and that neighbour is invisible, so the tract is admitted as a
+> edge, in the margin. Filter first and that neighbour is invisible, so the tract is classified as a
 > clean locus instead of bundled — silently, and differently for every `window_bp`.
 >
 > So the margin is not only the detector's context, it is the **policy's** context, and the order is:
-> detect on the slice → pre-filter on the slice → admit on the slice → **then** attribute by start.
+> detect on the slice → pre-filter on the slice → classify on the slice → **then** attribute by start.
 > Attribution is the last step, not the first. (Mutation-verified: pre-filtering the core-attributed
 > set alone fails `windowed_matches_the_resident_oracle_at_every_window_size`.)
 >
-> **(b) "It also covers admission for free … 1 kb is a lot more than 50" — true, and for a reason
-> this paragraph did not have.** There is **one margin**: the scan's `max_repeat_len`. Admission runs
+> **(b) "It also covers classification for free … 1 kb is a lot more than 50" — true, and for a reason
+> this paragraph did not have.** There is **one margin**: the scan's `max_repeat_len`. Classification runs
 > over the slice the scan already read, needs each tract's own bases (motif, purity) — which are in
 > that slice by construction — and answers the flank question by **arithmetic** against `contig_len`,
 > which no slice could answer anyway.
 >
 > *D3 answered this differently and it is worth one line, because the fix that replaced it deleted
-> code rather than adding it. `Locus` used to embed `tract ± flank_bp` of bases, so `admit` read past
-> the tract and **panicked** for tracts at the slice's own edge. D3 gave admission a second, wider
+> code rather than adding it. `SsrSegment` used to embed `tract ± flank_bp` of bases, so `classify` read past
+> the tract and **panicked** for tracts at the slice's own edge. D3 gave classification a second, wider
 > slice — a `flank_bp` margin on top of the `max_repeat_len` one, fetched separately, every window —
 > and called them "two margins, two questions". Dropping the payload (§1.2) dropped the second margin,
 > the second fetch, and both panics: there was only ever one question.*
 
-**2. Tell admission where the contig actually ends.**
+**2. Tell classification where the contig actually ends.**
 
 The rule ng inherits from `build_loci` works out a locus's right flank as
 `(new_end + flank_bp).min(contig_seq.len())` and throws the
@@ -439,8 +445,8 @@ nothing (§7).
 
 ## 3. The types
 
-Live in `src/ng/region_typing/` (§6): the walk's types in `mod.rs`, ng's ported `Locus` /
-`SsrAdmissionParams` / `admit` in `admission.rs`. `GenomeRegion` is shared vocabulary and lands in
+Live in `src/ng/region_typing/` (§6): the walk's types in `mod.rs`, ng's ported `SsrSegment` /
+`SsrSegmentCriteria` / `classify` in `segment_criteria.rs`. `GenomeRegion` is shared vocabulary and lands in
 `ng::types`.
 
 ```rust
@@ -449,16 +455,17 @@ Live in `src/ng/region_typing/` (§6): the walk's types in `mod.rs`, ng's ported
 /// the invariant (§2.3) reads it off directly. It is the one place ng's 1-based base is stated.
 pub struct TypedRegion { pub region: GenomeRegion, pub kind: RegionKind }
 
-/// Exactly one of the four is a genetic object; the other three are physical (§1.1).
+/// All four kinds are physical regions (§1.1) — none is a genetic locus.
 /// `Generic` and `Satellite` carry nothing because they *are* just spans.
 pub enum RegionKind {
-    /// ng's own `Locus` — motif, borders, purity. **Coordinates, no bases** (§1.2). Ported from
-    /// the catalog's, born 1-based/`u64` (§4, §5) and without its `ref_bytes`; production's stays
-    /// 0-based/`u32` and keeps them. No wrapper: it is 1-based like everything else in ng, and
-    /// `TypedRegion` already carries the region. It is `ReadPreparer::Locus`, closing
+    /// ng's own `SsrSegment` — motif, borders, purity. **Coordinates, no bases** (§1.2). A physical
+    /// stretch carrying an STR, *not* a locus (it becomes one only if variable, downstream). Ported
+    /// from the catalog's `Locus`, born 1-based/`u64` (§4, §5) and without its `ref_bytes`;
+    /// production's stays 0-based/`u32` and keeps them. No wrapper: it is 1-based like everything else
+    /// in ng, and `TypedRegion` already carries the region. It is `ReadPreparer::Locus`, closing
     /// `read_preparation_ssr.md` §8 — which will need the tract's bases, and will fetch them from
     /// the reference it opens to gather reads.
-    SsrLocus(Locus),                               // Locus = ng's, NOT ssr::types::Locus
+    SsrSegment(SsrSegment),                               // SsrSegment = ng's, NOT ssr::types::Locus
     /// A cluster of repeats none of which has clean flanks (§2.4). Carries the tracts as
     /// coordinates — enough to see the structure (each interval has its period) without this step
     /// pre-deciding what it is for. The hull is the `TypedRegion`'s own span.
@@ -508,7 +515,7 @@ impl GenomeRegions {
 
 The contig's name and length come from the `ContigList` the accessor already holds (needs a
 `contigs()` accessor added). The length is doubly load-bearing: it fixes the partition's right edge
-**and** it is what admission must be *told* rather than infer from its slice (§2.6).
+**and** it is what classification must be *told* rather than infer from its slice (§2.6).
 
 ### 3.1 Config and counts
 
@@ -522,11 +529,11 @@ pub struct TypedRegionConfig {
     pub scan: ScanParams,         // the scanner's defaults (2 / 7 / 2)
     pub max_repeat_len: Bp,       // the satellite cap AND the scan margin — one field because
                                   //   they must be the same number (§2.6). It must also be >=
-                                  //   admission's flank_bp, or a window cannot see a core tract's
+                                  //   classification's flank_bp, or a window cannot see a core tract's
                                   //   bundle neighbours — asserted in the walk (D3), because §10
                                   //   sweeps both knobs and sweeps run in release
     pub window_bp: Bp,            // the memory knob; default 100 kb. Must not change the output
-    pub admission: SsrAdmissionParams,  // ng's own (§5) — ALL of admission's rules, including the
+    pub criteria: SsrSegmentCriteria,  // ng's own (§5) — ALL of classification's rules, including the
                                   //   period scope and copy floors the catalog hardcodes. `flank_bp`
                                   //   (50) is the bundle threshold too, so there is no separate
                                   //   `bundle_threshold` knob (§2.4). Default = the catalog's
@@ -551,7 +558,7 @@ pub struct TypedRegionCounts {
 ```
 
 `repeat_bp_with_no_locus` is in **bp, broken out by reason**, because a per-repeat count answers the
-wrong question twice: admission trims every survivor, so a repeat that admits one locus and sheds
+wrong question twice: classification trims every survivor, so a repeat that classifies one locus and sheds
 200 bp contributes nothing to a per-repeat counter; and one total cannot separate a purity rejection
 from a copy-floor one, which is exactly the distinction §10 needs. These are the live-caller view of
 the catalog's measured ~35% STR coverage gap.
@@ -567,27 +574,27 @@ is worth more than the legacy, and a straddle in the coordinate system is the ki
 more expensive every month it survives.
 
 **Production is not ng's code, and does not move (Revision 2026-07-16).** `ssr::types::Locus` stays
-0-based/`u32`; `src/regions.rs` stays `u32`. ng's `Locus` is **its own type** — the same fields, born
+0-based/`u32`; `src/regions.rs` stays `u32`. ng's `SsrSegment` is **its own type** — the same fields, born
 1-based and `u64`. The rebase an earlier draft costed at "59 call sites across `src/ssr/`" is not
 performed at all: there is nothing to rebase, because ng's copy is written right the first time.
 
 That still buys what the rebase was for. An even earlier draft kept `Locus` 0-based and wrapped it in
-an `ng::SsrLocus` to present a 1-based surface — a type whose *entire* purpose was to hide the
-mismatch. With ng owning the type the wrapper has nothing left to do: `RegionKind::SsrLocus(Locus)`
-holds ng's `Locus` directly, `TypedRegion` already carries the region, and `ReadPreparer::Locus` is
-ng's `Locus` (`read_preparation_ssr.md` §8). **The workaround was bigger than the fix** — and the fix
+an `ng::SsrSegment` to present a 1-based surface — a type whose *entire* purpose was to hide the
+mismatch. With ng owning the type the wrapper has nothing left to do: `RegionKind::SsrSegment(SsrSegment)`
+holds ng's `SsrSegment` directly, `TypedRegion` already carries the region, and `ReadPreparer::Locus` is
+ng's `SsrSegment` (`read_preparation_ssr.md` §8). **The workaround was bigger than the fix** — and the fix
 turned out to be cheaper still, since owning the type costs less than rebasing someone else's.
 
-**What ng reuses from `src/ssr/` unchanged: nothing in this step, as it turns out.** `Locus` is
+**What ng reuses from `src/ssr/` unchanged: nothing in this step, as it turns out.** `SsrSegment` is
 obviously ng's — coordinates and width are all it is. `Motif`
 ([ssr/types.rs:36](../../../../src/ssr/types.rs)) looked like the opposite case, and this spec called
 it *"the Revision's 'reuse where it costs production nothing' case exactly"* — it is `pub(crate)`,
 and carries no coordinates and no width, so there is nothing to rebase.
 
 *(Corrected 2026-07-16, A1 review — the premise was true and **the conclusion was wrong**.* `Motif`
-*is `pub(crate)`; ng's `Locus` is `pub` and returns one, which trips rustc's `private_interfaces`
+*is `pub(crate)`; ng's `SsrSegment` is `pub` and returns one, which trips rustc's `private_interfaces`
 lint. The escapes were: widen it in `src/ssr/types.rs` — **touching production, forbidden**; demote
-ng's whole admission surface to `pub(crate)` — bends the ng-sibling convention and buys `dead_code`
+ng's whole classification surface to `pub(crate)` — bends the ng-sibling convention and buys `dead_code`
 warnings for every item until its Milestone-D consumer exists; or port 40 coordinate-free lines. So
 reuse did **not** cost production nothing — it cost a visibility compromise, which is the coupling
 "a fresh ng caller from scratch" exists to avoid. **ng ports `Motif` too.** The dividend: ng's
@@ -637,15 +644,15 @@ either: this step never opens an alignment file (§1.2).
 
 ---
 
-## 5. Admission — the policy is a parameter
+## 5. Classification — the policy is a parameter
 
 **Which repeats become STR loci is the experiment, not a fixture.** ng exists to find the best way
 to call SNPs, indels, and STRs; where the STR route beats the generic one is one of the things it is
-here to measure (§5.2, §10). So this step does not *have* an admission policy — it takes one, and
+here to measure (§5.2, §10). So this step does not *have* an classification policy — it takes one, and
 the partition is a function of it.
 
 **We port the catalog's implementation; we do not adopt its policy.** Those are different, and an
-earlier draft of this spec collapsed them into a goal ("reuse the catalog's admission policy"),
+earlier draft of this spec collapsed them into a goal ("reuse the catalog's classification policy"),
 which was backwards. `postprocess::build_loci`
 ([postprocess.rs:69](../../../../src/ssr/catalog/postprocess.rs)) is a working, tested
 implementation of the whole rule set — period scope, score gate, compound-motif drop, bundle drop,
@@ -668,7 +675,7 @@ carrying every change this step needs at once:
 | 1-based inclusive, `u64` | ng's coordinate system (§4); production stays 0-based/`u32` |
 | takes `Vec<RepeatInterval>` | ng's detector is the scanner; `TrfRecord` is trf-mod's shape and ng must not depend on it |
 | windowed — `bases_start` + `contig_len` passed in | §2.6's silent bug: a slice cannot be asked where the contig ends |
-| returns `Admitted { loci, bundled }` | §2.4 routes bundles instead of deleting them |
+| returns `Classified { loci, bundled }` | §2.4 routes bundles instead of deleting them |
 | **every rule a parameter** | §5.2's experiment (below) |
 
 That is five changes to one function; "a small tweak" it is not, which is exactly when the owner's
@@ -699,15 +706,15 @@ unchanged.
 
 ```rust
 // production, untouched (src/ssr/catalog/postprocess.rs) — 0-based, u32, whole-contig
-fn build_loci(recs: Vec<TrfRecord>, chrom: &str, contig_seq: &[u8], p: &CatalogParams) -> Vec<Locus>
+fn build_loci(recs: Vec<TrfRecord>, chrom: &str, contig_seq: &[u8], p: &CatalogParams) -> Vec<SsrSegment>
 
 // ng's copy (src/ng/) — 1-based, u64 throughout, so nothing converts in this call.
-fn admit(recs: Vec<RepeatInterval>, chrom: &str,
+fn classify(recs: Vec<RepeatInterval>, chrom: &str,
          bases: &[u8], bases_start: u64, contig_len: u64,
-         p: &SsrAdmissionParams) -> Admitted
+         p: &SsrSegmentCriteria) -> Classified
 
-struct Admitted {
-    loci: Vec<Locus>,                 // ng's Locus (§4) — exactly what build_loci returns today
+struct Classified {
+    loci: Vec<SsrSegment>,                 // ng's SsrSegment (§4) — exactly what build_loci returns today
     bundled: Vec<RepeatInterval>,     // NEW: the cluster members build_loci silently drops today
 }
 ```
@@ -764,12 +771,12 @@ It exists only in a test file (`catalog_prefilter`,
 `ssr_repeat_scanner.md` §6 says it "belongs in `catalog::run`" — written when the catalog swap was
 the only consumer.
 
-**ng copies it, alongside the admission policy it is inseparable from** (§5b — it exists because the
+**ng copies it, alongside the classification policy it is inseparable from** (§5b — it exists because the
 bundle drop runs before the copy floor, which is `build_loci`'s ordering). Production keeps its
-test-only copy; ng's lives beside ng's `admit`.
+test-only copy; ng's lives beside ng's `classify`.
 
 **The warning the earlier draft raised here was real, and is now accepted rather than dodged.** It
-said: *"two copies of an admission policy is how the caller and the catalog silently diverge — which
+said: *"two copies of an classification policy is how the caller and the catalog silently diverge — which
 would invalidate the oracle this step's validation rests on."* True. But the alternative it proposed —
 one shared `pub(crate)` fn in `src/ssr/catalog/` — requires production to move whenever an experiment
 does, which is the coupling the owner's rule exists to prevent. **We take the divergence risk and
@@ -779,10 +786,10 @@ Divergence caught by a test is a bug; divergence prevented by coupling is a froz
 ### 5.2 Which repeats belong on the STR path — a starting value, not a decision
 
 **v1 starts at period 2–6 with the catalog's copy floors, and that is scaffolding, not a finding.**
-It makes v1's admitted set identical to the catalog's, which is what makes the oracle real. It is
+It makes v1's classified set identical to the catalog's, which is what makes the oracle real. It is
 **not evidence the grid is right, and this spec should not be read as saying so.**
 
-**The question is two-dimensional and the code already admits it.** A 3-copy and a 40-copy period-3
+**The question is two-dimensional and the code already classifies it.** A 3-copy and a 40-copy period-3
 tract are different problems. The frontier runs over **period × tract length** — and
 `copy_number_floor` (period 2 → 5 copies, 3 → 4, rest → 3) bounded by `MIN_PERIOD`/`MAX_PERIOD`
 *is* that grid, already drawn by GangSTR for GangSTR's purposes and never measured against our
@@ -799,13 +806,13 @@ STR-awareness onto it (DRAGstr types STR context on a period 1–8 × repeat-len
 modulates the indel prior instead of forking — `ng_proposal.md`'s *"cheapest way to add STR-awareness
 to a general core"*).
 
-**One mechanical fact worth keeping:** scanning 1–6 and 2–6 admit **identical loci**, because the
+**One mechanical fact worth keeping:** scanning 1–6 and 2–6 classify **identical loci**, because the
 pre-filter drops period 1 *before* redundancy elimination — via an explicit `iv.period >= 2` clause,
 **not** the copy floor (`copy_floor(1)` falls through to the catch-all `3`, which a 3 bp poly-A
 clears). That ordering is load-bearing: redundancy treats every period as a multiple of 1, so a
 period-1 interval reaching it would annihilate every overlapping real tract. The ranges differ only
 in the *partition* — under 1–6 an over-1 kb poly-A becomes `Satellite`. v1 takes 2–6 to keep the
-admitted set equal to the catalog's.
+classified set equal to the catalog's.
 
 > **The paragraph above describes a bug, which is now fixed — 2026-07-17. The sentence about
 > `Satellite` was a symptom of it, and the ordering it praises was the cause.**
@@ -821,10 +828,10 @@ admitted set equal to the catalog's.
 > mean what it said, which is the whole of the bug. That is why an over-1 kb poly-A became a
 > `Satellite`: not by decision, but because its aliases were counted as tandem repeats.
 >
-> **The fix** ([`admission::prefilter`](../../../../src/ng/region_typing/admission.rs)) splits the one
+> **The fix** ([`segment_criteria::prefilter`](../../../../src/ng/region_typing/segment_criteria.rs)) splits the one
 > filter in two and puts the period floor **last**: copy floor → redundancy elimination → period floor.
 > Period 1 now survives long enough to eliminate its own aliases and is dropped afterwards, so a
-> homopolymer contributes **nothing** at 2..=6 and is admitted as a period-1 tract under its own motif
+> homopolymer contributes **nothing** at 2..=6 and is classified as a period-1 tract under its own motif
 > at 1..=6. **The range means what it says in both directions**, which is all a caller asked for.
 >
 > **The copy floor is what makes that safe, and it is why the ordering was as it was.** A surviving
@@ -848,11 +855,11 @@ admitted set equal to the catalog's.
 > tests failed and were rewritten *because they encoded the bug*:
 > `prefilter_drops_period_one_before_it_can_eliminate_a_real_str` asserted the alias should be **kept**
 > (its "real STR" was the poly-A's own period-2 alias, over the identical span), and the walk-level
-> homopolymer fixture asserted the run must reach admission as `Compound`.
+> homopolymer fixture asserted the run must reach classification as `Compound`.
 >
 > **Consequence for §3.1's counts.** `Compound` was reachable *only* via this bug — the E1e note in §8
 > below says so in as many words ("the poly-A cascade's fix is what creates this gate's only
-> customer"). With the alias gone, **the walk reaches one of admission's five gates, not two**:
+> customer"). With the alias gone, **the walk reaches one of classification's five gates, not two**:
 > `FlankClamped`. E1e's original *reasoning* about `Compound` — that a compound motif is a
 > period-multiple and redundancy drops it — was right all along; it was false only of period 1, and
 > only because of the ordering.
@@ -871,15 +878,15 @@ bake-off is a file, not a folder"). Step 3 has no competitor. Active-region dete
 doc's headline alternative — is **data-driven** and cannot run before any read is fetched; it belongs
 inside the pileup's locus definition, and `ng_step_interfaces.md:302` **already relocated its
 bake-off there**. Data-driven STR discovery is deferred by the proposal's own rule. What *does* vary
-here — period range, satellite cap, admission strictness — are **config knobs, not implementations**:
+here — period range, satellite cap, classification strictness — are **config knobs, not implementations**:
 swept by changing a number, not a `Box<dyn _>`. **`bench/` is deferred**, same reasoning as read
 filtering: no competitors, no frontier to plot.
 
 **Module: `src/ng/region_typing/`** — a folder, and the Revision is why. A step with no bake-off is a
 file, not a folder (`module_layout.md` principle 1), and step 3 has no bake-off — but it now also
-carries a ~500-line port of the admission policy (§5), which is a *different* concern from the walk
+carries a ~500-line port of the classification policy (§5), which is a *different* concern from the walk
 and has its own dense test suite. So: `region_typing/mod.rs` for the types and the walk,
-`region_typing/admission.rs` for the port (ng's `Locus`, `SsrAdmissionParams`, the pre-filter, `admit`,
+`region_typing/segment_criteria.rs` for the port (ng's `SsrSegment`, `SsrSegmentCriteria`, the pre-filter, `classify`,
 and §8.0's differential test against production). The folder tracks the code's size, not a bake-off —
 the `tandem_repeat.rs` precedent, promoted on the same grounds.
 
@@ -897,7 +904,7 @@ a `Satellite` verdict is coming to release them.
 
 **Raw bytes, not canonical — not a detail.** `RefSeq::fetch_into` serves canonical bases (ambiguity
 codes folded to `N`); the catalog reads the FASTA **verbatim** and `build_loci` embeds whatever it is
-handed. `Locus` compares by value, so canonical bytes would make every locus containing an IUPAC code
+handed. `SsrSegment` compares by value, so canonical bytes would make every locus containing an IUPAC code
 compare unequal to the catalog's — **silently breaking the oracle** on any assembly carrying them.
 
 **Which accessor.** `WindowedRefSeq` is the right shape (sliding buffer + `evict_before` = this
@@ -966,32 +973,32 @@ scepticism about interfaces designed ahead of an implementation.
 ### 8.0 Port fidelity — the oracle the Revision made necessary
 
 **What used to be true by construction is now a test.** The earlier design had ng *call* production's
-`build_loci`, so "ng admits what the catalog admits" needed no proving — it was the same function.
+`build_loci`, so "ng classifies what the catalog classifies" needed no proving — it was the same function.
 ng now owns a copy (§5), and a copy can drift: on transcription, and later, as experiments edit ng's
 side. §5.1 named this the real cost of the Revision. This is the mitigation.
 
-**Differential test: ng's `admit` vs production's `build_loci`, same inputs, same answers.** Both are
+**Differential test: ng's `classify` vs production's `build_loci`, same inputs, same answers.** Both are
 in this crate, so the test needs nothing new from production — `TrfRecord::for_test` is
 `#[cfg(test)] pub(crate)`, and a test module is exactly where it belongs (§5c):
 
 1. Take a set of `RepeatInterval`s (scanner output on the synthetic fixture, plus the crafted cases
    from `postprocess.rs`'s own tests).
-2. Feed ng's `admit` directly; feed production's `build_loci` the same intervals bridged through
+2. Feed ng's `classify` directly; feed production's `build_loci` the same intervals bridged through
    `TrfRecord::for_test`, at the **whole-contig degenerate case** (§5a) and the catalog's settings.
-3. Assert the `Locus` sets are identical **modulo the coordinate base** — ng's 1-based inclusive
+3. Assert the `SsrSegment` sets are identical **modulo the coordinate base** — ng's 1-based inclusive
    `[start, end]` is production's 0-based half-open `[start, end)` shifted by exactly one on `start`,
    with `end` unchanged. Compare through one conversion helper, stated once, so the test pins the
    arithmetic rather than restating the bug.
 4. **Do not compare `ref_bytes` or the flanks**: production has them, ng does not (§1.2), and that is
    a divergence rather than drift. What the differential pins is every *decision* — which tracts
-   admit, at what span, motif, period and purity — which is what "faithful" has to mean once the
+   classify, at what span, motif, period and purity — which is what "faithful" has to mean once the
    payload is gone.
 
 **What it proves and what it does not.** It proves the transcription is faithful *at the catalog's
 settings, whole-contig*. It does **not** cover the windowed path (§8's window-invariance does) or any
 other configuration (nothing can — that is §5.2's experiment). It is a **fixed-config regression
 test**, and it is expected to be *deleted or re-pinned* the day an experiment deliberately moves ng's
-admission away from the catalog's rules. Until then it is the tripwire on silent drift.
+classification away from the catalog's rules. Until then it is the tripwire on silent drift.
 
 **It also outlives the port.** Production is frozen *now*; when the experiments conclude and the
 port-back decision is taken (`ng_proposal.md` §3), this test is the thing that says what ng changed
@@ -1000,10 +1007,10 @@ and what it merely moved.
 ### 8.1 The `.cat` parity oracle
 
 **The oracle checks the machinery, not the policy — and only at one configuration.** `ssr-catalog`
-produces a `.cat` whose contents are a `Vec<Locus>`: same type, same reference, and — *if we
+produces a `.cat` whose contents are a `Vec<SsrSegment>`: same type, same reference, and — *if we
 configure it so* — the same settings. Run the walk at the catalog's settings, collect every
-`SsrLocus`, compare. What that proves is that the plumbing is sound: the windowed scan, the
-pre-filter, the admission call, the coordinate arithmetic. **It proves nothing about whether those
+`SsrSegment`, compare. What that proves is that the plumbing is sound: the windowed scan, the
+pre-filter, the classification call, the coordinate arithmetic. **It proves nothing about whether those
 settings are right**, and it is not a licence to treat the catalog's numbers as correct (§5).
 
 At any other configuration the two *should* differ — that is what an experiment is (§5.2). So this
@@ -1011,7 +1018,7 @@ is a **fixed-config regression test**, and it must be pinned to the catalog's se
 rather than to whatever `Default` happens to be, or it will start failing the first time someone
 moves a floor and reads it as a bug rather than a result.
 
-`scanner_parity.rs` is the precedent (compares `Locus` sets, tolerant of boundary wobble via span
+`scanner_parity.rs` is the precedent (compares `SsrSegment` sets, tolerant of boundary wobble via span
 overlap, readable diff).
 
 **Which `.cat`, now that the detector swap is cancelled (Revision).** An earlier draft preferred a
@@ -1044,7 +1051,7 @@ disposal separable is what preserved the oracle.
 a low-copy tract (both `Generic` — the §2.2 property, and see the correction below); a homopolymer; a 2 kb array (`Satellite`); a
 real STR *inside* a 2 kb array (swallowed — the §2.4 cost, made visible); **two tracts 10 bp apart**
 (one `SsrBundle` carrying both, *not* two `Generic` regions); **three tracts chained 30 bp apart** (one
-bundle of three — emergent transitivity); **a locus 60 bp from a bundle** (admitted; bundles do not
+bundle of three — emergent transitivity); **a locus 60 bp from a bundle** (classified; bundles do not
 spread); a tract at position 1 (flank clamps → `Generic`); a repeat-free contig; a tract at one
 contig's end abutting one at the next's start (transition arithmetic).
 
@@ -1067,29 +1074,29 @@ contig's end abutting one at the next's start (transition arithmetic).
 > **Two corrections to this section's fixture list, from writing it (2026-07-17).**
 >
 > **"An impure tract → `Generic`" is not one rule.** The *scanner* decides an impure tract's fate long
-> before admission does, because Ruzzo–Tompa returns **maximal-scoring** segments. Three outcomes: a
-> **small** interruption is paid for by the surrounding matches, the tract stays whole and admits — a
+> before classification does, because Ruzzo–Tompa returns **maximal-scoring** segments. Three outcomes: a
+> **small** interruption is paid for by the surrounding matches, the tract stays whole and classifies — a
 > **locus**; a **large** one splits the segment, and the pure pieces are a **bundle** if they are close
 > (two loci if not); only when the pieces fall under the copy floor is it **`Generic`**. The fixture
 > that pins §2.2's property is the third case, and it says so.
 >
-> **Admission's `Purity` gate is unreachable from the walk** — a tract impure enough to fail the 0.80
+> **Classification's `Purity` gate is unreachable from the walk** — a tract impure enough to fail the 0.80
 > floor always contains a purer sub-segment that scores higher, so the scanner emits *that*. Measured:
-> a 0.79-purity fixture comes back a **locus**, its pure core. Of admission's five gates the walk
+> a 0.79-purity fixture comes back a **locus**, its pure core. Of classification's five gates the walk
 > reaches exactly two, `Compound` (the homopolymer gate — §5b drops period 1 by the *floor*, so the
 > run's period-2 multiple has no eliminator left and arrives as motif `AA`) and `FlankClamped`. See
-> `admission::the_walk_reaches_only_two_of_admissions_five_gates`; §3.1's other three columns are
+> `segment_criteria::the_walk_reaches_only_one_of_classifications_five_gates`; §3.1's other three columns are
 > structurally zero.
 >
 > > **Superseded 2026-07-17 — it is ONE gate, `FlankClamped`.** "The run's period-2 multiple has no
 > > eliminator left" *was the bug* (§5.2's correction), and `Compound` had no other customer. With
-> > `prefilter` reordered, a homopolymer never reaches admission, so nothing is turned down and nothing
+> > `prefilter` reordered, a homopolymer never reaches classification, so nothing is turned down and nothing
 > > is counted — the walk-level fixture now asserts `RejectionCounts::default()`. **The zeroes were
-> > never a property of admission**: each is caused by a stage *upstream* of the gate — the scanner's
+> > never a property of classification**: each is caused by a stage *upstream* of the gate — the scanner's
 > > maximal-scoring segments for `Purity` and `NoCleanTrim`, the pre-filter for `CopyFloor` and now
 > > `Compound` — so the count moves whenever that stage does, and it has now moved twice. **Four of
 > > §3.1's five rejection columns are structurally zero.** The test is renamed
-> > `admission::the_walk_reaches_only_one_of_admissions_five_gates`.
+> > `segment_criteria::the_walk_reaches_only_one_of_classifications_five_gates`.
 
 ---
 
@@ -1100,12 +1107,12 @@ contig's end abutting one at the next's start (transition arithmetic).
 | the windowed scan (core + margin, coverage clipped, intervals by start) | `collect_windowed` ([tandem_repeat.rs:530](../../../../src/ng/tandem_repeat.rs)) | **the primitive this is built on** — must be promoted and streamed (§6.1) |
 | repeat detection | `find_tandem_repeats` ([tandem_repeat.rs:354](../../../../src/ng/tandem_repeat.rs)) | called per window by the above |
 | the region tiling | `RegionScanner` ([tandem_repeat.rs:586](../../../../src/ng/tandem_repeat.rs)) | **not reused** — merges before policy (§6.1) |
-| the admission policy | `build_loci` ([postprocess.rs:69](../../../../src/ssr/catalog/postprocess.rs)) | **copied into ng** — every decision transcribed unchanged; windowed, `RepeatInterval`-taking, 1-based/`u64`, all-knobs, returns `Admitted` (§5a), and **without the flank embed** (§1.2). Production's stays as it is |
+| the classification policy | `build_loci` ([postprocess.rs:69](../../../../src/ssr/catalog/postprocess.rs)) | **copied into ng** — every decision transcribed unchanged; windowed, `RepeatInterval`-taking, 1-based/`u64`, all-knobs, returns `Classified` (§5a), and **without the flank embed** (§1.2). Production's stays as it is |
 | the bundle selection | `drop_bundles`/`is_close` ([postprocess.rs:274](../../../../src/ssr/catalog/postprocess.rs)) | **copied with it** — selection kept, disposal not; re-associated to stream (§2.4, §2.6) |
-| the pre-filter | `catalog_prefilter` ([ng/scanner_parity.rs](../../../../src/ng/scanner_parity.rs)) | **copied into ng**, beside ng's `admit` (§5.1); the parity test keeps its own frozen copy, and B2 moved that test out of `src/ssr/` too (§9) |
-| admission knobs | `CatalogParams` ([catalog/mod.rs:42](../../../../src/ssr/catalog/mod.rs)) | **ng's own `SsrAdmissionParams`** — same defaults, plus the hardcoded period scope + copy floors as real knobs; no separate `bundle_threshold` (§2.4) |
+| the pre-filter | `catalog_prefilter` ([ng/scanner_parity.rs](../../../../src/ng/scanner_parity.rs)) | **copied into ng**, beside ng's `classify` (§5.1); the parity test keeps its own frozen copy, and B2 moved that test out of `src/ssr/` too (§9) |
+| classification knobs | `CatalogParams` ([catalog/mod.rs:42](../../../../src/ssr/catalog/mod.rs)) | **ng's own `SsrSegmentCriteria`** — same defaults, plus the hardcoded period scope + copy floors as real knobs; no separate `bundle_threshold` (§2.4) |
 | the STR locus | `ssr::types::Locus` ([types.rs:136](../../../../src/ssr/types.rs)) | **copied into ng**, born 1-based/`u64` (§4) and **without `ref_bytes`** (§1.2). Production's keeps them, 0-based/`u32` |
-| the motif | `ssr::types::Motif` ([types.rs:36](../../../../src/ssr/types.rs)) | **copied into ng** — reuse looked free (no coordinates, no width) but production's is `pub(crate)` and would leak through ng's `pub` `Locus` (§4, corrected at the A1 review) |
+| the motif | `ssr::types::Motif` ([types.rs:36](../../../../src/ssr/types.rs)) | **copied into ng** — reuse looked free (no coordinates, no width) but production's is `pub(crate)` and would leak through ng's `pub` `SsrSegment` (§4, corrected at the A1 review) |
 | what to walk | `RegionSet`/`Region`/`ContigBounds` ([regions.rs](../../../../src/regions.rs)) | **wrapped, read-only**, by `GenomeRegions` (§2.5); it already parses/coalesces/clamps BED. `regions.rs` does not move |
 | reference bases | `WindowedRefSeq` ([ng/ref_seq.rs](../../../../src/ng/ref_seq.rs)) | + a raw path (§6) and a `contigs()` accessor |
 | the iterator seam | `ReadFilter` ([read_filtering.md](read_filtering.md) §5) | the shape to match |
@@ -1152,10 +1159,10 @@ code"* — and listed a rebase of `ssr::types::Locus` across 59 call sites, thre
 cancelled.** Production is frozen; ng copies what it needs (§5). The list below is what remains, and
 it is entirely ng's own code.
 
-**The `Locus` rebase is not performed — it is not needed.** This was the draft's riskiest single item
+**The `SsrSegment` rebase is not performed — it is not needed.** This was the draft's riskiest single item
 ("an off-by-one here is a silently wrong genotype, not a crash"), scoped at 59 call sites across
 `src/ssr/`, and it earns a note because *deleting it is the Revision's clearest dividend*: ng's
-`Locus` is born 1-based, so there is no rebase, no 59 sites, no silent-genotype risk, and no need for
+`SsrSegment` is born 1-based, so there is no rebase, no 59 sites, no silent-genotype risk, and no need for
 the isolated-commit ritual the draft designed around it. Production's `Locus`, its `.cat` format, and
 `fetch_locus_reads`' inline conversion all stay exactly as they are. The one place the arithmetic
 still has to be right is ng's port — and §8.0 pins it against production directly, which is a
@@ -1168,7 +1175,7 @@ still has to be right is ng's port — and §8.0 pins it against production dire
   `u32` types widen (§4) — those are `src/ng/`, so they are ours.
 - **`ssr_catalog.md`** — **no changes.** The earlier draft's three (`u64` widening, dropping
   `bundle_threshold`, hoisting `MIN_PERIOD`/`MAX_PERIOD`/`copy_number_floor` into knobs) all now land
-  in ng's own `SsrAdmissionParams` instead (§5). The catalog keeps its hardcoded rules, its `u32`, and
+  in ng's own `SsrSegmentCriteria` instead (§5). The catalog keeps its hardcoded rules, its `u32`, and
   its two copy-floor tables; ng's copy folds them into one **on ng's side only**. The catalog
   documents production, and production did not move.
 

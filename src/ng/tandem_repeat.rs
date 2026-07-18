@@ -130,7 +130,7 @@ pub struct ScanParams {
     ///
     /// `u32`, not `u64`: this is a **count**, not a coordinate or a length, so
     /// spec §4's widening does not reach it (the same reason ids stay `u32`, and
-    /// matching `region_typing::admission::MinCopies`).
+    /// matching `region_typing::segment_criteria::MinCopies`).
     pub min_copies: u32,
 }
 
@@ -536,7 +536,7 @@ fn tile(
 ///
 /// That shape is what lets the two consumers differ where they must and agree
 /// where they must not. `RegionScanner` applies the rules to the raw detections;
-/// the typed-region walk applies them to its **pre-filtered** ones (`admission::
+/// the typed-region walk applies them to its **pre-filtered** ones (`segment_criteria::
 /// prefilter`, which the scanner must not know about — this module holds no
 /// consumer policy). Pre-computed fields would have forced the walk to either
 /// accept raw-derived coverage — capping detector noise, which spec §2.4 forbids —
@@ -553,7 +553,7 @@ pub struct ScannedWindow {
     /// The slice actually fetched and scanned, `[start, end)`, 0-based: the core
     /// plus a `max_repeat_len` margin each side, **clamped to the contig**.
     ///
-    /// Public because the walk fetches these same bases for itself — admission needs
+    /// Public because the walk fetches these same bases for itself — classification needs
     /// the sequence, which a scan result does not carry — and must not compute the
     /// range independently: that arithmetic is this module's rule, and two copies of
     /// it are two copies that can drift.
@@ -580,7 +580,7 @@ pub struct ScannedWindow {
     /// **Order: period-major, then ascending start** — inherited from
     /// [`find_tandem_repeats`], which scans one period at a time. It is **not**
     /// start-sorted, and neither is the concatenation across windows. A consumer
-    /// that needs coordinate order must sort; `admit` and `prefilter` both do, and
+    /// that needs coordinate order must sort; `classify` and `prefilter` both do, and
     /// `build_regions` re-sorts. Stated because the type is public and the ordering
     /// is not what a reader would assume.
     pub detections: Vec<RepeatInterval>,
@@ -744,7 +744,7 @@ pub fn scan_window(
 /// It is the primitive the **typed-region generator** stands on
 /// (`typed_regions.md` §6.1): that walk cannot use [`RegionScanner`], because
 /// `RegionScanner` merges coverage and classifies satellites **before any
-/// admission policy can run**, on raw permissive intervals, with nowhere to inject
+/// classification policy can run**, on raw permissive intervals, with nowhere to inject
 /// the pre-filter between detection and merge. The layer underneath it fits
 /// exactly — this one — because it does the genuinely hard part (core + margin,
 /// coverage clipped to cores, intervals attributed by start) and takes **no
@@ -776,7 +776,7 @@ pub fn scan_window(
 /// readers, which §6's 14.6 GB lesson forbids. A closure lets both pass their own
 /// bytes through **one** copy of the window rules.
 ///
-/// Only *admission* needs raw, incidentally: detection is case-insensitive and
+/// Only *classification* needs raw, incidentally: detection is case-insensitive and
 /// non-ACGT never matches, so `find_tandem_repeats` gives the same answer either
 /// way. That is why nothing before the walk tripped on this.
 ///

@@ -3,31 +3,31 @@
 //! Design: `doc/devel/ng/spec/typed_regions.md` (spec) and
 //! `doc/devel/ng/arch/typed_regions.md` (types & interfaces).
 //!
-//! **Build status (incremental).** [`admission`] — ng's own copy of the STR
-//! admission policy (Milestone A) — plus the walk's types: [`TypedRegion`],
+//! **Build status (incremental).** [`segment_criteria`] — ng's own copy of the STR
+//! classification policy (Milestone A) — plus the walk's types: [`TypedRegion`],
 //! [`RegionKind`], [`TypedRegionConfig`], [`TypedRegionCounts`],
 //! [`TypedRegionError`] (C2). `GenomeRegions` (C3) and `TypedRegionIterator` plus
 //! the walk itself (D–E) are still to come, so **nothing here has logic yet** —
 //! these are the shapes the walk will fill.
 //!
 //! **A folder, not a file, and not because of a bake-off** (there is none —
-//! spec §6). The admission port is a second concern with its own dense test
+//! spec §6). The classification port is a second concern with its own dense test
 //! suite, so it gets its own module beside the walk.
 //!
 //! ## Production is frozen; ng owns its copies
 //!
-//! Step 3 needs an STR admission policy that is windowed, 1-based/`u64`,
+//! Step 3 needs an STR classification policy that is windowed, 1-based/`u64`,
 //! driven by `RepeatInterval`s, all-knobs, and that hands bundle members back
 //! instead of dropping them. `ssr::catalog::postprocess::build_loci` is none of
 //! those things, and **reshaping it in place is not on the table** (spec
 //! Revision 2026-07-16, owner): production stays exactly as it is, so that it
 //! remains an *independent yardstick* for the experiments ng exists to run.
 //!
-//! So [`admission`] is a **port**: the logic transcribed unchanged, the shape
+//! So [`segment_criteria`] is a **port**: the logic transcribed unchanged, the shape
 //! ng's. What sharing one function used to guarantee for free, a test now pins
-//! — see [`admission`]'s differential against production (spec §8.0).
+//! — see [`segment_criteria`]'s differential against production (spec §8.0).
 
-pub mod admission;
+pub mod segment_criteria;
 
 /// The E3 port anchor: the whole stack, on a real multi-contig FASTA (`anchor.rs`).
 #[cfg(test)]
@@ -42,7 +42,7 @@ use crate::ng::tandem_repeat::{
 };
 use crate::ng::types::{Bp, ContigId, GenomeRegion, Position};
 use crate::regions::{BedError, ContigBounds, RegionSet};
-use admission::{Locus, RejectionCounts, SsrAdmissionParams};
+use segment_criteria::{RejectionCounts, SsrSegment, SsrSegmentCriteria};
 
 // ---------------------------------------------------------------------
 // What to walk
@@ -153,7 +153,7 @@ pub struct TypedRegion {
 ///
 /// | kind | is | why |
 /// |---|---|---|
-/// | `SsrLocus` | a **locus** | the only kind the reference alone hands you as a genetic object |
+/// | `SsrSegment` | a **locus** | the only kind the reference alone hands you as a genetic object |
 /// | `SsrBundle` | a region | real repeats, none with clean flanks, so no locus can be named |
 /// | `Generic` | a region | nothing more specific can be said from the reference alone |
 /// | `Satellite` | a region | a tandem array too long to be a microsatellite |
@@ -168,11 +168,11 @@ pub struct TypedRegion {
 /// affordable.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RegionKind {
-    /// ng's own [`Locus`] — motif, borders, purity. **Coordinates, no bases**: the
-    /// bases are in the reference the caller already has open (see [`Locus`]). No
+    /// ng's own [`SsrSegment`] — motif, borders, purity. **Coordinates, no bases**: the
+    /// bases are in the reference the caller already has open (see [`SsrSegment`]). No
     /// wrapper: it is 1-based like the rest of ng (spec §4), and [`TypedRegion`]
     /// already carries the region.
-    SsrLocus(Locus),
+    SsrSegment(SsrSegment),
     /// A cluster of repeats none of which has clean flanks (spec §2.4). Carries
     /// the tracts as coordinates — enough to see the structure (each interval has
     /// its period) without this step pre-deciding what it is for. The hull is the
@@ -185,7 +185,7 @@ pub enum RegionKind {
     SsrBundle { tracts: Box<[RepeatInterval]> },
     /// Nothing more specific can be said from the reference alone — **the
     /// default**, not a leftover. The other three are exceptions carved out of it
-    /// (spec §2.2), and a repeat admission turns down for any reason other than
+    /// (spec §2.2), and a repeat classification turns down for any reason other than
     /// bundling lands back here rather than becoming a hole.
     Generic,
     /// A tandem array longer than `max_repeat_len` — an array, not a
@@ -209,13 +209,13 @@ pub enum RegionKind {
 pub struct TypedRegionConfig {
     /// The period range the **scanner** looks for.
     ///
-    /// **Not the same knob as [`SsrAdmissionParams::periods`], and the floor is where
+    /// **Not the same knob as [`SsrSegmentCriteria::periods`], and the floor is where
     /// the difference bites.** The scanner is deliberately permissive (it scans 1..=6
-    /// and emits every period-multiple of every tract); admission is strict (2..=6 by
+    /// and emits every period-multiple of every tract); classification is strict (2..=6 by
     /// default).
     ///
-    /// The scanner must reach **period 1 even though nothing admits it**, because
-    /// `admission::prefilter` uses the period-1 interval as the *eliminator* that
+    /// The scanner must reach **period 1 even though nothing classifies it**, because
+    /// `segment_criteria::prefilter` uses the period-1 interval as the *eliminator* that
     /// removes a homopolymer's own aliases: `AAAA…` is a perfect `AA`, `AAA` and
     /// `AAAAA` repeat, and only period 1 divides them all. Scan from 2 and those
     /// aliases have nothing to eliminate them — a poly-A comes back as three
@@ -231,10 +231,10 @@ pub struct TypedRegionConfig {
     /// capture whole any repeat that is not a satellite, so it is exactly the
     /// length at which a repeat becomes one.
     ///
-    /// **It is also constrained from below by [`SsrAdmissionParams::flank_bp`]**, and
+    /// **It is also constrained from below by [`SsrSegmentCriteria::flank_bp`]**, and
     /// [`partition_windowed`] asserts it: the margin is what lets a window see a core
     /// tract's *neighbours*, and the bundle flank test is a `flank_bp`-radius question.
-    /// A margin narrower than that radius would admit tracts as clean loci that a
+    /// A margin narrower than that radius would classify tracts as clean loci that a
     /// whole-contig walk bundles — silently, and differently per `window_bp`.
     pub max_repeat_len: Bp,
     /// The walk's memory unit. **Must not change the output** (spec §2.3) — it is
@@ -242,19 +242,19 @@ pub struct TypedRegionConfig {
     /// acceptance test rather than a nicety.
     pub window_bp: Bp,
     /// Admission's rules — all of them (spec §5).
-    pub admission: SsrAdmissionParams,
+    pub criteria: SsrSegmentCriteria,
 }
 
-/// The scan period floor: **1**, wider than admission's, and it should stay there
-/// whatever admission's floor is set to.
+/// The scan period floor: **1**, wider than classification's, and it should stay there
+/// whatever classification's floor is set to.
 ///
-/// The scanner must *see* period-1 homopolymers even though nothing admits them:
+/// The scanner must *see* period-1 homopolymers even though nothing classifies them:
 /// `prefilter` keeps the period-1 interval through redundancy elimination precisely
 /// so it can eliminate the run's own `AA` / `AAA` / `AAAAA` aliases, and drops it by
 /// the period floor afterwards. **Not seeing them is not the same as dropping them**
 /// — that sentence is true, but not for the reason this doc used to give: the danger
 /// is not a surviving homopolymer, it is a surviving *alias* of one, which is what a
-/// scanner blind to period 1 leaves behind (`admission::prefilter`, fixed
+/// scanner blind to period 1 leaves behind (`segment_criteria::prefilter`, fixed
 /// 2026-07-17).
 pub const DEFAULT_SCAN_MIN_PERIOD: u8 = 1;
 
@@ -278,7 +278,7 @@ impl Default for TypedRegionConfig {
             scan: ScanParams::default(),
             max_repeat_len: Bp(DEFAULT_MAX_REPEAT_LEN),
             window_bp: Bp(DEFAULT_WINDOW_BP),
-            admission: SsrAdmissionParams::default(),
+            criteria: SsrSegmentCriteria::default(),
         }
     }
 }
@@ -304,11 +304,11 @@ pub struct TypedRegionCounts {
     pub satellites: u64,
     pub satellite_bp: u64,
     /// Repeat coverage that yielded **no locus**, in bp: every base of cleaned repeat
-    /// coverage the walk did not emit as an `SsrLocus` — because it was bundled,
-    /// capped as a satellite, or rejected by one of admission's gates.
+    /// coverage the walk did not emit as an `SsrSegment` — because it was bundled,
+    /// capped as a satellite, or rejected by one of classification's gates.
     ///
     /// In bp, not per repeat, because a per-repeat count answers the wrong
-    /// question twice: admission trims every survivor, so a repeat that admits one
+    /// question twice: classification trims every survivor, so a repeat that classifies one
     /// locus and sheds 200 bp contributes nothing to a per-repeat counter (spec
     /// §3.1).
     ///
@@ -316,14 +316,14 @@ pub struct TypedRegionCounts {
     /// loci that cancel it are subtracted as they are emitted, a block later. It is
     /// exact once the walk is exhausted, which is what the type promises.
     pub repeat_bp_with_no_locus: u64,
-    /// [`Self::repeat_bp_with_no_locus`] **broken out by admission's reason** — because
+    /// [`Self::repeat_bp_with_no_locus`] **broken out by classification's reason** — because
     /// one total cannot separate a purity rejection from a copy-floor one, and that is
     /// exactly the distinction spec §10's routing question turns on.
     ///
     /// **It does not partition the total**, and [`RejectionCounts`] says why: overlapping
     /// rejected repeats are both charged, and bases with no locus for a reason that is not
     /// a *rejection* (bundled, capped as a satellite, out of scope) are in the total and
-    /// not here. A diagnosis of admission's gates, not an account of the genome.
+    /// not here. A diagnosis of classification's gates, not an account of the genome.
     pub rejected_by_reason: RejectionCounts,
 }
 
@@ -337,13 +337,13 @@ pub struct TypedRegionCounts {
 /// catalog's implementation (spec §5):
 ///
 /// 1. **Detect** — [`find_tandem_repeats`] → raw, overlapping candidates. No policy.
-/// 2. **Clean** — [`admission::prefilter`]: per-period copy floor, then
+/// 2. **Clean** — [`segment_criteria::prefilter`]: per-period copy floor, then
 ///    period-multiple redundancy. **Not optional** (spec §5b).
-/// 3. **Admit** — [`admission::admit`] → the STR loci *and* the tracts it set
+/// 3. **Admit** — [`segment_criteria::classify`] → the STR loci *and* the tracts it set
 ///    aside as bundle members.
 /// 4. **Cap** — merge the cleaned intervals into coverage runs; a run over
-///    `max_repeat_len` is a satellite. Admitted loci inside one are dropped.
-/// 5. **Partition** — emit `SsrLocus` at each surviving tract, `Satellite` at each
+///    `max_repeat_len` is a satellite. Classified loci inside one are dropped.
+/// 5. **Partition** — emit `SsrSegment` at each surviving tract, `Satellite` at each
 ///    run, `Generic` across everything else.
 ///
 /// # Why this exists when the windowed walk is what ships
@@ -356,10 +356,10 @@ pub struct TypedRegionCounts {
 /// # A rejected repeat is generic territory, not a hole (spec §2.2)
 ///
 /// The generic path is the **default**; the other three are exceptions carved out
-/// of it. So a repeat admission turns down for being impure, or low-copy, or
+/// of it. So a repeat classification turns down for being impure, or low-copy, or
 /// compound simply stays `Generic` — it is not a bundle, and it is certainly not a
 /// hole. Only the *flank test* makes a bundle: a repeat with another repeat within
-/// `flank_bp` of it, which is exactly the set [`admission::admit`] hands back.
+/// `flank_bp` of it, which is exactly the set [`segment_criteria::classify`] hands back.
 pub fn partition_resident(
     chrom: &str,
     contig: ContigId,
@@ -377,15 +377,15 @@ pub fn partition_resident(
     // 1. Detect.
     let raw = find_tandem_repeats(bases, config.periods, &config.scan);
     // 2. Clean.
-    let cleaned = admission::prefilter(&raw, &config.admission);
+    let cleaned = segment_criteria::prefilter(&raw, &config.criteria);
     // 3. Admit — whole-contig is the degenerate window (spec §5a).
-    let admitted = admission::admit(
+    let classified = segment_criteria::classify(
         cleaned.clone(),
         chrom,
         bases,
         Position(1),
         Bp(contig_len),
-        &config.admission,
+        &config.criteria,
     );
     // 4. Cap: coverage runs over the *cleaned* intervals, then the satellite test.
     //
@@ -408,7 +408,7 @@ pub fn partition_resident(
 
     // 5. Partition — the whole contig as **one block** (below), then fill every gap
     //    with `Generic`.
-    let features = resolve_features(&runs, admitted.loci, &admitted.bundled, contig, config);
+    let features = resolve_features(&runs, classified.loci, &classified.bundled, contig, config);
 
     fill_generic_gaps(features, contig, contig_len)
 }
@@ -450,7 +450,7 @@ pub fn partition_resident(
 /// right-sounding reason (spec §2.4).
 ///
 /// **Both kinds, because both arise, and by different routes.** A cluster reaches here
-/// when the array's own tract passes admission's gates and bundles with its neighbour. A
+/// when the array's own tract passes classification's gates and bundles with its neighbour. A
 /// bare locus reaches here when it does *not*: a satellite run is built from **cleaned
 /// coverage**, while bundling only ever sees tracts that cleared the scope/score/compound
 /// gates — so an array rejected by one of those still forms a satellite and never bundles
@@ -471,13 +471,13 @@ pub fn partition_resident(
 /// `a_microsatellite_beside_a_satellite_is_absorbed_into_it`.
 fn resolve_features(
     runs: &[CoverageRun],
-    loci: Vec<Locus>,
+    loci: Vec<SsrSegment>,
     bundled: &[RepeatInterval],
     contig: ContigId,
     config: &TypedRegionConfig,
 ) -> Vec<TypedRegion> {
     let max_repeat_len = config.max_repeat_len.get();
-    let flank_bp = config.admission.flank_bp;
+    let flank_bp = config.criteria.flank_bp;
     let mut features: Vec<TypedRegion> = Vec::new();
 
     // The satellites: over-cap coverage runs — as spans that can still GROW (below).
@@ -487,7 +487,7 @@ fn resolve_features(
         .filter(|r| r.len() > max_repeat_len)
         .collect();
 
-    let mut loci: Vec<(CoverageRun, Locus)> = loci
+    let mut loci: Vec<(CoverageRun, SsrSegment)> = loci
         .into_iter()
         .map(|l| {
             (
@@ -545,9 +545,9 @@ fn resolve_features(
         }
     }
 
-    // Bundles (D2). `admit` set these aside — repeats too close to each other for
+    // Bundles (D2). `classify` set these aside — repeats too close to each other for
     // any of them to have a clean flank (spec §2.4) — and handed them back rather
-    // than deleting them, which is the whole point of `Admitted::bundled`. Each
+    // than deleting them, which is the whole point of `Classified::bundled`. Each
     // cluster becomes **one** region spanning the hull of its tracts: the gaps
     // between members are inside it, and rightly so — they are shorter than a
     // flank, so nothing can be anchored in them either.
@@ -557,7 +557,7 @@ fn resolve_features(
     // flank — far too short to hide an over-cap run — so a hull that reaches a satellite
     // has a member that reaches it.
     let clusters: Vec<(CoverageRun, Vec<RepeatInterval>)> =
-        admission::bundle_clusters(&members, flank_bp)
+        segment_criteria::bundle_clusters(&members, flank_bp)
             .into_iter()
             .map(|cluster| {
                 let hull = CoverageRun {
@@ -585,7 +585,7 @@ fn resolve_features(
                 start: Position(span.start),
                 end: Position(span.end),
             },
-            kind: RegionKind::SsrLocus(locus),
+            kind: RegionKind::SsrSegment(locus),
         });
     }
     for (hull, cluster) in clusters {
@@ -609,11 +609,11 @@ fn resolve_features(
 /// satellites and `span` become **one** span covering all of them, gaps included.
 /// Returns whether it was absorbed (and sets `absorbed`, the fixed-point loop's flag).
 ///
-/// # Why the gap, and not `admission::is_close`
+/// # Why the gap, and not `segment_criteria::is_close`
 ///
 /// This asks a **flank** question — *are there `flank_bp` clean bases between this
 /// feature and the array?* — so the gap is the measure, and `< flank_bp` is strict, as
-/// admission's own gap clause is (`is_close_is_strict_at_the_threshold`).
+/// classification's own gap clause is (`is_close_is_strict_at_the_threshold`).
 ///
 /// `is_close` itself is the wrong tool here despite testing the same relation between
 /// two *tracts*: it is four `abs_diff` clauses ported from GangSTR, and three of them
@@ -695,7 +695,7 @@ impl CoverageRun {
 /// question about the stretch, not about how the detector happened to split it.
 ///
 /// Input is `RepeatInterval`'s 0-based half-open; output is ng's 1-based
-/// inclusive, so `[s, e)` becomes `[s + 1, e]` — the same one conversion `admit`
+/// inclusive, so `[s, e)` becomes `[s + 1, e]` — the same one conversion `classify`
 /// makes (spec §4).
 fn coverage_runs(intervals: &[RepeatInterval]) -> Vec<CoverageRun> {
     let mut spans: Vec<CoverageRun> = intervals
@@ -742,14 +742,14 @@ fn coverage_runs(intervals: &[RepeatInterval]) -> Vec<CoverageRun> {
 ///
 /// - **`contig_len` comes from the reference's contig table** ([`ContigTable`]), never
 ///   from the window. This discharges spec §2.6's provenance obligation, outstanding
-///   since A3: `admit`'s guard admits a caller passing the *window's own end* as
+///   since A3: `classify`'s guard classifies a caller passing the *window's own end* as
 ///   `contig_len` — production's exact mistake, and arithmetically legal, so no
 ///   signature can catch it. Only a caller holding both the reference and the window
 ///   can, and this is that caller. Get it wrong and every locus within `flank_bp` of
 ///   every window boundary silently vanishes, a different set for each `window_bp`.
 /// - **The window geometry comes from [`scan_windowed`]**, not from arithmetic here:
 ///   one copy of the core/margin rules, per spec §6.1.
-/// - **The bases are raw** ([`RawRefSeq`]), because `Locus` compares by value and
+/// - **The bases are raw** ([`RawRefSeq`]), because `SsrSegment` compares by value and
 ///   canonical bytes would make every IUPAC-carrying locus unequal to the catalog's
 ///   (spec §6).
 ///
@@ -762,7 +762,7 @@ fn coverage_runs(intervals: &[RepeatInterval]) -> Vec<CoverageRun> {
 ///
 /// So there is one margin, spec §2.6's: `max_repeat_len`, what makes a repeat *segment*
 /// identically. Until 2026-07-17 there was a second — `flank_bp` on top of it — and a
-/// second fetch of every window to get it, because `Locus` embedded `tract ± flank_bp`
+/// second fetch of every window to get it, because `SsrSegment` embedded `tract ± flank_bp`
 /// of bases and a tract at the slice's own edge could not supply them. Removing the
 /// payload removed the margin, the re-fetch, and the two panics that policed it.
 /// **Collected**, so it holds the contig's regions after all — this is the walk's shape
@@ -833,14 +833,14 @@ pub struct TypedRegionIterator<R> {
 struct WindowTally {
     /// Cleaned repeat coverage this window owns, in bp.
     repeat_bp: u64,
-    /// Repeat bp this window's core owns that admission turned down, by reason.
+    /// Repeat bp this window's core owns that classification turned down, by reason.
     rejected: RejectionCounts,
 }
 
 /// One span's walk in progress: where the windows are up to, and the block carries.
 struct SpanWalk {
     contig: ContigId,
-    /// The contig's name — from the reference's table, and the name every `Locus` gets.
+    /// The contig's name — from the reference's table, and the name every `SsrSegment` gets.
     chrom: String,
     /// The contig's **true** length, from the reference's table (spec §2.6's provenance
     /// obligation). Not the span's, and never a window's.
@@ -903,17 +903,17 @@ impl<R: RawRefSeq + ContigTable + EvictableRefSeq> TypedRegionIterator<R> {
         // `max_repeat_len` of its core. The bundle flank test needs to see every repeat
         // within `flank_bp` of a core repeat. If the margin were the narrower of the two,
         // a core tract's neighbour could fall outside the window, go unseen, and the tract
-        // would be admitted as a clean locus instead of bundled — no error, and a
+        // would be classified as a clean locus instead of bundled — no error, and a
         // different answer for every `window_bp`.
         //
         // **An error, not an `assert!`.** Both knobs are on the command line, so this is
         // reachable from a typo — and user input must not panic. The reason it was an
         // `assert!` still holds and is served better here: A2's rule is that a swept
         // knob's guard must survive `--release`, and a `Result` does, unconditionally.
-        if config.max_repeat_len.get() < config.admission.flank_bp {
+        if config.max_repeat_len.get() < config.criteria.flank_bp {
             return Err(TypedRegionError::MarginNarrowerThanFlank {
                 max_repeat_len: config.max_repeat_len.get(),
-                flank_bp: config.admission.flank_bp,
+                flank_bp: config.criteria.flank_bp,
             });
         }
         // Fail now, not in the middle of chromosome 7 (above).
@@ -1021,7 +1021,7 @@ impl<R: RawRefSeq + ContigTable + EvictableRefSeq> TypedRegionIterator<R> {
         Ok(true)
     }
 
-    /// One window: detect (the cursor planned it), clean, admit, absorb.
+    /// One window: detect (the cursor planned it), clean, classify, absorb.
     ///
     /// An associated function rather than a method, because it needs `&self.reference`
     /// and `&mut self.current` at once — disjoint fields, which the borrow checker will
@@ -1049,12 +1049,12 @@ impl<R: RawRefSeq + ContigTable + EvictableRefSeq> TypedRegionIterator<R> {
         // 2. Clean. **Over the whole fetched slice, margins included**, which is what
         //    makes the verdict the resident one: redundancy elimination is a neighbour
         //    rule, and a core interval's neighbours live in the margin.
-        let cleaned = admission::prefilter(&window.detections, &config.admission);
+        let cleaned = segment_criteria::prefilter(&window.detections, &config.criteria);
 
         // 3. Admit, over **the slice we already scanned** — no second fetch, no second
         //    margin. Admission reads each tract's own bases (motif, purity) and answers
         //    the flank question by arithmetic against `contig_len`, so the scan slice is
-        //    exactly what it needs. Until 2026-07-17 `Locus` embedded tract ± flank_bp of
+        //    exactly what it needs. Until 2026-07-17 `SsrSegment` embedded tract ± flank_bp of
         //    bases, which a tract at the slice's own edge could not supply; that cost a
         //    wider re-fetch of every window, and the payload had no consumer.
         let bases_start = plan.fetched.start;
@@ -1066,7 +1066,7 @@ impl<R: RawRefSeq + ContigTable + EvictableRefSeq> TypedRegionIterator<R> {
                 ..*iv
             })
             .collect();
-        let admitted = admission::admit(
+        let classified = segment_criteria::classify(
             recs,
             &state.chrom,
             bases,
@@ -1075,7 +1075,7 @@ impl<R: RawRefSeq + ContigTable + EvictableRefSeq> TypedRegionIterator<R> {
             // the window's end — spec §2.6's provenance obligation, and the mistake no
             // signature can catch.
             Bp(state.contig_len),
-            &config.admission,
+            &config.criteria,
         );
 
         // The tally's raw material, taken before `absorb` consumes the window.
@@ -1089,11 +1089,11 @@ impl<R: RawRefSeq + ContigTable + EvictableRefSeq> TypedRegionIterator<R> {
                 .sum(),
             rejected: RejectionCounts::default(),
         };
-        // **Rejections are attributed to a core, exactly like everything else.** `admit`
+        // **Rejections are attributed to a core, exactly like everything else.** `classify`
         // ran over the whole fetched slice, so every window that can see a repeat rejects
         // it again; counting them all would make the tally depend on `window_bp`, which
         // is a memory knob. The interval's own start decides whose it is.
-        for (iv, reason) in &admitted.rejected {
+        for (iv, reason) in &classified.rejected {
             let start = iv.start + bases_start;
             if start >= plan.core.start && start < plan.core.end {
                 tally.rejected.add(*reason, iv.end - iv.start);
@@ -1103,7 +1103,7 @@ impl<R: RawRefSeq + ContigTable + EvictableRefSeq> TypedRegionIterator<R> {
         // 4-5. Cap and partition, one block at a time.
         state
             .walk
-            .absorb(&window, &cleaned, admitted, bases_start, config);
+            .absorb(&window, &cleaned, classified, bases_start, config);
         Ok(tally)
     }
 
@@ -1126,7 +1126,7 @@ impl<R: RawRefSeq + ContigTable + EvictableRefSeq> TypedRegionIterator<R> {
     fn tally(&mut self, region: &TypedRegion) {
         let bp = region.region.len();
         match &region.kind {
-            RegionKind::SsrLocus(_) => {
+            RegionKind::SsrSegment(_) => {
                 self.counts.ssr_loci += 1;
                 // This repeat coverage DID yield a locus, so it is not part of the gap.
                 // The locus's bases are a subset of the coverage counted when its window
@@ -1187,7 +1187,7 @@ impl<R: RawRefSeq + ContigTable + EvictableRefSeq> std::iter::FusedIterator
 /// **asked for** (spec §2.5).
 ///
 /// Two sets, because a BED edge must not cut a decision in half: a repeat at 999 is
-/// bundled away by a neighbour at 1030, so a walk that never looks past 1000 admits a
+/// bundled away by a neighbour at 1030, so a walk that never looks past 1000 classifies a
 /// locus the whole-genome run rejects — same reference, different calls, because of
 /// `--regions`. [`scan_set`] says why the scan set is the whole contig and not something
 /// cheaper.
@@ -1270,7 +1270,7 @@ fn scan_set<R: ContigTable>(
 /// Each of the other three is a **claim about its own extent**, and half of it is a
 /// different claim:
 ///
-/// - `SsrLocus` — a genetic object. Half a locus is not a locus: its coordinates, its
+/// - `SsrSegment` — a genetic object. Half a locus is not a locus: its coordinates, its
 ///   motif and its copy number all describe the whole tract.
 /// - `SsrBundle` — carries its member tracts; clip the hull and the members describe bases
 ///   outside their own region.
@@ -1287,7 +1287,7 @@ fn scan_set<R: ContigTable>(
 fn clips_at_a_bed_edge(kind: &RegionKind) -> bool {
     match kind {
         RegionKind::Generic => true,
-        RegionKind::SsrLocus(_) | RegionKind::SsrBundle { .. } | RegionKind::Satellite => false,
+        RegionKind::SsrSegment(_) | RegionKind::SsrBundle { .. } | RegionKind::Satellite => false,
     }
 }
 
@@ -1376,9 +1376,9 @@ struct BlockWalk {
     /// **Carry:** a satellite is longer than a window by definition, so a run's verdict
     /// is not reachable inside the window that started it.
     runs: Vec<CoverageRun>,
-    /// The open block's admitted loci, awaiting their runs' verdict (a locus inside a
+    /// The open block's classified loci, awaiting their runs' verdict (a locus inside a
     /// satellite is swallowed, spec §2.1).
-    loci: Vec<Locus>,
+    loci: Vec<SsrSegment>,
     /// The open block's bundle members, contig coordinates. **Carry:** a cluster chains
     /// across a window boundary as happily as inside one.
     bundled: Vec<RepeatInterval>,
@@ -1396,7 +1396,7 @@ struct BlockWalk {
 /// *position* and answering it per kind would ask it three times.
 enum WindowItem {
     Coverage(CoverageRun),
-    Locus(Locus),
+    Segment(SsrSegment),
     Bundled(RepeatInterval),
 }
 
@@ -1404,7 +1404,7 @@ impl WindowItem {
     fn start(&self) -> u64 {
         match self {
             Self::Coverage(run) => run.start,
-            Self::Locus(l) => l.start(),
+            Self::Segment(l) => l.start(),
             // 0-based half-open → 1-based inclusive (spec §4).
             Self::Bundled(iv) => iv.start + 1,
         }
@@ -1443,13 +1443,13 @@ impl BlockWalk {
     /// - **bundle members** are attributed by *the interval's* start, so each is
     ///   contributed once; and
     /// - **loci** by *the locus's* start (post-trim), which is also exactly once —
-    ///   every window whose slice holds the tract admits the same locus (that is what
+    ///   every window whose slice holds the tract classifies the same locus (that is what
     ///   the margin buys), and exactly one core holds its start.
     fn absorb(
         &mut self,
         window: &ScannedWindow,
         cleaned: &[RepeatInterval],
-        admitted: admission::Admitted,
+        classified: segment_criteria::Classified,
         bases_start: u64,
         config: &TypedRegionConfig,
     ) {
@@ -1474,17 +1474,17 @@ impl BlockWalk {
                 }),
         );
         items.extend(
-            admitted
+            classified
                 .loci
                 .into_iter()
                 .filter(|l| in_core(l.start() - 1))
-                .map(WindowItem::Locus),
+                .map(WindowItem::Segment),
         );
         items.extend(
-            admitted
+            classified
                 .bundled
                 .into_iter()
-                // Back to contig coordinates: `admit` hands these back in the offsets
+                // Back to contig coordinates: `classify` hands these back in the offsets
                 // it was given, which were offsets into the bases slice.
                 .map(|iv| RepeatInterval {
                     start: iv.start + bases_start,
@@ -1514,7 +1514,7 @@ impl BlockWalk {
                 // already arrived. If this ever fires, the attribution is wrong and the
                 // partition is about to be built out of order; loudly, in release, is
                 // the only useful way to learn that.
-                WindowItem::Locus(l) => {
+                WindowItem::Segment(l) => {
                     assert!(
                         self.block_is_open(),
                         "a locus at {} arrived with no coverage under it",
@@ -1546,7 +1546,7 @@ impl BlockWalk {
             .last()
             .expect("the block is open")
             .end
-            .saturating_add(config.admission.flank_bp)
+            .saturating_add(config.criteria.flank_bp)
     }
 
     /// Resolve the open block and emit it, with the generic run that preceded it.
@@ -1676,7 +1676,7 @@ pub enum TypedRegionError {
     #[error(
         "max_repeat_len ({max_repeat_len}) is the window's detection margin and must not \
          be narrower than flank_bp ({flank_bp}), the bundle radius: a window that cannot \
-         see a core tract's neighbours would admit them as loci instead of bundling them"
+         see a core tract's neighbours would classify them as loci instead of bundling them"
     )]
     MarginNarrowerThanFlank { max_repeat_len: u64, flank_bp: u64 },
 }
@@ -1690,7 +1690,7 @@ mod tests {
     /// oracle compares like with like. Pinned against the **literals**, not
     /// against the consts that define it: asserting `periods.min() ==
     /// DEFAULT_SCAN_MIN_PERIOD` would compare a constant with itself and could not
-    /// fail (the same tautology the A2 review caught in `SsrAdmissionParams`).
+    /// fail (the same tautology the A2 review caught in `SsrSegmentCriteria`).
     #[test]
     fn default_config_is_the_catalogs_settings() {
         let c = TypedRegionConfig::default();
@@ -1699,10 +1699,10 @@ mod tests {
         assert_eq!(c.max_repeat_len, Bp(1000), "the 1 kb satellite cap");
         assert_eq!(c.window_bp, Bp(100_000), "100 kb window");
         assert_eq!(c.scan, ScanParams::default());
-        assert_eq!(c.admission, SsrAdmissionParams::default());
+        assert_eq!(c.criteria, SsrSegmentCriteria::default());
     }
 
-    /// **The scanner scans wider than admission admits, and that is deliberate.**
+    /// **The scanner scans wider than classification classifies, and that is deliberate.**
     ///
     /// Two `periods` knobs look redundant until you ask why: a homopolymer tiles
     /// under every motif length, so the scanner emits its span at period 2, 3, 4, 5
@@ -1716,18 +1716,18 @@ mod tests {
     /// back. `a_homopolymer_does_not_survive_as_a_period_two_repeat` is the
     /// behavioural statement; this is the config-level guard.
     #[test]
-    fn the_scan_range_is_wider_than_the_admission_range() {
+    fn the_scan_range_is_wider_than_the_criteria_range() {
         let c = TypedRegionConfig::default();
         assert!(
-            c.periods.min() < c.admission.periods.min(),
+            c.periods.min() < c.criteria.periods.min(),
             "the scanner must SEE period {} so the pre-filter has an eliminator for \
-             that run's aliases; admission starts at {}",
+             that run's aliases; classification starts at {}",
             c.periods.min(),
-            c.admission.periods.min()
+            c.criteria.periods.min()
         );
         assert_eq!(
             c.periods.max(),
-            c.admission.periods.max(),
+            c.criteria.periods.max(),
             "the ceilings agree: nothing is gained by scanning wider than the \
              widest admissible period"
         );
@@ -1922,7 +1922,7 @@ mod tests {
         );
     }
 
-    /// A contig with one clean isolated (AT)*8 tract: Generic / SsrLocus / Generic.
+    /// A contig with one clean isolated (AT)*8 tract: Generic / SsrSegment / Generic.
     /// The smallest case that shows the partition doing its job.
     #[test]
     fn a_lone_tract_partitions_as_generic_locus_generic() {
@@ -1940,7 +1940,7 @@ mod tests {
         let kinds: Vec<_> = regions
             .iter()
             .map(|r| match &r.kind {
-                RegionKind::SsrLocus(_) => "locus",
+                RegionKind::SsrSegment(_) => "locus",
                 RegionKind::SsrBundle { .. } => "bundle",
                 RegionKind::Generic => "generic",
                 RegionKind::Satellite => "satellite",
@@ -1949,7 +1949,7 @@ mod tests {
         assert_eq!(kinds, vec!["generic", "locus", "generic"]);
 
         // And the locus is where the tract is — 1-based, so 0-based + 1.
-        let RegionKind::SsrLocus(l) = &regions[1].kind else {
+        let RegionKind::SsrSegment(l) = &regions[1].kind else {
             unreachable!()
         };
         assert_eq!(l.start(), tract_start_0 as u64 + 1);
@@ -1964,7 +1964,7 @@ mod tests {
     /// did not: it used `vec![b'C'; 60]` "flanks", which are a period-1 homopolymer
     /// — so the scanner found one period-2 tract spanning the *whole contig*, which
     /// starts at base 1, has no left flank, and was dropped. Nothing was swallowed
-    /// because nothing was ever admitted, and the assertion passed for entirely the
+    /// because nothing was ever classified, and the assertion passed for entirely the
     /// wrong reason (mutation caught it: "don't drop loci inside a satellite"
     /// survived). The control below is the fix: at the same settings but a cap
     /// above the array, the same bases DO yield a locus.
@@ -1990,12 +1990,12 @@ mod tests {
         assert!(
             !regions
                 .iter()
-                .any(|r| matches!(r.kind, RegionKind::SsrLocus(_))),
+                .any(|r| matches!(r.kind, RegionKind::SsrSegment(_))),
             "the locus is swallowed by the satellite — the §2.4 cost, made visible"
         );
 
-        // **The control.** Raise the cap above the array and the SAME bases admit a
-        // locus — so the absence above is the cap doing its job, not admission
+        // **The control.** Raise the cap above the array and the SAME bases classify a
+        // locus — so the absence above is the cap doing its job, not classification
         // quietly rejecting the tract for some unrelated reason. This is also what
         // makes `max_repeat_len` a parameter rather than a fact of nature (spec §10).
         let uncapped = TypedRegionConfig {
@@ -2007,7 +2007,7 @@ mod tests {
         assert_eq!(
             regions
                 .iter()
-                .filter(|r| matches!(r.kind, RegionKind::SsrLocus(_)))
+                .filter(|r| matches!(r.kind, RegionKind::SsrSegment(_)))
                 .count(),
             1,
             "above the cap the very same tract IS a locus"
@@ -2074,7 +2074,7 @@ mod tests {
         regions
             .iter()
             .map(|r| match &r.kind {
-                RegionKind::SsrLocus(_) => "locus",
+                RegionKind::SsrSegment(_) => "locus",
                 RegionKind::SsrBundle { .. } => "bundle",
                 RegionKind::Generic => "generic",
                 RegionKind::Satellite => "satellite",
@@ -2120,12 +2120,12 @@ mod tests {
     ///
     /// # But "impure → Generic" is not one rule, and it took this test to see it
     ///
-    /// The scanner decides an impure tract's fate long before admission does, because
+    /// The scanner decides an impure tract's fate long before classification does, because
     /// Ruzzo–Tompa returns **maximal-scoring** segments. So an interruption has three
     /// possible outcomes, and only the third is this fixture:
     ///
     /// 1. **small** — the surrounding matches pay for it, the tract stays whole, and it is
-    ///    pure enough to admit: a **locus**;
+    ///    pure enough to classify: a **locus**;
     /// 2. **large, with long pieces** — the segment splits, and the pure pieces are close
     ///    together: a **bundle** (or two loci, if far apart);
     /// 3. **large, with short pieces** — the segment splits and each piece falls under the
@@ -2136,7 +2136,7 @@ mod tests {
     /// walk: a tract impure enough to fail the 0.80 floor always contains a purer
     /// sub-segment that scores higher, so Ruzzo–Tompa emits *that* instead — measured, not
     /// argued (a 0.79-purity fixture comes back a **locus**, its pure core). See
-    /// `admission::the_walk_reaches_only_one_of_admissions_five_gates`.
+    /// `segment_criteria::the_walk_reaches_only_one_of_classifications_five_gates`.
     #[test]
     fn an_impure_tract_is_generic_when_its_pieces_fall_under_the_copy_floor() {
         let mut bases = filler(240);
@@ -2149,7 +2149,7 @@ mod tests {
         assert!(
             !regions
                 .iter()
-                .any(|r| matches!(r.kind, RegionKind::SsrLocus(_))),
+                .any(|r| matches!(r.kind, RegionKind::SsrSegment(_))),
             "an impure tract is not a locus: {:?}",
             kinds_of(&regions)
         );
@@ -2171,7 +2171,7 @@ mod tests {
     }
 
     /// **A homopolymer is `Generic` at periods 2..=6** (spec §8's fixture list): nothing
-    /// admits period 1, and the bases are still covered.
+    /// classifies period 1, and the bases are still covered.
     ///
     /// `prefilter` is what removes it, and **the whole homopolymer, not just its period-1
     /// label** — the 2026-07-17 ordering fix. A poly-A tiles under `AA`, `AAA`, `AAAAA`, so
@@ -2199,7 +2199,7 @@ mod tests {
         let loci: Vec<_> = regions
             .iter()
             .filter_map(|r| match &r.kind {
-                RegionKind::SsrLocus(l) => Some(l),
+                RegionKind::SsrSegment(l) => Some(l),
                 _ => None,
             })
             .collect();
@@ -2224,24 +2224,24 @@ mod tests {
             "the poly-A run is Generic territory"
         );
 
-        // **And it reaches admission not at all** — it is gone by the pre-filter, so it is
+        // **And it reaches classification not at all** — it is gone by the pre-filter, so it is
         // turned down by no gate and counted under no reason. That is what "out of scope"
         // has to mean: before the 2026-07-17 fix this fixture recorded THREE `Compound`
         // rejections for one homopolymer, because its period-2/3/5 aliases each reached
-        // `admit` separately. A rejection count that moves with the number of divisors of
+        // `classify` separately. A rejection count that moves with the number of divisors of
         // a run's length is not measuring anything.
         let counts = counts_over(&bases, 100_000);
         assert_eq!(
             counts.rejected_by_reason,
             RejectionCounts::default(),
             "the homopolymer is filtered out, not rejected — and the (CAG) tract is \
-             admitted, so nothing here is turned down at all: {:?}",
+             classified, so nothing here is turned down at all: {:?}",
             counts.rejected_by_reason
         );
     }
 
     /// **A rejected repeat is generic territory, not a hole** (spec §2.2). A
-    /// low-copy tract admission turns down must still be *covered* — completeness
+    /// low-copy tract classification turns down must still be *covered* — completeness
     /// is what the invariant is for.
     #[test]
     fn a_rejected_repeat_leaves_no_hole() {
@@ -2257,7 +2257,7 @@ mod tests {
         assert!(
             !regions
                 .iter()
-                .any(|r| matches!(r.kind, RegionKind::SsrLocus(_))),
+                .any(|r| matches!(r.kind, RegionKind::SsrSegment(_))),
             "below the copy floor: not a locus"
         );
         assert_eq!(
@@ -2282,7 +2282,7 @@ mod tests {
         assert!(
             !regions
                 .iter()
-                .any(|r| matches!(r.kind, RegionKind::SsrLocus(_))),
+                .any(|r| matches!(r.kind, RegionKind::SsrSegment(_))),
             "no left flank to anchor against: not a locus"
         );
     }
@@ -2345,7 +2345,7 @@ mod tests {
         assert!(
             !regions
                 .iter()
-                .any(|r| matches!(r.kind, RegionKind::SsrLocus(_))),
+                .any(|r| matches!(r.kind, RegionKind::SsrSegment(_))),
             "neither tract has a clean flank, so neither is a locus"
         );
     }
@@ -2388,7 +2388,7 @@ mod tests {
         );
     }
 
-    /// **Bundles do not spread.** A tract far enough from a cluster is admitted
+    /// **Bundles do not spread.** A tract far enough from a cluster is classified
     /// normally — the flank test is local, so a bundle does not contaminate its
     /// neighbourhood.
     #[test]
@@ -2412,7 +2412,7 @@ mod tests {
         let loci: Vec<_> = regions
             .iter()
             .filter_map(|r| match &r.kind {
-                RegionKind::SsrLocus(l) => Some(l),
+                RegionKind::SsrSegment(l) => Some(l),
                 _ => None,
             })
             .collect();
@@ -2458,7 +2458,7 @@ mod tests {
         };
         // Two clusters: {100,130 / 150,180} and {5000,5030 / 5040,5070}.
         let bundled = [iv(100, 130), iv(150, 180), iv(5000, 5030), iv(5040, 5070)];
-        let clusters = admission::bundle_clusters(&bundled, 50);
+        let clusters = segment_criteria::bundle_clusters(&bundled, 50);
         assert_eq!(clusters.len(), 2, "two clusters, not one and not four");
         assert_eq!(clusters[0].len(), 2);
         assert_eq!(clusters[1].len(), 2);
@@ -2471,7 +2471,7 @@ mod tests {
     /// The walk at the catalog's settings must reproduce the catalog: every golden
     /// locus is present, **or absent *and* inside a satellite run**. A strict
     /// subset, and that shape is *earned* by spec §2.4's ordering — the cap applies
-    /// to the *cleaned* coverage, after admission, so the difference can only go
+    /// to the *cleaned* coverage, after classification, so the difference can only go
     /// one way. Capping raw coverage would make it bidirectional and untestable.
     ///
     /// **The oracle is the committed trf-mod-built golden catalog** — a different
@@ -2481,7 +2481,7 @@ mod tests {
     /// model rejected), so it is a yardstick rather than a confound — hence overlap
     /// matching, inherited from `scanner_parity` for exactly that reason.
     ///
-    /// What this proves: the plumbing — the scan, the pre-filter, the admission
+    /// What this proves: the plumbing — the scan, the pre-filter, the classification
     /// call, the coordinate arithmetic. What it does **not** prove: that the
     /// catalog's settings are *right* (spec §5). A fixed-config regression test,
     /// pinned to those settings explicitly rather than to whatever `Default` is, or
@@ -2512,11 +2512,11 @@ mod tests {
 
         // ng's walk at the SAME settings, pinned explicitly.
         let config = TypedRegionConfig {
-            admission: SsrAdmissionParams {
+            criteria: SsrSegmentCriteria {
                 min_purity: cat_params.min_purity,
                 min_score: cat_params.min_score,
                 flank_bp: u64::from(cat_params.flank_bp),
-                ..SsrAdmissionParams::default()
+                ..SsrSegmentCriteria::default()
             },
             ..TypedRegionConfig::default()
         };
@@ -2542,7 +2542,7 @@ mod tests {
 
             for r in &regions {
                 match &r.kind {
-                    RegionKind::SsrLocus(l) => ours.push((name.clone(), l.start(), l.end())),
+                    RegionKind::SsrSegment(l) => ours.push((name.clone(), l.start(), l.end())),
                     RegionKind::Satellite => {
                         satellites.push((name.clone(), r.region.start.get(), r.region.end.get()))
                     }
@@ -2746,7 +2746,7 @@ mod tests {
     /// The 200 bp arm is the **control**, and it is what makes the 20 bp arm mean
     /// something: at 200 bp the same two features, built by the same code, give a clean
     /// `Generic / locus / Generic / Satellite` — so absorption at 20 bp is the *rule*
-    /// firing, not admission quietly rejecting a tract that was never viable.
+    /// firing, not classification quietly rejecting a tract that was never viable.
     #[test]
     fn a_microsatellite_beside_a_satellite_is_absorbed_into_it() {
         let config = TypedRegionConfig::default();
@@ -2754,7 +2754,7 @@ mod tests {
             regions
                 .iter()
                 .map(|r| match &r.kind {
-                    RegionKind::SsrLocus(_) => "locus",
+                    RegionKind::SsrSegment(_) => "locus",
                     RegionKind::SsrBundle { .. } => "bundle",
                     RegionKind::Generic => "generic",
                     RegionKind::Satellite => "satellite",
@@ -2868,7 +2868,7 @@ mod tests {
         let bases = windowing_fixture();
         let config = TypedRegionConfig::default();
         let raw = find_tandem_repeats(&bases, config.periods, &config.scan);
-        let cleaned = admission::prefilter(&raw, &config.admission);
+        let cleaned = segment_criteria::prefilter(&raw, &config.criteria);
 
         // The permissive scanner's noise must genuinely be here, or the two sets are the
         // same and everything below passes for free.
@@ -2928,8 +2928,8 @@ mod tests {
             rs.iter().filter(|r| f(&r.kind)).count()
         };
         assert!(
-            count(&resident, |k| matches!(k, RegionKind::SsrLocus(_))) >= 2,
-            "the fixture must admit loci: {resident:#?}"
+            count(&resident, |k| matches!(k, RegionKind::SsrSegment(_))) >= 2,
+            "the fixture must classify loci: {resident:#?}"
         );
         assert_eq!(
             count(&resident, |k| matches!(k, RegionKind::SsrBundle { .. })),
@@ -3049,9 +3049,9 @@ mod tests {
     /// **The contig-end clamp guard, at the walk level** (spec §2.6) — and the
     /// **provenance obligation**, discharged and pinned.
     ///
-    /// `admit` clamps a locus's flanks at the *contig's* ends and drops a locus whose
+    /// `classify` clamps a locus's flanks at the *contig's* ends and drops a locus whose
     /// flank clamped to nothing. Hand it the **window's** end as the contig's length —
-    /// production's exact mistake, and arithmetically legal, so `admit`'s own guard
+    /// production's exact mistake, and arithmetically legal, so `classify`'s own guard
     /// cannot catch it — and every locus within `flank_bp` of every window boundary
     /// silently vanishes, a different set for each `window_bp`.
     ///
@@ -3072,7 +3072,7 @@ mod tests {
         let loci: Vec<u64> = regions
             .iter()
             .filter_map(|r| match &r.kind {
-                RegionKind::SsrLocus(l) => Some(l.start()),
+                RegionKind::SsrSegment(l) => Some(l.start()),
                 _ => None,
             })
             .collect();
@@ -3103,7 +3103,7 @@ mod tests {
                 .expect("fetch");
             let mut starts: Vec<u64> = regions
                 .iter()
-                .filter(|r| matches!(r.kind, RegionKind::SsrLocus(_)))
+                .filter(|r| matches!(r.kind, RegionKind::SsrSegment(_)))
                 .map(|r| r.region.start.get())
                 .collect();
             let before = starts.len();
@@ -3142,7 +3142,7 @@ mod tests {
 
     /// **A margin narrower than the bundle radius silently un-bundles**, so the walk
     /// refuses it — with an **error**, and before any work. Without the guard, a core
-    /// tract whose neighbour fell outside the window would be admitted as a clean locus:
+    /// tract whose neighbour fell outside the window would be classified as a clean locus:
     /// no error, and a different answer for every `window_bp`.
     ///
     /// It is a `Result`, not an `assert!`, because both knobs are command-line flags
@@ -3298,7 +3298,7 @@ mod tests {
         assert_eq!(counts.spans, 1);
         assert_eq!(
             counts.ssr_loci,
-            kind_count(|k| matches!(k, RegionKind::SsrLocus(_)))
+            kind_count(|k| matches!(k, RegionKind::SsrSegment(_)))
         );
         assert_eq!(
             counts.ssr_bundles,
@@ -3338,9 +3338,9 @@ mod tests {
         // dropping it makes the number bigger, and bigger still satisfies `>=`.)
         let config = TypedRegionConfig::default();
         let raw = find_tandem_repeats(&bases, config.periods, &config.scan);
-        let cleaned = admission::prefilter(&raw, &config.admission);
+        let cleaned = segment_criteria::prefilter(&raw, &config.criteria);
         let coverage_bp: u64 = coverage_runs(&cleaned).iter().map(|r| r.len()).sum();
-        let locus_bp = bp_of(|k| matches!(k, RegionKind::SsrLocus(_)));
+        let locus_bp = bp_of(|k| matches!(k, RegionKind::SsrSegment(_)));
         assert!(
             coverage_bp > 0 && locus_bp > 0,
             "the fixture must have both"
@@ -3374,7 +3374,7 @@ mod tests {
 
     /// **The rejection breakdown must not depend on `window_bp`** (E1e).
     ///
-    /// This is the whole reason `admit` hands rejections back **per record** instead of
+    /// This is the whole reason `classify` hands rejections back **per record** instead of
     /// tallying them itself. It runs over a window's entire fetched slice, margins and
     /// all, so every window that can see a repeat rejects it again; a tally taken inside
     /// would count one repeat once per window and the number would move with a **memory
@@ -3385,11 +3385,11 @@ mod tests {
     /// about the reference, and `window_bp` may not touch any of them (spec §2.3).
     #[test]
     fn the_tally_does_not_depend_on_the_window() {
-        // The windowing fixture, plus a tract abutting base 1 — which admission turns
+        // The windowing fixture, plus a tract abutting base 1 — which classification turns
         // down for having no left flank (spec §2.6). That rejection is what gives the
-        // breakdown something to count: of admission's five gates, the pre-filter makes
+        // breakdown something to count: of classification's five gates, the pre-filter makes
         // three unreachable from the walk and this is the reachable one that a fixture
-        // can be sure of (`admission::the_pre_filter_makes_three_of_admissions_gates_
+        // can be sure of (`segment_criteria::the_pre_filter_makes_three_of_classifications_gates_
         // unreachable_from_the_walk`).
         let mut bases = windowing_fixture();
         bases[0..20].copy_from_slice(b"ATATATATATATATATATAT");
@@ -3410,7 +3410,7 @@ mod tests {
                 "window_bp = {window_bp} moved the tally — `window_bp` is a memory knob \
                  (spec §2.3). A rejection counted once per window that could SEE it is \
                  exactly how that happens: at window_bp = 100 the tract at base 1 is in \
-                 the fetched slice of the first ten windows, and `admit` turns it down in \
+                 the fetched slice of the first ten windows, and `classify` turns it down in \
                  every one of them"
             );
         }
@@ -3684,7 +3684,7 @@ mod tests {
                 // And the loci are the same objects, not merely the same kind.
                 let loci_in = |rs: &[TypedRegion]| -> Vec<(u64, u64)> {
                     rs.iter()
-                        .filter(|r| matches!(r.kind, RegionKind::SsrLocus(_)))
+                        .filter(|r| matches!(r.kind, RegionKind::SsrSegment(_)))
                         .map(|r| (r.region.start.get(), r.region.end.get()))
                         .filter(|(s, _)| *s >= want.0 && *s <= want.1)
                         .collect()
@@ -3814,7 +3814,7 @@ mod tests {
         let locus = got
             .iter()
             .find_map(|r| match &r.kind {
-                RegionKind::SsrLocus(l) => Some(l),
+                RegionKind::SsrSegment(l) => Some(l),
                 _ => None,
             })
             .expect("the tract at ~991 straddles the requested edge at 1000");
@@ -3828,7 +3828,7 @@ mod tests {
         let truth = whole
             .iter()
             .find_map(|r| match &r.kind {
-                RegionKind::SsrLocus(l) if l.start() == locus.start() => Some(l),
+                RegionKind::SsrSegment(l) if l.start() == locus.start() => Some(l),
                 _ => None,
             })
             .expect("the same locus exists in the whole-genome run");
