@@ -37,8 +37,8 @@ use std::path::Path;
 
 use crate::ng::ref_seq::{ContigTable, EvictableRefSeq, RawRefSeq, RefSeqError};
 use crate::ng::tandem_repeat::{
-    PeriodRange, RegionSpan, RepeatInterval, ScanParams, ScannedWindow, SegmentOptions,
-    WindowCursor, WindowPlan, find_tandem_repeats, scan_window,
+    RegionSpan, RepeatInterval, ScanParams, ScannedWindow, SegmentOptions, WindowCursor,
+    WindowPlan, find_tandem_repeats, scan_window,
 };
 use crate::ng::types::{Bp, ContigId, GenomeRegion, Position};
 use crate::regions::{BedError, ContigBounds, RegionSet};
@@ -207,24 +207,13 @@ pub enum RegionKind {
 /// authority.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TypedRegionConfig {
-    /// The period range the **scanner** looks for.
-    ///
-    /// **Not the same knob as [`SsrSegmentCriteria::periods`], and the floor is where
-    /// the difference bites.** The scanner is deliberately permissive (it scans 1..=6
-    /// and emits every period-multiple of every tract); classification is strict (2..=6 by
-    /// default).
-    ///
-    /// The scanner must reach **period 1 even though nothing classifies it**, because
-    /// `segment_criteria::prefilter` uses the period-1 interval as the *eliminator* that
-    /// removes a homopolymer's own aliases: `AAAA…` is a perfect `AA`, `AAA` and
-    /// `AAAAA` repeat, and only period 1 divides them all. Scan from 2 and those
-    /// aliases have nothing to eliminate them — a poly-A comes back as three
-    /// "repeats". **An eliminator that was never detected cannot eliminate**, so this
-    /// floor is machinery, not policy; it is not the knob a caller means when it says
-    /// which periods to analyse. See `prefilter`'s docs for the ordering this pairs
-    /// with (fixed 2026-07-17).
-    pub periods: PeriodRange,
-    /// The scanner's scoring weights.
+    /// The scanner's scoring weights. **The period range is not here** — it is
+    /// [`SsrSegmentCriteria::periods`], the one range the scanner detects and
+    /// classification accepts. They were two fields until the scanner learned to emit
+    /// only primitive periods (`find_tandem_repeats`); before that the scanner had to
+    /// over-scan from period 1 to give the pre-filter an eliminator for homopolymer
+    /// aliases, so "detect" and "accept" needed separate ranges. The scanner honours
+    /// its range now, so there is one.
     pub scan: ScanParams,
     /// The satellite cap **and** the window's detection margin — one field,
     /// because they must be the same number (spec §2.6): the margin exists to
@@ -245,22 +234,6 @@ pub struct TypedRegionConfig {
     pub criteria: SsrSegmentCriteria,
 }
 
-/// The scan period floor: **1**, wider than classification's, and it should stay there
-/// whatever classification's floor is set to.
-///
-/// The scanner must *see* period-1 homopolymers even though nothing classifies them:
-/// `prefilter` keeps the period-1 interval through redundancy elimination precisely
-/// so it can eliminate the run's own `AA` / `AAA` / `AAAAA` aliases, and drops it by
-/// the period floor afterwards. **Not seeing them is not the same as dropping them**
-/// — that sentence is true, but not for the reason this doc used to give: the danger
-/// is not a surviving homopolymer, it is a surviving *alias* of one, which is what a
-/// scanner blind to period 1 leaves behind (`segment_criteria::prefilter`, fixed
-/// 2026-07-17).
-pub const DEFAULT_SCAN_MIN_PERIOD: u8 = 1;
-
-/// The default scan period ceiling: **6**, the microsatellite ceiling.
-pub const DEFAULT_SCAN_MAX_PERIOD: u8 = 6;
-
 /// The satellite cap and detection margin: **1 kb**, comfortably above any real
 /// STR locus. Spec §10 asks whether it is right; it is a parameter, so the
 /// experiment can answer.
@@ -273,8 +246,6 @@ pub const DEFAULT_WINDOW_BP: u64 = 100_000;
 impl Default for TypedRegionConfig {
     fn default() -> Self {
         Self {
-            periods: PeriodRange::new(DEFAULT_SCAN_MIN_PERIOD, DEFAULT_SCAN_MAX_PERIOD)
-                .expect("the default scan period range is valid: 1 <= 1 <= 6"),
             scan: ScanParams::default(),
             max_str_len: Bp(DEFAULT_MAX_STR_LEN),
             window_bp: Bp(DEFAULT_WINDOW_BP),
@@ -375,7 +346,7 @@ pub fn partition_resident(
     }
 
     // 1. Detect.
-    let raw = find_tandem_repeats(bases, config.periods, &config.scan);
+    let raw = find_tandem_repeats(bases, config.criteria.periods, &config.scan);
     // 2. Clean.
     let cleaned = segment_criteria::prefilter(&raw, &config.criteria);
     // 3. Admit — whole-contig is the degenerate window (spec §5a).
@@ -1044,7 +1015,7 @@ impl<R: RawRefSeq + ContigTable + EvictableRefSeq> TypedRegionIterator<R> {
             plan.fetched.end - plan.fetched.start,
             bases,
         )?;
-        let window = scan_window(plan, bases, config.periods, &config.scan);
+        let window = scan_window(plan, bases, config.criteria.periods, &config.scan);
 
         // 2. Clean. **Over the whole fetched slice, margins included**, which is what
         //    makes the verdict the resident one: redundancy elimination is a neighbour
@@ -1694,43 +1665,15 @@ mod tests {
     #[test]
     fn default_config_is_the_catalogs_settings() {
         let c = TypedRegionConfig::default();
-        assert_eq!(c.periods.min(), 1, "the scanner scans period 1..");
-        assert_eq!(c.periods.max(), 6, "..to 6");
+        // One period range now (scanner detects = classification accepts), and it
+        // lives in `criteria` — the scanner honours it, so there is no separate scan
+        // range to over-scan (`the_scan_range...` guard retired with the two fields).
+        assert_eq!(c.criteria.periods.min(), 2, "the catalog's di.. floor");
+        assert_eq!(c.criteria.periods.max(), 6, "..to hexa ceiling");
         assert_eq!(c.max_str_len, Bp(1000), "the 1 kb satellite cap");
         assert_eq!(c.window_bp, Bp(100_000), "100 kb window");
         assert_eq!(c.scan, ScanParams::default());
         assert_eq!(c.criteria, SsrSegmentCriteria::default());
-    }
-
-    /// **The scanner scans wider than classification classifies, and that is deliberate.**
-    ///
-    /// Two `periods` knobs look redundant until you ask why: a homopolymer tiles
-    /// under every motif length, so the scanner emits its span at period 2, 3, 4, 5
-    /// and 6 as well as 1 — and **only the period-1 interval divides them all**, so
-    /// only it can eliminate them in `prefilter`. Scan from 2 and those aliases have
-    /// no eliminator: a poly-A enters the partition as three "repeats" (periods 2, 3
-    /// and 5). **An eliminator that was never detected cannot eliminate** — which is
-    /// what "not seeing them is not the same as dropping them" actually means.
-    ///
-    /// If these two ever coincide at the floor, the aliasing bug of 2026-07-17 is
-    /// back. `a_homopolymer_does_not_survive_as_a_period_two_repeat` is the
-    /// behavioural statement; this is the config-level guard.
-    #[test]
-    fn the_scan_range_is_wider_than_the_criteria_range() {
-        let c = TypedRegionConfig::default();
-        assert!(
-            c.periods.min() < c.criteria.periods.min(),
-            "the scanner must SEE period {} so the pre-filter has an eliminator for \
-             that run's aliases; classification starts at {}",
-            c.periods.min(),
-            c.criteria.periods.min()
-        );
-        assert_eq!(
-            c.periods.max(),
-            c.criteria.periods.max(),
-            "the ceilings agree: nothing is gained by scanning wider than the \
-             widest admissible period"
-        );
     }
 
     #[test]
@@ -2840,15 +2783,16 @@ mod tests {
         }
     }
 
-    /// **The cap applies to the CLEANED coverage, not the raw** (spec §2.4) — pinned at
-    /// last, and it took D3's fixture to do it.
+    /// **The cap applies to the CLEANED coverage, not the raw** (spec §2.4).
     ///
-    /// D1 could only assert this by inspection: mutation showed `coverage_runs(&raw)`
-    /// passing the entire suite, `.cat` parity included, because `raw ⊇ cleaned` and no
-    /// fixture then existed where the extra coverage changed a *satellite*. The
-    /// windowing fixture is the first that does — 6 kb of aperiodic filler carries real
-    /// scanner noise (1181 raw runs against 5 cleaned), and one noise interval abuts the
-    /// array, moving the satellite's edge.
+    /// The noise that discriminates the two sets is now the **copy floor's**: since the
+    /// scanner emits only primitive periods, its raw output no longer carries the flood
+    /// of aliases D1 relied on (raw and cleaned coverage coincide on the plain windowing
+    /// fixture — 5 runs each). What still differs is a *low-copy* interval: the scanner
+    /// emits down to 2 copies, and the copy floor drops it. Here a 2-copy `(CG)` speck
+    /// abuts the 1.2 kb array's right edge — in the RAW coverage it extends the array's
+    /// run 4 bp past the cap; in the CLEANED coverage it is gone. Cap the wrong set and
+    /// the satellite's edge moves.
     ///
     /// Written against the two candidate computations rather than a coordinate literal:
     /// it must fail when the cap moves to the raw set, and **not** when the detector's
@@ -2865,19 +2809,14 @@ mod tests {
     /// moving, and not both moving together (verified).
     #[test]
     fn the_satellite_cap_applies_to_the_cleaned_coverage_not_the_raw() {
-        let bases = windowing_fixture();
+        let mut bases = windowing_fixture();
+        // A 2-copy (CG) speck abutting the 1.2 kb (AT) array's right edge (it ends at
+        // 5200). The scanner emits it (min_copies 2); the copy floor (period 2 → 5)
+        // drops it. So the raw coverage run runs 4 bp longer than the cleaned one.
+        bases[5200..5204].copy_from_slice(b"CGCG");
         let config = TypedRegionConfig::default();
-        let raw = find_tandem_repeats(&bases, config.periods, &config.scan);
+        let raw = find_tandem_repeats(&bases, config.criteria.periods, &config.scan);
         let cleaned = segment_criteria::prefilter(&raw, &config.criteria);
-
-        // The permissive scanner's noise must genuinely be here, or the two sets are the
-        // same and everything below passes for free.
-        assert!(
-            coverage_runs(&raw).len() > 100 * coverage_runs(&cleaned).len(),
-            "the fixture must carry raw noise: {} raw runs vs {} cleaned",
-            coverage_runs(&raw).len(),
-            coverage_runs(&cleaned).len()
-        );
 
         let over_cap = |intervals: &[RepeatInterval]| -> Vec<(u64, u64)> {
             coverage_runs(intervals)
@@ -3337,7 +3276,7 @@ mod tests {
         // (A `>=` bound was the first version, and it left the subtraction untested:
         // dropping it makes the number bigger, and bigger still satisfies `>=`.)
         let config = TypedRegionConfig::default();
-        let raw = find_tandem_repeats(&bases, config.periods, &config.scan);
+        let raw = find_tandem_repeats(&bases, config.criteria.periods, &config.scan);
         let cleaned = segment_criteria::prefilter(&raw, &config.criteria);
         let coverage_bp: u64 = coverage_runs(&cleaned).iter().map(|r| r.len()).sum();
         let locus_bp = bp_of(|k| matches!(k, RegionKind::SsrSegment(_)));

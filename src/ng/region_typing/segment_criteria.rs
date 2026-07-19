@@ -690,30 +690,40 @@ impl Default for SsrSegmentCriteria {
 /// rather than assumed. Well-formed intervals are unaffected, so the port stays
 /// faithful.
 pub fn prefilter(intervals: &[RepeatInterval], params: &SsrSegmentCriteria) -> Vec<RepeatInterval> {
-    // The COPY floor only. The period floor is deliberately not here — it runs
-    // last, once redundancy elimination has had the period-1 intervals it needs
-    // (see the fn docs). The copy floor is what stops a 2 bp `GG` speck being an
-    // eliminator: `MinCopies`' period-1 entry is 10.
+    // Two cleanups, in this order — the ordering is load-bearing. The **period floor is
+    // gone**: the scanner emits only in-range periods and `classify` gates the range, so
+    // it was a no-op.
+    //
+    // (1) The **copy floor** — per-period `MinCopies` (the scanner's own floor is a flat
+    // 2). It drops low-copy noise (spec §5b), and it must run **before** (2): a repeat's
+    // motif can contain a homopolymer (`AAA` in `(GAAA)*n`), which the scanner emits as a
+    // short period-1 interval overlapping the tetranucleotide. Left in, (2) would let that
+    // `AAA` eliminate the `GAAA` as its multiple. The period-1 floor (10) removes the
+    // sub-run first, so the `GAAA` survives — this *is* the policy call the pre-filter
+    // exists to make (whether the homopolymer or its parent repeat is significant).
     let mut floored: Vec<RepeatInterval> = intervals
         .iter()
         .copied()
         .filter(|iv| {
-            // `iv.end > iv.start` first: it guards the subtraction below (see the
-            // fn docs), and it is what `classify` independently requires anyway.
+            // `iv.end > iv.start` guards the subtraction; `classify` requires it too.
             iv.end > iv.start
                 && (iv.end - iv.start) / u64::from(iv.period)
                     >= u64::from(params.min_copies.for_period(iv.period))
         })
         .collect();
-    // Process low periods first so a fundamental tract is kept and its multiples
-    // dropped. A homopolymer sorts first of all, which is what lets it take its own
-    // period-2/3/4/5/6 aliases with it.
+
+    // (2) **Overlapping period-multiple redundancy** (trf-mod's `IsRedundant`). NOT the
+    // homopolymer-alias job — the scanner's primitive-motif check already keeps a poly-A
+    // to period 1. What survives that is a phase-shifted re-detection of the *same* tract:
+    // a clean `(GAA)*13` at period 3 also matches, sloppily, as a period-6 `AAGATG`. That
+    // 6-mer is primitive, so the scanner keeps it — but it overlaps the period-3 tract and
+    // 6 is a multiple of 3, so drop it, or the two bundle and the locus vanishes.
     floored.sort_by_key(|iv| (iv.period, iv.start));
-    let mut kept: Vec<RepeatInterval> = Vec::new();
+    let mut kept: Vec<RepeatInterval> = Vec::with_capacity(floored.len());
     for iv in floored {
         let redundant = kept.iter().any(|a| {
             a.period < iv.period
-                && iv.period % a.period == 0
+                && iv.period.is_multiple_of(a.period)
                 && iv.start < a.end
                 && a.start < iv.end
         });
@@ -721,10 +731,6 @@ pub fn prefilter(intervals: &[RepeatInterval], params: &SsrSegmentCriteria) -> V
             kept.push(iv);
         }
     }
-    // The PERIOD floor, last: an out-of-scope interval has now done its
-    // eliminating. Dropping a homopolymer here drops the homopolymer, not merely
-    // its period-1 label — its aliases went with it above.
-    kept.retain(|iv| iv.period >= params.periods.min());
     kept
 }
 
@@ -1785,21 +1791,26 @@ mod tests {
             "a period-multiple of a surviving tract is eliminated"
         );
 
-        // **And a homopolymer's multiple is eliminated the same way** — since the
-        // 2026-07-17 ordering fix, which is what took `Compound`'s only customer away.
-        // The period-1 interval is kept as an eliminator, does its work, and is dropped
-        // by the period floor afterwards.
-        let homopolymer_and_multiple = vec![iv(20, 40, 1, 100), iv(20, 40, 2, 100)];
-        assert!(
-            prefilter(&homopolymer_and_multiple, &p).is_empty(),
-            "the homopolymer eliminates its own period-2 alias, then the period floor \
-             drops it: nothing survives, which is what `periods.min() == 2` asks for"
+        // **And a homopolymer never even reaches Compound** — the scanner emits it at
+        // period 1 only (`a_homopolymer_is_only_period_one`), so no period-2 `AA` alias
+        // is ever produced for the gate to catch. Fed the aliases by hand (period 1 in
+        // scope), the pre-filter's redundancy elimination collapses them to the period-1
+        // primitive; `classify`'s own period gate then drops period 1 at the default range.
+        let homopolymer_and_alias = vec![iv(20, 40, 1, 100), iv(20, 40, 2, 100)];
+        let with_p1 = SsrSegmentCriteria {
+            periods: PeriodRange::new(1, 6).unwrap(),
+            ..p.clone()
+        };
+        assert_eq!(
+            prefilter(&homopolymer_and_alias, &with_p1),
+            vec![iv(20, 40, 1, 100)],
+            "the period-2 alias is eliminated as a multiple of the period-1 primitive"
         );
 
-        // Compound is therefore unreachable from the walk: every compound motif is a
-        // period-multiple of a shorter one, and redundancy elimination now reaches all of
-        // them — period 1 included. It stays as `classify`'s own guard, for a caller handing
-        // in intervals the pre-filter never saw.
+        // Compound is therefore unreachable from the walk: the scanner emits only
+        // *primitive* motifs, and a compound motif is by definition non-primitive, so
+        // none reaches `classify`. The gate stays as `classify`'s own guard, for a caller
+        // handing in intervals the scanner never produced.
         let contig = b"CGCGCGCGCGCGCGCGCGCGAAAAAAAAAAAAAAAAAAAACGCGCGCGCGCGCGCGCGCG";
         assert_eq!(
             classify(
@@ -3213,80 +3224,69 @@ mod tests {
         );
     }
 
-    /// **A homopolymer does not come back as a period-2 repeat** — the ordering
-    /// bug fixed 2026-07-17, and the reason the period floor runs last.
-    ///
-    /// `AAAA…` tiles under `AA`, `AAA`, `AAAAA`, so the scanner emits the *same
-    /// span* at every period in scope. Only the period-1 interval divides them all,
-    /// so only it can eliminate them. The floor used to run first, and the aliases
-    /// outlived their eliminator: periods 2, 3 and 5 all survived (4 and 6 died as
-    /// multiples of 2), so one homopolymer entered the cleaned set as **three
-    /// repeats** and fed coverage, the satellite cap and the rejection counts as if
-    /// it were three. `periods.min() == 2` dropped the period-1 *label*; the
-    /// homopolymer sailed on under a wrong one.
-    ///
-    /// This is what makes the period range mean what it says, which is all the
-    /// caller asked for: **out of scope must mean gone, not relabelled.**
+    /// **The pre-filter drops a phase-shifted period-multiple re-detection** — its
+    /// job since the scanner learned to emit primitive periods (which is where a
+    /// homopolymer's `AA`/`AAA` aliases are now killed: `a_homopolymer_is_only_period_one`,
+    /// scanner-side). What survives *that* and still needs dropping is an impure
+    /// re-detection of a real repeat at a multiple period: a clean `(GAA)*13` at
+    /// period 3 also matches, sloppily, as a period-6 `AAGATG` over a wider span.
+    /// `AAGATG` is a primitive 6-mer, so the scanner keeps it — but it overlaps the
+    /// period-3 tract and 6 is a multiple of 3, so it is the same repeat seen worse.
+    /// Left in, the two bundle and the locus vanishes (this was a real `.cat` parity
+    /// break, `ctg1:1022-1057`).
     #[test]
-    fn a_homopolymer_does_not_survive_as_a_period_two_repeat() {
-        // What the scanner really emits for a 30 bp poly-A: every period tiles it.
-        // (Verified against `find_tandem_repeats` — this is its output, not a guess.)
-        let aliases: Vec<RepeatInterval> = (1..=6).map(|p| iv(100, 130, p, 100)).collect();
-
-        assert!(
-            prefilter(&aliases, &params()).is_empty(),
-            "at periods 2..=6 a homopolymer contributes NOTHING: the period-1 \
-             interval eliminates its own aliases, then the period floor drops it. \
-             Before the fix this returned periods 2, 3 and 5 — three 'repeats' \
-             where the sequence has one homopolymer"
+    fn a_period_multiple_re_detection_is_dropped() {
+        let real = iv(6, 45, 3, 100); // (GAA)*13, primitive period 3
+        let alias = iv(1, 45, 6, 100); // period-6 re-detection over the same repeat
+        assert_eq!(
+            prefilter(&[real, alias], &params()),
+            vec![real],
+            "the period-6 overlaps the period-3 and is a multiple of it → redundant"
         );
+        // A period-3 next to an unrelated period-2 (not a multiple, or not overlapping)
+        // is NOT redundant — both survive.
+        let two = iv(200, 240, 2, 100);
+        let mut both = prefilter(&[real, two], &params());
+        both.sort_by_key(|iv| iv.period);
+        assert_eq!(both, vec![two, real], "unrelated periods both kept");
+    }
 
-        // And the range means what it says in the other direction too: put period 1
-        // in scope and the homopolymer is a period-1 tract under its own motif —
-        // one interval, not six.
-        let with_homopolymers = SsrSegmentCriteria {
+    /// **The copy floor drops low-copy specks before they can eliminate anything.**
+    /// It runs *first*, and that ordering is load-bearing: aperiodic sequence is full
+    /// of 2 bp period-1 specks (`GG`, `TT`), and if one reached redundancy elimination
+    /// it would eliminate every real STR it overlaps (period 1 divides everything) —
+    /// the poly-A cascade. [`MinCopies`]'s period-1 entry of 10 stops them.
+    ///
+    /// (A period-1 speck only *reaches* the pre-filter if period 1 is in scope; at the
+    /// default 2..=6 the scanner never emits it. The floor still matters for low-copy
+    /// noise at every period, and this pins the ordering directly.)
+    #[test]
+    fn the_copy_floor_runs_before_redundancy_so_a_speck_is_not_an_eliminator() {
+        let speck = iv(100, 102, 1, 10); // 2 copies at period 1 — under the floor of 10
+        let real_str = iv(100, 130, 3, 100); // 10 copies at period 3, overlapping it
+        let with_p1 = SsrSegmentCriteria {
             periods: PeriodRange::new(1, 6).unwrap(),
             ..params()
         };
-        assert_eq!(
-            prefilter(&aliases, &with_homopolymers),
-            vec![iv(100, 130, 1, 100)],
-            "at periods 1..=6 the homopolymer is kept — once, at its true period"
-        );
-    }
-
-    /// **The copy floor is what keeps the period-1 eliminator honest**, and it is
-    /// load-bearing precisely because the period floor now runs last.
-    ///
-    /// Aperiodic sequence is full of 2 bp period-1 specks (`GG`, `TT` — 45 of them
-    /// in 300 bp of the test filler). If those reached redundancy elimination they
-    /// would eliminate every real STR they overlap, since period 1 divides
-    /// everything: the poly-A cascade, which scored 0/16 on the first parity run.
-    /// [`MinCopies`]'s period-1 entry of **10** is what stops them — an entry that
-    /// was unreachable dead weight until this ordering.
-    #[test]
-    fn a_two_bp_speck_is_not_an_eliminator_but_a_real_homopolymer_is() {
-        let speck = iv(100, 102, 1, 10); // 2 copies at period 1 — under the floor of 10
-        let real_str = iv(100, 130, 3, 100); // 10 copies at period 3, overlapping it
 
         assert_eq!(
-            prefilter(&[speck, real_str], &params()),
+            prefilter(&[speck, real_str], &with_p1),
             vec![real_str],
             "the speck is dropped by period 1's copy floor (10) before it can \
-             eliminate anything: it never becomes an eliminator"
+             eliminate anything: the real period-3 tract survives"
         );
 
-        // The floor is a knob, not a constant: drop it and the speck does eliminate
-        // the real tract. That is the cascade, and it is what the 10 buys.
+        // Drop the floor to 1 and the speck survives, then eliminates the real
+        // period-3 tract as its multiple — the cascade, and what the floor prevents.
         let no_floor = SsrSegmentCriteria {
             min_copies: MinCopies::uniform(1),
-            ..params()
+            ..with_p1
         };
-        assert!(
-            prefilter(&[speck, real_str], &no_floor).is_empty(),
-            "with the floor at 1 the speck survives, eliminates the period-3 tract \
-             as its multiple, and is then dropped by the period floor — the whole \
-             locus gone. This is why the copy floor must run FIRST"
+        assert_eq!(
+            prefilter(&[speck, real_str], &no_floor),
+            vec![speck],
+            "with the floor at 1 the speck survives and eliminates the real tract: \
+             the locus is gone, replaced by a 2 bp speck"
         );
     }
 

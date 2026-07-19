@@ -814,8 +814,24 @@ period-1 interval reaching it would annihilate every overlapping real tract. The
 in the *partition* — under 1–6 an over-1 kb poly-A becomes `Satellite`. v1 takes 2–6 to keep the
 classified set equal to the catalog's.
 
-> **The paragraph above describes a bug, which is now fixed — 2026-07-17. The sentence about
-> `Satellite` was a symptom of it, and the ordering it praises was the cause.**
+> **Superseded 2026-07-18 — the whole "scan from 1 so the pre-filter can eliminate homopolymer
+> aliases" story below is now history.** The scanner was fixed to emit only *primitive-period* repeats
+> (`find_tandem_repeats`, `e5d08b7`): a homopolymer is period 1 and is never emitted as a period-2
+> `AA` alias, so the aliases this section agonises over **never exist**. Consequences: there is now
+> **one** period range (`criteria.periods`) — the scanner detects it and classification accepts it,
+> the config's separate scan range is gone; the pre-filter's **period floor is removed** (the scanner
+> emits only in-range periods); and the pre-filter keeps just the **copy floor + overlapping-multiple
+> redundancy** (the latter for a *phase-shifted re-detection of the same tract*, e.g. a period-6
+> `AAGATG` over a period-3 `GAA` — a policy call, because the copy floor decides whether an `AAA`
+> sub-run or its `GAAA` parent is significant, which is why it is not the scanner's job). Everything
+> below is retained as the archaeology of how we got here; `typed_regions_cli.md` §2.2 states the
+> current design. **All parity oracles still hold.**
+>
+> ---
+>
+> **The paragraph above describes a bug, which was fixed — 2026-07-17 (and then subsumed by the
+> scanner fix, above). The sentence about `Satellite` was a symptom of it, and the ordering it praises
+> was the cause.**
 >
 > **The bug.** A homopolymer tiles under every motif length: `AAAA…` is a perfect period-2 `AA`,
 > period-3 `AAA` and period-5 `AAAAA` repeat, and the scanner emits the same span at all of them.

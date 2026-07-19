@@ -390,10 +390,18 @@ fn maximal_scoring_subsequences(
 /// it to the 0-based half-open tract it certifies, and emits it when its implied copy
 /// count clears `params.min_copies`. Pure and total over arbitrary bytes; deterministic.
 ///
-/// Returns raw, possibly-overlapping intervals — one region can match at several periods,
-/// and the finder does **not** de-duplicate periods or resolve overlaps; that is a
-/// consumer's job (spec §1, §3.5). Per-period results are start-sorted; across periods
-/// they are concatenated (period-ascending).
+/// **A repeat is never emitted as a longer non-primitive alias of itself** — a
+/// `AAAAAA` is period 1, not a period-2 `AA`, because a non-primitive motif is dropped
+/// at emission. This is the scanner honouring its period-range contract: asked for
+/// period 2, it does not return a homopolymer dressed as one.
+///
+/// It does **not** resolve every overlapping re-detection. A phase-shifted period-6
+/// re-detection of a period-3 tract (motif `AAGATG`, primitive-looking) still slips
+/// through, and so does a genuine period-1 homopolymer *inside* a higher-period motif
+/// (the `AAA` in `(GAAA)*n`). Collapsing those to one repeat is a **policy** decision —
+/// whether the `AAA` or the `GAAA` is the significant one is the copy-number floor's
+/// call — so it lives in the consumer's pre-filter, after that floor
+/// (`segment_criteria::prefilter`), not here.
 pub fn find_tandem_repeats(
     seq: &[u8],
     periods: PeriodRange,
