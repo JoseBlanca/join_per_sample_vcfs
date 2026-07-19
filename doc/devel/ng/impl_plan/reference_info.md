@@ -134,7 +134,7 @@ fixpoint); atomicity (a simulated mid-write failure leaves no partial file). *De
 
 ### Milestone D — the single-flight cache
 
-**D1. `ReferenceInfoCache` + `get_or_read`.**  ☐
+**D1. `ReferenceInfoCache` + `get_or_read`.**  ✅
 Two-level `Mutex<HashMap<Key, Arc<Mutex<Option<Arc<ReferenceInfo>>>>>>`; key = `(source
 discriminant, per-file (path, size, mtime))`; hold the map lock only for the slot lookup, the slot
 lock across the read (the single-flight); **successes only** cached; mtime-unavailable → bypass;

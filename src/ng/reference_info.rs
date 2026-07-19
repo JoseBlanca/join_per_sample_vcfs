@@ -19,14 +19,17 @@
 //! geometry + per-contig and whole-reference MD5 in one buffer; `Fasta { fai: Some }` reads
 //! the same and proves the supplied `.fai` describes the same genome (spec §3.3). And
 //! `write_fai` writes a `.fai` byte-identical to `samtools faidx`, atomically (Milestone C).
+//! `ReferenceInfoCache` is the compute-once, single-flight cache over the reader (Milestone D).
 
 use crate::fasta::{ContigEntry, ContigList};
 use md5::{Digest, Md5};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 // ---------------------------------------------------------------------
 // The data — ContigInfo, ReferenceInfo
@@ -773,6 +776,122 @@ pub fn write_fai(contigs: &[ContigInfo], out: &Path) -> io::Result<()> {
     tmp.flush()?;
     tmp.persist(out).map_err(|e| e.error)?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------
+// The cache — compute-once, single-flight (spec §3.7)
+// ---------------------------------------------------------------------
+
+/// A file's identity for cache keying: `(path as given, size, mtime)`. Stat-based, which is
+/// sound because a reference is write-once during a run (spec §5 T8). Paths are used as
+/// given (not canonicalised), so two spellings of one file compute twice — harmless.
+type FileStat = (PathBuf, u64, SystemTime);
+
+/// The cache key. The **source discriminant is part of the key** because the three shapes
+/// return *different* results for the same bytes — `Fai` yields `md5: None`; `FastaAlone`
+/// the table with MD5s but unverified; `FastaWithFai` the same verified against that index —
+/// so one must never satisfy another (spec §3.7).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum CacheKey {
+    Fai(FileStat),
+    FastaAlone(FileStat),
+    FastaWithFai(FileStat, FileStat),
+}
+
+/// One key's single-flight slot: `None` until the read finishes, then the shared result. The
+/// slot lock is held across the read (the single-flight), so same-key callers wait then hit.
+type Slot = Arc<Mutex<Option<Arc<ReferenceInfo>>>>;
+
+/// Stat one path into a `FileStat`, or `None` if it cannot be stat'd or its mtime is
+/// unavailable — in which case the caller bypasses the cache rather than fail (spec §3.7).
+fn file_stat(path: &Path) -> Option<FileStat> {
+    let meta = std::fs::metadata(path).ok()?;
+    let mtime = meta.modified().ok()?;
+    Some((path.to_path_buf(), meta.len(), mtime))
+}
+
+/// Build the cache key for a source, or `None` when any involved file cannot be stat'd (a
+/// missing file, or a platform without mtime) — the signal to bypass the cache.
+fn cache_key(source: &ReferenceSource) -> Option<CacheKey> {
+    Some(match source {
+        ReferenceSource::Fai(p) => CacheKey::Fai(file_stat(p)?),
+        ReferenceSource::Fasta { fasta, fai: None } => CacheKey::FastaAlone(file_stat(fasta)?),
+        ReferenceSource::Fasta {
+            fasta,
+            fai: Some(f),
+        } => CacheKey::FastaWithFai(file_stat(fasta)?, file_stat(f)?),
+    })
+}
+
+/// A thread-safe, compute-once, single-flight cache over [`read_reference_info`]. Caller-held
+/// (not a global static): construct one per run, share `&cache` across worker threads, and
+/// every thread asking for a reference already being read **waits** rather than re-reading
+/// it (spec §3.7). `Send + Sync`.
+///
+/// The consumer that makes it matter is parallel per-sample readers validating each sample's
+/// alignment file against the *same* reference: N workers would otherwise each read the whole
+/// genome to build the same table; the cache turns that into one read the others wait on.
+#[derive(Default)]
+pub struct ReferenceInfoCache {
+    /// Two-level lock: the map lock is held only to get-or-create a key's slot; the slot lock
+    /// is held across the read, which *is* the single-flight (same-key callers wait, then
+    /// hit). A read on one key therefore never blocks a read on another.
+    map: Mutex<HashMap<CacheKey, Slot>>,
+}
+
+impl ReferenceInfoCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Read a reference through the cache. The result is `Arc`-shared, so a hit is a pointer
+    /// clone. Keyed on `(source discriminant, per-file (path, size, mtime))` — `Fai`,
+    /// `Fasta { None }` and `Fasta { Some }` are distinct keys. **Successes only** are cached:
+    /// a transient I/O error is not, so it can retry. When a file cannot be stat'd (missing,
+    /// or no mtime), the cache is bypassed and the read runs uncached — the cache is an
+    /// optimisation, never a correctness gate (spec §3.7).
+    pub fn get_or_read(
+        &self,
+        source: ReferenceSource,
+    ) -> Result<Arc<ReferenceInfo>, ReferenceInfoError> {
+        let key = cache_key(&source);
+        self.get_or_read_with(key, move || read_reference_info(source))
+    }
+
+    /// The single-flight core, parameterised over the actual read so tests can drive it with
+    /// a counting / barrier-blocked read (the public `get_or_read` passes the real reader).
+    fn get_or_read_with<F>(
+        &self,
+        key: Option<CacheKey>,
+        read: F,
+    ) -> Result<Arc<ReferenceInfo>, ReferenceInfoError>
+    where
+        F: FnOnce() -> Result<ReferenceInfo, ReferenceInfoError>,
+    {
+        // No key (un-stattable file / no mtime): bypass, compute directly, do not cache. The
+        // read still produces the proper error for a missing file.
+        let Some(key) = key else {
+            return read().map(Arc::new);
+        };
+
+        // Hold the map lock only long enough to get-or-create this key's slot.
+        let slot = {
+            let mut map = self.map.lock().expect("reference-info cache map poisoned");
+            Arc::clone(map.entry(key).or_default())
+        };
+
+        // Hold the slot lock across the read — this is the single-flight: a second caller on
+        // the same key blocks here until the first finishes, then falls through to the hit.
+        let mut guard = slot.lock().expect("reference-info cache slot poisoned");
+        if let Some(existing) = guard.as_ref() {
+            return Ok(Arc::clone(existing));
+        }
+        // Miss: run the read with the slot lock still held. Errors are NOT cached — the slot
+        // stays `None`, so a transient failure can retry.
+        let info = Arc::new(read()?);
+        *guard = Some(Arc::clone(&info));
+        Ok(info)
+    }
 }
 
 #[cfg(test)]
@@ -1550,9 +1669,200 @@ mod tests {
 
         let result = write_fai(&info.contigs, &out);
         assert!(result.is_err(), "renaming over a directory must fail");
-        assert!(out.is_dir(), "out is untouched — no partial .fai replaced it");
+        assert!(
+            out.is_dir(),
+            "out is untouched — no partial .fai replaced it"
+        );
         // The temp file was cleaned up on failure — only the directory remains.
         let entries = std::fs::read_dir(dir.path()).unwrap().count();
         assert_eq!(entries, 1, "no leftover temp file after a failed write");
+    }
+
+    // =================================================================
+    // D1 — ReferenceInfoCache: compute-once, single-flight (spec §3.7).
+    // =================================================================
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn dummy_info() -> ReferenceInfo {
+        ReferenceInfo {
+            md5: None,
+            contigs: Vec::new(),
+        }
+    }
+
+    /// A fixed cache key for the seam tests (no real file needed).
+    fn test_key(tag: &str) -> CacheKey {
+        CacheKey::Fai((PathBuf::from(tag), 0, SystemTime::UNIX_EPOCH))
+    }
+
+    #[test]
+    fn cache_hit_computes_the_read_once() {
+        let cache = ReferenceInfoCache::new();
+        let key = test_key("ref");
+        let n = AtomicUsize::new(0);
+        let a = cache
+            .get_or_read_with(Some(key.clone()), || {
+                n.fetch_add(1, Ordering::SeqCst);
+                Ok(dummy_info())
+            })
+            .unwrap();
+        let b = cache
+            .get_or_read_with(Some(key), || {
+                n.fetch_add(1, Ordering::SeqCst);
+                Ok(dummy_info())
+            })
+            .unwrap();
+        assert_eq!(n.load(Ordering::SeqCst), 1, "the second call is a hit");
+        assert!(Arc::ptr_eq(&a, &b), "a hit returns the same Arc");
+    }
+
+    #[test]
+    fn cache_single_flight_reads_once_under_threads() {
+        let cache = Arc::new(ReferenceInfoCache::new());
+        let key = test_key("shared");
+        let n = Arc::new(AtomicUsize::new(0));
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let cache = Arc::clone(&cache);
+                let key = key.clone();
+                let n = Arc::clone(&n);
+                std::thread::spawn(move || {
+                    cache
+                        .get_or_read_with(Some(key), || {
+                            n.fetch_add(1, Ordering::SeqCst);
+                            // Hold the slot long enough that the other threads pile up on it.
+                            std::thread::sleep(std::time::Duration::from_millis(100));
+                            Ok(dummy_info())
+                        })
+                        .unwrap()
+                })
+            })
+            .collect();
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert_eq!(
+            n.load(Ordering::SeqCst),
+            1,
+            "the real read ran exactly once"
+        );
+        assert!(
+            results.iter().all(|r| Arc::ptr_eq(r, &results[0])),
+            "every thread got the same Arc"
+        );
+    }
+
+    #[test]
+    fn cache_different_keys_do_not_serialize() {
+        // The map lock is not held across a read: a read blocked on one key must not wedge a
+        // read on another. Thread A's read blocks until released; thread B (a different key)
+        // must complete *before* A is released.
+        let cache = Arc::new(ReferenceInfoCache::new());
+        let (release, blocked_read) = std::sync::mpsc::channel::<()>();
+
+        let a = {
+            let cache = Arc::clone(&cache);
+            std::thread::spawn(move || {
+                cache
+                    .get_or_read_with(Some(test_key("a")), move || {
+                        blocked_read.recv().unwrap(); // block until the test releases us
+                        Ok(dummy_info())
+                    })
+                    .unwrap()
+            })
+        };
+        let b = {
+            let cache = Arc::clone(&cache);
+            std::thread::spawn(move || {
+                cache
+                    .get_or_read_with(Some(test_key("b")), || Ok(dummy_info()))
+                    .unwrap()
+            })
+        };
+
+        b.join().unwrap(); // completes while A is still blocked — no serialization
+        release.send(()).unwrap();
+        a.join().unwrap();
+    }
+
+    #[test]
+    fn cache_distinguishes_fai_from_fasta_of_the_same_file() {
+        // The source discriminant is in the key: a cheap `Fai` read must not poison the entry
+        // a `Fasta` read needs (T6-adjacent).
+        let cache = ReferenceInfoCache::new();
+        let from_fai = cache
+            .get_or_read(ReferenceSource::Fai(sibling_fai_path(&golden_ref_path())))
+            .unwrap();
+        let from_fasta = cache
+            .get_or_read(ReferenceSource::Fasta {
+                fasta: golden_ref_path(),
+                fai: None,
+            })
+            .unwrap();
+        assert_eq!(from_fai.md5, None, "the Fai read has no digest");
+        assert!(from_fasta.md5.is_some(), "the Fasta read has the digest");
+        assert!(
+            !Arc::ptr_eq(&from_fai, &from_fasta),
+            "distinct keys, distinct entries"
+        );
+    }
+
+    #[test]
+    fn cache_does_not_cache_errors() {
+        let cache = ReferenceInfoCache::new();
+        let key = test_key("flaky");
+        let first = cache.get_or_read_with(Some(key.clone()), || {
+            Err(ReferenceInfoError::FastaRead {
+                path: PathBuf::from("x"),
+                source: io::Error::other("transient"),
+            })
+        });
+        assert!(first.is_err());
+
+        // The error was not cached, so the slot is retried and this read actually runs.
+        let n = AtomicUsize::new(0);
+        cache
+            .get_or_read_with(Some(key), || {
+                n.fetch_add(1, Ordering::SeqCst);
+                Ok(dummy_info())
+            })
+            .unwrap();
+        assert_eq!(n.load(Ordering::SeqCst), 1, "the retry ran the read");
+    }
+
+    #[test]
+    fn cache_bypasses_when_there_is_no_key() {
+        // No key (un-stattable file / no mtime) => not cached => every call reads.
+        let cache = ReferenceInfoCache::new();
+        let n = AtomicUsize::new(0);
+        let a = cache
+            .get_or_read_with(None, || {
+                n.fetch_add(1, Ordering::SeqCst);
+                Ok(dummy_info())
+            })
+            .unwrap();
+        let b = cache
+            .get_or_read_with(None, || {
+                n.fetch_add(1, Ordering::SeqCst);
+                Ok(dummy_info())
+            })
+            .unwrap();
+        assert_eq!(n.load(Ordering::SeqCst), 2, "no key => both calls read");
+        assert!(!Arc::ptr_eq(&a, &b), "the bypass does not share an Arc");
+
+        // A real missing file has no key, so it bypasses to the proper read error.
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("nope.fa.fai");
+        assert!(matches!(
+            cache
+                .get_or_read(ReferenceSource::Fai(missing))
+                .unwrap_err(),
+            ReferenceInfoError::FaiRead { .. }
+        ));
+    }
+
+    #[test]
+    fn cache_is_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<ReferenceInfoCache>();
     }
 }
