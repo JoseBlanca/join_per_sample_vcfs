@@ -287,6 +287,27 @@ pub enum ScanError {
 /// A tandem-repeat match requires **both** compared bases to canonicalise equal (so an
 /// `N == N` never matches — the two `None`s are not equal by this function's use).
 #[inline]
+/// Whether `motif` is **primitive** — it does not tile under any shorter period that
+/// divides its length. `AAA` is not (it tiles under `A`); `ATAT` is not (tiles under
+/// `AT`); `AT` and `CAG` are. A period-1 motif is always primitive. Case-insensitive,
+/// matching the scan's own base comparison, so a soft-masked homopolymer still reduces.
+///
+/// This is what makes [`find_tandem_repeats`] honour its period range on each tract's
+/// *true* period: a non-primitive motif is an alias of a shorter-period repeat, and the
+/// shorter one is what the caller asked about.
+fn is_primitive_motif(motif: &[u8]) -> bool {
+    let p = motif.len();
+    for q in 1..p {
+        if !p.is_multiple_of(q) {
+            continue; // only proper *divisors* of p can tile it exactly
+        }
+        if (q..p).all(|i| canonical_base(motif[i]) == canonical_base(motif[i - q])) {
+            return false; // tiles under its first q bases → not primitive
+        }
+    }
+    true
+}
+
 fn canonical_base(b: u8) -> Option<u8> {
     match b {
         b'A' | b'a' => Some(b'A'),
@@ -398,7 +419,14 @@ pub fn find_tandem_repeats(
             let tract_start = k0 as u64;
             let tract_end = (k1 + p + 1) as u64;
             let copies = (tract_end - tract_start) / u64::from(period);
-            if copies >= u64::from(params.min_copies) {
+            // Emit only PRIMITIVE-period repeats — honour the requested period range on
+            // the tract's true period, not on a non-primitive alias. `AAAAAA` tiles under
+            // `AA`, so it is *detected* at period 2, but its motif `AA` reduces to `A`
+            // (period 1): it is a homopolymer, not a dinucleotide, and reporting it as
+            // period 2 would be the scanner failing its own contract. The caller asked for
+            // period 2; a period-1 tract dressed as period 2 is not that.
+            let motif = &seq[tract_start as usize..tract_start as usize + p];
+            if copies >= u64::from(params.min_copies) && is_primitive_motif(motif) {
                 out.push(RepeatInterval {
                     start: tract_start,
                     end: tract_end,
@@ -1189,19 +1217,52 @@ mod tests {
     /// An (AT)*n tract matches at period 2 **and** its multiples 4 and 6 — all emitted;
     /// the finder does not de-duplicate periods (spec §3.5).
     #[test]
-    fn multiples_of_the_fundamental_period_are_all_emitted() {
+    fn only_the_primitive_period_is_emitted() {
+        // (AT)*10 tiles under `AT` (period 2), `ATAT` (4) and `ATATAT` (6), so the scorer
+        // matches at all three. But its *primitive* period is 2, and the scanner honours
+        // its contract: it emits the tract once, at period 2 — not as a period-4 or
+        // period-6 alias, which are the same repeat wearing a longer motif.
         let seq = b"ATATATATATATATATATAT"; // (AT)*10, 20 bp
         let got = find_tandem_repeats(seq, p(2, 6), &ScanParams::default());
         let periods: std::collections::BTreeSet<u8> = got.iter().map(|r| r.period).collect();
-        assert!(
-            periods.contains(&2),
-            "fundamental period 2 present: {got:?}"
+        assert_eq!(
+            periods,
+            std::collections::BTreeSet::from([2]),
+            "only the primitive period 2, no 4/6 aliases (nor 3/5 non-divisors): {got:?}"
         );
-        assert!(periods.contains(&4), "multiple period 4 present: {got:?}");
-        assert!(periods.contains(&6), "multiple period 6 present: {got:?}");
+    }
+
+    /// A genuine period-4 primitive (`ACGT`) is emitted at 4, not mistaken for an alias.
+    #[test]
+    fn a_genuine_higher_primitive_period_is_kept() {
+        let seq = b"ACGTACGTACGTACGT"; // (ACGT)*4 — primitive period 4
+        let got = find_tandem_repeats(seq, p(2, 6), &ScanParams::default());
         assert!(
-            !periods.contains(&3) && !periods.contains(&5),
-            "no match at non-divisor periods 3/5: {got:?}"
+            got.iter().any(|r| r.period == 4),
+            "ACGT is a primitive period-4 motif and must survive: {got:?}"
+        );
+        assert!(
+            got.iter().all(|r| r.period != 2 && r.period != 3),
+            "it does not tile under any shorter period, so no 2/3 detection: {got:?}"
+        );
+    }
+
+    /// A homopolymer is a period-1 tract and nothing else — never a di/tri/… alias.
+    #[test]
+    fn a_homopolymer_is_only_period_one() {
+        let seq = b"AAAAAAAAAAAAAAAAAAAA"; // poly-A, 20 bp
+        let got = find_tandem_repeats(seq, p(1, 6), &ScanParams::default());
+        let periods: std::collections::BTreeSet<u8> = got.iter().map(|r| r.period).collect();
+        assert_eq!(
+            periods,
+            std::collections::BTreeSet::from([1]),
+            "a poly-A is period 1 only — the whole aliasing problem, gone at the source: {got:?}"
+        );
+        // And asked for period 2+ only, the scanner returns nothing for it — the contract.
+        let got2 = find_tandem_repeats(seq, p(2, 6), &ScanParams::default());
+        assert!(
+            got2.is_empty(),
+            "asked for period 2..6, a homopolymer is not any of them: {got2:?}"
         );
     }
 
@@ -1280,9 +1341,13 @@ mod tests {
     }
 
     #[test]
-    fn overlapping_periods_merge_into_one_repeat_carrying_all() {
-        // (AT)*10 matches at periods 2, 4 and 6 — three overlapping intervals, one Repeat.
-        let seq = b"ATATATATATATATATATAT"; // 20 bp
+    fn adjacent_repeats_of_different_periods_merge_into_one_region() {
+        // An (AT)*8 tract abutting a (CAG)*5 tract: two primitive repeats (period 2 and 3)
+        // whose coverage abuts, so the region tiling merges them into one `Repeat` region
+        // carrying both intervals. (Before the primitive-period fix this test used (AT)*10's
+        // 2/4/6 aliases to exercise the merge; a real repeat is now needed, because aliases
+        // no longer exist.)
+        let seq = b"ATATATATATATATATCAGCAGCAGCAGCAG"; // (AT)*8 then (CAG)*5
         let regions = regions_of(seq, p(2, 6), &SegmentOptions::default());
         assert_tiles(&regions, seq.len() as u64);
         let repeats: Vec<_> = regions
@@ -1295,9 +1360,10 @@ mod tests {
         assert_eq!(repeats.len(), 1, "one merged repeat region: {regions:?}");
         let periods: std::collections::BTreeSet<u8> =
             repeats[0].intervals.iter().map(|iv| iv.period).collect();
-        assert!(
-            periods.contains(&2) && periods.contains(&4) && periods.contains(&6),
-            "the merged region carries all overlapping periods: {:?}",
+        assert_eq!(
+            periods,
+            std::collections::BTreeSet::from([2, 3]),
+            "the merged region carries both PRIMITIVE periods, no aliases: {:?}",
             repeats[0].intervals
         );
     }
