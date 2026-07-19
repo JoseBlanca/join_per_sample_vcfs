@@ -18,7 +18,7 @@
 
 use crate::fasta::{ContigEntry, ContigList};
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------------
 // The data — ContigInfo, ReferenceInfo
@@ -198,6 +198,26 @@ pub enum ReferenceInfoError {
     },
 }
 
+// ---------------------------------------------------------------------
+// Pure path helper
+// ---------------------------------------------------------------------
+
+/// `<fasta>` + `".fai"` — the reference naming convention, as a path, **no I/O**. A caller
+/// wanting sibling behaviour composes this with its own existence check; the module never
+/// probes the filesystem for a `.fai` it was not handed (spec §2, §3.6). This is the one
+/// place ng expresses the `<fasta>.fai` convention as a value; the module applies it only
+/// in the `read_reference_verifying_or_creating_fai` orchestrator (spec §3.11).
+///
+/// It appends `.fai` to the *whole* path — `ref.fa` → `ref.fa.fai`, not `ref.fai` — because
+/// that is what `samtools faidx` writes and what every reader in the tree seeks. (Five lines
+/// copied from `bam/alignment_input.rs`'s private `with_fai_extension`, the standing
+/// copy-what-you-need rule, `ng/mod.rs`.)
+pub fn sibling_fai_path(fasta: &Path) -> PathBuf {
+    let mut buf = fasta.as_os_str().to_owned();
+    buf.push(".fai");
+    PathBuf::from(buf)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -240,6 +260,30 @@ mod tests {
         // Order is the ContigId contract (spec §5 T1): the projection must not reorder.
         assert_eq!(list.entries[0].name, "chr1");
         assert_eq!(list.entries[1].name, "chr2");
+    }
+
+    #[test]
+    fn sibling_fai_path_appends_dot_fai_and_touches_nothing() {
+        // Appends to the whole path (samtools' convention), does not replace the extension.
+        assert_eq!(
+            sibling_fai_path(Path::new("/data/ref.fa")),
+            PathBuf::from("/data/ref.fa.fai")
+        );
+        assert_eq!(
+            sibling_fai_path(Path::new("ref.fasta")),
+            PathBuf::from("ref.fasta.fai")
+        );
+        // A path with no extension still just gets `.fai` appended.
+        assert_eq!(
+            sibling_fai_path(Path::new("genome")),
+            PathBuf::from("genome.fai")
+        );
+        // Pure: it returns a value for a path that does not exist, without any I/O — a
+        // filesystem probe would error or block on a bogus path; this cannot.
+        assert_eq!(
+            sibling_fai_path(Path::new("/no/such/place/ghost.fa")),
+            PathBuf::from("/no/such/place/ghost.fa.fai")
+        );
     }
 
     #[test]

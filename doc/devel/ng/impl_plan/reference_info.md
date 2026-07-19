@@ -72,7 +72,7 @@ with its tests.
 `contig_list()` projection), `ReferenceSource`, and the `#[non_exhaustive]` `ReferenceInfoError`
 (all variants, per-variant docs). Nouns/errors only, no logic. *Source:* arch §1.
 
-**A2. `sibling_fai_path`.**  ☐
+**A2. `sibling_fai_path`.**  ✅
 Pure path helper (`<fasta>` + `.fai`, no I/O — copy `with_fai_extension`'s five lines). Test: it
 appends `.fai` and touches no filesystem. *Depends:* A1. *Source:* arch §2, spec §2/§3.6.
 
