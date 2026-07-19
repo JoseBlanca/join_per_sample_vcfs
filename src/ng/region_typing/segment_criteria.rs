@@ -872,7 +872,7 @@ impl RejectionCounts {
 /// # Panics
 ///
 /// If `bases` cannot supply a survivor's flanks — i.e. the caller windowed without
-/// leaving a margin (spec §2.6 fetches core ± `max_repeat_len`, and 1 kb is far
+/// leaving a margin (spec §2.6 fetches core ± `max_str_len`, and 1 kb is far
 /// more than the 50 bp of flank). Loudly, because the alternative is dropping the
 /// locus quietly, which is the very bug this signature exists to kill.
 ///

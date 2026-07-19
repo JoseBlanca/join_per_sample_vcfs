@@ -188,8 +188,8 @@ pub enum RegionKind {
     /// (spec §2.2), and a repeat classification turns down for any reason other than
     /// bundling lands back here rather than becoming a hole.
     Generic,
-    /// A tandem array longer than `max_repeat_len` — an array, not a
-    /// microsatellite. A **typing** claim, and `max_repeat_len` is its parameter,
+    /// A tandem array longer than `max_str_len` — an array, not a
+    /// microsatellite. A **typing** claim, and `max_str_len` is its parameter,
     /// not a constant of nature (spec §2.1, §10).
     Satellite,
 }
@@ -236,7 +236,7 @@ pub struct TypedRegionConfig {
     /// tract's *neighbours*, and the bundle flank test is a `flank_bp`-radius question.
     /// A margin narrower than that radius would classify tracts as clean loci that a
     /// whole-contig walk bundles — silently, and differently per `window_bp`.
-    pub max_repeat_len: Bp,
+    pub max_str_len: Bp,
     /// The walk's memory unit. **Must not change the output** (spec §2.3) — it is
     /// a memory knob and nothing else, which is why window-invariance is an
     /// acceptance test rather than a nicety.
@@ -264,7 +264,7 @@ pub const DEFAULT_SCAN_MAX_PERIOD: u8 = 6;
 /// The satellite cap and detection margin: **1 kb**, comfortably above any real
 /// STR locus. Spec §10 asks whether it is right; it is a parameter, so the
 /// experiment can answer.
-pub const DEFAULT_MAX_REPEAT_LEN: u64 = 1000;
+pub const DEFAULT_MAX_STR_LEN: u64 = 1000;
 
 /// The walk's window core: **100 kb**. Memory only — it must never change the
 /// output.
@@ -276,7 +276,7 @@ impl Default for TypedRegionConfig {
             periods: PeriodRange::new(DEFAULT_SCAN_MIN_PERIOD, DEFAULT_SCAN_MAX_PERIOD)
                 .expect("the default scan period range is valid: 1 <= 1 <= 6"),
             scan: ScanParams::default(),
-            max_repeat_len: Bp(DEFAULT_MAX_REPEAT_LEN),
+            max_str_len: Bp(DEFAULT_MAX_STR_LEN),
             window_bp: Bp(DEFAULT_WINDOW_BP),
             criteria: SsrSegmentCriteria::default(),
         }
@@ -342,7 +342,7 @@ pub struct TypedRegionCounts {
 /// 3. **Admit** — [`segment_criteria::classify`] → the STR loci *and* the tracts it set
 ///    aside as bundle members.
 /// 4. **Cap** — merge the cleaned intervals into coverage runs; a run over
-///    `max_repeat_len` is a satellite. Classified loci inside one are dropped.
+///    `max_str_len` is a satellite. Classified loci inside one are dropped.
 /// 5. **Partition** — emit `SsrSegment` at each surviving tract, `Satellite` at each
 ///    run, `Generic` across everything else.
 ///
@@ -476,7 +476,7 @@ fn resolve_features(
     contig: ContigId,
     config: &TypedRegionConfig,
 ) -> Vec<TypedRegion> {
-    let max_repeat_len = config.max_repeat_len.get();
+    let max_str_len = config.max_str_len.get();
     let flank_bp = config.criteria.flank_bp;
     let mut features: Vec<TypedRegion> = Vec::new();
 
@@ -484,7 +484,7 @@ fn resolve_features(
     let mut satellites: Vec<CoverageRun> = runs
         .iter()
         .copied()
-        .filter(|r| r.len() > max_repeat_len)
+        .filter(|r| r.len() > max_str_len)
         .collect();
 
     let mut loci: Vec<(CoverageRun, SsrSegment)> = loci
@@ -524,7 +524,7 @@ fn resolve_features(
     //    on by induction.
     // 2. It is what makes the **windowed** walk correct at all. A window truncates a
     //    detection at its scanned slice's edge, and only a tract longer than
-    //    `max_repeat_len` can be truncated — i.e. an array. A truncated member's `end`
+    //    `max_str_len` can be truncated — i.e. an array. A truncated member's `end`
     //    is wrong, so `is_close` cannot re-chain it, and `bundle_clusters` sees a
     //    singleton. Absorbing members first means a truncated one never reaches
     //    clustering: it is over-cap, so it lies inside its own satellite run.
@@ -760,7 +760,7 @@ fn coverage_runs(intervals: &[RepeatInterval]) -> Vec<CoverageRun> {
 /// from scanning it — and it answers the flank question by arithmetic against
 /// `contig_len`, which no slice could answer anyway.
 ///
-/// So there is one margin, spec §2.6's: `max_repeat_len`, what makes a repeat *segment*
+/// So there is one margin, spec §2.6's: `max_str_len`, what makes a repeat *segment*
 /// identically. Until 2026-07-17 there was a second — `flank_bp` on top of it — and a
 /// second fetch of every window to get it, because `SsrSegment` embedded `tract ± flank_bp`
 /// of bases and a tract at the slice's own edge could not supply them. Removing the
@@ -899,8 +899,8 @@ impl<R: RawRefSeq + ContigTable + EvictableRefSeq> TypedRegionIterator<R> {
         config: TypedRegionConfig,
     ) -> Result<Self, TypedRegionError> {
         // **A swept knob that would silently un-bundle** (spec §10 sweeps both of these).
-        // The scan's margin is `max_repeat_len`, so a window sees every repeat within
-        // `max_repeat_len` of its core. The bundle flank test needs to see every repeat
+        // The scan's margin is `max_str_len`, so a window sees every repeat within
+        // `max_str_len` of its core. The bundle flank test needs to see every repeat
         // within `flank_bp` of a core repeat. If the margin were the narrower of the two,
         // a core tract's neighbour could fall outside the window, go unseen, and the tract
         // would be classified as a clean locus instead of bundled — no error, and a
@@ -910,9 +910,9 @@ impl<R: RawRefSeq + ContigTable + EvictableRefSeq> TypedRegionIterator<R> {
         // reachable from a typo — and user input must not panic. The reason it was an
         // `assert!` still holds and is served better here: A2's rule is that a swept
         // knob's guard must survive `--release`, and a `Result` does, unconditionally.
-        if config.max_repeat_len.get() < config.criteria.flank_bp {
+        if config.max_str_len.get() < config.criteria.flank_bp {
             return Err(TypedRegionError::MarginNarrowerThanFlank {
-                max_repeat_len: config.max_repeat_len.get(),
+                max_str_len: config.max_str_len.get(),
                 flank_bp: config.criteria.flank_bp,
             });
         }
@@ -1113,7 +1113,7 @@ impl<R: RawRefSeq + ContigTable + EvictableRefSeq> TypedRegionIterator<R> {
             // walk's own business (`resolve_features`). Same number, because spec §2.6
             // says it must be: the margin exists to capture whole any repeat that is not
             // a satellite.
-            max_repeat_len: self.config.max_repeat_len.get(),
+            max_repeat_len: self.config.max_str_len.get(),
             window_bp: self.config.window_bp.get(),
             // `RegionScanner`'s smoothing knobs; the window rules read neither. Zeroed
             // rather than defaulted so a reader does not go looking for where this walk
@@ -1205,14 +1205,14 @@ struct ScanSpan {
 ///
 /// # Why the whole contig, and not the requested span grown by a margin
 ///
-/// E2 grew each span by `max_repeat_len` and coalesced, which spec §2.5 chose over
+/// E2 grew each span by `max_str_len` and coalesced, which spec §2.5 chose over
 /// whole-contig scans on cost: *"makes a 10 kb region pay for a 90 Mb chromosome"*. **A
 /// fixed margin cannot deliver the emit rule.** Every finding that intersects a requested
 /// edge is returned **whole** ([`clips_at_a_bed_edge`]) — and "whole" is a fact about the
 /// feature, which does not care what the walk scanned:
 ///
-/// - a **satellite** is *by definition* longer than `max_repeat_len`, and the margin **is**
-///   `max_repeat_len` — so an array running past it came back cut. Measured: a 3 kb array
+/// - a **satellite** is *by definition* longer than `max_str_len`, and the margin **is**
+///   `max_str_len` — so an array running past it came back cut. Measured: a 3 kb array
 ///   reported `1001–4001` whole-genome and `1001–2300` under a BED, silently.
 /// - a **bundle** chains with no reach at all (spec §2.6: *"A–B–C–D each 30 bp apart runs
 ///   past any margin you choose"*), so a fixed margin was never going to hold one.
@@ -1275,7 +1275,7 @@ fn scan_set<R: ContigTable>(
 /// - `SsrBundle` — carries its member tracts; clip the hull and the members describe bases
 ///   outside their own region.
 /// - `Satellite` — **the case E2 first got wrong.** The label means *"an array too long to
-///   be a microsatellite"*, so the extent is the claim and `max_repeat_len` is what makes
+///   be a microsatellite"*, so the extent is the claim and `max_str_len` is what makes
 ///   it. Clip the fixture's 1.2 kb array to a 300 bp request and the result is a
 ///   `Satellite` region of 300 bp — a span that contradicts the very cap that produced the
 ///   label. E2 argued the opposite from `RegionKind`'s shape (`Satellite` carries no
@@ -1674,11 +1674,11 @@ pub enum TypedRegionError {
     /// Raised by the constructor, before any work: both knobs are on the command
     /// line, so this is what a typo looks like, and a typo must not panic.
     #[error(
-        "max_repeat_len ({max_repeat_len}) is the window's detection margin and must not \
+        "max_str_len ({max_str_len}) is the window's detection margin and must not \
          be narrower than flank_bp ({flank_bp}), the bundle radius: a window that cannot \
          see a core tract's neighbours would classify them as loci instead of bundling them"
     )]
-    MarginNarrowerThanFlank { max_repeat_len: u64, flank_bp: u64 },
+    MarginNarrowerThanFlank { max_str_len: u64, flank_bp: u64 },
 }
 
 #[cfg(test)]
@@ -1696,7 +1696,7 @@ mod tests {
         let c = TypedRegionConfig::default();
         assert_eq!(c.periods.min(), 1, "the scanner scans period 1..");
         assert_eq!(c.periods.max(), 6, "..to 6");
-        assert_eq!(c.max_repeat_len, Bp(1000), "the 1 kb satellite cap");
+        assert_eq!(c.max_str_len, Bp(1000), "the 1 kb satellite cap");
         assert_eq!(c.window_bp, Bp(100_000), "100 kb window");
         assert_eq!(c.scan, ScanParams::default());
         assert_eq!(c.criteria, SsrSegmentCriteria::default());
@@ -1997,9 +1997,9 @@ mod tests {
         // **The control.** Raise the cap above the array and the SAME bases classify a
         // locus — so the absence above is the cap doing its job, not classification
         // quietly rejecting the tract for some unrelated reason. This is also what
-        // makes `max_repeat_len` a parameter rather than a fact of nature (spec §10).
+        // makes `max_str_len` a parameter rather than a fact of nature (spec §10).
         let uncapped = TypedRegionConfig {
-            max_repeat_len: Bp(10_000),
+            max_str_len: Bp(10_000),
             ..config
         };
         let regions = partition_resident("chr1", ContigId(0), &bases, &uncapped);
@@ -2635,12 +2635,12 @@ mod tests {
     ///
     /// # The two fixtures that broke the old design
     ///
-    /// E2 grew each requested span by `max_repeat_len` and scanned that. Both of these
+    /// E2 grew each requested span by `max_str_len` and scanned that. Both of these
     /// defeat a margin, and both are pinned here because they are exactly the shapes a
     /// margin cannot hold:
     ///
-    /// - **a 3 kb array** — a satellite is *by definition* longer than `max_repeat_len`,
-    ///   and the margin **is** `max_repeat_len`. Under the old design a BED reported it as
+    /// - **a 3 kb array** — a satellite is *by definition* longer than `max_str_len`,
+    ///   and the margin **is** `max_str_len`. Under the old design a BED reported it as
     ///   `1001–2300` where the truth is `1001–4001`: a `Satellite` cut to 1300 bp,
     ///   silently. This is the common case, not an exotic one.
     /// - **a 1.5 kb chain** of tracts 30 bp apart — clustering has no reach at all (spec
@@ -2662,7 +2662,7 @@ mod tests {
             .expect("the fixture has one array");
         assert!(
             truth.region.len() > 3000,
-            "the array must be far longer than max_repeat_len: {:?}",
+            "the array must be far longer than max_str_len: {:?}",
             truth.region
         );
 
@@ -2691,7 +2691,7 @@ mod tests {
             .expect("the chain is one bundle");
         assert!(
             truth_hull.len() > 1400 && truth_tracts.len() >= 25,
-            "the chain must run well past max_repeat_len: {truth_hull:?}"
+            "the chain must run well past max_str_len: {truth_hull:?}"
         );
         assert!(
             !whole
@@ -2882,7 +2882,7 @@ mod tests {
         let over_cap = |intervals: &[RepeatInterval]| -> Vec<(u64, u64)> {
             coverage_runs(intervals)
                 .into_iter()
-                .filter(|r| r.len() > config.max_repeat_len.get())
+                .filter(|r| r.len() > config.max_str_len.get())
                 .map(|r| (r.start, r.end))
                 .collect()
         };
@@ -3152,7 +3152,7 @@ mod tests {
     #[test]
     fn a_detection_margin_narrower_than_the_bundle_radius_is_refused() {
         let config = TypedRegionConfig {
-            max_repeat_len: Bp(10),
+            max_str_len: Bp(10),
             ..TypedRegionConfig::default()
         };
         let err = partition_windowed(
@@ -3165,7 +3165,7 @@ mod tests {
             matches!(
                 err,
                 TypedRegionError::MarginNarrowerThanFlank {
-                    max_repeat_len: 10,
+                    max_str_len: 10,
                     flank_bp: 50
                 }
             ),
@@ -3752,7 +3752,7 @@ mod tests {
         // past both requested edges.
         //
         // **Clipping it would produce a `Satellite` region of 301 bp** — a span that
-        // contradicts the `max_repeat_len` (1 kb) test that produced the label. The extent
+        // contradicts the `max_str_len` (1 kb) test that produced the label. The extent
         // is the claim: "an array too long to be a microsatellite". That is what E2 got
         // wrong by reasoning from the type (`Satellite` carries no payload, so nothing
         // could be left misdescribed) instead of from the meaning.

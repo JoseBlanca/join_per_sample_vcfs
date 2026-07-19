@@ -164,7 +164,7 @@ by whatever settings the config carries — running them at the catalog's own se
    (one tract is re-detected at every multiple of its period). **Not optional** (§5).
 3. **Classify** — ng's `classify` (the ported `build_loci`) → the STR loci *and* the tracts it set aside as
    bundle members (§5).
-4. **Cap** — merge cleaned intervals into coverage runs; a run over `max_repeat_len` (1 kb) is
+4. **Cap** — merge cleaned intervals into coverage runs; a run over `max_str_len` (1 kb) is
    satellite. Drop classified loci *and bundles* inside one.
 5. **Partition** — emit `SsrSegment` at each surviving tract, `SsrBundle` across each surviving
    cluster's hull, `Satellite` at each run, `Generic` across the rest.
@@ -177,8 +177,8 @@ callable by neither half (§2.3). The window must never appear in the output.
 
 **A satellite array is typed as one object, not searched for loci inside it.** Satellite runs are
 excluded from classification's input, so nothing classified can land inside one and the one-label-per-base
-rule needs no tie-break. That is a **typing** claim — past `max_repeat_len` the tandem structure is
-an array, not a microsatellite — and `max_repeat_len` is its parameter, not a constant of nature
+rule needs no tie-break. That is a **typing** claim — past `max_str_len` the tandem structure is
+an array, not a microsatellite — and `max_str_len` is its parameter, not a constant of nature
 (§10 asks whether 1 kb is right). Whether anyone calls a satellite region is their business.
 
 ### 2.2 A rejected repeat is generic territory, not a hole
@@ -303,7 +303,7 @@ The BED chooses what you are *shown*, never what things *are*.
 **whole of every contig the request touches**; the emit set is the user's regions. Two sets still — but
 the scan set is not a guess.
 
-> **This replaces "grow each region by `max_repeat_len` and re-coalesce" (E2), which could not deliver
+> **This replaces "grow each region by `max_str_len` and re-coalesce" (E2), which could not deliver
 > the emit rule.** The margin was a *guessed reach*, and §2.6 had already said not to guess one:
 > *"bundles chain — A–B–C–D each 30 bp apart runs past any margin you choose… the data tells you when
 > it's over; you don't have to guess a reach."* §2.5 was the odd section out. Two measurements ended
@@ -311,7 +311,7 @@ the scan set is not a guess.
 >
 > - **a 3 kb array under a BED came back `1001–2300` instead of `1001–4001`** — a `Satellite` cut to
 >   1300 bp, silently. This is the **common** case, not an exotic one: a satellite is *by definition*
->   longer than `max_repeat_len`, and the margin **is** `max_repeat_len`, so no array running past it
+>   longer than `max_str_len`, and the margin **is** `max_str_len`, so no array running past it
 >   could ever be returned whole.
 > - **a 1.5 kb chain came back with 24 of its 30 member tracts.** This section used to wave that away —
 >   *"the residual … is dense-repeat territory heading for `Satellite`; §8 tests for it directly rather
@@ -348,7 +348,7 @@ of the other three is a **claim about its own extent**, and half of it is a diff
 locus's coordinates and copy number describe the whole tract; a bundle's hull has to hold its member
 tracts; and a `Satellite` means *"an array too long to be a microsatellite"*, so clipping a 1.2 kb
 array to a 300 bp request emits a `Satellite` region of 300 bp — **a span that contradicts the
-`max_repeat_len` test that produced the label**.
+`max_str_len` test that produced the label**.
 
 *E2 first ruled the opposite, reasoning from `RegionKind`'s shape: `Generic` and `Satellite` are the
 unit variants, carrying no payload, so clipping them could leave nothing misdescribed. That read the
@@ -372,7 +372,7 @@ whole window, and the code you call was written for a whole contig. Three proble
 
 Look only at your own 100 kb and a repeat lying across the right edge gets measured as a fragment —
 the detector decides where a repeat starts and stops from what it can see, so showing it half a
-tract gets you half an answer. Fix: fetch the core **plus 1 kb either side** (`max_repeat_len`), run
+tract gets you half an answer. Fix: fetch the core **plus 1 kb either side** (`max_str_len`), run
 detection on the whole slice, then keep only the repeats whose **start** lands in the core.
 
 That gives you both properties at once: each repeat is found **exactly once** (by the one window
@@ -398,7 +398,7 @@ covers it — and anything longer is a satellite, handled in 3).
 > set alone fails `windowed_matches_the_resident_oracle_at_every_window_size`.)
 >
 > **(b) "It also covers classification for free … 1 kb is a lot more than 50" — true, and for a reason
-> this paragraph did not have.** There is **one margin**: the scan's `max_repeat_len`. Classification runs
+> this paragraph did not have.** There is **one margin**: the scan's `max_str_len`. Classification runs
 > over the slice the scan already read, needs each tract's own bases (motif, purity) — which are in
 > that slice by construction — and answers the flank question by **arithmetic** against `contig_len`,
 > which no slice could answer anyway.
@@ -406,7 +406,7 @@ covers it — and anything longer is a satellite, handled in 3).
 > *D3 answered this differently and it is worth one line, because the fix that replaced it deleted
 > code rather than adding it. `SsrSegment` used to embed `tract ± flank_bp` of bases, so `classify` read past
 > the tract and **panicked** for tracts at the slice's own edge. D3 gave classification a second, wider
-> slice — a `flank_bp` margin on top of the `max_repeat_len` one, fetched separately, every window —
+> slice — a `flank_bp` margin on top of the `max_str_len` one, fetched separately, every window —
 > and called them "two margins, two questions". Dropping the payload (§1.2) dropped the second margin,
 > the second fetch, and both panics: there was only ever one question.*
 
@@ -527,7 +527,7 @@ pub struct TypedRegionConfig {
     pub periods: PeriodRange,     // starts at 2..=6 — the catalog's setting, for
                                   //   comparability only. A parameter, not a policy (§5)
     pub scan: ScanParams,         // the scanner's defaults (2 / 7 / 2)
-    pub max_repeat_len: Bp,       // the satellite cap AND the scan margin — one field because
+    pub max_str_len: Bp,       // the satellite cap AND the scan margin — one field because
                                   //   they must be the same number (§2.6). It must also be >=
                                   //   classification's flank_bp, or a window cannot see a core tract's
                                   //   bundle neighbours — asserted in the walk (D3), because §10
@@ -894,9 +894,9 @@ the `tandem_repeat.rs` precedent, promoted on the same grounds.
 
 | held | size |
 |---|---|
-| the window's bases | `window_bp + 2 · max_repeat_len` (~102 kb) |
+| the window's bases | `window_bp + 2 · max_str_len` (~102 kb) |
 | the open bundle cluster | data-bounded; one locus in ordinary sequence |
-| the open coverage run | ≤ `max_repeat_len` before the verdict is forced |
+| the open coverage run | ≤ `max_str_len` before the verdict is forced |
 | the open generic run | **two coordinates**, however many megabases |
 
 Two are data-bounded, not constant, and grow exactly where sequence is repeat-dense — which is where
@@ -928,7 +928,7 @@ and there is no way to inject the pre-filter between its detection and its merge
 **The layer below it fits exactly.** `collect_windowed`
 ([tandem_repeat.rs:530](../../../../src/ng/tandem_repeat.rs)) already does §2.6's hard part — core +
 margin, coverage clipped to cores, intervals attributed by start — and its doc already carries the
-reasoning this depends on (*"the `max_repeat_len` margins are load-bearing: Ruzzo–Tompa segmentation
+reasoning this depends on (*"the `max_str_len` margins are load-bearing: Ruzzo–Tompa segmentation
 is context-dependent"*). It is invariance-tested. **We should not reimplement it.** But it is
 private and whole-contig-eager, so: **promote it (crate-visible) and stream it** (an iterator of
 `{ core, coverage, intervals }` rather than two contig-wide `Vec`s). This is the previously-deferred
@@ -1268,7 +1268,7 @@ still has to be right is ng's port — and §8.0 pins it against production dire
   Note the coupling is now a feature: move `flank_bp` and the bundle definition moves with it, which
   is the whole point of collapsing the two knobs (§2.4).
 
-- **Is 1 kb the right line between "microsatellite" and "array"?** `max_repeat_len` is the scanner's
+- **Is 1 kb the right line between "microsatellite" and "array"?** `max_str_len` is the scanner's
   default and a round guess; it has never been measured against anything. §2.4's ordering makes it
   safe to reason about (it is applied to cleaned coverage, not detector noise), but that only makes
   the parameter honest, not right. **Leaning: keep 1 kb for v1**; `satellite_bp` and the loci it

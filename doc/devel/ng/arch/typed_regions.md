@@ -103,7 +103,7 @@ impl GenomeRegions {
 pub struct TypedRegionConfig {
     pub periods: PeriodRange,
     pub scan: ScanParams,
-    pub max_repeat_len: Bp,       // the satellite cap AND the detection margin — one field (spec §2.6)
+    pub max_str_len: Bp,       // the satellite cap AND the detection margin — one field (spec §2.6)
     pub window_bp: Bp,            // memory knob; must not change the output (spec §2.3)
     pub criteria: SsrSegmentCriteria,  // ng's own (segment_criteria.rs), NOT ssr's CatalogParams: same
                                   // defaults + the hardcoded period scope and copy floors as real
