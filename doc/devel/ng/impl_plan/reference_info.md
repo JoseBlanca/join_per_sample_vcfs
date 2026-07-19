@@ -160,7 +160,7 @@ info available before `join` and `join` upgrades it (`md5` None→Some); a stale
 on the slot** (single-flight-through-cache, same `Arc`); a failed verify does not poison the key;
 abandoning the handle warns. *Depends:* B3, D1. *Source:* spec §3.10.
 
-**E2. `read_reference_verifying_or_creating_fai`.**  ☐
+**E2. `read_reference_verifying_or_creating_fai`.**  ✅
 `sibling_fai_path`, then branch: `.fai` present → E1 (return `(info, Some(handle))`); absent →
 `cache.get_or_read(Fasta { None })` + `write_fai` (a write failure is **fatal** — `FaiWrite`), return
 `(info, None)`. Tests: fai-present → background verify, **no write**, handle present; fai-absent →

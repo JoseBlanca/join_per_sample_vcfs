@@ -20,6 +20,8 @@
 //! the same and proves the supplied `.fai` describes the same genome (spec §3.3). And
 //! `write_fai` writes a `.fai` byte-identical to `samtools faidx`, atomically (Milestone C).
 //! `ReferenceInfoCache` is the compute-once, single-flight cache over the reader (Milestone D).
+//! `read_fai_verify_in_background` and `read_reference_verifying_or_creating_fai` are the two
+//! composing entry points — background verify, and verify-or-index (Milestone E). Module complete.
 
 use crate::fasta::{ContigEntry, ContigList};
 use md5::{Digest, Md5};
@@ -984,6 +986,43 @@ pub fn read_fai_verify_in_background(
             handle: Some(handle),
         },
     ))
+}
+
+// ---------------------------------------------------------------------
+// The batteries-included orchestrator (spec §3.11)
+// ---------------------------------------------------------------------
+
+/// Read a reference the convenient way: derive the sibling `<fasta>.fai` and do the right
+/// thing (spec §3.11).
+/// - **`.fai` present** → verify in the background ([`read_fai_verify_in_background`]);
+///   returns immediately with `(info, Some(handle))` the caller must `join` before committing
+///   output.
+/// - **`.fai` absent** → scan the FASTA now (verified, MD5s), **write** the `.fai` beside it,
+///   and return `(verified info, None)`.
+///
+/// This is the *one* place the module adopts the `<fasta>.fai` convention (an exception to the
+/// §3.6 modularity line) and the *one* place a read can write a file. A `.fai`-write failure is
+/// **fatal** (`FaiWrite`): a caller on a read-only reference dir uses the primitives instead
+/// (`cache.get_or_read(Fasta { fai: None })`, which reads and caches but writes nothing).
+///
+/// The return is asymmetric on purpose: `Some(handle)` = verification pending (join to
+/// verify); `None` = already verified, nothing to await. A caller wanting uniformly-verified
+/// info writes `if let Some(h) = handle { h.join()?; }`.
+pub fn read_reference_verifying_or_creating_fai(
+    cache: &Arc<ReferenceInfoCache>,
+    fasta: PathBuf,
+) -> Result<(Arc<ReferenceInfo>, Option<VerificationHandle>), ReferenceInfoError> {
+    let fai = sibling_fai_path(&fasta);
+    if fai.exists() {
+        let (info, handle) = read_fai_verify_in_background(cache, fasta, fai)?;
+        Ok((info, Some(handle)))
+    } else {
+        // No `.fai`: scan now (verified, with the MD5s), then index the reference ourselves.
+        let info = cache.get_or_read(ReferenceSource::Fasta { fasta, fai: None })?;
+        write_fai(&info.contigs, &fai)
+            .map_err(|source| ReferenceInfoError::FaiWrite { path: fai, source })?;
+        Ok((info, None))
+    }
 }
 
 #[cfg(test)]
@@ -2092,5 +2131,119 @@ mod tests {
         let (_dir, fasta, fai) = golden_like_pair(60);
         let (_info, handle) = read_fai_verify_in_background(&cache, fasta, fai).unwrap();
         drop(handle); // must not panic or hang
+    }
+
+    // =================================================================
+    // E2 — read_reference_verifying_or_creating_fai (spec §3.11).
+    // =================================================================
+
+    /// Copy the golden FASTA into a fresh dir with **no** sibling `.fai`.
+    fn golden_fasta_without_fai() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let fasta = dir.path().join("ref.fa");
+        std::fs::copy(golden_ref_path(), &fasta).unwrap();
+        assert!(!sibling_fai_path(&fasta).exists());
+        (dir, fasta)
+    }
+
+    #[test]
+    fn orchestrator_fai_present_verifies_in_background_and_writes_nothing() {
+        let cache = Arc::new(ReferenceInfoCache::new());
+        let (_dir, fasta, fai) = golden_like_pair(60);
+        let fai_before = std::fs::read(&fai).unwrap();
+
+        let (info, handle) = read_reference_verifying_or_creating_fai(&cache, fasta).unwrap();
+        assert_eq!(info.md5, None, "immediate info is the .fai read");
+        let handle = handle.expect(".fai present => a handle to join");
+        assert_eq!(
+            std::fs::read(&fai).unwrap(),
+            fai_before,
+            "nothing is written when the .fai is present"
+        );
+        let verified = handle.join().unwrap();
+        assert!(verified.md5.is_some(), "join upgrades to verified info");
+    }
+
+    #[test]
+    fn orchestrator_fai_absent_scans_and_writes_a_samtools_identical_fai() {
+        let cache = Arc::new(ReferenceInfoCache::new());
+        let (_dir, fasta) = golden_fasta_without_fai();
+        let fai = sibling_fai_path(&fasta);
+
+        let (info, handle) =
+            read_reference_verifying_or_creating_fai(&cache, fasta.clone()).unwrap();
+        assert!(info.md5.is_some(), "the scan path returns verified info");
+        assert!(handle.is_none(), "nothing to await on the scan path");
+        assert!(fai.exists(), "the .fai was written beside the FASTA");
+        // Byte-identical to samtools faidx — the golden ref's committed `.fai` is the oracle.
+        let written = std::fs::read(&fai).unwrap();
+        let samtools = std::fs::read(sibling_fai_path(&golden_ref_path())).unwrap();
+        assert_eq!(written, samtools, "written .fai == samtools faidx");
+    }
+
+    #[test]
+    fn orchestrator_escape_hatch_reads_and_writes_nothing() {
+        // A read-only-dir caller drops to the primitive, which writes no `.fai`.
+        let cache = Arc::new(ReferenceInfoCache::new());
+        let (_dir, fasta) = golden_fasta_without_fai();
+        let fai = sibling_fai_path(&fasta);
+        let info = cache
+            .get_or_read(ReferenceSource::Fasta { fasta, fai: None })
+            .unwrap();
+        assert!(info.md5.is_some());
+        assert!(!fai.exists(), "the primitive writes nothing");
+    }
+
+    /// Whether the filesystem actually blocks writes into a read-only directory. `false` when
+    /// running as root (the dev container), where the permission bits are bypassed — the
+    /// write-failure test then skips rather than pass silently. Host runs (non-root) exercise
+    /// it for real.
+    #[cfg(unix)]
+    fn readonly_dirs_are_enforced() -> bool {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        let blocked = std::fs::File::create(dir.path().join("probe")).is_err();
+        let _ = std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755));
+        blocked
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn orchestrator_fai_write_failure_is_fatal() {
+        use std::os::unix::fs::PermissionsExt;
+        if !readonly_dirs_are_enforced() {
+            eprintln!(
+                "skipping orchestrator_fai_write_failure_is_fatal: read-only dirs not enforced \
+                 (running as root, e.g. the container) — validated on the host instead"
+            );
+            return;
+        }
+        let cache = Arc::new(ReferenceInfoCache::new());
+        let (dir, fasta) = golden_fasta_without_fai();
+
+        // Make the reference dir read-only: the scan still reads the FASTA, but writing the
+        // sibling `.fai` fails — and that failure is fatal.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        let result = read_reference_verifying_or_creating_fai(&cache, fasta.clone());
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            matches!(result, Err(ReferenceInfoError::FaiWrite { .. })),
+            "a .fai-write failure is fatal, got {result:?}"
+        );
+
+        // And the escape hatch: the primitive succeeds (a cache hit from the scan) and wrote
+        // no `.fai`.
+        let info = cache
+            .get_or_read(ReferenceSource::Fasta {
+                fasta: fasta.clone(),
+                fai: None,
+            })
+            .unwrap();
+        assert!(info.md5.is_some());
+        assert!(
+            !sibling_fai_path(&fasta).exists(),
+            "the escape hatch wrote no .fai"
+        );
     }
 }
