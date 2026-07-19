@@ -110,7 +110,7 @@ fields = `samtools faidx`; the LF/CR-LF vector; per-contig MD5 vs `Md5::digest` 
 whole-reference digest vs the golden `.cat` header; the space/tab predicate edge (hashed-as-absent).
 *Depends:* B1. *Source:* spec §6, §3.4.
 
-**B3. The fasta-vs-`.fai` check — `Fasta { fai: Some }`.**  ☐  **Own commit, do not bundle.**
+**B3. The fasta-vs-`.fai` check — `Fasta { fai: Some }`.**  ✅  **Own commit, do not bundle.**
 Add the field-for-field comparison of the pass's reconstruction against the supplied `.fai`;
 disagreement → `FastaFaiMismatch` naming the field + contig. **Silent** (a wrong comparison is a
 false pass/fail). Tests: a matching `.fai` passes; a **re-wrapped (stale)** `.fai` errors naming

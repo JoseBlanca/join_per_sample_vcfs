@@ -14,9 +14,10 @@
 //! (spec §3.6). Its output types are ng's own plain data — `ContigInfo` is the
 //! everything-about-a-contig type production never had in one place.
 //!
-//! Landed so far: the data types, the cheap `.fai` reader (Milestone A), and the
-//! from-byte-zero FASTA streaming pass for `Fasta { fai: None }` — geometry + per-contig
-//! and whole-reference MD5 in one buffer (Milestone B, B1).
+//! Landed so far: the data types and the cheap `.fai` reader (Milestone A), and the
+//! from-byte-zero FASTA streaming pass (Milestone B) — `Fasta { fai: None }` reconstructs
+//! geometry + per-contig and whole-reference MD5 in one buffer; `Fasta { fai: Some }` reads
+//! the same and proves the supplied `.fai` describes the same genome (spec §3.3).
 
 use crate::fasta::{ContigEntry, ContigList};
 use md5::{Digest, Md5};
@@ -222,11 +223,80 @@ pub fn read_reference_info(source: ReferenceSource) -> Result<ReferenceInfo, Ref
         ReferenceSource::Fai(path) => read_fai(&path),
         // Read the FASTA alone: names, order, lengths, every MD5, the reference digest.
         ReferenceSource::Fasta { fasta, fai: None } => read_fasta(&fasta),
-        // The fasta-vs-`.fai` cross-check lands in B3.
-        ReferenceSource::Fasta { fai: Some(_), .. } => {
-            todo!("the fasta-vs-.fai check lands in B3 (spec §3.3)")
+        // Read the FASTA and prove the supplied `.fai` describes the same genome (spec §3.3).
+        ReferenceSource::Fasta {
+            fasta,
+            fai: Some(fai),
+        } => read_fasta_verifying(&fasta, &fai),
+    }
+}
+
+/// The `Fasta { fai: Some }` arm: run the pass, then **prove** the supplied `.fai` describes
+/// the same genome (spec §3.3). "They match" means the whole index — all five `faidx.5`
+/// columns, reconstructed by the pass, compared field-for-field against the on-disk `.fai`.
+/// Names and lengths alone are not enough: a `fold -w` re-wrap keeps both and breaks the
+/// geometry every reader seeks by, so the check is exactly what a fetch depends on
+/// (`offset`, `length`, `line_bases`, `line_width`). A reordering is caught here too — the
+/// comparison is position-wise, so a permuted `.fai` disagrees on `name` (T1).
+fn read_fasta_verifying(fasta: &Path, fai: &Path) -> Result<ReferenceInfo, ReferenceInfoError> {
+    // Read the cheap `.fai` first so a missing or malformed index (T4, T2, FASTQ, a bad
+    // field) fails fast, before the expensive whole-genome pass.
+    let index = read_fai(fai)?;
+    let info = read_fasta(fasta)?;
+
+    if info.contigs.len() != index.contigs.len() {
+        return Err(ReferenceInfoError::FastaFaiMismatch {
+            fasta: fasta.to_path_buf(),
+            fai: fai.to_path_buf(),
+            contig: "(whole file)".to_string(),
+            field: "contig count".to_string(),
+            detail: format!(
+                "FASTA has {}, .fai has {}",
+                info.contigs.len(),
+                index.contigs.len()
+            ),
+        });
+    }
+    for (from_fasta, from_fai) in info.contigs.iter().zip(index.contigs.iter()) {
+        if let Some((field, detail)) = first_fai_field_disagreement(from_fasta, from_fai) {
+            return Err(ReferenceInfoError::FastaFaiMismatch {
+                fasta: fasta.to_path_buf(),
+                fai: fai.to_path_buf(),
+                contig: from_fasta.name.clone(),
+                field: field.to_string(),
+                detail,
+            });
         }
     }
+    Ok(info)
+}
+
+/// The first of the five `faidx.5` fields on which the FASTA's reconstruction and the `.fai`
+/// disagree, with a `fasta … / .fai …` detail — or `None` when they agree. `md5` is ignored
+/// (a `.fai` has none). Order matters: `name` first so a reordering reports `name`, then the
+/// geometry a re-wrap breaks, so the counterexample reports `line_bases` (spec §3.3).
+fn first_fai_field_disagreement(
+    from_fasta: &ContigInfo,
+    from_fai: &ContigInfo,
+) -> Option<(&'static str, String)> {
+    if from_fasta.name != from_fai.name {
+        return Some((
+            "name",
+            format!("fasta {:?}, .fai {:?}", from_fasta.name, from_fai.name),
+        ));
+    }
+    let fields: [(&'static str, u64, u64); 4] = [
+        ("length", from_fasta.length, from_fai.length),
+        ("offset", from_fasta.offset, from_fai.offset),
+        ("line_bases", from_fasta.line_bases, from_fai.line_bases),
+        ("line_width", from_fasta.line_width, from_fai.line_width),
+    ];
+    for (name, fasta_value, fai_value) in fields {
+        if fasta_value != fai_value {
+            return Some((name, format!("fasta {fasta_value}, .fai {fai_value}")));
+        }
+    }
+    None
 }
 
 /// The `Fai` arm: parse a `.fai` into `ContigInfo`s (`md5: None` — a `.fai` has no MD5
@@ -1252,5 +1322,145 @@ mod tests {
         assert_eq!(info.contigs[0].length, 10);
         assert_eq!(info.contigs[0].line_bases, 4);
         assert_eq!(info.contigs[0].line_width, 5);
+    }
+
+    // =================================================================
+    // B3 — the fasta-vs-`.fai` check (`Fasta { fai: Some }`, spec §3.3,
+    //      §5 T1).
+    // =================================================================
+
+    /// `n` aperiodic-ish bases (`ACGT…` cycled) — content is irrelevant to geometry.
+    fn bases(n: usize) -> Vec<u8> {
+        (0..n).map(|i| b"ACGT"[i % 4]).collect()
+    }
+
+    fn read_fasta_with_fai(
+        fasta: PathBuf,
+        fai: PathBuf,
+    ) -> Result<ReferenceInfo, ReferenceInfoError> {
+        read_reference_info(ReferenceSource::Fasta {
+            fasta,
+            fai: Some(fai),
+        })
+    }
+
+    #[test]
+    fn fasta_fai_check_passes_on_a_matching_index() {
+        // The `.fai` `write_wrapped_fasta` emits describes the FASTA it wrote; the pass must
+        // reconstruct the same five columns and agree.
+        let c1 = bases(150);
+        let c2 = bases(80);
+        let (_dir, fasta, fai) = write_wrapped_fasta(&[("c1", &c1), ("c2", &c2)], 60);
+        let info = read_fasta_with_fai(fasta, fai).expect("matching .fai verifies clean");
+        assert_eq!(info.contigs.len(), 2);
+        assert!(info.md5.is_some()); // the FASTA read still fills the digests
+    }
+
+    #[test]
+    fn fasta_fai_check_catches_a_rewrap_naming_line_bases() {
+        // The spec's counterexample (§3.3): re-wrapping keeps names and lengths but breaks
+        // the geometry. Same contig, indexed at width 40, FASTA written at width 60.
+        let c = bases(150);
+        let (dir60, fasta60, _fai60) = write_wrapped_fasta(&[("c", &c)], 60);
+        let (_dir40, _fasta40, fai40) = write_wrapped_fasta(&[("c", &c)], 40);
+
+        // Mutation-verify against a names-only check: names AND lengths match, so a cheaper
+        // check would pass — only the geometry gives it away.
+        let from_fasta = &read_fasta_none(fasta60.clone()).unwrap().contigs[0];
+        let from_fai = &read_fai(&fai40).unwrap().contigs[0];
+        assert_eq!(from_fasta.name, from_fai.name, "a names check would pass");
+        assert_eq!(
+            from_fasta.length, from_fai.length,
+            "a lengths check would pass"
+        );
+        assert_ne!(
+            from_fasta.line_bases, from_fai.line_bases,
+            "only geometry differs"
+        );
+
+        match read_fasta_with_fai(fasta60, fai40).unwrap_err() {
+            ReferenceInfoError::FastaFaiMismatch { field, contig, .. } => {
+                assert_eq!(
+                    field, "line_bases",
+                    "the re-wrap must be named at line_bases"
+                );
+                assert_eq!(contig, "c");
+            }
+            other => panic!("expected FastaFaiMismatch, got {other:?}"),
+        }
+        drop(dir60);
+    }
+
+    #[test]
+    fn fasta_fai_check_catches_a_single_contig_rewrap_where_offset_is_unchanged() {
+        // On a single contig the header is unchanged, so OFFSET matches even after a re-wrap
+        // (§3.3) — the case an offsets-only check would miss. `line_bases` still catches it.
+        let c = bases(200);
+        let (_d60, fasta60, _f60) = write_wrapped_fasta(&[("solo", &c)], 60);
+        let (_d50, _f50fa, fai50) = write_wrapped_fasta(&[("solo", &c)], 50);
+
+        let from_fasta = &read_fasta_none(fasta60.clone()).unwrap().contigs[0];
+        let from_fai = &read_fai(&fai50).unwrap().contigs[0];
+        assert_eq!(
+            from_fasta.offset, from_fai.offset,
+            "single-contig offset is unchanged"
+        );
+
+        match read_fasta_with_fai(fasta60, fai50).unwrap_err() {
+            ReferenceInfoError::FastaFaiMismatch { field, .. } => assert_eq!(field, "line_bases"),
+            other => panic!("expected FastaFaiMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fasta_fai_check_catches_a_reordering_and_the_digest_differs() {
+        // A permuted FASTA against its original `.fai` errors on `name` (position-wise), and
+        // the reference digest is order-dependent (T1).
+        let c1 = bases(120);
+        let c2 = bases(90);
+        let (_da, fasta_a, fai_a) = write_wrapped_fasta(&[("c1", &c1), ("c2", &c2)], 60);
+        let (_db, fasta_b, _fai_b) = write_wrapped_fasta(&[("c2", &c2), ("c1", &c1)], 60);
+
+        match read_fasta_with_fai(fasta_b.clone(), fai_a).unwrap_err() {
+            ReferenceInfoError::FastaFaiMismatch { field, contig, .. } => {
+                assert_eq!(field, "name");
+                assert_eq!(contig, "c2", "the FASTA's first contig after the swap");
+            }
+            other => panic!("expected FastaFaiMismatch, got {other:?}"),
+        }
+
+        // The digest pins the order all by itself.
+        let md5_a = read_fasta_none(fasta_a).unwrap().md5;
+        let md5_b = read_fasta_none(fasta_b).unwrap().md5;
+        assert_ne!(
+            md5_a, md5_b,
+            "a permuted reference has a different digest (T1)"
+        );
+    }
+
+    #[test]
+    fn fasta_fai_check_catches_a_contig_count_mismatch() {
+        let c1 = bases(120);
+        let c2 = bases(90);
+        let (_dir, fasta2, _fai2) = write_wrapped_fasta(&[("c1", &c1), ("c2", &c2)], 60);
+        let (_dir1, _fasta1, fai1) = write_wrapped_fasta(&[("c1", &c1)], 60);
+        match read_fasta_with_fai(fasta2, fai1).unwrap_err() {
+            ReferenceInfoError::FastaFaiMismatch { field, .. } => assert_eq!(field, "contig count"),
+            other => panic!("expected FastaFaiMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fasta_fai_check_errors_when_the_supplied_fai_is_missing() {
+        // T4: a supplied `.fai` that does not open errors — it does not degrade to reading
+        // the FASTA alone.
+        let c = bases(80);
+        let (dir, fasta, fai) = write_wrapped_fasta(&[("c", &c)], 60);
+        std::fs::remove_file(&fai).unwrap();
+        assert!(matches!(
+            read_fasta_with_fai(fasta, fai).unwrap_err(),
+            ReferenceInfoError::FaiRead { .. }
+        ));
+        drop(dir);
     }
 }
