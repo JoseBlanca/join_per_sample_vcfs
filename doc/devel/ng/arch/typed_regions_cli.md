@@ -48,7 +48,7 @@ pub enum PopVarCallerExpCommand {
 /// `TypedRegionConfig`. Defaults are the library `pub const`s (spec §2.1); the four tagged §2.3 carry
 /// the short-read values the consts do not yet hold (kept as record — the CLI slice applies them).
 pub struct TypedRegionsArgs {
-    pub reference: PathBuf,               // required; its .fai is required and never built (spec T1)
+    pub reference: PathBuf,               // required; its .fai is read, or created if absent (spec T1)
     pub output: PathBuf,                  // required
     pub regions: Option<PathBuf>,         // BED; None = whole genome. Costs scan time, not memory (spec T10)
 
@@ -95,7 +95,7 @@ the source chain and exits 1, the way `main.rs` does — see the T7a decision on
 ```rust
 #[non_exhaustive]
 pub enum TypedRegionsCliError {
-    Reference(ReferenceInfoError),             // #[from]  reference_info (T1) — the .fai read
+    Reference(ReferenceInfoError),             // #[from]  reference_info (T1) — read / verify / write-fai
     ContigTooLong { contig: String, len: u64 }, // u64 → u32 narrowing for RegionSet (spec T2)
     Bed(BedError),                             // #[from]  (regions.rs:315-379)
     Walk(TypedRegionError),                    // #[from]  the walk's own errors, incl. the flank pair (T3)
@@ -114,18 +114,21 @@ both numbers (spec T3). No `anyhow` in the CLI path (spec §6).
 pub fn run_typed_regions(args: &TypedRegionsArgs) -> Result<(), TypedRegionsCliError>;
 ```
 
-The `.fai` → `ContigList` step is **`reference_info`, reused as-is** (spec T1) — its
-`read_reference_info(ReferenceSource::Fai(path)) -> ReferenceInfo` then `.contig_list() -> ContigList`
-(ng's `reference_info`, `ng-contig-table`, merge-bound). **The `Fai` source, not `Fasta`**: the index
-alone gives names/order/lengths with `md5: None` and a cheap read, whereas `Fasta` reads the whole
-reference — which §3.4/§6 exist to avoid. Use `sibling_fai_path(&args.reference)` for the path; the
-`.fai` is required and never built.
+The reference step is **`reference_info`, reused as-is** (spec T1) — one batteries-included call
+`read_reference_verifying_or_creating_fai(cache: &Arc<ReferenceInfoCache>, fasta: PathBuf) ->
+(Arc<ReferenceInfo>, Option<VerificationHandle>)` (ng's `reference_info`, `ng-contig-table`,
+merge-bound). `.fai` present → the index is read in the foreground and the FASTA is verified on a
+background thread (`Some(handle)`); `.fai` absent → the FASTA is read once, the sibling `.fai` is
+written, and `None` comes back. `.contig_list()` gives the `ContigList`. The `VerificationHandle` is
+`#[must_use]` and **must be `join()`ed before the output is committed** — see step 6 and the decision
+in §6.
 
 **The `run_typed_regions` contract**, step by step (each a spec trap it discharges):
 
-1. `read_reference_info(ReferenceSource::Fai(sibling_fai_path(&args.reference)))?.contig_list()` → one
-   `ContigList`, built **once** and used **twice**: for `WindowedRefSeq::new` *and* for `GenomeRegions`
-   (spec T8 — else the walk's `UnknownContig` error renders a `ContigId` index, not a name).
+1. `let (info, verify) = read_reference_verifying_or_creating_fai(&cache, args.reference.clone())?;`
+   then `info.contig_list()` → one `ContigList`, used **twice**: for `WindowedRefSeq::new` *and* for
+   `GenomeRegions` (spec T8 — else the walk's `UnknownContig` error renders a `ContigId` index, not a
+   name). Hold `verify: Option<VerificationHandle>` for step 6.
 2. `GenomeRegions` from `--regions` (`from_bed_path`) or whole-genome (`whole_contigs`), over
    `&[ContigBounds]` derived from the same `ContigList`. The `u64 → u32` contig-length narrowing lives
    here and fails loudly (`u32::try_from`, spec T2) — never `as`.
@@ -134,9 +137,11 @@ reference — which §3.4/§6 exist to avoid. Use `sibling_fai_path(&args.refere
 4. `TypedRegionIterator::over_regions(reference, spans, config)`
    ([`mod.rs:838`](../../../../src/ng/region_typing/mod.rs)) — fallible setup (contig cross-check, the
    flank/margin pair).
-5. Write the header block, then stream `for r in iter { writer.write_row(r?)?; }` to a `.tmp` file,
-   **then rename** (spec §6 — a half-written partition is silently valid otherwise;
-   [`cli.rs:621-643`](../../../../src/pop_var_caller/cli.rs) is the precedent). No sort (the walk emits
+5. Write the header block, then stream `for r in iter { writer.write_row(r?)?; }` to a `.tmp` file.
+   **Then `if let Some(h) = verify { h.join()?; }` — the FASTA-verification barrier — and only then
+   rename** `.tmp` into place (spec §6 — a half-written *or* stale-`.fai` partition is silently valid
+   otherwise; [`cli.rs:621-643`](../../../../src/pop_var_caller/cli.rs) is the atomic-write precedent).
+   The background check overlapped the whole walk, so the join costs almost nothing. No sort (the walk emits
    in genomic order, [`mod.rs:575`](../../../../src/ng/region_typing/mod.rs)); no collect.
 6. Announce line to stderr at the start, a `key: k=v` summary at the end from
    `TypedRegionIterator::counts()` — subject to spec T9 (four of five rejection counters are
@@ -188,6 +193,14 @@ Distilled from the spec; see it for the reasoning. Open items marked `OPEN:`.
   coordinates; collecting a whole-genome partition puts back the memory it exists to avoid. `.tmp` +
   rename because a truncated partition is otherwise indistinguishable from a complete smaller one (spec
   §6).
+- **Reference read = verify-in-background / create-`.fai`, joined at the commit — decided.**
+  `read_reference_verifying_or_creating_fai` (owner, 2026-07-19): a present `.fai` is read in the
+  foreground and the FASTA verified on a background thread; an absent one is created from a FASTA scan.
+  The `#[must_use]` `VerificationHandle` is `join()`ed **immediately before the atomic rename**, so a
+  stale `.fai` aborts the run with the output still under its temp name — never a partition built
+  against a wrong contig table renamed into place. The background pass overlaps the walk, so the
+  barrier is nearly free. Rejected: the bare `ReferenceSource::Fai` (skips verification) and `Fasta`
+  (blocks the walk on the whole-genome read) (spec T1, §6).
 - **Propagate the flank/margin guard, don't re-check it — decided.** `TypedRegionError` carries both
   numbers; a CLI check is a second place to drift (spec T3).
 - **Hoist `format_error_chain` into the library — decided.** It is private to `src/main.rs`
@@ -216,7 +229,7 @@ Verify each row against the code when implementing (all cited `file:line` were r
 | binary skeleton (`main_exp.rs`, `cli.rs`, subcommand mod) | `src/main.rs`, `src/pop_var_caller/{mod,cli,ssr_catalog}.rs` | **new**; mirror the shape |
 | `TypedRegionsArgs` / `run_typed_regions` / `TypedRegionsCliError` | `SsrCatalogArgs` / `run_ssr_catalog` / `SsrCatalogCliError` ([ssr_catalog.rs:14-110](../../../../src/pop_var_caller/ssr_catalog.rs)) | **new**; same pattern |
 | `--min-copies` parser | `pop_var_caller/cli/parsers.rs` | **new** parser in `pop_var_caller_exp/cli/parsers.rs`; copy the pattern |
-| `.fai` → `ContigList` | `reference_info::read_reference_info(ReferenceSource::Fai(_))` + `.contig_list()` + `sibling_fai_path` (ng `reference_info`, `ng-contig-table`) | reuse as-is; the `Fai` source (index-only, `md5: None`), never `Fasta` |
+| reference → `ContigList` + verify | `reference_info::read_reference_verifying_or_creating_fai` + `ReferenceInfo::contig_list()` + `VerificationHandle::join` (ng `reference_info`, `ng-contig-table`) | reuse as-is; join the handle before the rename (T1, §6) |
 | walk driver | `TypedRegionIterator::over_regions` ([mod.rs:838](../../../../src/ng/region_typing/mod.rs)) | reuse as-is |
 | reference accessor | `WindowedRefSeq::new(PathBuf, ContigList)` ([ref_seq.rs:524](../../../../src/ng/ref_seq.rs)) | reuse as-is |
 | region set | `GenomeRegions::{whole_contigs, from_bed_path}` ([mod.rs:102](../../../../src/ng/region_typing/mod.rs)), over `ContigBounds` ([regions.rs:57](../../../../src/regions.rs)) | reuse; owns the `u32` narrowing (T2) |
@@ -229,9 +242,10 @@ Verify each row against the code when implementing (all cited `file:line` were r
 ## 8. Open items
 
 - **Impl-time confirmations (not design):** `reference_info` merges from `ng-contig-table` before this
-  is built (owner, 2026-07-19), so `ReferenceSource`/`ReferenceInfoError` are as read from that branch;
-  whether `run_typed_regions` also wants `over_contig` (the whole-genome path already works via
-  `whole_contigs` + `over_regions`).
+  is built (owner, 2026-07-19), so `read_reference_verifying_or_creating_fai`, `ReferenceInfoCache`,
+  `VerificationHandle::join` and `ReferenceInfoError` are as read from that branch (the CLI holds one
+  `Arc<ReferenceInfoCache>`); whether `run_typed_regions` also wants `over_contig` (the whole-genome
+  path already works via `whole_contigs` + `over_regions`).
 
 ## 9. Test & bench shape (spec §7)
 
@@ -249,5 +263,8 @@ walk again:
   claimed property).
 - **Flag-pair guard is a CLI error, not a panic** (T3) — mutation-verify: remove the check and it must
   fail with a panic, not pass.
+- **Stale `.fai` aborts before publishing** (T1) — corrupt the sibling `.fai`, assert the run errors
+  and leaves no output file (the verification join precedes the rename).
 
-No `bench/`: the subcommand orchestrates a single-threaded walk with no competing implementation.
+No `bench/`: the subcommand orchestrates a single-threaded walk; the reference verification runs on one
+background thread inside `reference_info`, not the walk. No competing implementation.

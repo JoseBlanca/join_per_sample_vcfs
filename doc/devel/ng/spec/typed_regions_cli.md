@@ -37,12 +37,14 @@ honestly (T9).
 what a consumer does with a `Satellite` row is theirs (spec §1). **A locus catalog** — `ssr-catalog`
 is production's; this is a *partition of the genome*, a
 different artefact with a different reader. **Indexing** (§8). **Reading the file back into ng** —
-nothing consumes it (§8). **Parallelism** — the walk is single-threaded by decision, not by
-omission (spec §7).
+nothing consumes it (§8). **A parallel walk** — the walk is single-threaded by decision (spec §7); the
+one other thread is the reference verification `reference_info` runs in the background (T1), which the
+walk never touches.
 
-**It does not:** open an alignment file; build a `.fai`; sort (the walk emits in genomic order,
+**It does not:** open an alignment file; sort (the walk emits in genomic order,
 [`mod.rs:575`](../../../../src/ng/region_typing/mod.rs)); filter by kind (that is `grep`, §3.3);
-collect the partition in memory (§6).
+collect the partition in memory (§6). It **may write a `.fai`**: if the reference has no sibling
+index, it creates one so the next run starts faster (T1) — the only file it writes besides the output.
 
 ---
 
@@ -314,12 +316,14 @@ is a memory knob that must not change the output (spec §2.3), so two files that
 `window_bp` should be identical below the header. Recording it keeps the file reproducible without
 implying it is part of the experiment.
 
-**No `reference_md5`**, and this is a departure worth its line. The catalog can afford one
+**No `reference_md5`**, and this is a departure worth its line. The catalog carries one
 ([`catalog/mod.rs:205-207`](../../../../src/ssr/catalog/mod.rs)) because it streams the whole FASTA
-anyway. This walk reads **only the requested spans**, through `.fai` random access; an MD5 would
-force a whole-genome read that a `--regions` run has otherwise avoided, and it would be a second
-reader over the reference — the thing spec §6's 14.6 GB lesson forbids. The reference path and its
-knobs identify the run; a caller wanting the MD5 can `md5sum` the FASTA.
+anyway. Here the digest *is* computed — the background verification (T1) reads the whole FASTA — but it
+lands only when `VerificationHandle::join` returns, which is *after* the walk, whereas the header is
+written *before* it. Putting the MD5 in the header would force the header, and so the walk, to **block
+on that background pass** — defeating the parallelism T1 exists for. So it stays out: the reference
+path and its knobs identify the run, the header stays reproducible from path + config alone, and a
+caller wanting the MD5 can `md5sum` the FASTA.
 
 ---
 
@@ -348,16 +352,26 @@ needs the `ContigList` to name them anyway. Keep one table for the whole run (T8
 
 Every item here came from opening the file it cites.
 
-**T1 — use `reference_info` for the `.fai` → `ContigList`, and use the `Fai` source, not `Fasta`.**
-The canonical builder now exists — `reference_info::read_reference_info(source) -> ReferenceInfo`, then
-`.contig_list() -> ContigList` (ng's `reference_info`, landing from branch `ng-contig-table`; owner,
-2026-07-19). Do **not** hand-roll a `.fai` reader (an earlier draft did — the tree had no such helper,
-so this command was "the first that must derive the table from the `.fai` alone"; that is no longer
-true). The trap is *which source*: `ReferenceSource::Fai(sibling_fai_path(&reference))` reads the index
-alone — names, order, lengths, `md5: None` — which is cheap and is exactly what this command wants;
-`ReferenceSource::Fasta { … }` reads the **whole reference**, reintroducing the genome-wide read that
-§3.4 and §6 exist to avoid. The `.fai` is **required and never built**, already the reference
-convention ([`cli.rs:123-125`](../../../../src/pop_var_caller/cli.rs)).
+**T1 — read the reference through `reference_info::read_reference_verifying_or_creating_fai`, and
+join the verification handle before you rename the output.** This one call
+(`(cache: &Arc<ReferenceInfoCache>, fasta: PathBuf) -> (Arc<ReferenceInfo>, Option<VerificationHandle>)`,
+ng's `reference_info`, landing from `ng-contig-table`; owner, 2026-07-19) does exactly what this
+command wants, in two cases (owner, 2026-07-19):
+
+- ***`.fai` present*** → it reads the index in the foreground (names, order, lengths — cheap, so the
+  walk can start at once) **and verifies the FASTA against that index on a background thread**,
+  returning `Some(handle)`. The walk runs while the check runs; a stale `.fai` (one whose FASTA no
+  longer matches) is caught there, not by producing a wrong partition.
+- ***`.fai` absent*** → it reads the FASTA once, **writes the sibling `.fai`** (so the next run takes
+  the fast path), and returns `None`. A `.fai`-write failure is fatal (`ReferenceInfoError::FaiWrite`).
+
+`.contig_list()` gives the `ContigList` for the walk. **The trap is the handle**: `VerificationHandle`
+is `#[must_use]`, and its verification is only worth running if it can stop a bad run — so
+`handle.join()?` **before** the atomic rename (§6), never after. Skip it and a partition built against
+a stale `.fai`'s contig table is renamed into place, silently wrong. Joining at the end costs almost
+nothing: the background pass overlapped the whole walk. Do **not** reach for the bare
+`ReferenceSource::Fai`/`Fasta` arms — `Fai` alone skips the verification, `Fasta` blocks the walk on
+the whole-genome read.
 
 **T2 — the contig length narrows, and `as` is not the answer.** `ContigEntry::length` is `u64`
 ([`fasta/mod.rs:37-43`](../../../../src/fasta/mod.rs)); `ContigBounds::length` is `u32`
@@ -464,7 +478,7 @@ and `run_typed_regions(&args) -> Result<(), TypedRegionsCliError>`
 ([`ssr_catalog.rs:56-74`](../../../../src/pop_var_caller/ssr_catalog.rs)); `main_exp.rs` walks the
 source chain and exits 1, the way `main.rs` does ([`main.rs:30-73`](../../../../src/main.rs)) — see
 T7a on sharing that walk rather than copying it. No anyhow in the CLI path. Variants this one needs,
-each a `#[from]` where it can be: `ReferenceInfoError` from the `.fai` read (T1), the contig-length narrowing (T2), `BedError`
+each a `#[from]` where it can be: `ReferenceInfoError` from reading, verifying, or writing the reference index (T1), the contig-length narrowing (T2), `BedError`
 ([`regions.rs:315-379`](../../../../src/regions.rs)), `TypedRegionError`, and output I/O. **Not** the
 `--max-str-len` / `--flank-bp` pair — `TypedRegionError` already carries it (T3).
 
@@ -488,6 +502,12 @@ writes in place ([`catalog/mod.rs:221-230`](../../../../src/ssr/catalog/mod.rs))
 because of a property peculiar to this artefact: a partition cut off halfway through chromosome 7 is
 indistinguishable from a complete partition of a smaller genome — nothing in the file says how far it
 was supposed to go. A half-written catalog at least fails its own reader's header checks.
+
+**The reference verification joins into that same barrier.** The rename is the commit point, so
+`VerificationHandle::join()?` goes **just before it** (T1): the walk streams to `.tmp` while the FASTA
+is checked in the background, and only a clean join renames `.tmp` into place. A verification failure —
+a stale `.fai` — aborts the run with the partition still under its temp name, never published. This is
+the one place the two threads meet, and it meets at the commit, which is exactly right.
 
 **Determinism** is the regression anchor. The walk is a pure function of reference, regions and
 config (`typed_regions.md` §7), so the same three inputs must give a byte-identical file — including

@@ -58,8 +58,9 @@ and `cli/parsers.rs`; the `PopVarCallerExpCommand` enum, `TypedRegionsArgs`, `Ty
   `MinCopies::new`, and the anchor fixture ([`anchor.rs`](../../../../src/ng/region_typing/anchor.rs))
   that drives the shipping stack from a real FASTA + `.fai`.
 - **`reference_info` merged from `ng-contig-table`** (owner, 2026-07-19: merges to `main` before this
-  is built) — `read_reference_info(ReferenceSource::Fai(_))`, `ReferenceInfo::contig_list()`,
-  `sibling_fai_path`, `ReferenceInfoError`. **The executor confirms this is on `main` before step D1.**
+  is built) — `read_reference_verifying_or_creating_fai`, `ReferenceInfoCache`,
+  `ReferenceInfo::contig_list()`, `VerificationHandle::join`, `ReferenceInfoError`. **The executor
+  confirms this is on `main` before step D1.**
 - **Templates to copy:** `ssr-catalog` for the subcommand shape
   ([`ssr_catalog.rs`](../../../../src/pop_var_caller/ssr_catalog.rs)); `pileup`'s `.tmp`+rename for the
   atomic write ([`cli.rs:621-643`](../../../../src/pop_var_caller/cli.rs)); `ssr-catalog`'s header
@@ -145,34 +146,41 @@ round-trip unit test over hand-built `Generic`/`Satellite`/`SsrSegment`/`SsrBund
 
 ### Milestone D — the fallible setup assembly
 
-**D1. Contig table + region set.**  ☐
-`read_reference_info(ReferenceSource::Fai(sibling_fai_path(&args.reference)))?.contig_list()` → one
-`ContigList`, used **twice** (T8): `WindowedRefSeq::new` and `GenomeRegions`. The `u64 → u32`
-contig-length narrowing lives here, via `u32::try_from` → `ContigTooLong` on overflow, never `as`
-(T2). `GenomeRegions::from_bed_path` for `--regions`, else `whole_contigs`. Unit tests: T2 rejects a
->4 Gb contig; a BED and the whole-genome path both build; the same `ContigList` feeds both. *Source:*
-spec T1/T2/T8, arch §4. *Depends:* B2; **precondition: `reference_info` on `main`.**
+**D1. Reference read + contig table + region set.**  ☐
+`read_reference_verifying_or_creating_fai(&cache, args.reference.clone())?` (one held
+`Arc<ReferenceInfoCache>`) → `(Arc<ReferenceInfo>, Option<VerificationHandle>)`; keep the handle for
+E1. `info.contig_list()` → one `ContigList`, used **twice** (T8): `WindowedRefSeq::new` and
+`GenomeRegions`. The `u64 → u32` contig-length narrowing lives here, via `u32::try_from` →
+`ContigTooLong` on overflow, never `as` (T2). `GenomeRegions::from_bed_path` for `--regions`, else
+`whole_contigs`. Unit tests: T2 rejects a >4 Gb contig; a BED and the whole-genome path both build;
+the same `ContigList` feeds both; **`.fai` absent → the sibling `.fai` is written**. *Source:* spec
+T1/T2/T8, arch §4. *Depends:* B2; **precondition: `reference_info` on `main`.**
 
-> **Checkpoint D:** the reference `.fai` becomes a `ContigList` via `reference_info` (the `Fai` source,
-> no whole-genome read); the narrowing fails loud; regions build for both paths. Pause for review.
+> **Checkpoint D:** the reference becomes a `ContigList` via `reference_info` (`.fai` read foreground +
+> FASTA verified in background, or FASTA scanned and `.fai` written); the narrowing fails loud; regions
+> build for both paths. Pause for review.
 
 ### Milestone E — the driver, end to end
 
 **E1. `run_typed_regions`.**  ☐
 Assemble `TypedRegionConfig` from the args (wrapping raw knobs in `Bp`/`Position`),
 `WindowedRefSeq::new`, `TypedRegionIterator::over_regions` (fallible setup — the flank/margin pair
-surfaces here, T3), then **stream** `for r in iter { writer.write_row(r?)?; }` to a `.tmp` file and
-**rename** (atomic; no sort, no collect). A stderr announce line at the start and a `key: k=v` summary
-from `counts()` at the end — print **all five** rejection counters, labelled, hardcoding none (T9).
-*Depends:* B, C, D. *Source:* spec §6, arch §4.
+surfaces here, T3), then **stream** `for r in iter { writer.write_row(r?)?; }` to a `.tmp` file;
+**`if let Some(h) = verify { h.join()?; }` (the FASTA-verification barrier, T1), then rename** (atomic;
+no sort, no collect) — the join goes *before* the rename so a stale `.fai` aborts with nothing
+published. A stderr announce line at the start and a `key: k=v` summary from `counts()` at the end —
+print **all five** rejection counters, labelled, hardcoding none (T9). *Depends:* B, C, D. *Source:*
+spec §6, arch §4.
 
 **E2. Integration tests — the file, on the anchor fixture.**  ☐
 On the anchor FASTA+`.fai`: (1) **round-trip** — written rows parse back field-for-field equal to the
 iterator's output (bundle fixture required); (2) **partition invariant** — concatenated spans
 reconstruct the requested regions; (3) **determinism** — two runs byte-identical; (4) **`--regions`
 read-back** — feed the output back as `--regions`, assert the same spans; (5) **the flag-pair guard is
-a CLI error, not a panic** (T3) — mutation-verify: remove the propagation and it must panic, not pass.
-Home: `typed_regions.rs`'s `#[cfg(test)]`. *Source:* spec §7, arch §9. *Depends:* E1.
+a CLI error, not a panic** (T3) — mutation-verify: remove the propagation and it must panic, not pass;
+(6) **a stale `.fai` aborts before publishing** — corrupt the sibling `.fai`, assert the run errors and
+no output file is left behind (the join barrier, T1). Home: `typed_regions.rs`'s `#[cfg(test)]`.
+*Source:* spec §7, arch §9. *Depends:* E1.
 
 > **Checkpoint E:** `type-regions` runs end-to-end on a real FASTA, writes a deterministic partition,
 > and round-trips through its own `--regions`. **The subcommand is complete.** Pause for review.
@@ -186,8 +194,8 @@ Home: `typed_regions.rs`'s `#[cfg(test)]`. *Source:* spec §7, arch §9. *Depend
 | A | `--help` runs for binary + subcommand; `format_error_chain` test green after the move; the guard grep passes |
 | B | ng suite green after the default re-pinning; top-level-CLI parse test at the §2.3 defaults; `--min-copies` count-mismatch unit tests |
 | C | **round-trip unit test** pinning the T4 conversion over all four kinds incl. a bundle; deterministic-header test |
-| D | unit tests — T2 narrowing rejects >4 Gb; BED + whole-genome build; one `ContigList` feeds both |
-| E | **integration on the anchor fixture:** round-trip, partition-invariant, determinism, `--regions` read-back, flag-pair-guard-is-an-error (mutation-verified) |
+| D | unit tests — T2 narrowing rejects >4 Gb; BED + whole-genome build; one `ContigList` feeds both; `.fai`-absent writes the sibling index |
+| E | **integration on the anchor fixture:** round-trip, partition-invariant, determinism, `--regions` read-back, flag-pair-guard-is-an-error, stale-`.fai`-aborts-before-publishing (all mutation/fixture-verified) |
 
 ## Out of scope (next plans)
 
