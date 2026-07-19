@@ -76,7 +76,7 @@ with its tests.
 Pure path helper (`<fasta>` + `.fai`, no I/O — copy `with_fai_extension`'s five lines). Test: it
 appends `.fai` and touches no filesystem. *Depends:* A1. *Source:* arch §2, spec §2/§3.6.
 
-**A3. Test fixtures + committed oracle constants.**  ☐
+**A3. Test fixtures + committed oracle constants.**  ✅
 A width-configurable FASTA writer (the existing `ref_seq.rs::build_fasta` is one-line-per-contig,
 so it cannot exercise geometry); run `samtools dict` + `samtools faidx` **once** on the golden
 reference and **commit** the `M5`/`LN`/`.fai` values as constants, plus the `faidx.5` LF/CR-LF

@@ -320,4 +320,197 @@ mod tests {
         let second = &list.entries[1];
         assert_eq!(second.md5, None); // the .fai-less contig's absent md5 rides through
     }
+
+    // =================================================================
+    // A3 — test fixtures + committed samtools oracle constants
+    //      (spec §6, §3.8; arch §7). The oracle is `samtools`, resolved
+    //      to committed constants so `samtools` is not a test-time dep.
+    // =================================================================
+
+    /// One contig's committed oracle values.
+    struct GoldenContig {
+        name: &'static str,
+        length: u64,
+        offset: u64,
+        line_bases: u64,
+        line_width: u64,
+        /// The `@SQ M5`, hex — from `samtools dict`.
+        md5_hex: &'static str,
+    }
+
+    /// The golden reference — `tests/data/tandem_repeat/synthetic_ref.fa`, the same file
+    /// `anchor.rs` reads and the golden `.cat` was built from — as `samtools 1.16.1`
+    /// describes it. Run **once** in the dev container and committed here: `samtools dict`
+    /// gave `LN`/`M5`; `samtools faidx` gave the five `.fai` columns (committed beside the
+    /// FASTA as `synthetic_ref.fa.fai`). The MD5s (B2's oracle) ride along now so the whole
+    /// oracle lands in one place.
+    const GOLDEN: [GoldenContig; 2] = [
+        GoldenContig {
+            name: "ctg1",
+            length: 2369,
+            offset: 6,
+            line_bases: 60,
+            line_width: 61,
+            md5_hex: "d6b8aee46bd8cfc7c7dbc13e7a9286c3",
+        },
+        GoldenContig {
+            name: "ctg2",
+            length: 346,
+            offset: 2421,
+            line_bases: 60,
+            line_width: 61,
+            md5_hex: "4d9680fefca4e59d9adcac944c7c52ab",
+        },
+    ];
+
+    /// Path to the committed golden FASTA (its `.fai` sits beside it).
+    fn golden_ref_path() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/tandem_repeat/synthetic_ref.fa")
+    }
+
+    /// A width-configurable FASTA writer for the geometry tests: each contig's bases wrapped
+    /// at `wrap` bases per line (LF, a possibly-shorter last line), plus a matching
+    /// five-column `.fai`, in a fresh tempdir. Returns `(dir, fasta, fai)` — the caller keeps
+    /// `dir` alive. Unlike `ref_seq.rs::build_fasta` (one line per contig, so no geometry to
+    /// exercise), this is what B/C stand on. Callers pass non-empty contigs.
+    fn write_wrapped_fasta(
+        contigs: &[(&str, &[u8])],
+        wrap: usize,
+    ) -> (tempfile::TempDir, PathBuf, PathBuf) {
+        assert!(wrap >= 1, "wrap width must be >= 1");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fasta_path = dir.path().join("ref.fa");
+        let fai_path = dir.path().join("ref.fa.fai");
+
+        let mut fasta: Vec<u8> = Vec::new();
+        let mut fai = String::new();
+        for (name, bases) in contigs {
+            fasta.extend_from_slice(format!(">{name}\n").as_bytes());
+            let seq_offset = fasta.len() as u64;
+            for chunk in bases.chunks(wrap) {
+                fasta.extend_from_slice(chunk);
+                fasta.push(b'\n');
+            }
+            // samtools reports the first line's base count; for a contig shorter than `wrap`
+            // that is the whole contig.
+            let line_bases = bases.len().min(wrap).max(1) as u64;
+            fai.push_str(&format!(
+                "{name}\t{}\t{seq_offset}\t{line_bases}\t{}\n",
+                bases.len(),
+                line_bases + 1,
+            ));
+        }
+        std::fs::write(&fasta_path, &fasta).expect("write fasta");
+        std::fs::write(&fai_path, fai).expect("write fai");
+        (dir, fasta_path, fai_path)
+    }
+
+    // ---- the htslib `faidx.5` man-page worked example (spec §3.8), verbatim ----
+    // Two contigs; the second header carries a description (`>two another chromosome`)
+    // whose NAME is the first word `two` (T7). Committed so B2 can pin §4's reconstruction
+    // against the format's own authors, not only local samtools.
+    const WORKED_ONE_HEADER: &str = ">one";
+    const WORKED_TWO_HEADER: &str = ">two another chromosome";
+    const WORKED_ONE_LINES: [&[u8]; 3] = [
+        b"ATGCATGCATGCATGCATGCATGCATGCAT",
+        b"GCATGCATGCATGCATGCATGCATGCATGC",
+        b"ATGCAT",
+    ];
+    const WORKED_TWO_LINES: [&[u8]; 2] = [b"ATGCATGCATGCAT", b"GCATGCATGCATGC"];
+    /// `(name, length, offset, line_bases, line_width)` under LF (`faidx.5`).
+    const WORKED_INDEX_LF: [(&str, u64, u64, u64, u64); 2] =
+        [("one", 66, 5, 30, 31), ("two", 28, 98, 14, 15)];
+    /// The same under CR-LF: `line_width` +1 per line, offsets shifted by the extra CRs.
+    const WORKED_INDEX_CRLF: [(&str, u64, u64, u64, u64); 2] =
+        [("one", 66, 6, 30, 32), ("two", 28, 103, 14, 16)];
+
+    /// Build the worked-example FASTA bytes under LF (`crlf = false`) or CR-LF.
+    fn build_worked_example(crlf: bool) -> Vec<u8> {
+        let nl: &[u8] = if crlf { b"\r\n" } else { b"\n" };
+        let mut out = Vec::new();
+        for header in [WORKED_ONE_HEADER, WORKED_TWO_HEADER] {
+            let lines: &[&[u8]] = if header == WORKED_ONE_HEADER {
+                &WORKED_ONE_LINES
+            } else {
+                &WORKED_TWO_LINES
+            };
+            out.extend_from_slice(header.as_bytes());
+            out.extend_from_slice(nl);
+            for line in lines {
+                out.extend_from_slice(line);
+                out.extend_from_slice(nl);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn golden_fai_fixture_matches_committed_constants() {
+        // The committed `synthetic_ref.fa.fai` (samtools) must equal the constants above —
+        // one pins the other, so a future edit to either is caught.
+        let fai_text = std::fs::read_to_string(sibling_fai_path(&golden_ref_path()))
+            .expect("committed golden .fai");
+        let rows: Vec<&str> = fai_text.lines().collect();
+        assert_eq!(rows.len(), GOLDEN.len(), "golden .fai row count");
+        for (row, g) in rows.iter().zip(GOLDEN.iter()) {
+            let cols: Vec<&str> = row.split('\t').collect();
+            assert_eq!(cols.len(), 5, "FASTA .fai has five columns");
+            assert_eq!(cols[0], g.name);
+            assert_eq!(cols[1].parse::<u64>().unwrap(), g.length);
+            assert_eq!(cols[2].parse::<u64>().unwrap(), g.offset);
+            assert_eq!(cols[3].parse::<u64>().unwrap(), g.line_bases);
+            assert_eq!(cols[4].parse::<u64>().unwrap(), g.line_width);
+            // Sanity on the committed M5 (B2's oracle): 32 lowercase hex digits.
+            assert_eq!(g.md5_hex.len(), 32, "M5 is 16 bytes = 32 hex chars");
+            assert!(
+                g.md5_hex.bytes().all(|b| b.is_ascii_hexdigit()),
+                "M5 is hex"
+            );
+        }
+    }
+
+    #[test]
+    fn wrapped_fasta_writer_geometry_is_self_consistent() {
+        // A contig of 10 bases wrapped at 4 → lines 4, 4, 2 (a shorter last line). The `.fai`
+        // the writer emits must describe the bytes it wrote: OFFSET points at the first base,
+        // and the geometry locates the last base too.
+        // `_dir` keeps the tempdir alive through the reads below (a bare `_` would delete it
+        // immediately); it drops at the end of the test.
+        let (_dir, fasta_path, fai_path) = write_wrapped_fasta(&[("solo", b"ACGTACGTAC")], 4);
+        let fasta = std::fs::read(&fasta_path).unwrap();
+        let fai = std::fs::read_to_string(&fai_path).unwrap();
+        let cols: Vec<&str> = fai.trim_end().split('\t').collect();
+        assert_eq!(cols[0], "solo");
+        let length: u64 = cols[1].parse().unwrap();
+        let offset: u64 = cols[2].parse().unwrap();
+        let line_bases: u64 = cols[3].parse().unwrap();
+        let line_width: u64 = cols[4].parse().unwrap();
+        assert_eq!((length, offset, line_bases, line_width), (10, 6, 4, 5)); // ">solo\n" = 6
+
+        // First base sits at OFFSET.
+        assert_eq!(fasta[offset as usize], b'A');
+        // Last base (10th, 1-based) via the same arithmetic every reader uses:
+        // line_idx = 9 / 4 = 2, in_line = 9 % 4 = 1 → offset + 2*line_width + 1.
+        let last = offset + 2 * line_width + 1;
+        assert_eq!(fasta[last as usize], b'C');
+    }
+
+    #[test]
+    fn faidx5_worked_example_vector_is_internally_consistent() {
+        // The committed index tuples must agree with the bytes `build_worked_example`
+        // produces — otherwise the vector B2 pins against would be self-contradictory.
+        for (crlf, index) in [(false, WORKED_INDEX_LF), (true, WORKED_INDEX_CRLF)] {
+            let fasta = build_worked_example(crlf);
+            for (name, _length, offset, _lb, _lw) in index {
+                // The sequence of each contig starts with 'A' at its committed OFFSET (both
+                // worked contigs begin `ATGC...`).
+                assert_eq!(
+                    fasta[offset as usize], b'A',
+                    "contig {name} sequence must start at offset {offset} (crlf={crlf})",
+                );
+            }
+        }
+        // T7: the second header carries a description; its name is the first word only.
+        assert_eq!(WORKED_TWO_HEADER.split_whitespace().next().unwrap(), ">two");
+    }
 }
