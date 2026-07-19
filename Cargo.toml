@@ -130,6 +130,13 @@ serial_test = "3"
 name = "pop_var_caller"
 path = "src/main.rs"
 
+# The ng experiment binary: ng's command surface, kept separate from the
+# production `pop_var_caller` CLI so ng's experiment knobs never grow it
+# (see doc/devel/ng/spec/typed_regions_cli.md §2). Same crate, same library.
+[[bin]]
+name = "pop_var_caller_exp"
+path = "src/main_exp.rs"
+
 [[bench]]
 name = "pileup_walker_scaling"
 harness = false

@@ -26,6 +26,7 @@ pub mod paralog;
 pub mod pileup;
 pub mod pileup_record;
 pub mod pop_var_caller;
+pub mod pop_var_caller_exp;
 pub mod psp;
 pub mod regions;
 pub mod sample_summary;
