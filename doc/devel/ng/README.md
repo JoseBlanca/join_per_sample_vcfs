@@ -16,8 +16,12 @@ by document kind:
     [`read_preparation_ssr.md`](spec/read_preparation_ssr.md) (STR: tract extraction →
     `SsrTractObs`).
   - [`typed_regions.md`](spec/typed_regions.md) — step 3 (the typed-region generator): walks
-    the reference and cuts it into `TypedRegion`s (SsrLocus / SsrBundle / Generic / Satellite).
+    the reference and cuts it into `TypedRegion`s (SsrSegment / SsrBundle / Generic / Satellite).
     First integrating spec — stands on `RefSeq`, the tandem-repeat scanner, and the STR catalog.
+  - [`typed_regions_cli.md`](spec/typed_regions_cli.md) — the **`pop_var_caller_exp`** binary
+    (ng's command surface, kept out of the production CLI) and its first subcommand,
+    `type-regions`: step 3's walk driven from the command line, writing the genome's
+    partition to a text file (kind + motif + repeat count per region).
   - [`ref_seq.md`](spec/ref_seq.md) — the `RefSeq` reference-sequence accessor
     (foundational infra: resident + streaming + in-memory impls). Read filtering #8 and
     the pileup depend on it.
@@ -31,6 +35,9 @@ by document kind:
     distilled (the code-facing companion to the spec).
   - [`typed_regions.md`](arch/typed_regions.md) — step 3's types & interfaces (the
     typed-region generator); companion to `spec/typed_regions.md`.
+  - [`typed_regions_cli.md`](arch/typed_regions_cli.md) — the `pop_var_caller_exp` /
+    `type-regions` types & interfaces (the CLI that drives step 3); companion to
+    `spec/typed_regions_cli.md`.
 - **`impl_plan/`** — step-by-step implementation plans (build order, not new design).
   - [`foundations.md`](impl_plan/foundations.md) — the first ng code: skeleton,
     `types.rs` seed, and the `RefSeq` accessor (three impls).
@@ -38,6 +45,9 @@ by document kind:
     the cascade, the `RecordSource`/`RawRecord` seam, the `ReadFilter` iterator.
   - [`typed_regions.md`](impl_plan/typed_regions.md) — step 3: the catalog rebase/knobs,
     the windowed substrate, and the `region_typing.rs` walk (resident → windowed).
+  - [`typed_regions_cli.md`](impl_plan/typed_regions_cli.md) — the `pop_var_caller_exp` /
+    `type-regions` build order: binary skeleton, `--min-copies` parser, output writer, and
+    the `run_typed_regions` driver.
 
 This mirrors the repo-wide `doc/devel/{specs,architecture,implementation_plans}`
 convention but scoped to ng, so the growing set of ng docs stays together.
