@@ -149,7 +149,7 @@ to read). *Source:* spec §3.7, §5 T8.
 
 ### Milestone E — the two entry points (compose everything)
 
-**E1. `read_fai_verify_in_background`.**  ☐
+**E1. `read_fai_verify_in_background`.**  ✅
 `&Arc<ReferenceInfoCache>` in. Foreground `cache.get_or_read(Fai)` (returns now, `md5: None`);
 spawn a **crossbeam** thread (not `rayon::spawn`) running `cache.get_or_read(Fasta { Some })`,
 delivering its `Result` to the `VerificationHandle` (`#[must_use]`; `is_finished`; `join` returns

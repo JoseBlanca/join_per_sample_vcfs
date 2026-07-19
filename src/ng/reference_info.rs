@@ -894,6 +894,98 @@ impl ReferenceInfoCache {
     }
 }
 
+// ---------------------------------------------------------------------
+// Background verification (spec §3.10)
+// ---------------------------------------------------------------------
+
+const VERIFY_HANDLE_DROP_WARNING: &str = "warning: ReferenceInfo verification handle dropped without join(); a possibly-pending \
+     reference-verification error went unobserved";
+
+/// The pending result of a background FASTA verification (spec §3.10). **`#[must_use]`, and it
+/// must be joined before the caller commits any output** — an unverified reference is a
+/// possibly-wrong run, and this handle is the *only* place that error surfaces.
+///
+/// The verified `ReferenceInfo` (MD5s filled) arrives by **return** from [`Self::join`], never
+/// by in-place mutation: `ContigInfo` stays a plain immutable struct, and immutable data plus
+/// message-passing (the returned value *is* the message) avoids shared-mutable-across-threads.
+#[must_use]
+#[derive(Debug)]
+pub struct VerificationHandle {
+    /// `Some` until `join` takes it; a dedicated OS thread's handle whose `join` yields the
+    /// verify's `Result` (a `JoinHandle` *is* the result channel — no separate channel needed;
+    /// a dedicated thread, not a rayon worker, so a seconds-long read cannot starve the pool).
+    handle: Option<std::thread::JoinHandle<Result<Arc<ReferenceInfo>, ReferenceInfoError>>>,
+}
+
+impl VerificationHandle {
+    /// Non-blocking: `true` once verification has finished, so a caller can defer `join` until
+    /// it will not block.
+    pub fn is_finished(&self) -> bool {
+        self.handle.as_ref().is_none_or(|h| h.is_finished())
+    }
+
+    /// Block until verification finishes and take its result — the **verified**
+    /// `ReferenceInfo` (MD5s filled) on success, the geometry or read error on failure.
+    pub fn join(mut self) -> Result<Arc<ReferenceInfo>, ReferenceInfoError> {
+        let handle = self
+            .handle
+            .take()
+            .expect("VerificationHandle already joined");
+        match handle.join() {
+            Ok(result) => result,
+            // The verify thread panicked (read_reference_info does not, so this is a bug, not
+            // bad input): re-raise rather than swallow it.
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    }
+}
+
+impl Drop for VerificationHandle {
+    fn drop(&mut self) {
+        // Abandoning the run's only verification hides a possibly-pending failure — warn
+        // rather than swallow it (but stay quiet if we are already unwinding a panic).
+        if self.handle.is_some() && !std::thread::panicking() {
+            eprintln!("{VERIFY_HANDLE_DROP_WARNING}");
+        }
+    }
+}
+
+/// Read the `.fai` **now** (fast, `md5: None`, returned immediately) and verify the FASTA
+/// against it on a **background thread** — both reads going **through the cache**, so the
+/// verify populates it and a concurrent reader of the same key coordinates on the
+/// single-flight slot instead of reading again (spec §3.10). Takes `&Arc<ReferenceInfoCache>`
+/// because the background thread outlives the call and holds a clone.
+///
+/// The initial `.fai` read is synchronous, so a missing or malformed `.fai` errors here,
+/// before any thread is spawned.
+pub fn read_fai_verify_in_background(
+    cache: &Arc<ReferenceInfoCache>,
+    fasta: PathBuf,
+    fai: PathBuf,
+) -> Result<(Arc<ReferenceInfo>, VerificationHandle), ReferenceInfoError> {
+    // Foreground: the cheap `.fai` read, available immediately (names/lengths/geometry, no
+    // digests). A missing or malformed `.fai` surfaces synchronously.
+    let info = cache.get_or_read(ReferenceSource::Fai(fai.clone()))?;
+
+    // Background: verify the FASTA against the `.fai` through the cache (§3.3 + §3.4), so the
+    // verified result — and its error — reach the caller via `join`, and the cache is
+    // populated for any later or concurrent reader of the same key.
+    let cache = Arc::clone(cache);
+    let handle = std::thread::spawn(move || {
+        cache.get_or_read(ReferenceSource::Fasta {
+            fasta,
+            fai: Some(fai),
+        })
+    });
+
+    Ok((
+        info,
+        VerificationHandle {
+            handle: Some(handle),
+        },
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1864,5 +1956,141 @@ mod tests {
     fn cache_is_send_and_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<ReferenceInfoCache>();
+    }
+
+    // =================================================================
+    // E1 — read_fai_verify_in_background (spec §3.10).
+    // =================================================================
+
+    /// A FASTA + matching `.fai` written into a fresh tempdir, both at wrap `w`.
+    fn golden_like_pair(w: usize) -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let c1 = bases(150);
+        let c2 = bases(95);
+        write_wrapped_fasta(&[("c1", &c1), ("c2", &c2)], w)
+    }
+
+    #[test]
+    fn background_verify_info_available_before_join_and_join_upgrades() {
+        let cache = Arc::new(ReferenceInfoCache::new());
+        let (_dir, fasta, fai) = golden_like_pair(60);
+        let (info, handle) = read_fai_verify_in_background(&cache, fasta, fai).unwrap();
+        // The foreground `.fai` read has no digests.
+        assert_eq!(info.md5, None);
+        assert_eq!(info.contigs.len(), 2);
+        // `join` upgrades to the verified info, with the digests filled.
+        let verified = handle.join().unwrap();
+        assert!(verified.md5.is_some(), "join fills the reference digest");
+        assert!(verified.contigs.iter().all(|c| c.md5.is_some()));
+    }
+
+    #[test]
+    fn background_verify_stale_fai_errors_on_join_not_before() {
+        // A `.fai` from a different wrap of the same contigs: names/lengths match (foreground
+        // read succeeds) but the geometry is stale (the verify fails on join).
+        let cache = Arc::new(ReferenceInfoCache::new());
+        let (_dir60, fasta60, _fai60) = golden_like_pair(60);
+        let (_dir40, _fasta40, fai40) = golden_like_pair(40);
+
+        let (info, handle) = read_fai_verify_in_background(&cache, fasta60, fai40).unwrap();
+        // The foreground read succeeded — the error is NOT surfaced before join.
+        assert_eq!(info.md5, None);
+        // Mutation-verify: a swallowed error would make this `Ok` and fail the test.
+        match handle.join() {
+            Err(ReferenceInfoError::FastaFaiMismatch { field, .. }) => {
+                assert_eq!(field, "line_bases")
+            }
+            other => panic!("expected a stale-.fai FastaFaiMismatch on join, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn background_verify_populates_the_cache() {
+        let cache = Arc::new(ReferenceInfoCache::new());
+        let (_dir, fasta, fai) = golden_like_pair(60);
+        let (_info, handle) =
+            read_fai_verify_in_background(&cache, fasta.clone(), fai.clone()).unwrap();
+        let verified = handle.join().unwrap();
+        // A later read of the same `Fasta { Some }` key is a hit — the verify populated it.
+        let again = cache
+            .get_or_read(ReferenceSource::Fasta {
+                fasta,
+                fai: Some(fai),
+            })
+            .unwrap();
+        assert!(
+            Arc::ptr_eq(&verified, &again),
+            "the background verify populated the cache"
+        );
+    }
+
+    #[test]
+    fn background_verify_concurrent_reader_coordinates_through_the_cache() {
+        // A reader of the same `Fasta { Some }` key, started while the verify runs, coordinates
+        // on the single-flight slot and gets the *same* Arc — not a second genome read.
+        let cache = Arc::new(ReferenceInfoCache::new());
+        let (_dir, fasta, fai) = golden_like_pair(60);
+        let (_info, handle) =
+            read_fai_verify_in_background(&cache, fasta.clone(), fai.clone()).unwrap();
+        let cache2 = Arc::clone(&cache);
+        let other = std::thread::spawn(move || {
+            cache2
+                .get_or_read(ReferenceSource::Fasta {
+                    fasta,
+                    fai: Some(fai),
+                })
+                .unwrap()
+        });
+        let verified = handle.join().unwrap();
+        let concurrent = other.join().unwrap();
+        assert!(
+            Arc::ptr_eq(&verified, &concurrent),
+            "the concurrent reader shared the verify's Arc through the cache"
+        );
+    }
+
+    #[test]
+    fn background_verify_failure_does_not_poison_the_key() {
+        let cache = Arc::new(ReferenceInfoCache::new());
+        let (_dir60, fasta60, _f60) = golden_like_pair(60);
+        let (_dir40, _f40, fai40) = golden_like_pair(40);
+        let (_info, handle) =
+            read_fai_verify_in_background(&cache, fasta60.clone(), fai40.clone()).unwrap();
+        assert!(handle.join().is_err());
+        // The failed verify was not cached, so a later read re-runs (and re-fails).
+        assert!(matches!(
+            cache
+                .get_or_read(ReferenceSource::Fasta {
+                    fasta: fasta60,
+                    fai: Some(fai40),
+                })
+                .unwrap_err(),
+            ReferenceInfoError::FastaFaiMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn background_verify_missing_fai_errors_before_spawning() {
+        // The foreground `.fai` read is synchronous: a missing `.fai` errors here, not on join.
+        let cache = Arc::new(ReferenceInfoCache::new());
+        let dir = tempfile::tempdir().unwrap();
+        let fasta = dir.path().join("ref.fa");
+        std::fs::write(&fasta, b">c\nACGT\n").unwrap();
+        let fai = dir.path().join("ref.fa.fai");
+        assert!(matches!(
+            read_fai_verify_in_background(&cache, fasta, fai).unwrap_err(),
+            ReferenceInfoError::FaiRead { .. }
+        ));
+    }
+
+    #[test]
+    fn abandoning_the_handle_does_not_panic_and_the_warning_is_pinned() {
+        // The Drop warning is the guard against a lost error; pin its text, and prove that
+        // dropping an un-joined handle runs cleanly (it warns to stderr — visible under
+        // --nocapture — rather than swallowing silently).
+        assert!(VERIFY_HANDLE_DROP_WARNING.contains("without join"));
+        let cache = Arc::new(ReferenceInfoCache::new());
+        let (_dir, fasta, fai) = golden_like_pair(60);
+        let (_info, handle) = read_fai_verify_in_background(&cache, fasta, fai).unwrap();
+        drop(handle); // must not panic or hang
     }
 }
