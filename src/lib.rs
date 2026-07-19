@@ -17,6 +17,7 @@
 
 pub mod bam;
 pub mod baq;
+pub mod error_render;
 pub mod fasta;
 pub mod genetics;
 pub mod iter_ext;

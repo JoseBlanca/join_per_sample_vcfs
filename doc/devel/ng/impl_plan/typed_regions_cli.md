@@ -73,14 +73,14 @@ and `cli/parsers.rs`; the `PopVarCallerExpCommand` enum, `TypedRegionsArgs`, `Ty
 
 ### Milestone A — the binary skeleton (scaffold, no logic)
 
-**A1. The second binary exists and runs.**  ☐
+**A1. The second binary exists and runs.**  ✅
 `Cargo.toml` `[[bin]] name = "pop_var_caller_exp", path = "src/main_exp.rs"`; `src/main_exp.rs` thin
 (parse → dispatch → render error → exit, like `main.rs:1-4`); `pub mod pop_var_caller_exp;` in
 `lib.rs`; `src/pop_var_caller_exp/{mod,cli}.rs` with the top-level `Parser` and
 `PopVarCallerExpCommand { TypeRegions(TypedRegionsArgs) }` (a stub `run` for now). Prove:
 `pop_var_caller_exp --help` and `type-regions --help` run. *Source:* arch §Module home, spec §2.
 
-**A2. Hoist `format_error_chain` into the library.**  ☐ — **own commit (production edit, pure move).**
+**A2. Hoist `format_error_chain` into the library.**  ✅ — **own commit (production edit, pure move).**
 Move the fn (and its `#[cfg(test)]`) from `src/main.rs` into a library module both binaries import;
 `main.rs` now calls the hoisted one. No behaviour change — the existing test stays green. *Source:*
 spec T7a, arch §6. *Depends:* A1.
