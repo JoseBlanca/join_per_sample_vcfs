@@ -690,18 +690,16 @@ impl Default for SsrSegmentCriteria {
 /// rather than assumed. Well-formed intervals are unaffected, so the port stays
 /// faithful.
 pub fn prefilter(intervals: &[RepeatInterval], params: &SsrSegmentCriteria) -> Vec<RepeatInterval> {
-    // Two cleanups, in this order — the ordering is load-bearing. The **period floor is
-    // gone**: the scanner emits only in-range periods and `classify` gates the range, so
-    // it was a no-op.
-    //
-    // (1) The **copy floor** — per-period `MinCopies` (the scanner's own floor is a flat
-    // 2). It drops low-copy noise (spec §5b), and it must run **before** (2): a repeat's
-    // motif can contain a homopolymer (`AAA` in `(GAAA)*n`), which the scanner emits as a
-    // short period-1 interval overlapping the tetranucleotide. Left in, (2) would let that
-    // `AAA` eliminate the `GAAA` as its multiple. The period-1 floor (10) removes the
-    // sub-run first, so the `GAAA` survives — this *is* the policy call the pre-filter
-    // exists to make (whether the homopolymer or its parent repeat is significant).
-    let mut floored: Vec<RepeatInterval> = intervals
+    // **The copy floor, and nothing else** (spec §5b). The scanner now honours its
+    // interface fully: it emits each repeat once, at its primitive period, with
+    // period-multiple re-detections of the same tract already resolved by geometry
+    // (`find_tandem_repeats`). So the two jobs this used to do are gone — the period
+    // floor (the scanner emits only in-range periods; `classify` gates the range) and
+    // the redundancy elimination (the scanner's now). What is left is *significance*:
+    // the scanner is deliberately permissive (a flat floor of 2), and this applies the
+    // per-period `MinCopies` (e.g. 6 for a homopolymer), which is the one genuinely
+    // policy decision — whether a short repeat is worth calling an STR.
+    intervals
         .iter()
         .copied()
         .filter(|iv| {
@@ -710,28 +708,7 @@ pub fn prefilter(intervals: &[RepeatInterval], params: &SsrSegmentCriteria) -> V
                 && (iv.end - iv.start) / u64::from(iv.period)
                     >= u64::from(params.min_copies.for_period(iv.period))
         })
-        .collect();
-
-    // (2) **Overlapping period-multiple redundancy** (trf-mod's `IsRedundant`). NOT the
-    // homopolymer-alias job — the scanner's primitive-motif check already keeps a poly-A
-    // to period 1. What survives that is a phase-shifted re-detection of the *same* tract:
-    // a clean `(GAA)*13` at period 3 also matches, sloppily, as a period-6 `AAGATG`. That
-    // 6-mer is primitive, so the scanner keeps it — but it overlaps the period-3 tract and
-    // 6 is a multiple of 3, so drop it, or the two bundle and the locus vanishes.
-    floored.sort_by_key(|iv| (iv.period, iv.start));
-    let mut kept: Vec<RepeatInterval> = Vec::with_capacity(floored.len());
-    for iv in floored {
-        let redundant = kept.iter().any(|a| {
-            a.period < iv.period
-                && iv.period.is_multiple_of(a.period)
-                && iv.start < a.end
-                && a.start < iv.end
-        });
-        if !redundant {
-            kept.push(iv);
-        }
-    }
-    kept
+        .collect()
 }
 
 // ---------------------------------------------------------------------
@@ -1782,35 +1759,13 @@ mod tests {
              cannot fire from the walk"
         );
 
-        // Compound, on an STR multiple: redundancy elimination drops it, so THIS compound
-        // never reaches the gate. (Both must be present, as the scanner emits them.)
-        let fundamental_and_multiple = vec![iv(20, 40, 2, 100), iv(20, 40, 4, 100)];
-        assert_eq!(
-            prefilter(&fundamental_and_multiple, &p),
-            vec![iv(20, 40, 2, 100)],
-            "a period-multiple of a surviving tract is eliminated"
-        );
-
-        // **And a homopolymer never even reaches Compound** — the scanner emits it at
-        // period 1 only (`a_homopolymer_is_only_period_one`), so no period-2 `AA` alias
-        // is ever produced for the gate to catch. Fed the aliases by hand (period 1 in
-        // scope), the pre-filter's redundancy elimination collapses them to the period-1
-        // primitive; `classify`'s own period gate then drops period 1 at the default range.
-        let homopolymer_and_alias = vec![iv(20, 40, 1, 100), iv(20, 40, 2, 100)];
-        let with_p1 = SsrSegmentCriteria {
-            periods: PeriodRange::new(1, 6).unwrap(),
-            ..p.clone()
-        };
-        assert_eq!(
-            prefilter(&homopolymer_and_alias, &with_p1),
-            vec![iv(20, 40, 1, 100)],
-            "the period-2 alias is eliminated as a multiple of the period-1 primitive"
-        );
-
-        // Compound is therefore unreachable from the walk: the scanner emits only
-        // *primitive* motifs, and a compound motif is by definition non-primitive, so
-        // none reaches `classify`. The gate stays as `classify`'s own guard, for a caller
-        // handing in intervals the scanner never produced.
+        // Compound is unreachable from the walk, and it is the **scanner** that makes it
+        // so: it emits only primitive motifs (a compound motif like `AA`/`ATAT` is
+        // non-primitive), and it resolves period-multiple re-detections of a tract
+        // (`tandem_repeat::a_period_multiple_re_detection_is_dropped_by_geometry`). So no
+        // compound motif ever reaches `classify` from the walk. The gate stays as
+        // `classify`'s own guard, for a caller handing in intervals the scanner never
+        // produced — verified here by feeding it one directly:
         let contig = b"CGCGCGCGCGCGCGCGCGCGAAAAAAAAAAAAAAAAAAAACGCGCGCGCGCGCGCGCGCG";
         assert_eq!(
             classify(
@@ -1871,17 +1826,17 @@ mod tests {
     // ---- the pre-filter -----------------------------------------------------
 
     #[test]
-    fn prefilter_drops_low_copy_noise_and_period_multiples() {
-        // A real (AT)*10 tract, re-detected at its period-4 multiple, plus a
-        // 2-copy noise interval. Only the fundamental period-2 tract survives.
+    fn prefilter_drops_low_copy_noise() {
+        // The pre-filter is now just the copy floor — period-multiple re-detections are
+        // resolved in the scanner (`find_tandem_repeats`), not here. A real (AT)*10 tract
+        // clears the period-2 floor (5); a 2-copy speck does not.
         let real = iv(100, 120, 2, 100);
-        let multiple = iv(100, 120, 4, 100);
         let noise = iv(500, 504, 2, 10);
-        let kept = prefilter(&[real, multiple, noise], &params());
+        let kept = prefilter(&[real, noise], &params());
         assert_eq!(
             kept,
             vec![real],
-            "fundamental kept; multiple + noise dropped"
+            "the real tract is kept, the 2-copy speck dropped"
         );
     }
 
@@ -3224,71 +3179,9 @@ mod tests {
         );
     }
 
-    /// **The pre-filter drops a phase-shifted period-multiple re-detection** — its
-    /// job since the scanner learned to emit primitive periods (which is where a
-    /// homopolymer's `AA`/`AAA` aliases are now killed: `a_homopolymer_is_only_period_one`,
-    /// scanner-side). What survives *that* and still needs dropping is an impure
-    /// re-detection of a real repeat at a multiple period: a clean `(GAA)*13` at
-    /// period 3 also matches, sloppily, as a period-6 `AAGATG` over a wider span.
-    /// `AAGATG` is a primitive 6-mer, so the scanner keeps it — but it overlaps the
-    /// period-3 tract and 6 is a multiple of 3, so it is the same repeat seen worse.
-    /// Left in, the two bundle and the locus vanishes (this was a real `.cat` parity
-    /// break, `ctg1:1022-1057`).
-    #[test]
-    fn a_period_multiple_re_detection_is_dropped() {
-        let real = iv(6, 45, 3, 100); // (GAA)*13, primitive period 3
-        let alias = iv(1, 45, 6, 100); // period-6 re-detection over the same repeat
-        assert_eq!(
-            prefilter(&[real, alias], &params()),
-            vec![real],
-            "the period-6 overlaps the period-3 and is a multiple of it → redundant"
-        );
-        // A period-3 next to an unrelated period-2 (not a multiple, or not overlapping)
-        // is NOT redundant — both survive.
-        let two = iv(200, 240, 2, 100);
-        let mut both = prefilter(&[real, two], &params());
-        both.sort_by_key(|iv| iv.period);
-        assert_eq!(both, vec![two, real], "unrelated periods both kept");
-    }
-
-    /// **The copy floor drops low-copy specks before they can eliminate anything.**
-    /// It runs *first*, and that ordering is load-bearing: aperiodic sequence is full
-    /// of 2 bp period-1 specks (`GG`, `TT`), and if one reached redundancy elimination
-    /// it would eliminate every real STR it overlaps (period 1 divides everything) —
-    /// the poly-A cascade. [`MinCopies`]'s period-1 entry of 10 stops them.
-    ///
-    /// (A period-1 speck only *reaches* the pre-filter if period 1 is in scope; at the
-    /// default 2..=6 the scanner never emits it. The floor still matters for low-copy
-    /// noise at every period, and this pins the ordering directly.)
-    #[test]
-    fn the_copy_floor_runs_before_redundancy_so_a_speck_is_not_an_eliminator() {
-        let speck = iv(100, 102, 1, 10); // 2 copies at period 1 — under the floor of 10
-        let real_str = iv(100, 130, 3, 100); // 10 copies at period 3, overlapping it
-        let with_p1 = SsrSegmentCriteria {
-            periods: PeriodRange::new(1, 6).unwrap(),
-            ..params()
-        };
-
-        assert_eq!(
-            prefilter(&[speck, real_str], &with_p1),
-            vec![real_str],
-            "the speck is dropped by period 1's copy floor (10) before it can \
-             eliminate anything: the real period-3 tract survives"
-        );
-
-        // Drop the floor to 1 and the speck survives, then eliminates the real
-        // period-3 tract as its multiple — the cascade, and what the floor prevents.
-        let no_floor = SsrSegmentCriteria {
-            min_copies: MinCopies::uniform(1),
-            ..with_p1
-        };
-        assert_eq!(
-            prefilter(&[speck, real_str], &no_floor),
-            vec![speck],
-            "with the floor at 1 the speck survives and eliminates the real tract: \
-             the locus is gone, replaced by a 2 bp speck"
-        );
-    }
+    // (Period-multiple re-detection is resolved in the scanner now — see
+    // `tandem_repeat::a_period_multiple_re_detection_is_dropped_by_geometry`. The
+    // pre-filter is just the copy floor, tested above.)
 
     /// **M6 — a malformed interval is dropped, not underflowed.**
     ///

@@ -390,18 +390,19 @@ fn maximal_scoring_subsequences(
 /// it to the 0-based half-open tract it certifies, and emits it when its implied copy
 /// count clears `params.min_copies`. Pure and total over arbitrary bytes; deterministic.
 ///
-/// **A repeat is never emitted as a longer non-primitive alias of itself** — a
-/// `AAAAAA` is period 1, not a period-2 `AA`, because a non-primitive motif is dropped
-/// at emission. This is the scanner honouring its period-range contract: asked for
-/// period 2, it does not return a homopolymer dressed as one.
+/// **Each repeat is reported once, at its true period** — the scanner honours its
+/// interface, and both mechanisms it uses are pure geometry (no significance policy):
+/// - a **non-primitive motif** is dropped at emission (`AA` reduces to `A`), so a
+///   homopolymer is period 1, never a period-2 alias of itself;
+/// - a **period-multiple re-detection of the same tract** is dropped in a post-pass:
+///   a `(GAA)` period-3 repeat also matches, sloppily, as a period-6 `AAGATG` — a
+///   primitive 6-mer the motif check keeps, but the period-3 detection *covers most of
+///   it*, so it is the same tract seen worse.
 ///
-/// It does **not** resolve every overlapping re-detection. A phase-shifted period-6
-/// re-detection of a period-3 tract (motif `AAGATG`, primitive-looking) still slips
-/// through, and so does a genuine period-1 homopolymer *inside* a higher-period motif
-/// (the `AAA` in `(GAAA)*n`). Collapsing those to one repeat is a **policy** decision —
-/// whether the `AAA` or the `GAAA` is the significant one is the copy-number floor's
-/// call — so it lives in the consumer's pre-filter, after that floor
-/// (`segment_criteria::prefilter`), not here.
+/// The "covers most" test is what keeps this out of policy: a genuine shorter repeat
+/// that merely *sits inside* a longer one (the `AAA` inside `(GAAA)*n`) covers only a
+/// sliver of it, so it is **not** treated as a re-detection — both are kept, and which
+/// is significant is the consumer's copy-floor call, not the scanner's.
 pub fn find_tandem_repeats(
     seq: &[u8],
     periods: PeriodRange,
@@ -444,7 +445,30 @@ pub fn find_tandem_repeats(
             }
         });
     }
-    out
+
+    // Drop a period-multiple re-detection of the same tract. `iv` (the longer period) is
+    // redundant iff a shorter period `a` divides it and **covers at least half of it** —
+    // "covers most" is what says *same tract*, not merely *overlapping*. A phase-shifted
+    // period-6 `AAGATG` over a period-3 `GAA` is covered ~90% and goes; a period-1 `AAA`
+    // sitting inside a period-4 `(GAAA)` covers a sliver and stays (a genuinely different,
+    // smaller repeat — the copy floor, downstream, decides if it is significant). No
+    // copy-number policy here: purely how much of `iv` the shorter `a` explains.
+    out.sort_by_key(|iv| (iv.period, iv.start));
+    let mut kept: Vec<RepeatInterval> = Vec::with_capacity(out.len());
+    for iv in out {
+        let iv_len = iv.end - iv.start;
+        let redundant = kept.iter().any(|a| {
+            if a.period >= iv.period || !iv.period.is_multiple_of(a.period) {
+                return false;
+            }
+            let overlap = a.end.min(iv.end).saturating_sub(a.start.max(iv.start));
+            overlap * 2 >= iv_len // ≥ 50% of the longer tract
+        });
+        if !redundant {
+            kept.push(iv);
+        }
+    }
+    kept
 }
 
 // ---------------------------------------------------------------------
@@ -1271,6 +1295,36 @@ mod tests {
         assert!(
             got2.is_empty(),
             "asked for period 2..6, a homopolymer is not any of them: {got2:?}"
+        );
+    }
+
+    /// **A phase-shifted period-multiple re-detection is dropped; a repeat that merely
+    /// sits inside another is kept.** This is the geometry test — the scanner resolves
+    /// same-tract redundancy by *how much* the shorter covers the longer, no copy floor.
+    #[test]
+    fn a_period_multiple_re_detection_is_dropped_by_geometry() {
+        // A (GAA)*n repeat with a couple of stray bases before it: the scanner finds
+        // the clean period-3, and also a sloppy period-6 that starts earlier (motif
+        // `AAGATG`). The period-3 covers most of the period-6, so the period-6 goes.
+        let seq = b"ATGAAGAAGAAGAAGAAGAAGAAGAAGAAGAAGAAG";
+        let got = find_tandem_repeats(seq, p(2, 6), &ScanParams::default());
+        assert!(
+            got.iter().any(|r| r.period == 3),
+            "the primitive period-3 GAA survives: {got:?}"
+        );
+        assert!(
+            !got.iter().any(|r| r.period == 6),
+            "the period-6 re-detection of the same tract is dropped: {got:?}"
+        );
+
+        // A homopolymer INSIDE a higher-period motif is a different, smaller repeat that
+        // covers only a sliver — it must NOT eliminate its parent. (GAAA)*n has an `AAA`
+        // run in every unit; the period-4 tetranucleotide must survive them.
+        let seq = b"GAAAGAAAGAAAGAAAGAAAGAAAGAAAGAAA"; // (GAAA)*8
+        let got = find_tandem_repeats(seq, p(1, 6), &ScanParams::default());
+        assert!(
+            got.iter().any(|r| r.period == 4),
+            "the period-4 (GAAA) survives its own internal AAA homopolymer runs: {got:?}"
         );
     }
 

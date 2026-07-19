@@ -820,12 +820,12 @@ classified set equal to the catalog's.
 > `AA` alias, so the aliases this section agonises over **never exist**. Consequences: there is now
 > **one** period range (`criteria.periods`) — the scanner detects it and classification accepts it,
 > the config's separate scan range is gone; the pre-filter's **period floor is removed** (the scanner
-> emits only in-range periods); and the pre-filter keeps just the **copy floor + overlapping-multiple
-> redundancy** (the latter for a *phase-shifted re-detection of the same tract*, e.g. a period-6
-> `AAGATG` over a period-3 `GAA` — a policy call, because the copy floor decides whether an `AAA`
-> sub-run or its `GAAA` parent is significant, which is why it is not the scanner's job). Everything
-> below is retained as the archaeology of how we got here; `typed_regions_cli.md` §2.2 states the
-> current design. **All parity oracles still hold.**
+> emits only in-range periods); the **overlapping-multiple redundancy moved *into* the scanner** — a
+> phase-shifted re-detection of the same tract (a period-6 `AAGATG` over a period-3 `GAA`) is dropped
+> there by geometry (the shorter covers most of the longer), which is pure detection, not policy; and
+> the pre-filter is left as **just the copy floor** (the one real policy call — whether a short repeat
+> is worth calling an STR). Everything below is retained as the archaeology of how we got here;
+> `typed_regions_cli.md` §2.2 states the current design. **All parity oracles still hold.**
 >
 > ---
 >
