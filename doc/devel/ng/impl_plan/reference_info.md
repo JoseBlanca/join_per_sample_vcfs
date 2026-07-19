@@ -95,7 +95,7 @@ fields; the three rejections error (named). *Depends:* A1, A3. *Source:* spec §
 
 ### Milestone B — the FASTA streaming pass (the heart; silent-failure isolated)
 
-**B1. The one-buffer, byte-zero pass — `Fasta { fai: None }`.**  ☐  **Own commit, do not bundle.**
+**B1. The one-buffer, byte-zero pass — `Fasta { fai: None }`.**  ✅  **Own commit, do not bundle.**
 The from-byte-zero streaming loop (one ~64 KiB buffer, never a whole contig): per contig produce
 name, length, `offset`, `line_bases`, `line_width`, the per-contig MD5 and the running
 whole-reference MD5, in one pass. The single predicate — a base is `[0x21,0x7E]` (`isgraph`); CR-LF
@@ -104,7 +104,7 @@ falls out of `line_width − line_bases`; uniform-line-width guard (T3). Copy
 **Silent** (a wrong number is a wrong `.fai`/M5): lands with its oracle green. *Depends:* A1, A3.
 *Source:* spec §4, §3.4, §3.8.
 
-**B2. Oracle test for the pass.**  ☐  *(lands with B1 — it is B1's guard.)*
+**B2. Oracle test for the pass.**  ✅  *(lands with B1 — it is B1's guard.)*
 Against the committed constants: per-contig M5 = `samtools dict`; `LN` and the reconstructed `.fai`
 fields = `samtools faidx`; the LF/CR-LF vector; per-contig MD5 vs `Md5::digest` one-shot; the
 whole-reference digest vs the golden `.cat` header; the space/tab predicate edge (hashed-as-absent).

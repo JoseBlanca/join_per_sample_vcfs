@@ -14,11 +14,16 @@
 //! (spec §3.6). Its output types are ng's own plain data — `ContigInfo` is the
 //! everything-about-a-contig type production never had in one place.
 //!
-//! **Milestone A** landed here so far: the data types, and the cheap `.fai` reader.
+//! Landed so far: the data types, the cheap `.fai` reader (Milestone A), and the
+//! from-byte-zero FASTA streaming pass for `Fasta { fai: None }` — geometry + per-contig
+//! and whole-reference MD5 in one buffer (Milestone B, B1).
 
 use crate::fasta::{ContigEntry, ContigList};
+use md5::{Digest, Md5};
 use std::collections::HashSet;
+use std::fs::File;
 use std::io;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------------
@@ -215,9 +220,11 @@ pub enum ReferenceInfoError {
 pub fn read_reference_info(source: ReferenceSource) -> Result<ReferenceInfo, ReferenceInfoError> {
     match source {
         ReferenceSource::Fai(path) => read_fai(&path),
-        ReferenceSource::Fasta { .. } => {
-            // The from-byte-zero streaming pass (geometry + MD5) is Milestone B.
-            todo!("the Fasta streaming pass lands in Milestone B (spec §4)")
+        // Read the FASTA alone: names, order, lengths, every MD5, the reference digest.
+        ReferenceSource::Fasta { fasta, fai: None } => read_fasta(&fasta),
+        // The fasta-vs-`.fai` cross-check lands in B3.
+        ReferenceSource::Fasta { fai: Some(_), .. } => {
+            todo!("the fasta-vs-.fai check lands in B3 (spec §3.3)")
         }
     }
 }
@@ -308,6 +315,333 @@ fn fai_field_error(path: &Path, contig: &str, detail: String) -> ReferenceInfoEr
             io::ErrorKind::InvalidData,
             format!("malformed .fai for contig {contig}: {detail}"),
         ),
+    }
+}
+
+// ---------------------------------------------------------------------
+// The FASTA streaming pass (spec §4) — the heart
+// ---------------------------------------------------------------------
+
+/// One read window. Resident memory is one of these regardless of contig size — the pass
+/// never holds a whole contig (spec §4). The same size `compute_contig_md5_streaming` uses.
+const FASTA_PASS_BUFFER_SIZE: usize = 64 * 1024;
+
+/// The `Fasta { fai: None }` arm: read the FASTA from **byte zero**, in one streaming pass,
+/// reconstructing every contig's geometry and MD5 and the whole-reference digest (spec §4).
+/// From byte zero, not seeking by an index, because a `.fai`-driven reader can only confirm
+/// the index agrees with itself (spec §3.3 — the circular check). One buffer, never a whole
+/// contig.
+fn read_fasta(path: &Path) -> Result<ReferenceInfo, ReferenceInfoError> {
+    let mut file = File::open(path).map_err(|source| ReferenceInfoError::FastaRead {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mut buf = [0u8; FASTA_PASS_BUFFER_SIZE];
+    let mut pass = FastaPass::new(path);
+    let mut first_window = true;
+    loop {
+        let n = file
+            .read(&mut buf)
+            .map_err(|source| ReferenceInfoError::FastaRead {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        if n == 0 {
+            break;
+        }
+        if first_window {
+            first_window = false;
+            // A bgzip `.fa.gz` starts with the gzip magic; its `.fai` offsets index the
+            // *uncompressed* stream, so parsing the raw bytes as FASTA is nonsense. Reject
+            // it cleanly rather than misread (spec §3.8; the reader is deferred, §7).
+            if n >= 2 && buf[0] == 0x1f && buf[1] == 0x8b {
+                return Err(ReferenceInfoError::CompressedReference {
+                    path: path.to_path_buf(),
+                });
+            }
+        }
+        for &b in &buf[..n] {
+            pass.push_byte(b)?;
+        }
+    }
+    pass.finish()
+}
+
+/// Where the pass is in the file's grammar.
+enum PassMode {
+    /// Before the first `>` header.
+    Start,
+    /// Inside a definition line (after `>`, before its terminator).
+    Header,
+    /// Reading a contig's sequence lines.
+    Sequence,
+}
+
+/// The from-byte-zero streaming state. Holds only bounded state — the current contig's
+/// name, the running line counters, the two MD5 states, and one flush buffer — never a
+/// whole contig. `offset`/geometry are reconstructed the way htslib's own indexer does, so
+/// a `.fai` comparison (B3) is like-for-like (spec §4).
+struct FastaPass<'a> {
+    path: &'a Path,
+    /// Byte offset of the current byte being processed (0-based).
+    pos: u64,
+    mode: PassMode,
+    /// True at file start and immediately after a `\n` — the only place a `>` opens a header.
+    at_line_start: bool,
+
+    /// The whole-reference digest: every contig's uppercased bases, concatenated in file
+    /// order (spec §3.4).
+    reference_md5: Md5,
+    contigs: Vec<ContigInfo>,
+    seen_names: HashSet<String>,
+
+    // ---- current contig (meaningful in Header / Sequence) ----
+    name_bytes: Vec<u8>,
+    /// Set once the name's first word ends (at whitespace); the rest of the header is skipped.
+    name_done: bool,
+    /// Byte offset of the contig's first base (`faidx.5` OFFSET).
+    seq_offset: u64,
+    length: u64,
+    contig_md5: Md5,
+    /// The first sequence line's bases; fixes the geometry every later line must match.
+    /// `None` until the first line completes.
+    line_bases0: Option<u64>,
+    line_width0: u64,
+    cur_line_bases: u64,
+    cur_line_width: u64,
+    /// A line shorter than `line_bases0` was seen; only the *last* line may be short, so a
+    /// further sequence line after one is a non-uniform-geometry error (spec §3.8, T3).
+    short_line_seen: bool,
+
+    /// Uppercased bases batched before feeding the MD5s (one `update` per full window
+    /// instead of per byte). Reused across the whole pass.
+    upper: Vec<u8>,
+}
+
+impl<'a> FastaPass<'a> {
+    fn new(path: &'a Path) -> Self {
+        FastaPass {
+            path,
+            pos: 0,
+            mode: PassMode::Start,
+            at_line_start: true,
+            reference_md5: Md5::new(),
+            contigs: Vec::new(),
+            seen_names: HashSet::new(),
+            name_bytes: Vec::new(),
+            name_done: false,
+            seq_offset: 0,
+            length: 0,
+            contig_md5: Md5::new(),
+            line_bases0: None,
+            line_width0: 0,
+            cur_line_bases: 0,
+            cur_line_width: 0,
+            short_line_seen: false,
+            upper: Vec::with_capacity(FASTA_PASS_BUFFER_SIZE),
+        }
+    }
+
+    fn push_byte(&mut self, b: u8) -> Result<(), ReferenceInfoError> {
+        match self.mode {
+            PassMode::Start => {
+                if b == b'>' {
+                    self.begin_header();
+                } else if b <= 0x20 {
+                    // Tolerate leading blank lines / whitespace before the first header.
+                    if b == b'\n' {
+                        self.at_line_start = true;
+                    }
+                } else {
+                    return Err(self.malformed("sequence data before the first '>' header"));
+                }
+            }
+            PassMode::Header => {
+                if b == b'\n' {
+                    // A definition with an empty name is malformed (spec §5 T3).
+                    if self.name_bytes.is_empty() {
+                        return Err(self.malformed("definition line has an empty contig name"));
+                    }
+                    // The definition line ends; the next byte is the contig's first base.
+                    self.seq_offset = self.pos + 1;
+                    self.mode = PassMode::Sequence;
+                    self.at_line_start = true;
+                    self.cur_line_bases = 0;
+                    self.cur_line_width = 0;
+                } else if !self.name_done {
+                    // The name is the first word (spec §5 T7): stop at whitespace.
+                    if b == b' ' || b == b'\t' || b == b'\r' {
+                        self.name_done = true;
+                    } else {
+                        self.name_bytes.push(b);
+                    }
+                }
+                // else: past the name, inside the description — skipped until '\n'.
+            }
+            PassMode::Sequence => {
+                if self.at_line_start && b == b'>' {
+                    // This contig ends and a new one begins.
+                    self.finalize_contig()?;
+                    self.begin_header();
+                } else if b == b'\n' {
+                    self.cur_line_width += 1;
+                    self.complete_line(false)?;
+                    self.at_line_start = true;
+                } else {
+                    self.at_line_start = false;
+                    self.cur_line_width += 1;
+                    // The single predicate (spec §3.4/§4): a base is `[0x21, 0x7E]`
+                    // (printable, non-space). `\r`, spaces and tabs fall out of the count
+                    // and out of the MD5 for free.
+                    if (0x21..=0x7e).contains(&b) {
+                        self.cur_line_bases += 1;
+                        self.length += 1;
+                        self.push_base(b);
+                    }
+                }
+            }
+        }
+        self.pos += 1;
+        Ok(())
+    }
+
+    /// Start a new contig's header (the `>` has just been seen but is not part of the name).
+    fn begin_header(&mut self) {
+        self.mode = PassMode::Header;
+        self.at_line_start = false;
+        self.name_bytes.clear();
+        self.name_done = false;
+        self.length = 0;
+        self.line_bases0 = None;
+        self.line_width0 = 0;
+        self.cur_line_bases = 0;
+        self.cur_line_width = 0;
+        self.short_line_seen = false;
+        self.contig_md5 = Md5::new();
+    }
+
+    /// Feed one base byte (already known to be `[0x21, 0x7E]`), uppercased, to both digests
+    /// — batched so the MD5s see one `update` per full window, not one per byte.
+    fn push_base(&mut self, b: u8) {
+        self.upper.push(b.to_ascii_uppercase());
+        if self.upper.len() == self.upper.capacity() {
+            self.flush_md5();
+        }
+    }
+
+    fn flush_md5(&mut self) {
+        if !self.upper.is_empty() {
+            self.contig_md5.update(&self.upper);
+            self.reference_md5.update(&self.upper);
+            self.upper.clear();
+        }
+    }
+
+    /// A sequence line has ended (`\n`, or `is_last` at EOF). Fix or check the geometry: the
+    /// first line sets it; every later line must match it, except the last, which may be
+    /// shorter (`faidx.c` — "Different line length in sequence", spec §3.8/§4).
+    fn complete_line(&mut self, is_last: bool) -> Result<(), ReferenceInfoError> {
+        match self.line_bases0 {
+            None => {
+                self.line_bases0 = Some(self.cur_line_bases);
+                self.line_width0 = self.cur_line_width;
+            }
+            Some(lb0) => {
+                if self.cur_line_bases > lb0 {
+                    return Err(self.malformed(&format!(
+                        "line has {} bases, more than the first line's {lb0}",
+                        self.cur_line_bases
+                    )));
+                }
+                if !is_last {
+                    if self.short_line_seen {
+                        return Err(self.malformed(
+                            "a line shorter than the first was not the last line of the contig",
+                        ));
+                    }
+                    if self.cur_line_bases < lb0 {
+                        self.short_line_seen = true;
+                    } else if self.cur_line_width != self.line_width0 {
+                        // A full interior line whose width changed = a mid-contig terminator
+                        // change (e.g. LF→CR-LF); caught here, not silently reconstructed.
+                        return Err(self.malformed(&format!(
+                            "line width {} differs from the first line's {}",
+                            self.cur_line_width, self.line_width0
+                        )));
+                    }
+                }
+            }
+        }
+        self.cur_line_bases = 0;
+        self.cur_line_width = 0;
+        Ok(())
+    }
+
+    /// Emit the current contig. Flushes its bases, rejects an empty contig (T3) and a
+    /// duplicate name (T2), and records name/length/geometry/md5 in file order.
+    fn finalize_contig(&mut self) -> Result<(), ReferenceInfoError> {
+        self.flush_md5();
+        if self.length == 0 {
+            return Err(self.malformed("empty contig (no sequence bases)"));
+        }
+        // A contig with bases always has a completed line (the `\n` before the next `>`, or
+        // the last-line completion at EOF), so this is an internal invariant — but the
+        // module never panics on a supplied reference (spec §5 T3), so it surfaces as an
+        // error rather than an `expect`.
+        let Some(line_bases) = self.line_bases0 else {
+            return Err(self.malformed("contig has bases but no completed sequence line"));
+        };
+        let digest: [u8; 16] = std::mem::replace(&mut self.contig_md5, Md5::new())
+            .finalize()
+            .into();
+        let name = String::from_utf8_lossy(&self.name_bytes).into_owned();
+        if !self.seen_names.insert(name.clone()) {
+            return Err(ReferenceInfoError::DuplicateContigName {
+                path: self.path.to_path_buf(),
+                name,
+            });
+        }
+        self.contigs.push(ContigInfo {
+            name,
+            length: self.length,
+            offset: self.seq_offset,
+            line_bases,
+            line_width: self.line_width0,
+            md5: Some(digest),
+        });
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<ReferenceInfo, ReferenceInfoError> {
+        match self.mode {
+            // An empty file (or whitespace only): no contigs, the digest of nothing.
+            PassMode::Start => {}
+            PassMode::Header => {
+                return Err(self.malformed("contig header not followed by any sequence"));
+            }
+            PassMode::Sequence => {
+                if self.cur_line_width > 0 {
+                    // A last line with no trailing newline.
+                    self.complete_line(true)?;
+                }
+                self.finalize_contig()?;
+            }
+        }
+        let digest: [u8; 16] = self.reference_md5.finalize().into();
+        Ok(ReferenceInfo {
+            md5: Some(digest),
+            contigs: self.contigs,
+        })
+    }
+
+    fn malformed(&self, detail: &str) -> ReferenceInfoError {
+        ReferenceInfoError::MalformedFasta {
+            path: self.path.to_path_buf(),
+            contig: (!self.name_bytes.is_empty())
+                .then(|| String::from_utf8_lossy(&self.name_bytes).into_owned()),
+            byte_offset: self.pos,
+            detail: detail.to_string(),
+        }
     }
 }
 
@@ -723,5 +1057,200 @@ mod tests {
             read_reference_info(ReferenceSource::Fai(missing)).unwrap_err(),
             ReferenceInfoError::FaiRead { .. }
         ));
+    }
+
+    // =================================================================
+    // B (B1+B2) — the FASTA streaming pass (`Fasta { fai: None }`), and
+    //      its samtools/`.cat`/`faidx.5` oracle (spec §4, §3.4, §3.8).
+    // =================================================================
+
+    fn hex_to_md5(hex: &str) -> [u8; 16] {
+        let mut out = [0u8; 16];
+        for (i, byte) in out.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).expect("hex digit pair");
+        }
+        out
+    }
+
+    fn write_bytes_fasta(bytes: &[u8]) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("ref.fa");
+        std::fs::write(&path, bytes).expect("write fasta");
+        (dir, path)
+    }
+
+    fn read_fasta_none(path: PathBuf) -> Result<ReferenceInfo, ReferenceInfoError> {
+        read_reference_info(ReferenceSource::Fasta {
+            fasta: path,
+            fai: None,
+        })
+    }
+
+    #[test]
+    fn fasta_pass_reconstructs_the_golden_index_and_per_contig_md5() {
+        let info = read_fasta_none(golden_ref_path()).expect("golden FASTA parses");
+        assert_eq!(info.contigs.len(), GOLDEN.len());
+        for (got, g) in info.contigs.iter().zip(GOLDEN.iter()) {
+            assert_eq!(got.name, g.name);
+            assert_eq!(got.length, g.length, "LN for {}", g.name);
+            assert_eq!(got.offset, g.offset, "offset for {}", g.name);
+            assert_eq!(got.line_bases, g.line_bases);
+            assert_eq!(got.line_width, g.line_width);
+            // The per-contig MD5 equals `samtools dict`'s @SQ M5 (spec §3.4).
+            assert_eq!(got.md5, Some(hex_to_md5(g.md5_hex)), "M5 for {}", g.name);
+        }
+    }
+
+    #[test]
+    fn fasta_pass_reference_md5_matches_the_golden_cat_header() {
+        use crate::ssr::catalog::io::CatalogReader;
+        let info = read_fasta_none(golden_ref_path()).unwrap();
+        let cat_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/data/tandem_repeat/golden.ssr_catalog.bed.gz");
+        let reader = CatalogReader::new(std::fs::File::open(cat_path).unwrap()).unwrap();
+        let expected = reader.header().reference_md5.clone();
+        let got = crate::pop_var_caller::common::format_md5_hex(info.md5.unwrap());
+        assert_eq!(
+            got, expected,
+            "whole-reference digest vs the golden .cat header"
+        );
+    }
+
+    #[test]
+    fn fasta_pass_reproduces_the_faidx5_worked_example() {
+        // The strongest geometry check: reconstruct the man-page vector byte-for-byte, under
+        // both line endings (spec §3.8). CR-LF falls out of `line_width - line_bases`.
+        for (crlf, index) in [(false, WORKED_INDEX_LF), (true, WORKED_INDEX_CRLF)] {
+            let (_dir, path) = write_bytes_fasta(&build_worked_example(crlf));
+            let info = read_fasta_none(path).unwrap();
+            assert_eq!(info.contigs.len(), 2, "crlf={crlf}");
+            for (got, (name, length, offset, lb, lw)) in info.contigs.iter().zip(index) {
+                assert_eq!(got.name, name, "crlf={crlf}");
+                assert_eq!(
+                    (got.length, got.offset, got.line_bases, got.line_width),
+                    (length, offset, lb, lw),
+                    "contig {name} crlf={crlf}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fasta_pass_per_contig_md5_matches_one_shot() {
+        // Streaming MD5 == the one-shot `Md5::digest` of the filtered, uppercased bases —
+        // production's own streaming-matches-one-shot check, over the golden reference.
+        let info = read_fasta_none(golden_ref_path()).unwrap();
+        let file = std::fs::File::open(golden_ref_path()).unwrap();
+        let mut reader = noodles_fasta::io::Reader::new(std::io::BufReader::new(file));
+        for (rec, got) in reader.records().zip(info.contigs.iter()) {
+            let rec = rec.unwrap();
+            let upper: Vec<u8> = rec
+                .sequence()
+                .as_ref()
+                .iter()
+                .filter(|&&b| (0x21..=0x7e).contains(&b))
+                .map(|b| b.to_ascii_uppercase())
+                .collect();
+            let one_shot: [u8; 16] = Md5::digest(&upper).into();
+            assert_eq!(
+                got.md5,
+                Some(one_shot),
+                "one-shot vs streaming for {}",
+                got.name
+            );
+        }
+    }
+
+    #[test]
+    fn fasta_pass_space_and_tab_hash_as_absent() {
+        // The predicate edge that distinguishes our rule from production's (spec §3.4/§6):
+        // a sequence line carrying a space and a tab hashes as if they were not there, and
+        // they count toward neither `line_bases` nor `length`.
+        let (_d1, with_ws) = write_bytes_fasta(b">sp\nACG T\tACG\n");
+        let (_d2, control) = write_bytes_fasta(b">ctl\nACGTACG\n");
+        let a = read_fasta_none(with_ws).unwrap();
+        let b = read_fasta_none(control).unwrap();
+        assert_eq!(a.contigs[0].length, 7, "space and tab are not bases");
+        assert_eq!(a.contigs[0].line_bases, 7);
+        assert_eq!(
+            a.contigs[0].md5, b.contigs[0].md5,
+            "the space/tab line hashes identically to the clean one"
+        );
+    }
+
+    #[test]
+    fn fasta_pass_rejects_bases_before_the_first_header() {
+        let (_dir, path) = write_bytes_fasta(b"ACGT\n>c\nACGT\n");
+        match read_fasta_none(path).unwrap_err() {
+            ReferenceInfoError::MalformedFasta { detail, contig, .. } => {
+                assert!(detail.contains("before the first"), "detail: {detail}");
+                assert_eq!(contig, None, "no contig header seen yet");
+            }
+            other => panic!("expected MalformedFasta, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fasta_pass_rejects_a_non_uniform_interior_line() {
+        // A short interior line followed by another line — the short one was not last (T3).
+        let (_dir, path) = write_bytes_fasta(b">c\nACGTAC\nACG\nACGTAC\n");
+        assert!(matches!(
+            read_fasta_none(path).unwrap_err(),
+            ReferenceInfoError::MalformedFasta { .. }
+        ));
+    }
+
+    #[test]
+    fn fasta_pass_rejects_an_empty_contig() {
+        let (_dir, path) = write_bytes_fasta(b">a\n>b\nACGT\n");
+        match read_fasta_none(path).unwrap_err() {
+            ReferenceInfoError::MalformedFasta { detail, contig, .. } => {
+                assert!(detail.contains("empty contig"), "detail: {detail}");
+                assert_eq!(contig.as_deref(), Some("a"));
+            }
+            other => panic!("expected MalformedFasta, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fasta_pass_rejects_a_compressed_reference() {
+        // gzip magic → a clean CompressedReference, not compressed bytes misread as FASTA.
+        let (_dir, path) = write_bytes_fasta(&[0x1f, 0x8b, 0x08, 0x00, 0x00]);
+        assert!(matches!(
+            read_fasta_none(path).unwrap_err(),
+            ReferenceInfoError::CompressedReference { .. }
+        ));
+    }
+
+    #[test]
+    fn fasta_pass_rejects_a_duplicate_contig_name() {
+        let (_dir, path) = write_bytes_fasta(b">dup\nACGT\n>dup\nTTTT\n");
+        match read_fasta_none(path).unwrap_err() {
+            ReferenceInfoError::DuplicateContigName { name, .. } => assert_eq!(name, "dup"),
+            other => panic!("expected DuplicateContigName, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fasta_pass_rejects_an_empty_contig_name() {
+        // T3: a definition line with no name (here `>` then a space) is malformed.
+        let (_dir, path) = write_bytes_fasta(b"> desc only\nACGT\n");
+        match read_fasta_none(path).unwrap_err() {
+            ReferenceInfoError::MalformedFasta { detail, .. } => {
+                assert!(detail.contains("empty contig name"), "detail: {detail}");
+            }
+            other => panic!("expected MalformedFasta, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fasta_pass_handles_a_last_line_without_a_trailing_newline() {
+        // A full last line at EOF (no `\n`) must still index correctly (length/geometry).
+        let (_dir, path) = write_bytes_fasta(b">c\nACGT\nACGT\nAC");
+        let info = read_fasta_none(path).unwrap();
+        assert_eq!(info.contigs.len(), 1);
+        assert_eq!(info.contigs[0].length, 10);
+        assert_eq!(info.contigs[0].line_bases, 4);
+        assert_eq!(info.contigs[0].line_width, 5);
     }
 }
