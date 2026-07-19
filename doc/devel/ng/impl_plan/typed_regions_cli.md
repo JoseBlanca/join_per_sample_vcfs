@@ -85,7 +85,7 @@ Move the fn (and its `#[cfg(test)]`) from `src/main.rs` into a library module bo
 `main.rs` now calls the hoisted one. No behaviour change — the existing test stays green. *Source:*
 spec T7a, arch §6. *Depends:* A1.
 
-**A3. Re-aim the B2 dependency guard.**  ☐
+**A3. Re-aim the B2 dependency guard.**  ✅
 `rg 'use crate::ng' src/ --glob '!src/ng/**'` gains `--glob '!src/pop_var_caller_exp/**'` (wherever
 the guard lives). Confirm production still names nothing in ng. *Source:* spec T7, arch §6. *Depends:*
 A1.
