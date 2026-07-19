@@ -20,6 +20,7 @@ mod scanner_parity;
 pub mod raw_chrom_reader;
 pub mod read;
 pub mod ref_seq;
+pub mod reference_info;
 pub mod region_typing;
 pub mod tandem_repeat;
 pub mod types;

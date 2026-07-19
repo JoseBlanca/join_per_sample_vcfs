@@ -25,6 +25,10 @@ by document kind:
   - [`ref_seq.md`](spec/ref_seq.md) — the `RefSeq` reference-sequence accessor
     (foundational infra: resident + streaming + in-memory impls). Read filtering #8 and
     the pileup depend on it.
+  - [`reference_info.md`](spec/reference_info.md) — reading a reference's info (contig table +
+    content digest + reconstructed index) from a FASTA (optionally checked against a `.fai`) or
+    a `.fai` alone; with the MD5s, the fasta↔fai check, a caller-held cache, and a `.fai` writer.
+    Builds the `ContigList` every `RefSeq` impl takes but none can build.
 - **`arch/`** — architecture (the shared types and the interfaces implementations
   plug into).
   - [`ng_step_interfaces.md`](arch/ng_step_interfaces.md) — the common domain
@@ -38,6 +42,9 @@ by document kind:
   - [`typed_regions_cli.md`](arch/typed_regions_cli.md) — the `pop_var_caller_exp` /
     `type-regions` types & interfaces (the CLI that drives step 3); companion to
     `spec/typed_regions_cli.md`.
+  - [`reference_info.md`](arch/reference_info.md) — the reference-info reader's types &
+    interfaces (`ReferenceInfo`/`ContigInfo`, the cache, the writer, the background verify);
+    companion to `spec/reference_info.md`. Foundational infra, not a step.
 - **`impl_plan/`** — step-by-step implementation plans (build order, not new design).
   - [`foundations.md`](impl_plan/foundations.md) — the first ng code: skeleton,
     `types.rs` seed, and the `RefSeq` accessor (three impls).
@@ -48,6 +55,8 @@ by document kind:
   - [`typed_regions_cli.md`](impl_plan/typed_regions_cli.md) — the `pop_var_caller_exp` /
     `type-regions` build order: binary skeleton, `--min-copies` parser, output writer, and
     the `run_typed_regions` driver.
+  - [`reference_info.md`](impl_plan/reference_info.md) — the reference-info reader: types →
+    `.fai` reader → FASTA pass (the heart) → writer → cache → the two entry points.
 
 This mirrors the repo-wide `doc/devel/{specs,architecture,implementation_plans}`
 convention but scoped to ng, so the growing set of ng docs stays together.
