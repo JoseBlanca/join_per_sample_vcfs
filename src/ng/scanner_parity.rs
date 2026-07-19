@@ -45,9 +45,9 @@
 //!
 //! [`catalog_prefilter`] is that policy, kept here **verbatim as trf-mod's
 //! shape**. Note ng has since ported it properly, with the floors as a real knob,
-//! to [`crate::ng::region_typing::admission::prefilter`] — this copy stays frozen
+//! to [`crate::ng::region_typing::segment_criteria::prefilter`] — this copy stays frozen
 //! against the golden path rather than tracking ng's, so that the two oracles stay
-//! independent: if ng's prefilter drifts, `admission`'s own differential says so,
+//! independent: if ng's prefilter drifts, `classification`'s own differential says so,
 //! and this one keeps measuring the scanner against trf-mod.
 
 use std::fs::File;

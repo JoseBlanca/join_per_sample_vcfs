@@ -195,12 +195,12 @@ pub trait RawRefSeq: RefSeq {
 /// # Provenance, not convenience (`typed_regions.md` §2.6)
 ///
 /// This trait exists for one caller with one need. The typed-region walk must tell
-/// `admit` how long a contig *really* is, and that number cannot be derived from the
+/// `classify` how long a contig *really* is, and that number cannot be derived from the
 /// window in hand: a slice mistaken for a chromosome makes every flank clamp at the
 /// window edge, which silently throws away every locus within `flank_bp` of every
 /// boundary — a different set for every `window_bp`, and no error either way.
 ///
-/// `admit` guards what arithmetic can catch, and its guard is **inherently
+/// `classify` guards what arithmetic can catch, and its guard is **inherently
 /// incomplete**: a caller passing the window's own end as `contig_len` is
 /// arithmetically legal. No signature can close that; only *provenance* can — the
 /// length must be **read from the reference's table**, and the walk is the only
@@ -820,8 +820,8 @@ mod tests {
     }
 
     /// `contigs()` hands back the reference's own table — the **provenance** the
-    /// walk needs to tell `admit` a contig's true length (typed_regions.md §2.6).
-    /// `admit`'s own guard cannot catch a caller who passes the window's end as
+    /// walk needs to tell `classify` a contig's true length (typed_regions.md §2.6).
+    /// `classify`'s own guard cannot catch a caller who passes the window's end as
     /// `contig_len`; reading the length from here is what rules that out.
     /// **B2's payoff: a coordinate past `u32` is reported, not clamped.**
     ///
@@ -1167,8 +1167,8 @@ mod tests {
     }
 
     /// `contigs()` hands back the reference's own table — the **provenance** the
-    /// walk needs to tell `admit` a contig's true length (typed_regions.md §2.6).
-    /// `admit`'s guard cannot catch a caller who passes the *window's* end as
+    /// walk needs to tell `classify` a contig's true length (typed_regions.md §2.6).
+    /// `classify`'s guard cannot catch a caller who passes the *window's* end as
     /// `contig_len`, because that is arithmetically legal; reading the length from
     /// here is what rules it out. Hence an accessor on the walk's substrate, not a
     /// getter for its own sake.

@@ -5,7 +5,7 @@
 //! read-filtering module ([`read`]), the tandem-repeat scanner primitive
 //! ([`tandem_repeat`], a shared sequence primitive — types-and-scaffold stage),
 //! and step 3's typed-region generator ([`region_typing`] — Milestone A, the
-//! admission port).
+//! segment-criteria port).
 //!
 //! **Production is frozen.** ng is a from-scratch caller: it does not edit
 //! `src/ssr/` or `src/regions.rs`, and it does not depend on trf-mod. Where ng

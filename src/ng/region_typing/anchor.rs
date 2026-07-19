@@ -187,7 +187,7 @@ fn kinds(regions: &[TypedRegion]) -> Vec<&'static str> {
     regions
         .iter()
         .map(|r| match &r.kind {
-            RegionKind::SsrLocus(_) => "locus",
+            RegionKind::SsrSegment(_) => "locus",
             RegionKind::SsrBundle { .. } => "bundle",
             RegionKind::Generic => "generic",
             RegionKind::Satellite => "satellite",
@@ -212,7 +212,7 @@ fn on_contig(regions: &[TypedRegion], contig: ContigId) -> Vec<TypedRegion> {
 /// The walk at the catalog's settings must reproduce the catalog: every golden locus is
 /// present, **or** absent *and* inside a satellite run. A strict subset, and that shape is
 /// earned by spec §2.4's ordering — the cap applies to the *cleaned* coverage, after
-/// admission, so the difference can only go one way.
+/// classification, so the difference can only go one way.
 ///
 /// The oracle is the committed **trf-mod-built** golden catalog: a different detector, a
 /// different code path, nothing ng touched. Overlap matching, inherited from
@@ -255,7 +255,7 @@ fn the_walk_reproduces_the_golden_catalog_through_the_shipping_stack() {
     // or this starts failing the first time someone moves a floor and reads a *result*
     // as a bug.
     let config = TypedRegionConfig {
-        admission: crate::ng::region_typing::admission::SsrAdmissionParams {
+        criteria: crate::ng::region_typing::segment_criteria::SsrSegmentCriteria {
             min_purity: cat_params.min_purity,
             min_score: cat_params.min_score,
             flank_bp: u64::from(cat_params.flank_bp),
@@ -287,7 +287,7 @@ fn the_walk_reproduces_the_golden_catalog_through_the_shipping_stack() {
     let ours: Vec<(String, u64, u64)> = regions
         .iter()
         .filter_map(|r| match &r.kind {
-            RegionKind::SsrLocus(l) => Some((name_of(r.region.contig), l.start(), l.end())),
+            RegionKind::SsrSegment(l) => Some((name_of(r.region.contig), l.start(), l.end())),
             _ => None,
         })
         .collect();
@@ -536,7 +536,7 @@ fn the_edge_cases_hold_on_a_multi_contig_reference() {
 
     // **The control.** The same tract, the same settings, flanks either side: a locus. So
     // every "not a locus" above is the contig's end doing its job, and not a tract that was
-    // never going to be admitted (D1's satellite test taught this the hard way).
+    // never going to be classified (D1's satellite test taught this the hard way).
     let fifth = on_contig(&regions, ContigId(4));
     assert_eq!(
         kinds(&fifth),

@@ -130,7 +130,7 @@ pub struct ScanParams {
     ///
     /// `u32`, not `u64`: this is a **count**, not a coordinate or a length, so
     /// spec §4's widening does not reach it (the same reason ids stay `u32`, and
-    /// matching `region_typing::admission::MinCopies`).
+    /// matching `region_typing::segment_criteria::MinCopies`).
     pub min_copies: u32,
 }
 
@@ -287,6 +287,27 @@ pub enum ScanError {
 /// A tandem-repeat match requires **both** compared bases to canonicalise equal (so an
 /// `N == N` never matches — the two `None`s are not equal by this function's use).
 #[inline]
+/// Whether `motif` is **primitive** — it does not tile under any shorter period that
+/// divides its length. `AAA` is not (it tiles under `A`); `ATAT` is not (tiles under
+/// `AT`); `AT` and `CAG` are. A period-1 motif is always primitive. Case-insensitive,
+/// matching the scan's own base comparison, so a soft-masked homopolymer still reduces.
+///
+/// This is what makes [`find_tandem_repeats`] honour its period range on each tract's
+/// *true* period: a non-primitive motif is an alias of a shorter-period repeat, and the
+/// shorter one is what the caller asked about.
+fn is_primitive_motif(motif: &[u8]) -> bool {
+    let p = motif.len();
+    for q in 1..p {
+        if !p.is_multiple_of(q) {
+            continue; // only proper *divisors* of p can tile it exactly
+        }
+        if (q..p).all(|i| canonical_base(motif[i]) == canonical_base(motif[i - q])) {
+            return false; // tiles under its first q bases → not primitive
+        }
+    }
+    true
+}
+
 fn canonical_base(b: u8) -> Option<u8> {
     match b {
         b'A' | b'a' => Some(b'A'),
@@ -369,10 +390,19 @@ fn maximal_scoring_subsequences(
 /// it to the 0-based half-open tract it certifies, and emits it when its implied copy
 /// count clears `params.min_copies`. Pure and total over arbitrary bytes; deterministic.
 ///
-/// Returns raw, possibly-overlapping intervals — one region can match at several periods,
-/// and the finder does **not** de-duplicate periods or resolve overlaps; that is a
-/// consumer's job (spec §1, §3.5). Per-period results are start-sorted; across periods
-/// they are concatenated (period-ascending).
+/// **Each repeat is reported once, at its true period** — the scanner honours its
+/// interface, and both mechanisms it uses are pure geometry (no significance policy):
+/// - a **non-primitive motif** is dropped at emission (`AA` reduces to `A`), so a
+///   homopolymer is period 1, never a period-2 alias of itself;
+/// - a **period-multiple re-detection of the same tract** is dropped in a post-pass:
+///   a `(GAA)` period-3 repeat also matches, sloppily, as a period-6 `AAGATG` — a
+///   primitive 6-mer the motif check keeps, but the period-3 detection *covers most of
+///   it*, so it is the same tract seen worse.
+///
+/// The "covers most" test is what keeps this out of policy: a genuine shorter repeat
+/// that merely *sits inside* a longer one (the `AAA` inside `(GAAA)*n`) covers only a
+/// sliver of it, so it is **not** treated as a re-detection — both are kept, and which
+/// is significant is the consumer's copy-floor call, not the scanner's.
 pub fn find_tandem_repeats(
     seq: &[u8],
     periods: PeriodRange,
@@ -398,7 +428,14 @@ pub fn find_tandem_repeats(
             let tract_start = k0 as u64;
             let tract_end = (k1 + p + 1) as u64;
             let copies = (tract_end - tract_start) / u64::from(period);
-            if copies >= u64::from(params.min_copies) {
+            // Emit only PRIMITIVE-period repeats — honour the requested period range on
+            // the tract's true period, not on a non-primitive alias. `AAAAAA` tiles under
+            // `AA`, so it is *detected* at period 2, but its motif `AA` reduces to `A`
+            // (period 1): it is a homopolymer, not a dinucleotide, and reporting it as
+            // period 2 would be the scanner failing its own contract. The caller asked for
+            // period 2; a period-1 tract dressed as period 2 is not that.
+            let motif = &seq[tract_start as usize..tract_start as usize + p];
+            if copies >= u64::from(params.min_copies) && is_primitive_motif(motif) {
                 out.push(RepeatInterval {
                     start: tract_start,
                     end: tract_end,
@@ -408,7 +445,30 @@ pub fn find_tandem_repeats(
             }
         });
     }
-    out
+
+    // Drop a period-multiple re-detection of the same tract. `iv` (the longer period) is
+    // redundant iff a shorter period `a` divides it and **covers at least half of it** —
+    // "covers most" is what says *same tract*, not merely *overlapping*. A phase-shifted
+    // period-6 `AAGATG` over a period-3 `GAA` is covered ~90% and goes; a period-1 `AAA`
+    // sitting inside a period-4 `(GAAA)` covers a sliver and stays (a genuinely different,
+    // smaller repeat — the copy floor, downstream, decides if it is significant). No
+    // copy-number policy here: purely how much of `iv` the shorter `a` explains.
+    out.sort_by_key(|iv| (iv.period, iv.start));
+    let mut kept: Vec<RepeatInterval> = Vec::with_capacity(out.len());
+    for iv in out {
+        let iv_len = iv.end - iv.start;
+        let redundant = kept.iter().any(|a| {
+            if a.period >= iv.period || !iv.period.is_multiple_of(a.period) {
+                return false;
+            }
+            let overlap = a.end.min(iv.end).saturating_sub(a.start.max(iv.start));
+            overlap * 2 >= iv_len // ≥ 50% of the longer tract
+        });
+        if !redundant {
+            kept.push(iv);
+        }
+    }
+    kept
 }
 
 // ---------------------------------------------------------------------
@@ -536,7 +596,7 @@ fn tile(
 ///
 /// That shape is what lets the two consumers differ where they must and agree
 /// where they must not. `RegionScanner` applies the rules to the raw detections;
-/// the typed-region walk applies them to its **pre-filtered** ones (`admission::
+/// the typed-region walk applies them to its **pre-filtered** ones (`segment_criteria::
 /// prefilter`, which the scanner must not know about — this module holds no
 /// consumer policy). Pre-computed fields would have forced the walk to either
 /// accept raw-derived coverage — capping detector noise, which spec §2.4 forbids —
@@ -553,7 +613,7 @@ pub struct ScannedWindow {
     /// The slice actually fetched and scanned, `[start, end)`, 0-based: the core
     /// plus a `max_repeat_len` margin each side, **clamped to the contig**.
     ///
-    /// Public because the walk fetches these same bases for itself — admission needs
+    /// Public because the walk fetches these same bases for itself — classification needs
     /// the sequence, which a scan result does not carry — and must not compute the
     /// range independently: that arithmetic is this module's rule, and two copies of
     /// it are two copies that can drift.
@@ -580,7 +640,7 @@ pub struct ScannedWindow {
     /// **Order: period-major, then ascending start** — inherited from
     /// [`find_tandem_repeats`], which scans one period at a time. It is **not**
     /// start-sorted, and neither is the concatenation across windows. A consumer
-    /// that needs coordinate order must sort; `admit` and `prefilter` both do, and
+    /// that needs coordinate order must sort; `classify` and `prefilter` both do, and
     /// `build_regions` re-sorts. Stated because the type is public and the ordering
     /// is not what a reader would assume.
     pub detections: Vec<RepeatInterval>,
@@ -744,7 +804,7 @@ pub fn scan_window(
 /// It is the primitive the **typed-region generator** stands on
 /// (`typed_regions.md` §6.1): that walk cannot use [`RegionScanner`], because
 /// `RegionScanner` merges coverage and classifies satellites **before any
-/// admission policy can run**, on raw permissive intervals, with nowhere to inject
+/// classification policy can run**, on raw permissive intervals, with nowhere to inject
 /// the pre-filter between detection and merge. The layer underneath it fits
 /// exactly — this one — because it does the genuinely hard part (core + margin,
 /// coverage clipped to cores, intervals attributed by start) and takes **no
@@ -776,7 +836,7 @@ pub fn scan_window(
 /// readers, which §6's 14.6 GB lesson forbids. A closure lets both pass their own
 /// bytes through **one** copy of the window rules.
 ///
-/// Only *admission* needs raw, incidentally: detection is case-insensitive and
+/// Only *classification* needs raw, incidentally: detection is case-insensitive and
 /// non-ACGT never matches, so `find_tandem_repeats` gives the same answer either
 /// way. That is why nothing before the walk tripped on this.
 ///
@@ -1189,19 +1249,82 @@ mod tests {
     /// An (AT)*n tract matches at period 2 **and** its multiples 4 and 6 — all emitted;
     /// the finder does not de-duplicate periods (spec §3.5).
     #[test]
-    fn multiples_of_the_fundamental_period_are_all_emitted() {
+    fn only_the_primitive_period_is_emitted() {
+        // (AT)*10 tiles under `AT` (period 2), `ATAT` (4) and `ATATAT` (6), so the scorer
+        // matches at all three. But its *primitive* period is 2, and the scanner honours
+        // its contract: it emits the tract once, at period 2 — not as a period-4 or
+        // period-6 alias, which are the same repeat wearing a longer motif.
         let seq = b"ATATATATATATATATATAT"; // (AT)*10, 20 bp
         let got = find_tandem_repeats(seq, p(2, 6), &ScanParams::default());
         let periods: std::collections::BTreeSet<u8> = got.iter().map(|r| r.period).collect();
-        assert!(
-            periods.contains(&2),
-            "fundamental period 2 present: {got:?}"
+        assert_eq!(
+            periods,
+            std::collections::BTreeSet::from([2]),
+            "only the primitive period 2, no 4/6 aliases (nor 3/5 non-divisors): {got:?}"
         );
-        assert!(periods.contains(&4), "multiple period 4 present: {got:?}");
-        assert!(periods.contains(&6), "multiple period 6 present: {got:?}");
+    }
+
+    /// A genuine period-4 primitive (`ACGT`) is emitted at 4, not mistaken for an alias.
+    #[test]
+    fn a_genuine_higher_primitive_period_is_kept() {
+        let seq = b"ACGTACGTACGTACGT"; // (ACGT)*4 — primitive period 4
+        let got = find_tandem_repeats(seq, p(2, 6), &ScanParams::default());
         assert!(
-            !periods.contains(&3) && !periods.contains(&5),
-            "no match at non-divisor periods 3/5: {got:?}"
+            got.iter().any(|r| r.period == 4),
+            "ACGT is a primitive period-4 motif and must survive: {got:?}"
+        );
+        assert!(
+            got.iter().all(|r| r.period != 2 && r.period != 3),
+            "it does not tile under any shorter period, so no 2/3 detection: {got:?}"
+        );
+    }
+
+    /// A homopolymer is a period-1 tract and nothing else — never a di/tri/… alias.
+    #[test]
+    fn a_homopolymer_is_only_period_one() {
+        let seq = b"AAAAAAAAAAAAAAAAAAAA"; // poly-A, 20 bp
+        let got = find_tandem_repeats(seq, p(1, 6), &ScanParams::default());
+        let periods: std::collections::BTreeSet<u8> = got.iter().map(|r| r.period).collect();
+        assert_eq!(
+            periods,
+            std::collections::BTreeSet::from([1]),
+            "a poly-A is period 1 only — the whole aliasing problem, gone at the source: {got:?}"
+        );
+        // And asked for period 2+ only, the scanner returns nothing for it — the contract.
+        let got2 = find_tandem_repeats(seq, p(2, 6), &ScanParams::default());
+        assert!(
+            got2.is_empty(),
+            "asked for period 2..6, a homopolymer is not any of them: {got2:?}"
+        );
+    }
+
+    /// **A phase-shifted period-multiple re-detection is dropped; a repeat that merely
+    /// sits inside another is kept.** This is the geometry test — the scanner resolves
+    /// same-tract redundancy by *how much* the shorter covers the longer, no copy floor.
+    #[test]
+    fn a_period_multiple_re_detection_is_dropped_by_geometry() {
+        // A (GAA)*n repeat with a couple of stray bases before it: the scanner finds
+        // the clean period-3, and also a sloppy period-6 that starts earlier (motif
+        // `AAGATG`). The period-3 covers most of the period-6, so the period-6 goes.
+        let seq = b"ATGAAGAAGAAGAAGAAGAAGAAGAAGAAGAAGAAG";
+        let got = find_tandem_repeats(seq, p(2, 6), &ScanParams::default());
+        assert!(
+            got.iter().any(|r| r.period == 3),
+            "the primitive period-3 GAA survives: {got:?}"
+        );
+        assert!(
+            !got.iter().any(|r| r.period == 6),
+            "the period-6 re-detection of the same tract is dropped: {got:?}"
+        );
+
+        // A homopolymer INSIDE a higher-period motif is a different, smaller repeat that
+        // covers only a sliver — it must NOT eliminate its parent. (GAAA)*n has an `AAA`
+        // run in every unit; the period-4 tetranucleotide must survive them.
+        let seq = b"GAAAGAAAGAAAGAAAGAAAGAAAGAAAGAAA"; // (GAAA)*8
+        let got = find_tandem_repeats(seq, p(1, 6), &ScanParams::default());
+        assert!(
+            got.iter().any(|r| r.period == 4),
+            "the period-4 (GAAA) survives its own internal AAA homopolymer runs: {got:?}"
         );
     }
 
@@ -1280,9 +1403,13 @@ mod tests {
     }
 
     #[test]
-    fn overlapping_periods_merge_into_one_repeat_carrying_all() {
-        // (AT)*10 matches at periods 2, 4 and 6 — three overlapping intervals, one Repeat.
-        let seq = b"ATATATATATATATATATAT"; // 20 bp
+    fn adjacent_repeats_of_different_periods_merge_into_one_region() {
+        // An (AT)*8 tract abutting a (CAG)*5 tract: two primitive repeats (period 2 and 3)
+        // whose coverage abuts, so the region tiling merges them into one `Repeat` region
+        // carrying both intervals. (Before the primitive-period fix this test used (AT)*10's
+        // 2/4/6 aliases to exercise the merge; a real repeat is now needed, because aliases
+        // no longer exist.)
+        let seq = b"ATATATATATATATATCAGCAGCAGCAGCAG"; // (AT)*8 then (CAG)*5
         let regions = regions_of(seq, p(2, 6), &SegmentOptions::default());
         assert_tiles(&regions, seq.len() as u64);
         let repeats: Vec<_> = regions
@@ -1295,9 +1422,10 @@ mod tests {
         assert_eq!(repeats.len(), 1, "one merged repeat region: {regions:?}");
         let periods: std::collections::BTreeSet<u8> =
             repeats[0].intervals.iter().map(|iv| iv.period).collect();
-        assert!(
-            periods.contains(&2) && periods.contains(&4) && periods.contains(&6),
-            "the merged region carries all overlapping periods: {:?}",
+        assert_eq!(
+            periods,
+            std::collections::BTreeSet::from([2, 3]),
+            "the merged region carries both PRIMITIVE periods, no aliases: {:?}",
             repeats[0].intervals
         );
     }
