@@ -67,7 +67,7 @@ with its tests.
 
 ### Milestone A — types + the cheap (`.fai`) reader
 
-**A1. Types + module scaffold.**  ☐
+**A1. Types + module scaffold.**  ✅
 `pub mod reference_info;` in `ng/mod.rs`; the data types `ContigInfo`, `ReferenceInfo` (+ the
 `contig_list()` projection), `ReferenceSource`, and the `#[non_exhaustive]` `ReferenceInfoError`
 (all variants, per-variant docs). Nouns/errors only, no logic. *Source:* arch §1.
