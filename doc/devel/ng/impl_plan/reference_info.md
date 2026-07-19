@@ -122,7 +122,7 @@ unchanged); a reordering caught by the digest (T1). *Depends:* B1. *Source:* spe
 
 ### Milestone C — the `.fai` writer
 
-**C1. `write_fai`.**  ☐  **Own commit, do not bundle.**
+**C1. `write_fai`.**  ✅  **Own commit, do not bundle.**
 Five-column `faidx.5` from `&[ContigInfo]` (`md5` ignored), written **atomically** (`.tmp` + rename).
 **Silent** (a wrong byte is a wrong index). Tests: **byte-identical to the committed `samtools faidx`
 `.fai`**; round-trip (`write_fai` → read back as `Fasta { Some }` verifies clean — a `read→write→read`

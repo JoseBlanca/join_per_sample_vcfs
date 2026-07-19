@@ -17,14 +17,15 @@
 //! Landed so far: the data types and the cheap `.fai` reader (Milestone A), and the
 //! from-byte-zero FASTA streaming pass (Milestone B) — `Fasta { fai: None }` reconstructs
 //! geometry + per-contig and whole-reference MD5 in one buffer; `Fasta { fai: Some }` reads
-//! the same and proves the supplied `.fai` describes the same genome (spec §3.3).
+//! the same and proves the supplied `.fai` describes the same genome (spec §3.3). And
+//! `write_fai` writes a `.fai` byte-identical to `samtools faidx`, atomically (Milestone C).
 
 use crate::fasta::{ContigEntry, ContigList};
 use md5::{Digest, Md5};
 use std::collections::HashSet;
 use std::fs::File;
 use std::io;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------------
@@ -733,6 +734,45 @@ pub fn sibling_fai_path(fasta: &Path) -> PathBuf {
     let mut buf = fasta.as_os_str().to_owned();
     buf.push(".fai");
     PathBuf::from(buf)
+}
+
+// ---------------------------------------------------------------------
+// The `.fai` writer
+// ---------------------------------------------------------------------
+
+/// Write a `.fai` from contig info — the five-column `faidx.5` form (`md5` ignored, a `.fai`
+/// has no MD5 column), **byte-identical to `samtools faidx`**: five TAB-separated columns,
+/// one `\n`-terminated line per contig, no trailing blank line. The real use is indexing a
+/// FASTA that lacks a `.fai` (spec §3.9).
+///
+/// Written **atomically** — a sibling temp file, then a rename over `out` — because a
+/// half-written `.fai` is silently valid (no header, no checksum, nothing a reader would
+/// reject), so every later run would trust a truncated index. The temp file is a sibling so
+/// the rename stays on one filesystem (a cross-device rename is not atomic), and on any
+/// failure it is removed, leaving `out` untouched.
+pub fn write_fai(contigs: &[ContigInfo], out: &Path) -> io::Result<()> {
+    use std::fmt::Write as _;
+    let mut text = String::new();
+    for c in contigs {
+        // name \t length \t offset \t line_bases \t line_width — the five faidx.5 columns.
+        // `writeln!` emits `\n` (never `\r\n`), matching samtools on every platform.
+        writeln!(
+            text,
+            "{}\t{}\t{}\t{}\t{}",
+            c.name, c.length, c.offset, c.line_bases, c.line_width
+        )
+        .expect("formatting into a String is infallible");
+    }
+
+    let dir = out
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+    tmp.write_all(text.as_bytes())?;
+    tmp.flush()?;
+    tmp.persist(out).map_err(|e| e.error)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1462,5 +1502,57 @@ mod tests {
             ReferenceInfoError::FaiRead { .. }
         ));
         drop(dir);
+    }
+
+    // =================================================================
+    // C1 — write_fai (spec §3.9): byte-identical to samtools, atomic.
+    // =================================================================
+
+    #[test]
+    fn write_fai_is_byte_identical_to_samtools() {
+        // The oracle: a `.fai` we write is indistinguishable from the committed
+        // `samtools faidx` one for the golden reference.
+        let info = read_fasta_none(golden_ref_path()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out.fai");
+        write_fai(&info.contigs, &out).unwrap();
+        let ours = std::fs::read(&out).unwrap();
+        let samtools = std::fs::read(sibling_fai_path(&golden_ref_path())).unwrap();
+        assert_eq!(
+            ours, samtools,
+            "write_fai must equal samtools faidx byte-for-byte"
+        );
+    }
+
+    #[test]
+    fn write_fai_round_trip_is_a_fixpoint() {
+        // read → write → read: the `.fai` we write verifies clean against its own FASTA.
+        let c1 = bases(150);
+        let c2 = bases(85);
+        let (_dir, fasta, _fai) = write_wrapped_fasta(&[("c1", &c1), ("c2", &c2)], 60);
+        let info = read_fasta_none(fasta.clone()).unwrap();
+        let out_dir = tempfile::tempdir().unwrap();
+        let out = out_dir.path().join("ref.fa.fai");
+        write_fai(&info.contigs, &out).unwrap();
+        read_fasta_with_fai(fasta, out).expect("write_fai output verifies against its FASTA");
+    }
+
+    #[test]
+    fn write_fai_is_atomic_no_partial_file_on_failure() {
+        // The atomic writer only ever creates `out` by renaming a fully-written temp file,
+        // so a failure at any point leaves no partial `.fai`. Force the rename to fail by
+        // making `out` an existing directory (renaming a file over a directory is rejected
+        // even for root, so this holds in the container too).
+        let info = read_fasta_none(golden_ref_path()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("occupied");
+        std::fs::create_dir(&out).unwrap();
+
+        let result = write_fai(&info.contigs, &out);
+        assert!(result.is_err(), "renaming over a directory must fail");
+        assert!(out.is_dir(), "out is untouched — no partial .fai replaced it");
+        // The temp file was cleaned up on failure — only the directory remains.
+        let entries = std::fs::read_dir(dir.path()).unwrap().count();
+        assert_eq!(entries, 1, "no leftover temp file after a failed write");
     }
 }
