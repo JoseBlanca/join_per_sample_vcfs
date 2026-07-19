@@ -17,6 +17,7 @@
 //! **Milestone A** landed here so far: the data types, and the cheap `.fai` reader.
 
 use crate::fasta::{ContigEntry, ContigList};
+use std::collections::HashSet;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -125,9 +126,11 @@ pub enum ReferenceSource {
 #[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
 pub enum ReferenceInfoError {
-    /// The `.fai` index could not be read — missing, unreadable, or malformed enough that
-    /// `noodles_fasta::fai::fs::read` rejected it (the `Fai` arm, and the `.fai` half of a
-    /// `Fasta { fai: Some }` read).
+    /// The `.fai` index could not be read: missing, unreadable, malformed enough that
+    /// `noodles_fasta::fai::fs::read` rejected it, or it parsed but failed ng's field
+    /// guards (`line_bases > 0`, `line_width >= line_bases` — the `ContigFai::validate`
+    /// checks, copied). The `source` carries the specifics (contig + reason for a guard
+    /// failure). The `Fai` arm, and the `.fai` half of a `Fasta { fai: Some }` read.
     #[error("failed to read .fai index {path:?}")]
     FaiRead {
         path: PathBuf,
@@ -196,6 +199,116 @@ pub enum ReferenceInfoError {
         #[source]
         source: io::Error,
     },
+}
+
+// ---------------------------------------------------------------------
+// The reader
+// ---------------------------------------------------------------------
+
+/// Read a reference. **Pure** — no shared state, no memoisation, no filesystem probing
+/// beyond opening the paths it was handed; every call does the full work the source names
+/// (spec §3.1). A single-call consumer calls this directly; one that reads a reference
+/// repeatedly or from several threads holds a `ReferenceInfoCache` (Milestone D) instead.
+///
+/// Milestone A implements the cheap `Fai` arm; the `Fasta` streaming pass lands in
+/// Milestone B (spec §4).
+pub fn read_reference_info(source: ReferenceSource) -> Result<ReferenceInfo, ReferenceInfoError> {
+    match source {
+        ReferenceSource::Fai(path) => read_fai(&path),
+        ReferenceSource::Fasta { .. } => {
+            // The from-byte-zero streaming pass (geometry + MD5) is Milestone B.
+            todo!("the Fasta streaming pass lands in Milestone B (spec §4)")
+        }
+    }
+}
+
+/// The `Fai` arm: parse a `.fai` into `ContigInfo`s (`md5: None` — a `.fai` has no MD5
+/// column). Names, order, lengths and geometry only, at the cost of one small file read
+/// (spec §3.1). Rejects a FASTQ index (six columns, §3.8), a duplicate contig name (T2),
+/// and a `.fai` failing the field guards (T3).
+fn read_fai(path: &Path) -> Result<ReferenceInfo, ReferenceInfoError> {
+    // Detect a FASTQ index (six columns) *before* the numeric parse. noodles splits each
+    // line into five fields (`splitn(5, '\t')`), so a sixth column is folded into
+    // `line_width` and rejected as a generic parse error — losing the diagnosis. htslib
+    // distinguishes the two indices the same way, by column count (spec §3.8).
+    let text = std::fs::read_to_string(path).map_err(|source| ReferenceInfoError::FaiRead {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    for line in text.lines().filter(|l| !l.is_empty()) {
+        if line.split('\t').count() >= 6 {
+            return Err(ReferenceInfoError::FastqIndex {
+                path: path.to_path_buf(),
+            });
+        }
+    }
+
+    // Reuse noodles for the authoritative numeric parse — the same call the rest of the
+    // tree makes (`raw_chrom_reader.rs`, `alignment_input.rs`).
+    let index =
+        noodles_fasta::fai::fs::read(path).map_err(|source| ReferenceInfoError::FaiRead {
+            path: path.to_path_buf(),
+            source,
+        })?;
+
+    let records: &[noodles_fasta::fai::Record] = index.as_ref();
+    let mut contigs = Vec::with_capacity(records.len());
+    let mut seen: HashSet<&[u8]> = HashSet::with_capacity(records.len());
+    for record in records {
+        let name_bytes = AsRef::<[u8]>::as_ref(record.name());
+        // T2: a duplicate contig name is rejected, not warned-and-dropped like htslib —
+        // ng resolves contigs by position, so dropping one renumbers every ContigId.
+        if !seen.insert(name_bytes) {
+            return Err(ReferenceInfoError::DuplicateContigName {
+                path: path.to_path_buf(),
+                name: String::from_utf8_lossy(name_bytes).into_owned(),
+            });
+        }
+        let name = String::from_utf8_lossy(name_bytes).into_owned();
+        let line_bases = record.line_bases();
+        let line_width = record.line_width();
+        // The field guards `ContigFai::validate` enforces (copied, spec §3.8): a
+        // `line_bases` of 0 divides by zero in every reader's offset arithmetic, and
+        // `line_width < line_bases` cannot hold (the width includes the terminator).
+        if line_bases == 0 {
+            return Err(fai_field_error(
+                path,
+                &name,
+                "line_bases = 0 (would divide-by-zero in offset arithmetic)".to_string(),
+            ));
+        }
+        if line_width < line_bases {
+            return Err(fai_field_error(
+                path,
+                &name,
+                format!(
+                    "line_width ({line_width}) < line_bases ({line_bases}) — line_width must \
+                     include the trailing newline"
+                ),
+            ));
+        }
+        contigs.push(ContigInfo {
+            name,
+            length: record.length(),
+            offset: record.offset(),
+            line_bases,
+            line_width,
+            md5: None,
+        });
+    }
+    Ok(ReferenceInfo { md5: None, contigs })
+}
+
+/// A `.fai` field-guard failure, as a `FaiRead` carrying a synthesised `InvalidData` error
+/// (the shape `RawChromReader` wraps `ContigFai::validate`'s error in).
+fn fai_field_error(path: &Path, contig: &str, detail: String) -> ReferenceInfoError {
+    ReferenceInfoError::FaiRead {
+        path: path.to_path_buf(),
+        source: io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("malformed .fai for contig {contig}: {detail}"),
+        ),
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -512,5 +625,103 @@ mod tests {
         }
         // T7: the second header carries a description; its name is the first word only.
         assert_eq!(WORKED_TWO_HEADER.split_whitespace().next().unwrap(), ">two");
+    }
+
+    // =================================================================
+    // A4 — read_reference_info, the `Fai` arm (spec §4 Fai arm, §3.8,
+    //      §5 T2/T3; arch §5).
+    // =================================================================
+
+    /// The FASTQ index from the `faidx.5` worked example — six columns (spec §3.8).
+    const WORKED_FASTQ_FAI: &str = "fastq1\t66\t8\t30\t31\t79\nfastq2\t28\t156\t14\t15\t188\n";
+
+    /// Write raw `.fai` text into a fresh tempdir; returns `(dir, fai_path)`.
+    fn write_fai_text(text: &str) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("ref.fa.fai");
+        std::fs::write(&path, text).expect("write .fai");
+        (dir, path)
+    }
+
+    #[test]
+    fn fai_arm_parses_the_committed_golden_fai() {
+        let info = read_reference_info(ReferenceSource::Fai(sibling_fai_path(&golden_ref_path())))
+            .expect("golden .fai parses");
+
+        // A `.fai`-only read carries no digests.
+        assert_eq!(info.md5, None);
+        assert_eq!(info.contigs.len(), GOLDEN.len());
+        for (got, g) in info.contigs.iter().zip(GOLDEN.iter()) {
+            assert_eq!(got.name, g.name);
+            assert_eq!(got.length, g.length);
+            assert_eq!(got.offset, g.offset);
+            assert_eq!(got.line_bases, g.line_bases);
+            assert_eq!(got.line_width, g.line_width);
+            assert_eq!(got.md5, None, "the Fai arm has no MD5 column to read");
+        }
+    }
+
+    #[test]
+    fn fai_arm_rejects_a_duplicate_contig_name() {
+        let (_dir, path) = write_fai_text("dup\t10\t5\t10\t11\ndup\t10\t22\t10\t11\n");
+        match read_reference_info(ReferenceSource::Fai(path)).unwrap_err() {
+            ReferenceInfoError::DuplicateContigName { name, .. } => assert_eq!(name, "dup"),
+            other => panic!("expected DuplicateContigName, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fai_arm_rejects_a_fastq_index() {
+        let (_dir, path) = write_fai_text(WORKED_FASTQ_FAI);
+        assert!(
+            matches!(
+                read_reference_info(ReferenceSource::Fai(path)).unwrap_err(),
+                ReferenceInfoError::FastqIndex { .. }
+            ),
+            "a six-column FASTQ index must be named, not misparsed",
+        );
+    }
+
+    #[test]
+    fn fai_arm_rejects_line_bases_zero() {
+        // `line_bases == 0` divides by zero downstream; the guard catches it (T3).
+        let (_dir, path) = write_fai_text("c\t10\t3\t0\t1\n");
+        match read_reference_info(ReferenceSource::Fai(path)).unwrap_err() {
+            ReferenceInfoError::FaiRead { source, .. } => {
+                assert!(
+                    source.to_string().contains("line_bases = 0"),
+                    "source detail: {source}"
+                );
+            }
+            other => panic!("expected FaiRead, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fai_arm_rejects_line_width_below_line_bases() {
+        // `line_width` must include the terminator, so it cannot be < `line_bases` (T3).
+        let (_dir, path) = write_fai_text("c\t10\t3\t10\t5\n");
+        match read_reference_info(ReferenceSource::Fai(path)).unwrap_err() {
+            ReferenceInfoError::FaiRead { source, .. } => {
+                assert!(
+                    source
+                        .to_string()
+                        .contains("line_width (5) < line_bases (10)"),
+                    "source detail: {source}"
+                );
+            }
+            other => panic!("expected FaiRead, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fai_arm_errors_on_a_missing_index() {
+        // T4: a `.fai` that does not open is an error, not a silent fall-back.
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("nope.fa.fai");
+        assert!(matches!(
+            read_reference_info(ReferenceSource::Fai(missing)).unwrap_err(),
+            ReferenceInfoError::FaiRead { .. }
+        ));
     }
 }

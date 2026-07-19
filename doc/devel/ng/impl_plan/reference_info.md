@@ -83,7 +83,7 @@ reference and **commit** the `M5`/`LN`/`.fai` values as constants, plus the `fai
 worked example as a second vector. Test infra — pairs with A4 and guards all of B/C. *Source:*
 arch §7, spec §6/§3.8.
 
-**A4. `read_reference_info` — the `Fai` arm.**  ☐
+**A4. `read_reference_info` — the `Fai` arm.**  ✅
 `ReferenceSource::Fai` → `noodles fai::fs::read` → `Vec<ContigInfo>` (`md5: None`); reject duplicate
 names (T2), a 6-column FASTQ index (§3.8), and a `.fai` failing the field guards (`line_bases > 0`,
 `line_width ≥ line_bases` — copy `ContigFai::validate`). Tests: parse the committed `.fai`, assert
