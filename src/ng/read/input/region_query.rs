@@ -45,7 +45,9 @@
 
 use std::fs::File;
 use std::io;
+use std::iter::FusedIterator;
 use std::path::Path;
+use std::sync::Arc;
 
 use noodles_bam as bam;
 use noodles_bgzf as bgzf;
@@ -53,9 +55,10 @@ use noodles_csi::BinningIndex;
 use noodles_csi::binning_index::index::reference_sequence::bin::Chunk;
 use noodles_sam as sam;
 
+use crate::bam::alignment_input::MappedRead;
 use crate::bam::index_preflight::AlignmentIndex;
-use crate::ng::read::filtering::{NoodlesRawRecord, RecordSource};
-use crate::ng::types::GenomeRegion;
+use crate::ng::read::filtering::{NoodlesRawRecord, ReadFilterError, RecordSource};
+use crate::ng::types::{ContigId, GenomePosition, GenomeRegion, Position};
 
 use super::AlignmentFileError;
 
@@ -249,8 +252,118 @@ impl RecordSource for BamRegionSource<'_> {
     }
 }
 
+/// Proves, while streaming, that the reads really do arrive in genome order.
+///
+/// Everything downstream is built on that, so it is **checked, not trusted**:
+/// the last emitted [`GenomePosition`] is kept, and a read whose key is
+/// **strictly less** than it is a hard [`AlignmentFileError::OutOfOrderRead`].
+/// There is no tolerance, no warning-and-continue, and no silent re-sort — an
+/// unsorted file is a fatal input error the user must see.
+///
+/// Four things fix the semantics (spec §3.2):
+///
+/// - **The key is `(contig, position)`**, so a position regression within a
+///   contig and a contig-order regression are one violation, not two checks.
+///   "Contig order" means the reference's, because the open gate proved
+///   `ref_id == ContigId`.
+/// - **Equal keys are legal.** Several reads may start at the same base; only a
+///   decrease is rejected.
+/// - **It sits on the *filtered* stream**, so the guarantee is about exactly
+///   the reads the caller sees. Dropped reads cannot break the monotonicity of
+///   what survives.
+/// - **The state lives here, in the per-region iterator, never on the handle.**
+///   A caller is entitled to query region B and then region A; that is a new
+///   forward scan, not a regression. Carrying the last key on the handle would
+///   turn legitimate random access into a spurious error.
+///
+/// This and the `@HD SO` check at open are complementary rather than redundant:
+/// the header check is cheap and fails before any work, while this one catches
+/// the file that *claims* to be sorted and is not — which the header check
+/// structurally cannot see.
+pub(crate) struct OrderVerified<I> {
+    inner: I,
+    /// The last key emitted, or `None` before the first read.
+    last: Option<GenomePosition>,
+    path: Arc<Path>,
+    /// Set on clean end of input or after an error is yielded, so the iterator
+    /// is fused: the first `Err` surfaces once and then `None`.
+    done: bool,
+}
+
+impl<I> OrderVerified<I> {
+    pub(crate) fn new(inner: I, path: Arc<Path>) -> Self {
+        Self {
+            inner,
+            last: None,
+            path,
+            done: false,
+        }
+    }
+}
+
+/// Where a read sits in the genome. Sound as a cross-file comparison key only
+/// because the open gate proved this file's `ref_id`s are the reference's
+/// `ContigId`s.
+fn key_of(read: &MappedRead) -> GenomePosition {
+    GenomePosition {
+        // PANIC-FREE: `ref_id` comes from a 32-bit field in both BAM and CRAM,
+        // so it fits by construction. Checked rather than `as`-cast because a
+        // wrapped value would collapse two contigs onto one key and silently
+        // disarm this guard — the one thing it must never do. Matches
+        // `filtering.rs`'s handling of the same value.
+        contig: ContigId(u32::try_from(read.ref_id).expect("ref_id fits u32")),
+        position: Position(read.pos),
+    }
+}
+
+impl<I> Iterator for OrderVerified<I>
+where
+    I: Iterator<Item = Result<MappedRead, ReadFilterError>>,
+{
+    type Item = Result<MappedRead, AlignmentFileError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+
+        match self.inner.next() {
+            None => {
+                self.done = true;
+                None
+            }
+            Some(Err(error)) => {
+                self.done = true;
+                Some(Err(AlignmentFileError::Filter(error)))
+            }
+            Some(Ok(read)) => {
+                let current = key_of(&read);
+                if let Some(previous) = self.last
+                    && current < previous
+                {
+                    self.done = true;
+                    return Some(Err(AlignmentFileError::OutOfOrderRead {
+                        path: self.path.to_path_buf(),
+                        previous,
+                        current,
+                    }));
+                }
+                self.last = Some(current);
+                Some(Ok(read))
+            }
+        }
+    }
+}
+
+impl<I> FusedIterator for OrderVerified<I> where
+    I: Iterator<Item = Result<MappedRead, ReadFilterError>>
+{
+}
+
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use noodles_sam::alignment::RecordBuf;
     use noodles_sam::alignment::record_buf::{QualityScores, Sequence};
     use tempfile::TempDir;
@@ -595,6 +708,232 @@ mod tests {
             BamRegionSource::new(reader, &header, &index, region(9, 1, 100), &path, 0),
             Err(AlignmentFileError::Region { .. })
         ));
+    }
+
+    // -----------------------------------------------------------------
+    // The order guard (C3) — T4a..T4d
+    // -----------------------------------------------------------------
+
+    /// A `MappedRead` at a genome position. Only `ref_id` and `pos` matter to
+    /// the guard, so the rest is minimal — the guard is a pure adapter over the
+    /// filtered stream and never looks at sequence or CIGAR.
+    fn read_at(qname: &str, ref_id: usize, pos: u64) -> MappedRead {
+        MappedRead {
+            qname: qname.as_bytes().to_vec(),
+            flag: 0,
+            ref_id,
+            pos,
+            mapq: 60,
+            cigar: Vec::new(),
+            seq: Vec::new(),
+            qual: Vec::new(),
+            mate_ref_id: None,
+            mate_pos: None,
+            adaptor_boundary: None,
+            source_file_index: 0,
+        }
+    }
+
+    fn planted_path() -> Arc<Path> {
+        Arc::from(Path::new("/data/planted.bam"))
+    }
+
+    /// An iterator that yields `None` and then **keeps going** — what a
+    /// non-fused inner looks like. `std::iter::from_fn` cannot model this,
+    /// because it fuses itself.
+    struct Resuming {
+        items: Vec<Option<Result<MappedRead, ReadFilterError>>>,
+        next_index: usize,
+    }
+
+    impl Iterator for Resuming {
+        type Item = Result<MappedRead, ReadFilterError>;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            let item = self.items.get_mut(self.next_index)?.take();
+            self.next_index += 1;
+            item
+        }
+    }
+
+    /// Drive the guard over a planted stream and collect what a caller would
+    /// see: the read names that surfaced, and the error if one did.
+    fn through_the_guard(
+        reads: Vec<MappedRead>,
+    ) -> (Vec<String>, Option<AlignmentFileError>, usize) {
+        let stream = reads.into_iter().map(Ok);
+        let mut guard = OrderVerified::new(stream, planted_path());
+
+        let mut names = Vec::new();
+        let mut error = None;
+        for item in &mut guard {
+            match item {
+                Ok(read) => names.push(String::from_utf8_lossy(&read.qname).into_owned()),
+                Err(e) => {
+                    error = Some(e);
+                    break;
+                }
+            }
+        }
+        // How many items the iterator yields *after* the error — must be zero,
+        // because the guard fuses.
+        let after = guard.count();
+        (names, error, after)
+    }
+
+    /// **T4a — a planted position regression is fatal.**
+    ///
+    /// The header can say `SO:coordinate` and the data can still be unsorted;
+    /// that is the case the open gate structurally cannot see. The error names
+    /// both keys, so the message can say *where* the file breaks rather than
+    /// only that it does.
+    ///
+    /// Mutation-verified: deleting the comparison in `OrderVerified::next`
+    /// makes this test fail, which is the whole point — a guard that never
+    /// fires looks exactly like a guard that works.
+    #[test]
+    fn t4a_a_position_regression_within_a_contig_is_an_error() {
+        let (names, error, after) = through_the_guard(vec![
+            read_at("a", 0, 100),
+            read_at("b", 0, 200),
+            read_at("c", 0, 150), // backwards
+            read_at("d", 0, 300),
+        ]);
+
+        assert_eq!(names, vec!["a", "b"], "the reads before the break flow");
+        match error.expect("the regression must be fatal") {
+            AlignmentFileError::OutOfOrderRead {
+                path,
+                previous,
+                current,
+            } => {
+                assert_eq!(previous.position.get(), 200);
+                assert_eq!(current.position.get(), 150);
+                // Asserted because `path` is a constructor argument: a wiring
+                // mistake at C4 would produce a correct-looking error naming
+                // the wrong file.
+                assert_eq!(path, PathBuf::from("/data/planted.bam"));
+            }
+            other => panic!("expected OutOfOrderRead, got {other:?}"),
+        }
+        assert_eq!(after, 0, "and the iterator fuses — no read after the error");
+    }
+
+    /// **T4b — a contig-order regression is the same violation.** The key is
+    /// `(contig, position)`, so a read on an earlier contig after a later one
+    /// is caught by the same comparison, even though its *position* went up.
+    #[test]
+    fn t4b_a_contig_order_regression_is_the_same_error() {
+        let (names, error, _) = through_the_guard(vec![
+            read_at("a", 1, 100),
+            read_at("b", 0, 900), // earlier contig, later position
+        ]);
+
+        assert_eq!(names, vec!["a"]);
+        match error.expect("a contig regression must be fatal") {
+            AlignmentFileError::OutOfOrderRead {
+                previous, current, ..
+            } => {
+                assert_eq!(previous.contig.get(), 1);
+                assert_eq!(current.contig.get(), 0);
+            }
+            other => panic!("expected OutOfOrderRead, got {other:?}"),
+        }
+    }
+
+    /// **T4c — equal keys are legal.** Several reads may start at the same
+    /// base; only a strict decrease is a violation. A guard using `<=` would
+    /// reject every pile-up in every real file.
+    #[test]
+    fn t4c_reads_sharing_a_start_position_are_not_a_regression() {
+        let (names, error, _) = through_the_guard(vec![
+            read_at("a", 0, 100),
+            read_at("b", 0, 100),
+            read_at("c", 0, 100),
+            read_at("d", 0, 101),
+        ]);
+
+        assert_eq!(names, vec!["a", "b", "c", "d"]);
+        assert!(error.is_none(), "equal positions are ordinary, not a fault");
+    }
+
+    /// **T4d — the check does not span queries.** A caller may query region B
+    /// and then region A; the second is a new forward scan, not a regression.
+    /// This is why the state lives in the iterator and never on the handle —
+    /// carrying it there would turn legitimate random access into a spurious
+    /// error.
+    #[test]
+    fn t4d_querying_a_later_region_then_an_earlier_one_is_not_a_regression() {
+        let (later, error, _) = through_the_guard(vec![read_at("b1", 0, 9000)]);
+        assert_eq!(later, vec!["b1"]);
+        assert!(error.is_none());
+
+        // A *separate* guard, as a second query gets — starting at position 10,
+        // far behind where the first one ended.
+        let (earlier, error, _) = through_the_guard(vec![read_at("a1", 0, 10)]);
+        assert_eq!(earlier, vec!["a1"]);
+        assert!(
+            error.is_none(),
+            "a new region query starts a new scan; it cannot regress against \
+             a previous one"
+        );
+
+        // And the fresh guard is *armed*, not merely permissive — a guard that
+        // had been silently disabled would also pass the assertion above.
+        let (_, error, _) = through_the_guard(vec![read_at("a1", 0, 10), read_at("a2", 0, 5)]);
+        assert!(
+            matches!(error, Some(AlignmentFileError::OutOfOrderRead { .. })),
+            "the second query's own guard still catches its own regression"
+        );
+    }
+
+    /// **The other half of the fuse.** `FusedIterator` is claimed without
+    /// requiring `I: FusedIterator`, so the latch has to hold against an inner
+    /// that returns `None` and then resumes — otherwise a read could reappear
+    /// after the stream was reported ended. Only the *error* path's fuse was
+    /// covered before; deleting `done = true` from the clean-exhaustion arm
+    /// left every test green.
+    #[test]
+    fn the_guard_stays_ended_even_if_what_it_wraps_resumes() {
+        let inner = Resuming {
+            items: vec![
+                Some(Ok(read_at("a", 0, 1))),
+                None,
+                Some(Ok(read_at("b", 0, 2))),
+            ],
+            next_index: 0,
+        };
+        let mut guard = OrderVerified::new(inner, planted_path());
+
+        assert!(matches!(guard.next(), Some(Ok(_))));
+        assert!(guard.next().is_none(), "the inner reported end of input");
+        assert!(
+            guard.next().is_none(),
+            "and the guard stays ended — the latch holds, not just the inner"
+        );
+    }
+
+    /// An error from the filter below is wrapped and fuses the stream, rather
+    /// than being mistaken for a clean end of input.
+    #[test]
+    fn a_filter_error_is_wrapped_and_fuses_the_guard() {
+        let stream = vec![
+            Ok(read_at("a", 0, 1)),
+            Err(ReadFilterError::Source(io::Error::other("planted"))),
+            Ok(read_at("b", 0, 2)),
+        ]
+        .into_iter();
+        let mut guard = OrderVerified::new(stream, planted_path());
+
+        assert!(matches!(guard.next(), Some(Ok(_))));
+        assert!(matches!(
+            guard.next(),
+            Some(Err(AlignmentFileError::Filter(_)))
+        ));
+        assert!(
+            guard.next().is_none(),
+            "fused: the read after the error is not reachable"
+        );
     }
 
     #[test]
