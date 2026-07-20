@@ -161,7 +161,7 @@ high-mismatch read is dropped — proves the full filter is composed in, not the
 counting wrapper). **Pin here:** the `counts()` mechanism under `&self` (per-handle tallies summed, or
 atomics) — arch §7 left it as an impl-time confirmation. *Depends:* C2, C3. *Source:* spec §3.2, arch §4.
 
-**C5. `CramRegionSource`.**  ☐
+**C5. `CramRegionSource`.**  ✅
 `.crai` walk with a **carried cursor or binary search** — not production's rescan-from-entry-0, which
 is O(n) per locus ([`segment_reader.rs:1043`](../../../../src/bam/segment_reader.rs)) — container
 decode, drop non-overlapping, container-level early stop. **Oracle (T8):** the same reads written as
