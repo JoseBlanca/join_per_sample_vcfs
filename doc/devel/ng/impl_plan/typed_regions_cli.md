@@ -130,7 +130,7 @@ then the `#`-prefixed column header. **No `date`, no `reference_md5`** (determin
 byte-identical across two calls; every config knob appears; `window_bp` present. *Source:* spec §3.4,
 §6; arch §5. *Depends:* B2.
 
-**C2. The row formatter + the T4 coordinate conversion.**  ☐ — **own commit, do not bundle; round-trip
+**C2. The row formatter + the T4 coordinate conversion.**  ✅ — **own commit, do not bundle; round-trip
 oracle green before and after.**
 `TypedRegion` → one BED row: typed columns with `.` for absent; `motif` via `str::from_utf8` on a bound
 `motif()` (T6); `copies` = `tract_len()/period()`, fractional (T5); `purity` from `purity_fraction()`;
