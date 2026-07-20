@@ -146,7 +146,7 @@ round-trip unit test over hand-built `Generic`/`Satellite`/`SsrSegment`/`SsrBund
 
 ### Milestone D — the fallible setup assembly
 
-**D1. Reference read + contig table + region set.**  ☐
+**D1. Reference read + contig table + region set.**  ✅
 `read_reference_verifying_or_creating_fai(&cache, args.reference.clone())?` (one held
 `Arc<ReferenceInfoCache>`) → `(Arc<ReferenceInfo>, Option<VerificationHandle>)`; keep the handle for
 E1. `info.contig_list()` → one `ContigList`, used **twice** (T8): `WindowedRefSeq::new` and

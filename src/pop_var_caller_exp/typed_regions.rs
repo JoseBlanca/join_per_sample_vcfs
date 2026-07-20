@@ -3,33 +3,41 @@
 //! struct, the `run_typed_regions` driver, and its `#[non_exhaustive]`
 //! error enum.
 //!
-//! **In progress (Milestone B complete).** The full knob surface — including
-//! the `--min-copies` table and its
-//! [parser](crate::pop_var_caller_exp::cli::parsers::parse_min_copies) — and the
-//! real error enum are here; `run_typed_regions` is wired in Milestone E.
+//! **In progress (Milestone D complete).** Here already: the full knob surface
+//! and its `--min-copies`
+//! [parser](crate::pop_var_caller_exp::cli::parsers::parse_min_copies); the
+//! error enum; the output writer ([`write_header`] + [`write_row`], including
+//! the T4 coordinate conversion); and the fallible setup
+//! ([`prepare_walk_inputs`]). Milestone E wires [`run_typed_regions`], which
+//! assembles the config, streams the rows, and joins the reference
+//! verification before publishing.
 //! See `doc/devel/ng/impl_plan/typed_regions_cli.md`.
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use clap::Args;
 use thiserror::Error;
 
 use crate::fasta::ContigList;
-use crate::ng::reference_info::ReferenceInfoError;
+use crate::ng::reference_info::{
+    ReferenceInfoCache, ReferenceInfoError, VerificationHandle,
+    read_reference_verifying_or_creating_fai,
+};
 use crate::ng::region_typing::segment_criteria::{
     DEFAULT_FLANK_BP, DEFAULT_MAX_PERIOD, DEFAULT_MIN_PERIOD, DEFAULT_MIN_PURITY,
     DEFAULT_MIN_SCORE, MAX_MOTIF_LEN, MinCopies, SsrSegmentCriteria,
 };
 use crate::ng::region_typing::{
-    DEFAULT_MAX_STR_LEN, DEFAULT_WINDOW_BP, RegionKind, TypedRegion, TypedRegionConfig,
-    TypedRegionError,
+    DEFAULT_MAX_STR_LEN, DEFAULT_WINDOW_BP, GenomeRegions, RegionKind, TypedRegion,
+    TypedRegionConfig, TypedRegionError,
 };
 use crate::ng::tandem_repeat::{
     DEFAULT_MATCH_REWARD, DEFAULT_MIN_COPIES, DEFAULT_MISMATCH_PENALTY, RepeatInterval, ScanParams,
 };
 use crate::ng::types::{ContigId, GenomeRegion};
-use crate::regions::BedError;
+use crate::regions::{BedError, ContigBounds};
 
 /// `type-regions` arguments — the authoritative knob list; `run_typed_regions`
 /// (Milestone E) translates it into a `TypedRegionConfig`. Every knob defaults
@@ -368,8 +376,112 @@ pub fn write_row<W: io::Write>(
     }
 }
 
-/// Run the walk and write the partition. Wired in Milestone E1; Milestones B–D
-/// build its inputs (the args surface, the output writer, the reference setup).
+// ---------------------------------------------------------------------
+// The fallible setup (spec T1, T2, T8; arch §4)
+// ---------------------------------------------------------------------
+
+/// The reference-derived inputs the walk needs, assembled once.
+///
+/// **Holds one [`ContigList`], which is the point** (spec T8). The walk's
+/// `over_regions` is fallible because a [`GenomeRegions`] was validated against
+/// *a* contig table and nothing ties that one to the reference's; if they
+/// disagree the failure is `UnknownContig(ContigId)`, which renders as an index,
+/// not a name. Feeding this one table to both `GenomeRegions` (here) and
+/// `WindowedRefSeq` (in the driver) makes that error unreachable — but only if
+/// the caller uses *this* list rather than reading the reference again.
+pub struct WalkInputs {
+    /// The reference's contig table — the one table, used twice.
+    pub contigs: ContigList,
+    /// What to emit. A BED chooses what is emitted, never what is scanned
+    /// (spec T10).
+    pub regions: GenomeRegions,
+    /// The background FASTA verification, when a `.fai` was read in the
+    /// foreground. **`join()` it before the output is published** (spec T1, §6) —
+    /// it is what catches a stale `.fai`, and joining after the rename would
+    /// publish a partition built against a wrong contig table.
+    pub verify: Option<VerificationHandle>,
+}
+
+/// Narrow the reference's contig lengths to the `u32` a [`RegionSet`] needs,
+/// **failing rather than folding** (spec T2).
+///
+/// `ContigEntry::length` is `u64`; `ContigBounds::length` is `u32`. The only
+/// precedent in the tree casts (`e.length as u32`) and it is a test. B2 deleted
+/// exactly that shape from ng and recorded the rule: a silent narrowing would
+/// make a >4 Gb contig report a wrong length, and a region set built on it would
+/// clamp spans to nonsense. A contig that large is unrepresentable to `RegionSet`
+/// whatever we do, so failing is the honest answer, not a limitation we chose.
+fn contig_bounds(contigs: &ContigList) -> Result<Vec<ContigBounds<'_>>, TypedRegionsCliError> {
+    contigs
+        .entries
+        .iter()
+        .map(|entry| {
+            let length =
+                u32::try_from(entry.length).map_err(|_| TypedRegionsCliError::ContigTooLong {
+                    contig: entry.name.clone(),
+                    len: entry.length,
+                })?;
+            Ok(ContigBounds {
+                name: &entry.name,
+                length,
+            })
+        })
+        .collect()
+}
+
+/// Read the reference and resolve what to emit — the walk's fallible setup.
+///
+/// The reference goes through `reference_info`'s batteries-included entry point
+/// (spec T1), which has two cases:
+///
+/// - ***`.fai` present*** → the index is read in the foreground (cheap, so the
+///   walk can start at once) and the FASTA is verified against it on a
+///   background thread, returning `Some(handle)`. A stale `.fai` is caught
+///   there rather than by producing a wrong partition.
+/// - ***`.fai` absent*** → the FASTA is read once, the sibling `.fai` is written
+///   so the next run takes the fast path, and `None` comes back. A `.fai`-write
+///   failure is fatal.
+///
+/// The `#[must_use]` handle is returned for the caller to join **before it
+/// publishes output**, never after.
+///
+/// **Known wart, on the error paths only.** If the region set fails to build
+/// (a bad BED, an over-long contig) after a `.fai` was read, the pending handle
+/// is dropped un-joined and `VerificationHandle`'s `Drop` prints its "dropped
+/// without join()" warning beside the real error. Nothing is published on those
+/// paths, so abandoning the check is legitimate — the warning is misleading, not
+/// a correctness problem. Joining instead would stall a *failing* run on a whole
+/// FASTA read, which is worse. A clean fix needs a way to abandon a handle
+/// deliberately (a `VerificationHandle::abandon`), which lives in
+/// `reference_info` rather than here.
+pub fn prepare_walk_inputs(
+    args: &TypedRegionsArgs,
+    cache: &Arc<ReferenceInfoCache>,
+) -> Result<WalkInputs, TypedRegionsCliError> {
+    let (info, verify) = read_reference_verifying_or_creating_fai(cache, args.reference.clone())?;
+    let contigs = info.contig_list();
+
+    // `bounds` borrows `contigs`; the region set owns its data, so the one table
+    // is free to travel on to `WindowedRefSeq` (T8). The block is for legibility
+    // — under NLL the borrow would end at `bounds`'s last use anyway.
+    let regions = {
+        let bounds = contig_bounds(&contigs)?;
+        match args.regions.as_deref() {
+            Some(bed) => GenomeRegions::from_bed_path(bed, &bounds)?,
+            None => GenomeRegions::whole_contigs(&bounds),
+        }
+    };
+
+    Ok(WalkInputs {
+        contigs,
+        regions,
+        verify,
+    })
+}
+
+/// Run the walk and write the partition. Wired in Milestone E1, which assembles
+/// the config, opens the reference, streams the rows, and joins `verify` before
+/// the atomic rename.
 pub fn run_typed_regions(_args: &TypedRegionsArgs) -> Result<(), TypedRegionsCliError> {
     todo!("run_typed_regions is implemented in Milestone E1")
 }
@@ -970,6 +1082,257 @@ mod tests {
             copies.fract() > 0.0,
             "the column is fractional, not truncated: {copies}"
         );
+    }
+
+    // ---- the fallible setup (spec T1, T2, T8) ---------------------------
+
+    /// A two-contig FASTA on disk, one line per contig, with **no** `.fai`.
+    /// Returns the temp dir (kept alive by the caller) and the FASTA path.
+    fn write_test_fasta() -> (tempfile::TempDir, PathBuf) {
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fasta = dir.path().join("ref.fa");
+        let mut file = std::fs::File::create(&fasta).expect("create the FASTA");
+        writeln!(file, ">chr1").expect("write");
+        writeln!(file, "{}", "ACGTACGTAC".repeat(10)).expect("write"); // 100 bp
+        writeln!(file, ">chr2").expect("write");
+        writeln!(file, "{}", "TTGGCCAATT".repeat(5)).expect("write"); // 50 bp
+        (dir, fasta)
+    }
+
+    fn args_for(reference: &Path, regions: Option<PathBuf>) -> TypedRegionsArgs {
+        let mut argv = vec![
+            "pop_var_caller_exp".to_string(),
+            "type-regions".to_string(),
+            "--reference".to_string(),
+            reference.display().to_string(),
+            "--output".to_string(),
+            "out.tsv".to_string(),
+        ];
+        if let Some(bed) = regions {
+            argv.push("--regions".to_string());
+            argv.push(bed.display().to_string());
+        }
+        let cli = Cli::try_parse_from(argv).expect("the args parse");
+        let PopVarCallerExpCommand::TypeRegions(args) = cli.cmd;
+        args
+    }
+
+    /// **T2 — the contig-length narrowing fails rather than folds.** A contig
+    /// past `u32::MAX` is unrepresentable to a `RegionSet` whatever we do, so it
+    /// is an error naming the contig, not an `as` cast that silently reports a
+    /// wrong length.
+    #[test]
+    fn a_contig_longer_than_four_gb_is_rejected_by_name() {
+        let contigs = ContigList {
+            entries: vec![
+                ContigEntry {
+                    name: "small".to_string(),
+                    length: 1_000,
+                    md5: None,
+                },
+                ContigEntry {
+                    name: "huge".to_string(),
+                    length: u64::from(u32::MAX) + 1,
+                    md5: None,
+                },
+            ],
+        };
+        let err = contig_bounds(&contigs).expect_err("a >4 Gb contig must be refused");
+        match err {
+            TypedRegionsCliError::ContigTooLong { contig, len } => {
+                assert_eq!(contig, "huge", "the error names the offending contig");
+                assert_eq!(len, u64::from(u32::MAX) + 1, "and its real length");
+            }
+            other => panic!("expected ContigTooLong, got {other:?}"),
+        }
+    }
+
+    /// The boundary is exact: `u32::MAX` fits, one more does not.
+    #[test]
+    fn a_contig_of_exactly_u32_max_still_fits() {
+        let contigs = ContigList {
+            entries: vec![ContigEntry {
+                name: "edge".to_string(),
+                length: u64::from(u32::MAX),
+                md5: None,
+            }],
+        };
+        let bounds = contig_bounds(&contigs).expect("u32::MAX is representable");
+        assert_eq!(bounds[0].length, u32::MAX);
+    }
+
+    /// The whole-genome path builds one whole-contig span per contig.
+    ///
+    /// Asserts the **extents**, not merely which contigs appear: membership
+    /// alone would pass if `whole_contigs` produced 1-base spans, spans of the
+    /// wrong length, or spans in the wrong order. The fixture knows the answer
+    /// exactly (chr1 = 100 bp, chr2 = 50 bp), so it is asserted.
+    #[test]
+    fn the_whole_genome_path_covers_each_contig_end_to_end() {
+        let (_dir, fasta) = write_test_fasta();
+        let cache = Arc::new(ReferenceInfoCache::new());
+        let inputs =
+            prepare_walk_inputs(&args_for(&fasta, None), &cache).expect("the setup succeeds");
+
+        assert_eq!(
+            inputs.contigs.entries.len(),
+            2,
+            "both contigs are in the table"
+        );
+        let spans: Vec<(u32, u64, u64)> = inputs
+            .regions
+            .iter()
+            .map(|r| (r.contig.get(), r.start.get(), r.end.get()))
+            .collect();
+        assert_eq!(
+            spans,
+            vec![(0, 1, 100), (1, 1, 50)],
+            "one whole-contig span each, 1-based inclusive, in contig order"
+        );
+    }
+
+    /// The `--regions` path builds, and resolves BED names against **this**
+    /// contig table (T8) — a span named `chr2` comes back on the contig the
+    /// table calls `chr2`, not on index 0.
+    #[test]
+    fn a_bed_builds_regions_resolved_against_the_same_contig_table() {
+        use std::io::Write as _;
+        let (dir, fasta) = write_test_fasta();
+        let bed = dir.path().join("want.bed");
+        let mut file = std::fs::File::create(&bed).expect("create the BED");
+        writeln!(file, "chr2\t10\t40").expect("write");
+        drop(file);
+
+        let cache = Arc::new(ReferenceInfoCache::new());
+        let inputs =
+            prepare_walk_inputs(&args_for(&fasta, Some(bed)), &cache).expect("the setup succeeds");
+
+        let regions: Vec<_> = inputs.regions.iter().collect();
+        assert_eq!(regions.len(), 1, "one requested span: {regions:?}");
+        let contig_id = regions[0].contig.get() as usize;
+        assert_eq!(
+            inputs.contigs.entries[contig_id].name, "chr2",
+            "the BED's chrom resolved through the SAME table the walk will use (T8)"
+        );
+    }
+
+    /// **T8 — one table, used twice.** Every `ContigId` the region set carries
+    /// indexes the contig table the caller is handed, so the list that resolved
+    /// the regions is the same one that will open the reference. If they could
+    /// differ, the walk's failure would be `UnknownContig(ContigId)` — an index,
+    /// not a name.
+    /// **Tied by content, not by count.** A bare `id < entries.len()` bounds
+    /// check is true *by construction* — `whole_contigs` derives each id from
+    /// the slice index of whatever table it was handed — so it could never fail
+    /// and would still pass against a permuted table or a different reference's
+    /// table of the same size. Asserting each span's extent against *that entry's
+    /// length* is what a mismatched table actually breaks (chr1 100 vs chr2 50).
+    ///
+    /// The cross-module half of T8 — that E1 hands *this* list to
+    /// `WindowedRefSeq` — is not observable from inside `prepare_walk_inputs`;
+    /// this guards the in-function half.
+    #[test]
+    fn each_region_matches_the_returned_tables_entry() {
+        let (_dir, fasta) = write_test_fasta();
+        let cache = Arc::new(ReferenceInfoCache::new());
+        let inputs =
+            prepare_walk_inputs(&args_for(&fasta, None), &cache).expect("the setup succeeds");
+
+        let regions: Vec<_> = inputs.regions.iter().collect();
+        assert_eq!(
+            regions.len(),
+            inputs.contigs.entries.len(),
+            "one whole-contig span per table entry"
+        );
+        for region in &regions {
+            let entry = inputs
+                .contigs
+                .entries
+                .get(region.contig.get() as usize)
+                .expect("every ContigId indexes the returned table");
+            assert_eq!(
+                region.end.get(),
+                entry.length,
+                "the span on '{}' must run to that entry's own length — a permuted \
+                 or foreign table breaks here, where a bounds check would not",
+                entry.name
+            );
+        }
+    }
+
+    /// A BED naming a contig the reference does not have is a `Bed` error — the
+    /// one error arm of the setup that is neither the reference nor the
+    /// narrowing. `RegionSet` rejects it up front, which is what lets the walk
+    /// itself have so few failure modes.
+    ///
+    /// **Known noise on this path** (see `prepare_walk_inputs`): the background
+    /// verification handle is dropped un-joined here, so `VerificationHandle`'s
+    /// `Drop` prints its "dropped without join()" warning alongside the real
+    /// error. Nothing was published, so the abandonment is legitimate — the
+    /// warning is misleading rather than wrong.
+    #[test]
+    fn a_bed_naming_an_unknown_contig_is_a_bed_error() {
+        use std::io::Write as _;
+        let (dir, fasta) = write_test_fasta();
+        let bed = dir.path().join("unknown.bed");
+        let mut file = std::fs::File::create(&bed).expect("create the BED");
+        writeln!(file, "chrZ\t10\t40").expect("write");
+        drop(file);
+
+        let cache = Arc::new(ReferenceInfoCache::new());
+        // Matched rather than `expect_err`, which would need `Debug` on
+        // `WalkInputs` — and that would mean deriving it through a live thread
+        // handle for a test message.
+        match prepare_walk_inputs(&args_for(&fasta, Some(bed)), &cache) {
+            Err(TypedRegionsCliError::Bed(_)) => {}
+            Err(other) => panic!("expected a Bed error, got {other:?}"),
+            Ok(_) => panic!("a BED naming an absent contig must be refused"),
+        }
+    }
+
+    /// **T1, the `.fai`-absent case** — the reference is scanned once and the
+    /// sibling `.fai` is **written**, so the next run takes the fast path. No
+    /// handle comes back: there is nothing left to verify.
+    #[test]
+    fn an_absent_fai_is_created_beside_the_reference() {
+        let (_dir, fasta) = write_test_fasta();
+        // Ask the module for the convention rather than re-deriving it: a
+        // hand-built `with_extension` only happens to agree while the fixture is
+        // named `.fa`, and would silently check an unrelated path if renamed.
+        let fai = crate::ng::reference_info::sibling_fai_path(&fasta);
+        assert!(!fai.exists(), "the fixture starts without a .fai");
+
+        let cache = Arc::new(ReferenceInfoCache::new());
+        let inputs =
+            prepare_walk_inputs(&args_for(&fasta, None), &cache).expect("the setup succeeds");
+
+        assert!(fai.exists(), "the sibling .fai must be written: {fai:?}");
+        assert!(
+            inputs.verify.is_none(),
+            "a FASTA scanned in the foreground is already verified — nothing to join"
+        );
+    }
+
+    /// **T1, the `.fai`-present case** — the index is read in the foreground and
+    /// the FASTA is verified on a background thread, so a handle comes back for
+    /// the caller to join before publishing (§6).
+    #[test]
+    fn a_present_fai_returns_a_verification_handle() {
+        let (_dir, fasta) = write_test_fasta();
+        let cache = Arc::new(ReferenceInfoCache::new());
+        // First run writes the .fai.
+        prepare_walk_inputs(&args_for(&fasta, None), &cache).expect("the first run succeeds");
+
+        // Second run finds it, and verifies in the background.
+        let inputs =
+            prepare_walk_inputs(&args_for(&fasta, None), &cache).expect("the second run succeeds");
+        let handle = inputs
+            .verify
+            .expect("a .fai read in the foreground leaves a verification pending");
+        handle
+            .join()
+            .expect("the reference matches its own fresh .fai");
     }
 
     /// `--min-copies` is accepted when it carries exactly six values.
