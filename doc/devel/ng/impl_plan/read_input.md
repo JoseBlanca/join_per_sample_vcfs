@@ -153,7 +153,7 @@ through), **T4b** (contig-order regression), **T4c** (equal positions are legal)
 region B then region A is not a regression). The second silent failure: a guard that never fires
 looks exactly like a guard that works. *Depends:* A1, C2. *Source:* spec §3.2, arch §4.
 
-**C4. `reads_in_region(&self)` — the composed chain.**  ☐
+**C4. `reads_in_region(&self)` — the composed chain.**  ✅
 Source → `ReadFilter` (probe-free, buffers from the handle) → `OrderVerified` → `RegionReads`,
 returning the handle on `Drop` including on the error path; `counts()`. Tests **T9** (a #8
 high-mismatch read is dropped — proves the full filter is composed in, not the cheap subset),
