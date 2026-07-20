@@ -124,7 +124,7 @@ B2.
 
 ### Milestone C — the output writer (the heart)
 
-**C1. The header block.**  ☐
+**C1. The header block.**  ✅
 Write `## key: value` lines from the *resolved* `TypedRegionConfig` (every knob, fixed key order),
 then the `#`-prefixed column header. **No `date`, no `reference_md5`** (determinism). Unit test:
 byte-identical across two calls; every config knob appears; `window_bp` present. *Source:* spec §3.4,
