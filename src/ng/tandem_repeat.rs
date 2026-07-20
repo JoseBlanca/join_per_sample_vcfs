@@ -301,21 +301,47 @@ fn is_primitive_motif(motif: &[u8]) -> bool {
         if !p.is_multiple_of(q) {
             continue; // only proper *divisors* of p can tile it exactly
         }
-        if (q..p).all(|i| canonical_base(motif[i]) == canonical_base(motif[i - q])) {
+        if (q..p).all(|i| CANONICAL[motif[i] as usize] == CANONICAL[motif[i - q] as usize]) {
             return false; // tiles under its first q bases → not primitive
         }
     }
     true
 }
 
-fn canonical_base(b: u8) -> Option<u8> {
-    match b {
-        b'A' | b'a' => Some(b'A'),
-        b'C' | b'c' => Some(b'C'),
-        b'G' | b'g' => Some(b'G'),
-        b'T' | b't' => Some(b'T'),
-        _ => None,
-    }
+/// Canonical base for every byte: `A`/`C`/`G`/`T` in either case map to the uppercase
+/// base, and **everything else maps to `0`** — a sentinel no canonical base can equal.
+///
+/// This replaced a `match` (2026-07-20). The match was **54.7% of the walk's remaining
+/// self-time** once the two quadratics were gone, which is what a chain of comparisons
+/// costs when it runs twice per scored position: ~9.4 billion calls over tomato
+/// (2 × 6 periods × 782 Mb). A 256-byte table is one L1-resident load instead.
+///
+/// The `0` sentinel is what lets the table serve both callers, whose semantics differ:
+///
+/// - [`is_primitive_motif`] compared `Option`s, so two non-ACGT bytes compared **equal**
+///   (`None == None`). `0 == 0` preserves that.
+/// - the scoring closure in [`find_tandem_repeats`] required `(Some(a), Some(b))` with
+///   `a == b`, so a non-ACGT byte matched **nothing**, not even another one. The
+///   explicit `!= 0` guard in [`bases_match`] preserves that.
+static CANONICAL: [u8; 256] = {
+    let mut table = [0u8; 256];
+    table[b'A' as usize] = b'A';
+    table[b'a' as usize] = b'A';
+    table[b'C' as usize] = b'C';
+    table[b'c' as usize] = b'C';
+    table[b'G' as usize] = b'G';
+    table[b'g' as usize] = b'G';
+    table[b'T' as usize] = b'T';
+    table[b't' as usize] = b'T';
+    table
+};
+
+/// Do two bytes canonicalise to the **same ACGT base**? A non-ACGT byte matches nothing
+/// — an `N` beside an `N` is absence of evidence, not evidence of a repeat.
+#[inline]
+fn bases_match(x: u8, y: u8) -> bool {
+    let cx = CANONICAL[x as usize];
+    cx != 0 && cx == CANONICAL[y as usize]
 }
 
 /// One open segment in the Ruzzo–Tompa working stack: `l`/`r` are the cumulative score
@@ -466,12 +492,15 @@ pub fn find_tandem_repeats(
             continue; // no position has a partner `p` bases back
         }
         // Score index `k` (0-based over `p..n`) corresponds to position `j = k + p`.
-        let scores = (p..n).map(
-            |j| match (canonical_base(seq[j]), canonical_base(seq[j - p])) {
-                (Some(a), Some(b)) if a == b => i64::from(params.match_reward),
-                _ => -i64::from(params.mismatch_penalty),
-            },
-        );
+        let reward = i64::from(params.match_reward);
+        let penalty = -i64::from(params.mismatch_penalty);
+        let scores = (p..n).map(|j| {
+            if bases_match(seq[j], seq[j - p]) {
+                reward
+            } else {
+                penalty
+            }
+        });
         maximal_scoring_subsequences(scores, |k0, k1, score| {
             // Segment [k0, k1] → tract [k0, k1 + p + 1): the earliest base involved is
             // `j0 - p = k0`, the latest is `j1 = k1 + p`, so the exclusive end is `k1+p+1`.
