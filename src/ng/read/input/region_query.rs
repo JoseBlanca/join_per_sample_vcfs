@@ -26,23 +26,6 @@
 //! handle, so querying region B and then region A is a new forward scan rather
 //! than a spurious regression (spec §3.2).
 
-// This module's items are built by `reads_in_region`, which lands in step C4;
-// until then only its own tests construct them. `expect` rather than `allow`,
-// so once C4 makes everything live the expectation goes unfulfilled and the
-// build fails naming this line.
-//
-// Module-level rather than per-item because rustc reports the associated items
-// as one group, so per-item expectations go unfulfilled individually. The cost
-// is that a genuinely-dead *new* item would hide here for the one commit until
-// C4; the enforcement that matters — this attribute cannot outlive C4 — holds.
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "reads_in_region (C4) builds and drives this module"
-    )
-)]
-
 use std::fs::File;
 use std::io;
 use std::iter::FusedIterator;
@@ -90,19 +73,31 @@ pub(crate) struct BamRegionSource<'a> {
     done: bool,
 }
 
+/// What a region query resolves to before any reader is involved: which
+/// contig, and which chunks of the file to scan.
+///
+/// Split out from the source so **every fallible part of setting up a query
+/// happens before a reader is taken from the pool**. Taking the handle
+/// transfers the obligation to return it; a `?` after that point would lose a
+/// reader silently (`BorrowedReader::take`).
+pub(crate) struct RegionPlan {
+    chunks: Vec<Chunk>,
+    target_reference_sequence_id: usize,
+    region: GenomeRegion,
+}
+
 impl<'a> BamRegionSource<'a> {
-    /// Query the index for the region's chunks and prepare to scan them.
+    /// Resolve the region and query the index for its chunks.
     ///
     /// The index query happens here, once per region — an in-memory lookup on
-    /// the index parsed at open, never a re-parse (spec §3.3).
-    pub(crate) fn new(
-        reader: bam::io::Reader<bgzf::io::Reader<File>>,
-        header: &'a sam::Header,
+    /// the index parsed at open, never a re-parse (spec §3.3). No reader is
+    /// touched, so a failure costs nothing to recover from.
+    pub(crate) fn plan(
+        header: &sam::Header,
         index: &AlignmentIndex,
         region: GenomeRegion,
         path: &Path,
-        source_file_index: usize,
-    ) -> Result<Self, AlignmentFileError> {
+    ) -> Result<RegionPlan, AlignmentFileError> {
         let invalid_region = || AlignmentFileError::Region { region };
 
         let target_reference_sequence_id =
@@ -132,16 +127,31 @@ impl<'a> BamRegionSource<'a> {
             source,
         })?;
 
-        Ok(Self {
-            reader,
-            header,
-            chunks: chunks.into_iter(),
-            current_chunk_end: None,
+        Ok(RegionPlan {
+            chunks,
             target_reference_sequence_id,
             region,
+        })
+    }
+
+    /// Attach a reader to a plan. **Infallible**, which is what makes it safe
+    /// to call after the pooled handle has been taken.
+    pub(crate) fn new(
+        reader: bam::io::Reader<bgzf::io::Reader<File>>,
+        header: &'a sam::Header,
+        plan: RegionPlan,
+        source_file_index: usize,
+    ) -> Self {
+        Self {
+            reader,
+            header,
+            chunks: plan.chunks.into_iter(),
+            current_chunk_end: None,
+            target_reference_sequence_id: plan.target_reference_sequence_id,
+            region: plan.region,
             source_file_index,
             done: false,
-        })
+        }
     }
 
     /// Give the reader back, for the pool.
@@ -297,6 +307,46 @@ impl<I> OrderVerified<I> {
             last: None,
             path,
             done: false,
+        }
+    }
+
+    /// Unwrap, so the stream that owns this can reclaim what it lent.
+    pub(crate) fn into_inner(self) -> I {
+        self.inner
+    }
+}
+
+/// The region reader for whichever container the file is.
+///
+/// A [`RecordSource`] that delegates to the per-format source. BAM and CRAM are
+/// two containers for one idea, so this is an enum rather than a trait — and it
+/// is what lets everything above the source be written once, generic over
+/// neither format nor container (`arch/alignment_file.md` §4).
+pub(crate) enum RegionSource<'a> {
+    Bam(BamRegionSource<'a>),
+}
+
+impl RegionSource<'_> {
+    /// Give the reader back, in the shape the pool stores it.
+    pub(crate) fn into_reader(self) -> super::open_bam::ReaderKind {
+        match self {
+            Self::Bam(source) => super::open_bam::ReaderKind::Bam(source.into_reader()),
+        }
+    }
+}
+
+impl RecordSource for RegionSource<'_> {
+    type Record = NoodlesRawRecord;
+
+    fn header(&self) -> &sam::Header {
+        match self {
+            Self::Bam(source) => source.header(),
+        }
+    }
+
+    fn read_next(&mut self, buf: &mut NoodlesRawRecord) -> io::Result<bool> {
+        match self {
+            Self::Bam(source) => source.read_next(buf),
         }
     }
 }
@@ -505,8 +555,8 @@ mod tests {
             .expect("open bam");
         reader.read_header().expect("read header");
 
-        let mut source = BamRegionSource::new(reader, header, &index, region, path, 0)
-            .expect("build the source");
+        let plan = BamRegionSource::plan(header, &index, region, path).expect("plan the query");
+        let mut source = BamRegionSource::new(reader, header, plan, 0);
 
         let mut buf = NoodlesRawRecord::default();
         let mut names = Vec::new();
@@ -613,9 +663,12 @@ mod tests {
             .expect("open bam");
         reader.read_header().expect("read header");
 
-        let mut source =
-            BamRegionSource::new(reader, &header, &index, region(0, 1, 100_000), &path, 0)
-                .expect("source");
+        let mut source = BamRegionSource::new(
+            reader,
+            &header,
+            BamRegionSource::plan(&header, &index, region(0, 1, 100_000), &path).expect("plan"),
+            0,
+        );
 
         let mut buf = NoodlesRawRecord::default();
         let mut previous = 0u64;
@@ -647,8 +700,12 @@ mod tests {
             .expect("open bam");
         reader.read_header().expect("read header");
 
-        let mut source = BamRegionSource::new(reader, &header, &index, region(0, 1, 100), &path, 0)
-            .expect("source");
+        let mut source = BamRegionSource::new(
+            reader,
+            &header,
+            BamRegionSource::plan(&header, &index, region(0, 1, 100), &path).expect("plan"),
+            0,
+        );
 
         // Drain, then confirm the source latched `done` rather than running on.
         let mut buf = NoodlesRawRecord::default();
@@ -676,15 +733,23 @@ mod tests {
             .expect("open bam");
         reader.read_header().expect("read header");
 
-        let mut source = BamRegionSource::new(reader, &header, &index, region(0, 1, 100), &path, 0)
-            .expect("source");
+        let mut source = BamRegionSource::new(
+            reader,
+            &header,
+            BamRegionSource::plan(&header, &index, region(0, 1, 100), &path).expect("plan"),
+            0,
+        );
         let mut buf = NoodlesRawRecord::default();
         while source.read_next(&mut buf).expect("read") {}
 
         // Hand it back, then drive a second query with the very same reader.
         let reader = source.into_reader();
-        let mut second = BamRegionSource::new(reader, &header, &index, region(1, 1, 200), &path, 0)
-            .expect("source");
+        let mut second = BamRegionSource::new(
+            reader,
+            &header,
+            BamRegionSource::plan(&header, &index, region(1, 1, 200), &path).expect("plan"),
+            0,
+        );
         let mut seen = 0;
         while second.read_next(&mut buf).expect("read") {
             seen += 1;
@@ -705,7 +770,7 @@ mod tests {
         reader.read_header().expect("read header");
 
         assert!(matches!(
-            BamRegionSource::new(reader, &header, &index, region(9, 1, 100), &path, 0),
+            BamRegionSource::plan(&header, &index, region(9, 1, 100), &path),
             Err(AlignmentFileError::Region { .. })
         ));
     }
@@ -946,7 +1011,7 @@ mod tests {
         reader.read_header().expect("read header");
 
         assert!(matches!(
-            BamRegionSource::new(reader, &header, &index, region(0, 500, 100), &path, 0),
+            BamRegionSource::plan(&header, &index, region(0, 500, 100), &path),
             Err(AlignmentFileError::Region { .. })
         ));
     }

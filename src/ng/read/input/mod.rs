@@ -173,6 +173,15 @@ pub enum AlignmentFileError {
     )]
     Region { region: GenomeRegion },
 
+    /// The file opened, but its container cannot serve region queries yet.
+    ///
+    /// Only CRAM, and only until `CramRegionSource` lands. A distinct variant
+    /// rather than reusing [`Self::Region`]: the region is perfectly valid, and
+    /// blaming the caller for a gap in this module would send them looking in
+    /// the wrong place.
+    #[error("region queries over '{path}' are not supported yet (CRAM)")]
+    UnsupportedForRegionQuery { path: PathBuf },
+
     /// Querying the parsed index for a region's chunks failed.
     ///
     /// Distinct from [`Self::Region`]: the region has already been checked

@@ -21,23 +21,29 @@
 //! sense of "the alignment file" (spec §6).
 
 use std::fs::File;
-use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use noodles_bam as bam;
 use noodles_bgzf as bgzf;
 use noodles_cram as cram;
 use noodles_sam as sam;
 
+use crate::bam::alignment_input::MappedRead;
 use crate::bam::index_preflight::{
     AlignmentFileKind, AlignmentIndex, load_alignment_index, preflight_alignment_indexes,
 };
 use crate::fasta::{ContigEntry, ContigList};
-use crate::ng::read::filtering::{NoodlesRawRecord, ReadFilterBuffers, ReadFilterConfig};
+use crate::ng::read::filtering::{
+    NoodlesRawRecord, ReadFilter, ReadFilterBuffers, ReadFilterConfig, ReadFilterCounts,
+};
+use crate::ng::ref_seq::RawRefSeq;
 use crate::ng::reference_info::ReferenceInfo;
+use crate::ng::types::GenomeRegion;
 
 use super::AlignmentFileError;
+use super::region_query::{BamRegionSource, OrderVerified, RegionSource};
 
 /// One opened, **validated** alignment file.
 ///
@@ -52,15 +58,15 @@ use super::AlignmentFileError;
 /// (spec §3.3). Not `Clone` — it owns an index and a reader pool; sharing is
 /// by reference.
 pub struct AlignmentFile {
-    path: PathBuf,
+    /// `Arc` so the per-query order guard can hold it for its error message
+    /// without an allocation per query.
+    path: Arc<Path>,
     /// Kept for the region query, which resolves a contig to a `ref_id` and
     /// hands the header to the record source. Read from C2 onwards.
-    #[expect(dead_code, reason = "the region query (C2) reads this")]
     header: sam::Header,
     /// Parsed once, at open — never re-read per query (spec §3.3). Queried from
     /// C2 onwards, which is the guarantee the whole per-query cost model rests
     /// on: a query is an in-memory lookup plus a seek.
-    #[expect(dead_code, reason = "the region query (C2) queries this")]
     index: AlignmentIndex,
     /// From `@RG SM`. The k-file agreement check belongs to `SampleReads`.
     sample_name: String,
@@ -74,7 +80,6 @@ pub struct AlignmentFile {
     /// Handed to the per-query `ReadFilter` from C4 onwards. Held on the file
     /// rather than passed per query because the filtering policy is the file's
     /// for the whole run, not the caller's per region.
-    #[expect(dead_code, reason = "reads_in_region (C4) builds the filter from this")]
     filter_config: ReadFilterConfig,
     /// Idle readers and their scratch, borrowed per query and returned on
     /// `Drop`. A `Mutex` so `reads_in_region` can take `&self` (spec §3.3).
@@ -89,6 +94,15 @@ pub struct AlignmentFile {
     /// run, so it is worth being able to state rather than assume — T13 asserts
     /// it directly.
     readers_opened: AtomicUsize,
+    /// This file's step-1 tally, summed as each region stream ends.
+    ///
+    /// The `&self` API's answer to `counts()`: a per-read running total would
+    /// need a lock on the hot path or an atomic per counter, so each stream
+    /// keeps its own tally and folds it in here on `Drop` — one lock per query,
+    /// beside the one the pool already takes.
+    counts: Mutex<ReadFilterCounts>,
+    /// Stamped onto every `MappedRead` this file yields.
+    source_file_index: usize,
 }
 
 /// One idle reader positioned past the header, **plus the scratch its next
@@ -100,12 +114,7 @@ pub struct AlignmentFile {
 /// and the header are deliberately *not* here — they stay on `AlignmentFile`,
 /// shared, so no pooled reader ever re-parses them.
 struct ReaderHandle {
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the region query (C2) reads through this")
-    )]
     reader: ReaderKind,
-    #[expect(dead_code, reason = "the region query (C4) lends these to the filter")]
     buffers: ReadFilterBuffers<NoodlesRawRecord>,
 }
 
@@ -118,10 +127,12 @@ struct ReaderHandle {
 /// this open and flagged it for revisiting when the CRAM container cache lands
 /// — that cache is per-worker and *not* pooled, so it will sit beside this
 /// rather than inside it.
-enum ReaderKind {
-    #[expect(dead_code, reason = "BamRegionSource (C2) seeks this")]
+pub(crate) enum ReaderKind {
     Bam(bam::io::Reader<bgzf::io::Reader<File>>),
-    #[expect(dead_code, reason = "CramRegionSource (C5) seeks this")]
+    /// Opened and pooled; **read** from C5, which builds the CRAM region
+    /// source. Until then `reads_in_region` rejects CRAM up front, so this
+    /// reader is created and returned but never driven.
+    #[expect(dead_code, reason = "CramRegionSource (C5) reads through this")]
     Cram(cram::io::Reader<File>),
 }
 
@@ -149,10 +160,6 @@ impl BorrowedReader<'_> {
     /// re-established loses a reader silently — the pool would just open
     /// another, and only `readers_opened` climbing would show it. Do every
     /// fallible part of building a region stream *before* calling this.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the region query (C2) takes the parts this way")
-    )]
     fn take(mut self) -> ReaderHandle {
         self.handle
             .take()
@@ -165,6 +172,52 @@ impl Drop for BorrowedReader<'_> {
         if let Some(handle) = self.handle.take() {
             self.file.return_handle(handle);
         }
+    }
+}
+
+/// One region's reads: source → step-1 filter → order guard, coordinate-ordered
+/// and lazy.
+///
+/// Forward-only. A region query is one forward scan, and re-entry means a new
+/// query. A fatal error is yielded once and then the iterator is done — the
+/// `ReadFilter` convention carried outward, so `let read = read?;` surfaces it
+/// and it cannot be mistaken for a clean end of input.
+///
+/// **The pooled reader goes back on `Drop`, including on the error path and
+/// when a caller abandons the stream half-way**, along with this query's drop
+/// tally. An `Option` because `drop` gets `&mut self` and has to move the
+/// stream out to unwrap it.
+pub struct RegionReads<'a, R: RawRefSeq> {
+    file: &'a AlignmentFile,
+    stream: Option<OrderVerified<ReadFilter<RegionSource<'a>, R>>>,
+}
+
+impl<R: RawRefSeq> Iterator for RegionReads<'_, R> {
+    type Item = Result<MappedRead, AlignmentFileError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.stream.as_mut()?.next()
+    }
+}
+
+impl<R: RawRefSeq> std::iter::FusedIterator for RegionReads<'_, R> {}
+
+impl<R: RawRefSeq> Drop for RegionReads<'_, R> {
+    fn drop(&mut self) {
+        let Some(stream) = self.stream.take() else {
+            return;
+        };
+
+        // Unwrap the chain in the order it was built: guard → filter → source
+        // → reader. `into_parts` also yields the buffers and the tally, which
+        // is why the filter has to be taken apart rather than just dropped —
+        // the drops this query recorded would vanish with it.
+        let (source, buffers, counts) = stream.into_inner().into_parts();
+        self.file.return_handle(ReaderHandle {
+            reader: source.into_reader(),
+            buffers,
+        });
+        self.file.add_counts(&counts);
     }
 }
 
@@ -190,6 +243,19 @@ impl AlignmentFile {
         reference: &ReferenceInfo,
         filter_config: ReadFilterConfig,
         build_index_if_missing: bool,
+    ) -> Result<Self, AlignmentFileError> {
+        Self::open_as(path, reference, filter_config, build_index_if_missing, 0)
+    }
+
+    /// `open`, with the file's index within its sample — the value stamped onto
+    /// every `MappedRead` as `source_file_index`. `SampleReads` (E1) passes the
+    /// position in its list; a lone file is 0.
+    pub fn open_as(
+        path: &Path,
+        reference: &ReferenceInfo,
+        filter_config: ReadFilterConfig,
+        build_index_if_missing: bool,
+        source_file_index: usize,
     ) -> Result<Self, AlignmentFileError> {
         let header = read_header(path)?;
 
@@ -268,7 +334,7 @@ impl AlignmentFile {
         let sq_md5s = file_contigs.entries.iter().map(|entry| entry.md5).collect();
 
         Ok(Self {
-            path: path.to_path_buf(),
+            path: Arc::from(path),
             header,
             index,
             sample_name,
@@ -279,6 +345,8 @@ impl AlignmentFile {
             // queried costs no descriptor.
             readers: Mutex::new(Vec::new()),
             readers_opened: AtomicUsize::new(0),
+            counts: Mutex::new(ReadFilterCounts::default()),
+            source_file_index,
         })
     }
 
@@ -297,6 +365,94 @@ impl AlignmentFile {
         &self.path
     }
 
+    /// Every read overlapping `region`, coordinate-ordered and step-1-filtered.
+    ///
+    /// The chain is source → [`ReadFilter`] → order guard, and it is the
+    /// *complete* product of this module: the sample layer either uses it as-is
+    /// or merges k of them, and this module is indifferent to which.
+    ///
+    /// Takes **`&self`**, not `&mut self` — the load-bearing signature choice
+    /// (spec §3.3). A reader comes from the internal pool and the returned
+    /// iterator gives it back on `Drop`, so N threads may query one file
+    /// concurrently without touching a single call site.
+    ///
+    /// `reference` is the caller's own accessor, passed **per query** rather
+    /// than stored: `RawRefSeq` impls are stateful readers, so one shared
+    /// accessor would need a mutex on the hot path the moment queries run
+    /// concurrently, and `&self` queries would fight over one file cursor
+    /// (arch §5).
+    ///
+    /// The filter is built **probe-free**: the open gate already proved
+    /// something strictly stronger than the per-contig resolve probe, and
+    /// paying that probe per query would mean ~10⁶ × the contig count in
+    /// reference fetches.
+    pub fn reads_in_region<R: RawRefSeq>(
+        &self,
+        region: GenomeRegion,
+        reference: R,
+    ) -> Result<RegionReads<'_, R>, AlignmentFileError> {
+        // **Everything fallible happens first**, before a reader leaves the
+        // pool: the format check, resolving the region, and querying the index
+        // all touch no reader, so any of them failing costs nothing to recover
+        // from — whereas a `?` after the handle is taken would lose that reader
+        // silently (`BorrowedReader::take`).
+        //
+        // The format check has to come first of all: `plan` reads the index,
+        // and a CRAM file's index is a `.crai`, which the BAM planner cannot
+        // make sense of.
+        if !matches!(
+            AlignmentFileKind::from_path(&self.path),
+            Some(AlignmentFileKind::Bam)
+        ) {
+            return Err(AlignmentFileError::UnsupportedForRegionQuery {
+                path: self.path.to_path_buf(),
+            });
+        }
+        let plan = BamRegionSource::plan(&self.header, &self.index, region, &self.path)?;
+
+        let borrowed = self.borrow_reader()?;
+        let handle = borrowed.take();
+        let ReaderHandle { reader, buffers } = handle;
+
+        let source = match reader {
+            ReaderKind::Bam(reader) => RegionSource::Bam(BamRegionSource::new(
+                reader,
+                &self.header,
+                plan,
+                self.source_file_index,
+            )),
+            ReaderKind::Cram(_) => {
+                unreachable!("the format check above rejects CRAM before any reader is taken")
+            }
+        };
+
+        let filter =
+            ReadFilter::with_validated_contigs(source, reference, self.filter_config, buffers);
+
+        Ok(RegionReads {
+            file: self,
+            stream: Some(OrderVerified::new(filter, Arc::clone(&self.path))),
+        })
+    }
+
+    /// This file's step-1 tally, summed over the region queries served so far.
+    ///
+    /// **Per query, not per read**: each stream adds its own tally here when it
+    /// ends, so a stream still running is not yet reflected. That is the price
+    /// of `&self` — a running total updated per read would need either a lock
+    /// on the hot path or an atomic per counter, and neither buys anything a
+    /// caller reading counts *after* draining actually wants.
+    ///
+    /// A stream that is never dropped — leaked, or held for the process
+    /// lifetime — never contributes at all, and takes its pooled reader with
+    /// it. That is inherent to returning things on `Drop`.
+    pub fn counts(&self) -> ReadFilterCounts {
+        self.counts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
     /// Take an idle reader from the pool, opening one only if the pool is
     /// empty.
     ///
@@ -307,10 +463,6 @@ impl AlignmentFile {
     ///
     /// A freshly opened reader is positioned past the header, matching one that
     /// has been returned to the pool, so the two are interchangeable.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the region query (C2) borrows through this")
-    )]
     fn borrow_reader(&self) -> Result<BorrowedReader<'_>, AlignmentFileError> {
         // The `let` ends the guard's scope, so the lock is released before
         // `open_reader` runs. Written as a `match` scrutinee it would still be
@@ -330,6 +482,15 @@ impl AlignmentFile {
         })
     }
 
+    /// Fold a finished stream's tally into the file's.
+    fn add_counts(&self, counts: &ReadFilterCounts) {
+        let mut total = self
+            .counts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        total.add(counts);
+    }
+
     fn return_handle(&self, handle: ReaderHandle) {
         self.lock_pool().push(handle);
     }
@@ -339,7 +500,7 @@ impl AlignmentFile {
     /// one, and the reader has to be advanced past it either way.
     fn open_reader(&self) -> Result<ReaderHandle, AlignmentFileError> {
         let open_error = |source: std::io::Error| AlignmentFileError::Open {
-            path: self.path.clone(),
+            path: self.path.to_path_buf(),
             source,
         };
 
@@ -983,6 +1144,28 @@ mod tests {
         let file = AlignmentFile::open(&cram_path, &reference, ReadFilterConfig::default(), false)
             .expect("a matching CRAM opens");
 
+        // Querying a CRAM is *not supported yet* — and must say so, rather
+        // than panicking (which it did: `plan` reads the index, and a `.crai`
+        // hit the BAM planner's `unreachable!` before the format was ever
+        // checked) or blaming the caller's region.
+        let region = GenomeRegion {
+            contig: crate::ng::types::ContigId(0),
+            start: crate::ng::types::Position(1),
+            end: crate::ng::types::Position(50),
+        };
+        assert!(
+            matches!(
+                file.reads_in_region(region, reference_bases()),
+                Err(AlignmentFileError::UnsupportedForRegionQuery { .. })
+            ),
+            "a CRAM region query must be a clean error until C5"
+        );
+        assert_eq!(
+            file.readers_opened(),
+            0,
+            "and it must be rejected before any reader is taken"
+        );
+
         let borrowed = file.borrow_reader().expect("borrow a CRAM reader");
         assert!(
             matches!(
@@ -993,7 +1176,7 @@ mod tests {
         );
         drop(borrowed);
 
-        assert_eq!(file.readers_opened(), 1);
+        assert_eq!(file.readers_opened(), 1, "the pool still works for CRAM");
         assert_eq!(file.pooled_readers(), 1);
     }
 
@@ -1032,6 +1215,359 @@ mod tests {
 
         file.return_handle(handle);
         assert_eq!(file.pooled_readers(), 1, "and the stream hands it back");
+    }
+
+    // -----------------------------------------------------------------
+    // The composed chain — reads_in_region (C4): T9, T10, T13
+    // -----------------------------------------------------------------
+
+    use noodles_sam::alignment::RecordBuf;
+
+    use crate::ng::read::input::test_fixtures::read_named_with_length;
+    use crate::ng::ref_seq::InMemoryRefSeq;
+
+    /// An all-`A` reference matching the fixture contigs, so a read of `A`s
+    /// matches perfectly and a read of `C`s mismatches at every base.
+    fn reference_bases() -> InMemoryRefSeq {
+        InMemoryRefSeq::from_contigs(
+            FIXTURE_CONTIGS
+                .iter()
+                .map(|(_, length)| vec![b'A'; *length])
+                .collect(),
+        )
+    }
+
+    /// A read whose bases all mismatch the all-`A` reference — filter #8's
+    /// business, and only reachable if the *whole* filter is composed in.
+    fn all_mismatching_read(qname: &str, start: usize) -> RecordBuf {
+        let mut record = read_named_with_length(qname, 0, start, 30);
+        record.sequence_mut().as_mut().fill(b'C');
+        record
+    }
+
+    fn opened_over(records: &[RecordBuf]) -> (TempDir, TempDir, AlignmentFile) {
+        let (reference_dir, reference) = fixture_reference(false);
+        let (bam_dir, path) = indexed_bam(&bam_header(&matching_contigs()), records);
+        let file = AlignmentFile::open(&path, &reference, ReadFilterConfig::default(), false)
+            .expect("the fixture matches");
+        (reference_dir, bam_dir, file)
+    }
+
+    fn whole_first_contig() -> GenomeRegion {
+        GenomeRegion {
+            contig: crate::ng::types::ContigId(0),
+            start: crate::ng::types::Position(1),
+            end: crate::ng::types::Position(FIXTURE_CONTIGS[0].1 as u64),
+        }
+    }
+
+    /// **T9 — the full step-1 filter runs, not just the cheap subset.**
+    ///
+    /// A read that mismatches the reference at every base is filter #8's
+    /// business, and #8 is the *reference-dependent* filter — the one a region
+    /// reader that applied only flag/MAPQ checks would miss. Its drop being
+    /// charged to `high_mismatch_fraction` is what proves `ReadFilter` is
+    /// composed into the chain rather than a subset of it. This is the property
+    /// that decided the rebuild over reusing production's reader.
+    #[test]
+    fn t9_the_served_stream_runs_the_reference_dependent_filter() {
+        let (_reference_dir, _bam_dir, file) = opened_over(&[
+            read_named_with_length("clean", 0, 1, 30),
+            all_mismatching_read("mismatching", 40),
+        ]);
+
+        let reads: Vec<MappedRead> = file
+            .reads_in_region(whole_first_contig(), reference_bases())
+            .expect("query")
+            .collect::<Result<_, _>>()
+            .expect("no fatal error");
+
+        assert_eq!(reads.len(), 1, "only the clean read survives");
+        assert_eq!(reads[0].qname, b"clean");
+
+        let counts = file.counts();
+        assert_eq!(
+            counts.high_mismatch_fraction, 1,
+            "the drop is charged to filter #8, so the whole cascade ran"
+        );
+        assert_eq!(counts.kept, 1);
+    }
+
+    /// Chunk-edge slop is dropped **uncounted**: a read the index over-returned
+    /// is not a read the filter rejected, and charging it to a `DropReason`
+    /// would make the tally mean something different for an indexed read than
+    /// for a whole-file one.
+    #[test]
+    fn records_outside_the_region_are_dropped_without_being_counted() {
+        let (_reference_dir, _bam_dir, file) = opened_over(&[
+            read_named_with_length("inside", 0, 1, 30),
+            read_named_with_length("outside", 0, 60, 30),
+        ]);
+
+        let region = GenomeRegion {
+            contig: crate::ng::types::ContigId(0),
+            start: crate::ng::types::Position(1),
+            end: crate::ng::types::Position(35),
+        };
+        let reads: Vec<MappedRead> = file
+            .reads_in_region(region, reference_bases())
+            .expect("query")
+            .collect::<Result<_, _>>()
+            .expect("no fatal error");
+
+        assert_eq!(reads.len(), 1);
+        let counts = file.counts();
+        assert_eq!(counts.kept, 1);
+        assert_eq!(
+            counts.duplicate
+                + counts.low_mapq
+                + counts.supplementary
+                + counts.secondary
+                + counts.unmapped
+                + counts.qc_fail
+                + counts.too_short
+                + counts.high_mismatch_fraction
+                + counts.bad_cigar,
+            0,
+            "the out-of-region read is charged to no drop reason at all"
+        );
+    }
+
+    /// **T13 — the file is opened once and the index parsed once**, however
+    /// many regions are queried. The index cannot be re-parsed by construction
+    /// (it is owned by the handle), so what is asserted is the observable half:
+    /// many queries, one reader.
+    ///
+    /// This is the guarantee the whole per-query cost model rests on, and the
+    /// one that decides whether ~10⁶ STR queries are affordable. A regression
+    /// changes no answers — only cost — so nothing but an explicit assertion
+    /// would catch it.
+    #[test]
+    fn t13_many_region_queries_open_the_file_once() {
+        let (_reference_dir, _bam_dir, file) =
+            opened_over(&[read_named_with_length("r", 0, 1, 30)]);
+
+        for _ in 0..25 {
+            let reads: Vec<MappedRead> = file
+                .reads_in_region(whole_first_contig(), reference_bases())
+                .expect("query")
+                .collect::<Result<_, _>>()
+                .expect("no fatal error");
+            assert_eq!(reads.len(), 1);
+        }
+
+        assert_eq!(
+            file.readers_opened(),
+            1,
+            "25 queries, one reader — the pool served every one after the first"
+        );
+        assert_eq!(file.pooled_readers(), 1, "and it is back in the pool");
+    }
+
+    /// **T10 — a fatal mid-stream error is yielded once, then the stream is
+    /// done.** A truncated file must not look like a short region.
+    #[test]
+    fn t10_a_truncated_file_yields_one_error_and_then_nothing() {
+        let (_reference_dir, reference) = fixture_reference(false);
+        // Enough records to span several BGZF blocks: truncating a
+        // single-block file would destroy the *header*, which is a different
+        // fault (the gate's) from the mid-stream one this test is about.
+        let mut records: Vec<RecordBuf> = Vec::new();
+        for start in 1..=60 {
+            for copy in 0..120 {
+                records.push(read_named_with_length(
+                    &format!("r{start}_{copy}"),
+                    0,
+                    start,
+                    30,
+                ));
+            }
+        }
+        let (_bam_dir, path) = indexed_bam(&bam_header(&matching_contigs()), &records);
+
+        let file = AlignmentFile::open(&path, &reference, ReadFilterConfig::default(), false)
+            .expect("opens");
+
+        // Truncate *after* opening, so the gate and the index are intact and
+        // the fault can only appear mid-stream.
+        let full = std::fs::metadata(&path).expect("stat").len();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("reopen")
+            .set_len(full * 3 / 4)
+            .expect("truncate");
+
+        let mut reads = file
+            .reads_in_region(whole_first_contig(), reference_bases())
+            .expect("the query itself still plans");
+
+        let mut reads_before_error = 0;
+        let mut errors = 0;
+        let mut after_error = 0;
+        while let Some(item) = reads.next() {
+            match item {
+                Ok(_) => reads_before_error += 1,
+                Err(_) => {
+                    errors += 1;
+                    // Everything the iterator yields after the first error.
+                    after_error = reads.by_ref().count();
+                    break;
+                }
+            }
+        }
+
+        // Without this the test would pass against a chain that yielded
+        // *nothing* — it would still reach the truncation and still fuse. That
+        // is exactly the shape of the fixture bug this module already hit once.
+        assert!(
+            reads_before_error > 0,
+            "reads must flow before the truncation is reached"
+        );
+        assert_eq!(errors, 1, "the truncation surfaced as a fatal error");
+        assert_eq!(after_error, 0, "and the stream fused rather than resuming");
+
+        // The reader still comes back on the error path — the case where its
+        // state is least obvious.
+        drop(reads);
+        assert_eq!(
+            file.pooled_readers(),
+            1,
+            "a stream that ended in an error still returns its reader"
+        );
+    }
+
+    /// The signature exists so N threads can query one file at once, and
+    /// nothing so far has actually done that through `reads_in_region` — the
+    /// pool tests stop at `borrow_reader`. A `Rc` or `RefCell` creeping into
+    /// the chain would break this and surface only at the first parallel call
+    /// site, a step or two away.
+    #[test]
+    fn a_region_stream_is_send_so_threads_can_share_one_file() {
+        fn assert_send<T: Send>() {}
+        assert_send::<RegionReads<'_, InMemoryRefSeq>>();
+        assert_send::<&AlignmentFile>();
+    }
+
+    /// And the same thing dynamically: eight concurrent queries, every reader
+    /// returned, **every tally folded in**. The counts assertion is the
+    /// valuable half — it is what would catch a fold lost under contention.
+    #[test]
+    fn concurrent_region_queries_each_get_a_reader_and_bank_every_tally() {
+        let (_reference_dir, _bam_dir, file) =
+            opened_over(&[read_named_with_length("r", 0, 1, 30)]);
+
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    let reads: Vec<MappedRead> = file
+                        .reads_in_region(whole_first_contig(), reference_bases())
+                        .expect("query")
+                        .collect::<Result<_, _>>()
+                        .expect("no fatal error");
+                    assert_eq!(reads.len(), 1);
+                });
+            }
+        });
+
+        assert_eq!(
+            file.counts().kept,
+            8,
+            "every stream folded its tally in — none lost to the race"
+        );
+        assert_eq!(
+            file.pooled_readers(),
+            file.readers_opened(),
+            "and every reader opened came back"
+        );
+    }
+
+    /// **T4d, re-sited from C3.** The order guard's state lives in the
+    /// per-region iterator, so querying a later region and then an earlier one
+    /// **on the same handle** is a new forward scan, not a regression. C3 could
+    /// only assert this with two separate guards, which could not fail if the
+    /// state ever migrated to the handle. This can.
+    #[test]
+    fn t4d_a_later_region_then_an_earlier_one_on_one_handle_is_not_a_regression() {
+        let (_reference_dir, _bam_dir, file) = opened_over(&[
+            read_named_with_length("early", 0, 1, 30),
+            read_named_with_length("late", 0, 60, 30),
+        ]);
+
+        let later = GenomeRegion {
+            contig: crate::ng::types::ContigId(0),
+            start: crate::ng::types::Position(55),
+            end: crate::ng::types::Position(100),
+        };
+        let earlier = GenomeRegion {
+            contig: crate::ng::types::ContigId(0),
+            start: crate::ng::types::Position(1),
+            end: crate::ng::types::Position(40),
+        };
+
+        let first: Vec<MappedRead> = file
+            .reads_in_region(later, reference_bases())
+            .expect("query")
+            .collect::<Result<_, _>>()
+            .expect("the later region streams");
+        assert_eq!(first.len(), 1);
+
+        let second: Vec<MappedRead> = file
+            .reads_in_region(earlier, reference_bases())
+            .expect("query")
+            .collect::<Result<_, _>>()
+            .expect("an earlier region on the same handle is a new forward scan");
+        assert_eq!(second.len(), 1);
+    }
+
+    /// A query that fails to plan must not cost a reader — the pool is only
+    /// touched once everything fallible has succeeded.
+    #[test]
+    fn a_failed_query_returns_no_reader_because_it_never_took_one() {
+        let (_reference_dir, _bam_dir, file) =
+            opened_over(&[read_named_with_length("r", 0, 1, 30)]);
+
+        let nonexistent_contig = GenomeRegion {
+            contig: crate::ng::types::ContigId(9),
+            start: crate::ng::types::Position(1),
+            end: crate::ng::types::Position(10),
+        };
+        assert!(matches!(
+            file.reads_in_region(nonexistent_contig, reference_bases()),
+            Err(AlignmentFileError::Region { .. })
+        ));
+        assert_eq!(
+            file.readers_opened(),
+            0,
+            "planning failed before the pool was touched"
+        );
+    }
+
+    /// Abandoning a stream half-way still returns the reader, and still banks
+    /// the drops recorded so far — both happen in `Drop`, so neither depends on
+    /// the caller draining.
+    #[test]
+    fn abandoning_a_stream_returns_the_reader_and_banks_its_counts() {
+        let (_reference_dir, _bam_dir, file) = opened_over(&[
+            all_mismatching_read("bad", 1),
+            read_named_with_length("good", 0, 40, 30),
+        ]);
+
+        {
+            let mut reads = file
+                .reads_in_region(whole_first_contig(), reference_bases())
+                .expect("query");
+            // Pull exactly one read, then walk away.
+            let _ = reads.next();
+            assert_eq!(file.pooled_readers(), 0, "the reader is out on loan");
+        }
+
+        assert_eq!(file.pooled_readers(), 1, "returned on drop");
+        assert_eq!(
+            file.counts().high_mismatch_fraction,
+            1,
+            "the drop seen before abandoning was banked, not lost"
+        );
     }
 
     // --- the hex decoder's edges ---

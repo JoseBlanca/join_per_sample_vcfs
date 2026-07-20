@@ -14,9 +14,9 @@ use noodles_core::Position as RecordPosition;
 use noodles_sam as sam;
 use noodles_sam::alignment::RecordBuf;
 use noodles_sam::alignment::io::Write as _;
-use noodles_sam::alignment::record::MappingQuality;
 use noodles_sam::alignment::record::cigar::Op;
 use noodles_sam::alignment::record::cigar::op::Kind;
+use noodles_sam::alignment::record::{Flags, MappingQuality};
 use noodles_sam::alignment::record_buf::{QualityScores, Sequence};
 use sam::header::record::value::Map;
 use sam::header::record::value::map::{ReadGroup, ReferenceSequence};
@@ -129,6 +129,10 @@ pub(crate) fn read_named_with_length(
     RecordBuf::builder()
         .set_name(qname.as_bytes())
         .set_reference_sequence_id(reference_sequence_id)
+        // Explicit, because `RecordBuf`'s default flags are `UNMAPPED` — a
+        // fixture that left them alone would be silently dropped by filter #1
+        // in any test that runs the real filter.
+        .set_flags(Flags::empty())
         .set_mapping_quality(MappingQuality::new(60).expect("mapq in range"))
         .set_alignment_start(RecordPosition::try_from(start).unwrap())
         .set_cigar([Op::new(Kind::Match, length)].into_iter().collect())

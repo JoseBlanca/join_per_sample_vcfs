@@ -128,6 +128,39 @@ pub struct ReadFilterCounts {
 }
 
 impl ReadFilterCounts {
+    /// Add another tally into this one, counter by counter.
+    ///
+    /// Destructured exhaustively rather than field-by-field, so a counter added
+    /// to this struct later must be routed here explicitly or this stops
+    /// compiling — the same guard `record_drop`'s exhaustive `match` gives the
+    /// `DropReason` mapping. A tally that silently stopped summing one reason
+    /// would under-report drops without failing anything.
+    pub(crate) fn add(&mut self, other: &Self) {
+        let Self {
+            kept,
+            duplicate,
+            low_mapq,
+            supplementary,
+            secondary,
+            unmapped,
+            qc_fail,
+            too_short,
+            high_mismatch_fraction,
+            bad_cigar,
+        } = other;
+
+        self.kept += kept;
+        self.duplicate += duplicate;
+        self.low_mapq += low_mapq;
+        self.supplementary += supplementary;
+        self.secondary += secondary;
+        self.unmapped += unmapped;
+        self.qc_fail += qc_fail;
+        self.too_short += too_short;
+        self.high_mismatch_fraction += high_mismatch_fraction;
+        self.bad_cigar += bad_cigar;
+    }
+
     /// Tally one drop against its counter. The exhaustive `match` is the guard for
     /// the documented `DropReason` ↔ `ReadFilterCounts` 1:1 mapping: adding a
     /// `DropReason` variant without a counter here is a compile error, so the two
@@ -715,11 +748,6 @@ impl<S: RecordSource, R: RawRefSeq> ReadFilter<S, R> {
     /// the filter as an `Option` and `take()`s it there. Without that, the
     /// buffers *and* the query's counts are lost on exactly the paths that are
     /// easiest to forget — an early drop and the error path.
-    // Exercised by tests; its production caller is `RegionReads::drop`, which
-    // lands in step C4 of the read-input plan. Kept `pub(crate)` rather than
-    // widened to `pub` to silence this: the containment is worth more than the
-    // attribute costs, and the attribute goes away when C4 lands.
-    #[allow(dead_code)]
     pub(crate) fn into_parts(self) -> (S, ReadFilterBuffers<S::Record>, ReadFilterCounts) {
         // Destructured exhaustively, with no `..`: this function's whole job is
         // to hand back everything that was lent, so a field added to
