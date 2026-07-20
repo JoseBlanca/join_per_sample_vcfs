@@ -104,7 +104,7 @@ to `--min-period 2` and add the "homopolymer is a period-1 locus" test; pin the 
 `min_copies`/`max_str_len` from its header (`typed_regions.md` §8.1). *Source:* spec §2.3. *Depends:* —
 (library-only; independent of A).
 
-**B2. `TypedRegionsArgs` + `TypedRegionsCliError`.**  ☐
+**B2. `TypedRegionsArgs` + `TypedRegionsCliError`.**  ✅
 The `Args` struct — `--reference`/`--output`/`--regions` + every knob `default_value_t` the `DEFAULT_*`
 const under `help_heading = "Advanced"` — and the `#[non_exhaustive]` error enum (`Reference`,
 `ContigTooLong`, `Bed`, `Walk`, `Output`; `#[from]` where it fits). No logic. Test: parses through the
