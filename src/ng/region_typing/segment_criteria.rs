@@ -343,16 +343,21 @@ pub const DEFAULT_MIN_PURITY: f32 = 0.8;
 /// costs. The catalog's value.
 pub const DEFAULT_MIN_SCORE: i32 = 0;
 
-/// Flank margin (bp) embedded each side of a tract. The catalog's value, and
-/// (spec §2.4) also the bundle radius.
-pub const DEFAULT_FLANK_BP: u64 = 50;
+/// Flank margin (bp) embedded each side of a tract. The short-read default
+/// (spec §2.3): 30 bp is more than enough unique sequence to anchor a short
+/// read to a locus, where the catalog's inherited 50 was unmeasured. It is
+/// also (spec §2.4) the bundle radius, so lowering it also loosens what
+/// counts as a bundle. Soft, and swept (spec §10).
+pub const DEFAULT_FLANK_BP: u64 = 30;
 
-/// The narrowest period classified by default: **2**, excluding period-1
-/// homopolymers. The standard GangSTR/HipSTR drop — error-prone for STR
-/// genotyping, and not the di/tri/tetra-nucleotide target. Dropping them
-/// *before* bundling is load-bearing: it stops a long poly-A/T run from
-/// bundle-dropping an adjacent real STR.
-pub const DEFAULT_MIN_PERIOD: u8 = 2;
+/// The narrowest period classified by default: **1**, so a qualifying
+/// homopolymer is a period-1 STR locus (spec §2.3). Mononucleotides stutter
+/// most under Illumina, so they belong on the STR path; the
+/// [`MinCopies`] floor of 6 for period 1 is what this default exists to use.
+/// Detecting period 1 *before* bundling is load-bearing: a period-1 divisor
+/// eliminates redundant longer-period intervals during pre-filter (the
+/// poly-A cascade).
+pub const DEFAULT_MIN_PERIOD: u8 = 1;
 
 /// The widest period classified by default: **6**, the microsatellite ceiling.
 pub const DEFAULT_MAX_PERIOD: u8 = 6;
@@ -447,14 +452,19 @@ impl MinCopies {
 }
 
 impl Default for MinCopies {
-    /// GangSTR's table (`minimal_trim.py`: `thresholds = {1:10, 2:5, 3:4, 4:3,
-    /// 5:3, 6:3}`, default 3), which production hardcodes in two places and this
-    /// folds into one. Period 1's entry is unreachable at the default period scope
-    /// — [`DEFAULT_MIN_PERIOD`] excludes it — and is kept for parity with the
-    /// source table, and because §10's experiment may put period 1 back.
+    /// The short-read copy-number floors (spec §2.3), one per period 1..6: the
+    /// copy number at which a repeat starts to **stutter** — below it, the
+    /// generic SNP/indel caller handles the tract fine and only a stuttering one
+    /// needs the STR route. The mononucleotide floor is **6** (the Illumina
+    /// read-artifact onset, not the higher ~9-unit germline-slippage threshold);
+    /// shorter motifs stutter more, so periods 4–6 sit at 3. Every number is a
+    /// starting value, soft and swept (spec §10). This deliberately diverges from
+    /// the catalog's `[10,5,4,3,3,3]` — the trf-mod parity oracle pins the
+    /// catalog's values explicitly (spec §2.3), so the divergence costs it
+    /// nothing.
     fn default() -> Self {
         //         period:  1  2  3  4  5  6
-        Self::new([10, 5, 4, 3, 3, 3], 3)
+        Self::new([6, 4, 4, 3, 3, 3], 3)
     }
 }
 
@@ -480,11 +490,12 @@ impl Default for MinCopies {
 /// primitive and bundle-ness is derived from it** — a repeat is bundled exactly
 /// when another sits too close for it to have a clean flank — so one number says
 /// it, and the §10 experiment on flank size moves the bundle definition with it
-/// for free. `default_matches_the_frozen_catalog_params` pins that the collapse
-/// is safe: production ships both at the same value.
+/// for free. The port-fidelity differential (`matched_params`) pins that the
+/// collapse is safe: it drives production with `bundle_threshold == flank_bp` and
+/// asserts ng's one-number policy still agrees.
 ///
-/// `Default` is the catalog's own values — for §8's comparability **only**, not
-/// an endorsement (spec §5.2).
+/// `Default` is ng's short-read values now (spec §2.3), which diverge from the
+/// catalog's; the `.cat` parity oracles pin the catalog's values explicitly (§8.1).
 ///
 /// The fields are `pub` and unvalidated, as production's `CatalogParams` is;
 /// [`classify`] `debug_assert`s the contracts that are otherwise only prose.
@@ -550,14 +561,14 @@ pub struct SsrSegmentCriteria {
 }
 
 impl Default for SsrSegmentCriteria {
-    /// The catalog's pinned Stage-0 defaults, field for field.
-    ///
-    /// **This must equal `CatalogParams::default()`**, and that is not decoration
-    /// — spec §8.1's `.cat` parity oracle compares ng's walk against a catalog
-    /// built at those values, and the comparison is meaningless if the two drift.
-    /// Production is frozen, so it can only drift by an ng-side edit; that edit
-    /// should be deliberate, so `default_matches_the_frozen_catalog_params` pins
-    /// every field.
+    /// ng's **short-read** classification defaults (spec §2.3), which
+    /// **deliberately diverge from the catalog's**: `--min-period 1` (a homopolymer
+    /// of ≥ 6 bp is a period-1 locus), a 30 bp flank, and the short-read copy floors
+    /// `[6,4,4,3,3,3]` (see [`MinCopies::default`]). This is *not* `CatalogParams`'s
+    /// settings — those are pinned explicitly by the `.cat` parity oracles (spec
+    /// §8.1), which must not read `Default` (the anchor and
+    /// `the_resident_partition_reproduces_the_golden_catalog` build a catalog-valued
+    /// config by hand). `default_config_is_the_short_read_settings` pins these values.
     ///
     /// Note `min_score`'s value is a no-op gate — see the field's own doc.
     fn default() -> Self {
@@ -1383,6 +1394,21 @@ mod tests {
         matched_params(0.8, 0, 5).0
     }
 
+    /// The catalog's full classification settings — what
+    /// [`SsrSegmentCriteria::default`] carried before spec §2.3 moved `Default`
+    /// to the short-read floors. The bundling/mechanic tests below were written
+    /// against these values (a **50 bp** flank radius, di..hexa, `[10,5,4,3,3,3]`),
+    /// so they pin them explicitly now that `Default` no longer supplies them.
+    fn catalog_criteria() -> SsrSegmentCriteria {
+        SsrSegmentCriteria {
+            periods: PeriodRange::new(2, 6).expect("2..=6 is a valid period range"),
+            min_purity: 0.8,
+            min_score: 0,
+            flank_bp: 50,
+            min_copies: MinCopies::new([10, 5, 4, 3, 3, 3], 3),
+        }
+    }
+
     /// `classify` over a whole contig — spec §5a's **degenerate case**:
     /// `bases_start = 1`, `contig_len = bases.len()`, so the window IS the contig
     /// and the two roles `contig_seq.len()` used to play coincide again.
@@ -1873,10 +1899,11 @@ mod tests {
     /// **`flank_bp` maps onto *both* of production's knobs**, which is the A2
     /// collapse stated as code: ng has one number where production has
     /// `flank_bp` and `bundle_threshold`, and this pair is only equivalent
-    /// because production ships them equal (spec §2.4;
-    /// `default_matches_the_frozen_catalog_params` pins it). Anywhere the two
-    /// sides are compared, they must therefore agree — so the differential is
-    /// also the evidence the collapse costs nothing.
+    /// because production ships them equal (spec §2.4). This helper sets
+    /// `bundle_threshold: flank_bp` and the differential then asserts the two
+    /// sides still agree — so the differential is itself the evidence the collapse
+    /// costs nothing (the pin that `default_matches_the_frozen_catalog_params`
+    /// used to carry, now that §2.3 deleted that test).
     fn matched_params(
         min_purity: f32,
         min_score: i32,
@@ -1887,11 +1914,17 @@ mod tests {
                 min_purity,
                 min_score,
                 flank_bp: u64::from(flank_bp),
-                // `periods` and `min_copies` take the catalog's values —
-                // which is what makes them comparable with production's hardcoded
-                // ones at all. A2's knobs are exercised by the tests that set them
-                // explicitly, never by a silent default drifting in here.
-                ..SsrSegmentCriteria::default()
+                // `periods` and `min_copies` are pinned to the **catalog's**
+                // values here — di..hexa and `[10,5,4,3,3,3]` — which is what
+                // makes them comparable with production's hardcoded ones at all.
+                // As of spec §2.3 ng's `Default` no longer holds them (it carries
+                // the short-read floors), so this is exactly the re-pinning this
+                // helper's own doc predicted: "the day an experiment deliberately
+                // moves ng's classification away from the catalog's rules". A2's
+                // knobs are exercised by the tests that set them explicitly, never
+                // by a silent default drifting in here.
+                periods: PeriodRange::new(2, 6).expect("2..=6 is a valid period range"),
+                min_copies: MinCopies::new([10, 5, 4, 3, 3, 3], 3),
             },
             CatalogParams {
                 min_purity,
@@ -2320,7 +2353,7 @@ mod tests {
     #[test]
     fn classify_at_default_never_rejects_a_score_the_scanner_can_emit() {
         let mut contig = b"CGCGC".to_vec();
-        contig.resize(60, b'C'); // room for the 50 bp default flank
+        contig.resize(60, b'C'); // room for the 30 bp default flank
         contig.extend_from_slice(b"ATATATATATATATAT");
         contig.resize(140, b'G');
         let at_default = |score| {
@@ -2351,64 +2384,7 @@ mod tests {
         );
     }
 
-    /// **M8 — `Default` must equal the frozen catalog's, field for field.**
-    ///
-    /// Spec §8.1's `.cat` parity oracle compares ng's walk against a catalog built
-    /// at these values; the comparison is meaningless if they drift. Production is
-    /// frozen, so drift can only come from an ng-side edit — which should be
-    /// deliberate, and is now loud. Before this test, `::default()` had **no caller
-    /// in the tree** and no field of it was pinned by anything.
-    #[test]
-    fn default_matches_the_frozen_catalog_params() {
-        let ours = SsrSegmentCriteria::default();
-        let theirs = CatalogParams::default();
-        assert_eq!(ours.min_purity, theirs.min_purity, "min_purity");
-        assert_eq!(ours.min_score, theirs.min_score, "min_score");
-        assert_eq!(ours.flank_bp, u64::from(theirs.flank_bp), "flank_bp");
-
-        // **The A2 collapse, justified rather than asserted.** ng has one number
-        // where production has two. That is only lossless because production ships
-        // them equal — so this is the evidence for the collapse, and the tripwire
-        // if the premise ever stops holding.
-        assert_eq!(
-            u64::from(theirs.bundle_threshold),
-            ours.flank_bp,
-            "spec §2.4 collapses bundle_threshold into flank_bp; that is safe ONLY \
-             because the catalog ships them at the same value"
-        );
-
-        // The knobs A2 hoisted: `Default` must still be the catalog's hardcoded
-        // rules, or spec §8's oracles stop comparing like with like.
-        //
-        // **Against literals, not against our own consts.** Asserting
-        // `ours.periods.min() == DEFAULT_MIN_PERIOD` would compare the constant
-        // with itself — `Default` is *defined* as `PeriodRange::new(
-        // DEFAULT_MIN_PERIOD, DEFAULT_MAX_PERIOD)` — so it could not fail, and
-        // the one A2 knob that can silently decalibrate both §8 oracles would be
-        // free to drift with this test green. Production's `MIN_PERIOD` /
-        // `MAX_PERIOD` are private consts ng cannot read, so they are restated
-        // here as the oracle, exactly as
-        // `the_folded_copy_floor_table_reproduces_both_of_productions` does for
-        // the minimums. If production ever moves, this fails and says so.
-        assert_eq!(
-            ours.periods.min(),
-            2,
-            "postprocess.rs's MIN_PERIOD is 2 — period-1 homopolymers are dropped"
-        );
-        assert_eq!(
-            ours.periods.max(),
-            6,
-            "postprocess.rs's MAX_PERIOD is 6 — the microsatellite ceiling"
-        );
-        assert_eq!(
-            ours.min_copies,
-            MinCopies::default(),
-            "the folded minimum table; its VALUES are pinned against production by \
-             the_folded_copy_floor_table_reproduces_both_of_productions"
-        );
-    }
-
-    /// **A2 — the folded table reproduces *both* of production's, exactly.**
+    /// **A2 — the folded catalog table reproduces *both* of production's, exactly.**
     ///
     /// A1 carried production's two copy-floor tables verbatim; A2 folds them into
     /// one [`MinCopies`]. This is the fold's proof obligation: the single
@@ -2419,11 +2395,21 @@ mod tests {
     /// oracle — which is the point: if production ever changes, this fails and says
     /// so, rather than ng drifting quietly.
     ///
+    /// **Pinned against the catalog's table explicitly, not `Default`.** As of spec
+    /// §2.3 ng's `Default` carries the short-read floors (`[6,4,4,3,3,3]`), *not*
+    /// the catalog's — so the value under test here is the catalog table
+    /// `[10,5,4,3,3,3]` that the `.cat` parity oracles pin (§8.1), restated as a
+    /// literal. (This is the still-true half of the deleted
+    /// `default_matches_the_frozen_catalog_params`: §2.3 dropped that test's
+    /// coupling of `Default` to production, and the fold-reproduces-the-catalog
+    /// proof — which keeps the golden oracles trustworthy — lives on here.)
+    ///
     /// The docs called these tables "disagreeing" (spec §5/§10, and A1's code).
     /// They do not: their one numeric difference is period 1, which neither gate
-    /// can reach. That is why A2 is a *deletion*, not a reconciliation.
+    /// reaches at the catalog's 2..=6 scope. That is why A2 is a *deletion*, not a
+    /// reconciliation.
     #[test]
-    fn the_folded_copy_floor_table_reproduces_both_of_productions() {
+    fn the_catalog_copy_floor_table_reproduces_both_of_productions() {
         // `postprocess::copy_number_floor` — classification's, verbatim.
         fn productions_copy_floor(period: usize) -> u64 {
             match period {
@@ -2446,38 +2432,39 @@ mod tests {
             }
         }
 
-        let folded = MinCopies::default();
-        let defaults = SsrSegmentCriteria::default();
+        // The catalog's copy-floor table (the golden `.cat` was built at these);
+        // ng's `Default` no longer holds it (spec §2.3), so it is pinned here.
+        let catalog_floors = MinCopies::new([10, 5, 4, 3, 3, 3], 3);
 
-        for period in defaults.periods.min()..=defaults.periods.max() {
+        // The catalog's period scope is 2..=6 (production's hardcoded
+        // MIN_PERIOD/MAX_PERIOD, restated — they are private consts ng cannot read).
+        for period in 2..=6u8 {
             assert_eq!(
-                u64::from(folded.for_period(period)),
+                u64::from(catalog_floors.for_period(period)),
                 productions_copy_floor(period as usize),
-                "folded table must match production's ADMISSION floor at period {period}"
+                "catalog table must match production's ADMISSION floor at period {period}"
             );
             assert_eq!(
-                folded.for_period(period),
+                catalog_floors.for_period(period),
                 productions_prefilter_floor(period),
-                "folded table must match production's PRE-FILTER floor at period {period}"
+                "catalog table must match production's PRE-FILTER floor at period {period}"
             );
         }
 
         // The `_ => 3` arm both originals carry, for a period wider than the table.
-        assert_eq!(folded.for_period(7), productions_prefilter_floor(7));
-        assert_eq!(u64::from(folded.for_period(7)), productions_copy_floor(7));
+        assert_eq!(catalog_floors.for_period(7), productions_prefilter_floor(7));
+        assert_eq!(
+            u64::from(catalog_floors.for_period(7)),
+            productions_copy_floor(7)
+        );
 
-        // Period 1 is the ONLY value the two originals differ on (10 vs 3), and it
-        // is unreachable: the default period floor is 2. That unreachability is
+        // Period 1 is the ONLY value the two originals differ on (10 vs 3), and at
+        // the catalog's 2..=6 scope it is unreachable. That unreachability is
         // exactly why "disagreeing" was the wrong word for them.
         assert_ne!(
             productions_copy_floor(1),
             u64::from(productions_prefilter_floor(1)),
             "period 1 is the one value the two originals differ on"
-        );
-        assert!(
-            defaults.periods.min() > 1,
-            "if period 1 became admissible by default, the two originals WOULD \
-             disagree and the fold would need a decision, not a deletion"
         );
     }
 
@@ -2505,7 +2492,7 @@ mod tests {
     fn classify_keeps_a_locus_the_window_edge_would_have_eaten() {
         // Contig: 10 kb. Tract at 0-based 1000..1016. The window is bases[900..1026]
         // = 1-based [901, 1026], so the tract ends **10 bp from the window's right
-        // edge** — far less than the 50 bp flank.
+        // edge** — far less than the 30 bp flank (the short-read Default).
         //
         // That window used to be illegal: `finish_locus` read the tract ± flank_bp to
         // embed it, so it panicked and the caller had to fetch a wider slice. Since
@@ -2524,7 +2511,7 @@ mod tests {
             win,
             Position(win_start_1),
             Bp(contig.len() as u64),
-            &SsrSegmentCriteria::default(), // flank_bp = 50
+            &SsrSegmentCriteria::default(), // flank_bp = 30 (short-read Default)
         );
         assert_eq!(
             classified.loci.len(),
@@ -2595,8 +2582,8 @@ mod tests {
     fn a_tract_at_the_windows_left_edge_keeps_its_flank_from_the_contig() {
         let (contig, _) = contig_with_one_tract_at(1000, 10_000);
         // The window STARTS at the tract: bases[1000..1076] = 1-based [1001, 1076].
-        // Not one base of the 50 bp left flank is inside it — and the contig has
-        // 1000 bp of it, so the locus stands.
+        // Not one base of the 30 bp left flank (the short-read Default) is inside it —
+        // and the contig has 1000 bp of it, so the locus stands.
         let win = &contig[1000..1076];
         let classified = classify(
             vec![iv(0, 16, 2, 100)],
@@ -2667,7 +2654,7 @@ mod tests {
             win,
             Position(901),
             Bp(contig.len() as u64),
-            &SsrSegmentCriteria::default(),
+            &catalog_criteria(),
         );
         assert!(
             classified.loci.is_empty(),
@@ -2777,7 +2764,7 @@ mod tests {
             &contig,
             Position(1),
             Bp(contig.len() as u64),
-            &SsrSegmentCriteria::default(),
+            &catalog_criteria(),
         );
 
         assert_eq!(

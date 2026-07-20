@@ -95,7 +95,7 @@ A1.
 
 ### Milestone B — the input surface (Args, parser, defaults)
 
-**B1. Apply the §2.3 short-read defaults to the library consts.**  ☐ — **own commit; oracle: the ng
+**B1. Apply the §2.3 short-read defaults to the library consts.**  ✅ — **own commit; oracle: the ng
 test suite green after re-pinning.**
 Edit `DEFAULT_MIN_PERIOD` 2→1, `DEFAULT_FLANK_BP` 50→30, `DEFAULT_MAX_STR_LEN` 1000→100,
 `MinCopies::default()` `[10,5,4,3,3,3]`→`[6,4,4,3,3,3]`; delete
