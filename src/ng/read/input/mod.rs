@@ -59,11 +59,25 @@ pub enum AlignmentFileError {
     /// Cheap and checked first, but **not** a substitute for the streaming
     /// order guard: this catches a file that does not *claim* to be sorted,
     /// while [`Self::OutOfOrderRead`] catches the file that claims it and lies.
+    ///
+    /// `sort_order` carries what the header actually said — `queryname` and a
+    /// missing tag are the same rejection but not the same diagnosis, and a
+    /// user whose file says `SO:queryname` should be told that rather than
+    /// left to guess. `None` means the tag (or the whole `@HD` line) was
+    /// absent. (Arch §2 sketched this variant with only `path`; signatures
+    /// there are illustrative, and production's equivalent carries the observed
+    /// value too.)
     #[error(
-        "alignment file '{path}' is not coordinate-sorted \
-         (@HD SO is missing or not 'coordinate')"
+        "alignment file '{path}' is not coordinate-sorted (@HD SO is {})",
+        match sort_order {
+            Some(value) => format!("'{value}'"),
+            None => "missing".to_string(),
+        }
     )]
-    NotCoordinateSorted { path: PathBuf },
+    NotCoordinateSorted {
+        path: PathBuf,
+        sort_order: Option<String>,
+    },
 
     /// The file's `@SQ` list is not the reference's contig table (spec §3.1,
     /// check 2). `detail` comes from `ContigList::first_disagreement` and names
@@ -88,6 +102,28 @@ pub enum AlignmentFileError {
     /// one layer up, as [`IngestError::SampleNameMismatch`].
     #[error("alignment file '{path}' names more than one sample: {}", names.join(", "))]
     MultipleSampleNames { path: PathBuf, names: Vec<String> },
+
+    /// The `@RG` records name **no** sample — either the file has none at all,
+    /// or one carries no `SM` tag (spec §3.1, check 4).
+    ///
+    /// The other half of "exactly one sample". Arch §2's variant list covered
+    /// only the *more than one* case, but a file that cannot say whose reads it
+    /// holds fails the same check for the same reason, and the sample layer
+    /// above has nothing to compare. Production rejects these files too.
+    ///
+    /// `read_group` distinguishes the two causes: `Some(id)` names the record
+    /// missing its tag, `None` means the file has no `@RG` lines.
+    #[error(
+        "alignment file '{path}' names no sample: {}",
+        match read_group {
+            Some(id) => format!("@RG '{id}' has no SM tag"),
+            None => "the file has no @RG records".to_string(),
+        }
+    )]
+    MissingSampleName {
+        path: PathBuf,
+        read_group: Option<String>,
+    },
 
     /// A record regressed in genome position: the file claims `SO:coordinate`
     /// and is not sorted (spec §3.2). Carries **both** keys so the message can

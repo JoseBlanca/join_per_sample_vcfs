@@ -20,27 +20,206 @@
 //! The name says BAM but the module opens CRAM too — "BAM" in the everyday
 //! sense of "the alignment file" (spec §6).
 
-// The header readers below are the gate's parts, built (step B1) one commit
-// before the gate that calls them (step B2). They have tests but no production
-// caller yet, which `-D warnings` reads as dead code.
-//
-// `expect` rather than `allow` on purpose: the moment B2 calls these, the
-// expectation goes unfulfilled and the build fails *naming this line*, so
-// removing it is enforced by the compiler rather than remembered.
-//
-// `not(test)`, because under `cfg(test)` the tests below are callers and the
-// lint would not fire — an unconditional `expect` is itself unfulfilled there.
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "B2 (AlignmentFile::open) consumes these; remove this attribute with it"
-    )
-)]
+use std::fs::File;
+use std::path::{Path, PathBuf};
 
+use noodles_bam as bam;
+use noodles_cram as cram;
 use noodles_sam as sam;
 
+use crate::bam::index_preflight::{
+    AlignmentFileKind, AlignmentIndex, load_alignment_index, preflight_alignment_indexes,
+};
 use crate::fasta::{ContigEntry, ContigList};
+use crate::ng::read::filtering::ReadFilterConfig;
+use crate::ng::reference_info::ReferenceInfo;
+
+use super::AlignmentFileError;
+
+/// One opened, **validated** alignment file.
+///
+/// The gate of [`AlignmentFile::open`] has passed, so `ref_id == ContigId`
+/// holds for every record this file will ever yield — the invariant the region
+/// query, the order guard and the cross-file merge all lean on without
+/// re-checking. There is no way to hold one of these unvalidated: `open` either
+/// returns a validated handle or an error.
+///
+/// The parsed index is owned here and lives for the whole run: a region query
+/// is an in-memory lookup plus a seek, never a file open or an index parse
+/// (spec §3.3). Not `Clone` — it owns an index, and will own a reader pool;
+/// sharing is by reference.
+#[derive(Debug)]
+pub struct AlignmentFile {
+    path: PathBuf,
+    /// Kept for the region query, which resolves a contig to a `ref_id` and
+    /// hands the header to the record source. Read from C2 onwards.
+    #[expect(dead_code, reason = "the region query (C2) reads this")]
+    header: sam::Header,
+    /// Parsed once, at open — never re-read per query (spec §3.3). Queried from
+    /// C2 onwards, which is the guarantee the whole per-query cost model rests
+    /// on: a query is an in-memory lookup plus a seek.
+    #[expect(dead_code, reason = "the region query (C2) queries this")]
+    index: AlignmentIndex,
+    /// From `@RG SM`. The k-file agreement check belongs to `SampleReads`.
+    sample_name: String,
+    /// The `@SQ M5` tags, indexed by `ContigId` — which is sound precisely
+    /// because the gate just proved this file's `@SQ` order *is* the
+    /// reference's. `None` where the file carries no usable `M5`.
+    ///
+    /// Captured at open and compared much later, by `check_assembly` (D1),
+    /// once the caller has joined `reference_info`'s background verification.
+    sq_md5s: Vec<Option<[u8; 16]>>,
+    /// Handed to the per-query `ReadFilter` from C4 onwards. Held on the file
+    /// rather than passed per query because the filtering policy is the file's
+    /// for the whole run, not the caller's per region.
+    #[expect(dead_code, reason = "reads_in_region (C4) builds the filter from this")]
+    filter_config: ReadFilterConfig,
+}
+
+impl AlignmentFile {
+    /// Open one indexed BAM/CRAM and **validate it or fail**.
+    ///
+    /// Four checks, fail-fast **in this order** (spec §3.1): `@HD SO` is
+    /// `coordinate`; the `@SQ` list equals `reference.contig_list()` exactly,
+    /// order included; the index loads; the `@RG` records name exactly one
+    /// sample. The order is cheapest-and-most-fundamental first, so a file that
+    /// is wrong in several ways reports the most basic fault rather than
+    /// whichever check happens to run.
+    ///
+    /// **The `@SQ` check is the permutation fix.** Comparing *in order* against
+    /// the reference is what distinguishes this from the resolves-only check it
+    /// replaces: a file whose contig list is a re-ordering of the reference's
+    /// resolves every index and then fetches the wrong contig for every read.
+    ///
+    /// With `build_index_if_missing`, an absent index is built next to the file
+    /// rather than rejected; that is a caller policy, not this module's.
+    pub fn open(
+        path: &Path,
+        reference: &ReferenceInfo,
+        filter_config: ReadFilterConfig,
+        build_index_if_missing: bool,
+    ) -> Result<Self, AlignmentFileError> {
+        let header = read_header(path)?;
+
+        // 1. @HD SO.
+        let observed_sort_order = sort_order(&header);
+        if observed_sort_order.as_deref() != Some("coordinate") {
+            return Err(AlignmentFileError::NotCoordinateSorted {
+                path: path.to_path_buf(),
+                sort_order: observed_sort_order,
+            });
+        }
+
+        // 2. @SQ vs the reference's contig table — names, lengths, order, and
+        //    digests where both sides carry one. `first_disagreement` applies
+        //    the absent-digest-is-a-wildcard rule itself (`fasta/mod.rs`, its
+        //    `if let (Some, Some)` arm) rather than going through
+        //    `ContigEntry`'s `PartialEq`, which encodes the same rule
+        //    separately — so a `.fai`-only reference compares on name and
+        //    length alone with no branch needed here.
+        //
+        //    The file is the left operand so the message reads "file value vs
+        //    reference value", the direction a user needs: the reference is the
+        //    authority and the file is the thing that is wrong.
+        let file_contigs = contig_list(&header);
+        file_contigs
+            .first_disagreement(&reference.contig_list())
+            .map_err(|detail| AlignmentFileError::ContigReconcile {
+                path: path.to_path_buf(),
+                detail,
+            })?;
+
+        // 3. The index — parsed here, once, and held for the life of the run.
+        if build_index_if_missing {
+            preflight_alignment_indexes(&[path.to_path_buf()], true).map_err(|source| {
+                AlignmentFileError::Index {
+                    path: path.to_path_buf(),
+                    source,
+                }
+            })?;
+        }
+        let index = load_alignment_index(path).map_err(|source| AlignmentFileError::Index {
+            path: path.to_path_buf(),
+            source,
+        })?;
+
+        // 4. Exactly one @RG SM.
+        let sample_name = match sample_names(&header) {
+            SampleNames::One(name) => name,
+            SampleNames::Several(names) => {
+                return Err(AlignmentFileError::MultipleSampleNames {
+                    path: path.to_path_buf(),
+                    names,
+                });
+            }
+            SampleNames::MissingTag { read_group_id } => {
+                return Err(AlignmentFileError::MissingSampleName {
+                    path: path.to_path_buf(),
+                    read_group: Some(read_group_id),
+                });
+            }
+            SampleNames::NoReadGroups => {
+                return Err(AlignmentFileError::MissingSampleName {
+                    path: path.to_path_buf(),
+                    read_group: None,
+                });
+            }
+        };
+
+        // Free, and only sound now: check 2 proved this order is the
+        // reference's, so position i really is `ContigId(i)`.
+        let sq_md5s = file_contigs.entries.iter().map(|entry| entry.md5).collect();
+
+        Ok(Self {
+            path: path.to_path_buf(),
+            header,
+            index,
+            sample_name,
+            sq_md5s,
+            filter_config,
+        })
+    }
+
+    /// The single sample this file's `@RG` records name.
+    pub fn sample_name(&self) -> &str {
+        &self.sample_name
+    }
+
+    /// The `@SQ M5` tags, indexed by `ContigId`, for the deferred assembly
+    /// check. `None` where the file carried no usable digest.
+    pub fn sq_md5s(&self) -> &[Option<[u8; 16]>] {
+        &self.sq_md5s
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+/// Read just the SAM header, dispatching on the file's extension.
+///
+/// The reader is opened and dropped here: the gate needs the header, and the
+/// readers a query will use come from the pool (step C1).
+fn read_header(path: &Path) -> Result<sam::Header, AlignmentFileError> {
+    let open_error = |source: std::io::Error| AlignmentFileError::Open {
+        path: path.to_path_buf(),
+        source,
+    };
+
+    let file = File::open(path).map_err(open_error)?;
+
+    match AlignmentFileKind::from_path(path) {
+        Some(AlignmentFileKind::Bam) => bam::io::Reader::new(file).read_header(),
+        Some(AlignmentFileKind::Cram) => cram::io::Reader::new(file).read_header(),
+        // `load_alignment_index` rejects this too, but the header read comes
+        // first, so the extension has to be understood here.
+        None => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "expected a '.bam' or '.cram' extension",
+        )),
+    }
+    .map_err(open_error)
+}
 
 /// The `@HD SO` value, or `None` when the header carries no `@HD` line or no
 /// sort-order tag at all.
@@ -448,6 +627,469 @@ mod tests {
 
     /// Range patterns fail at their edges, and a `z`-only test cannot see it.
     /// These six characters each sit one step outside a valid range.
+    // -----------------------------------------------------------------
+    // The gate — `AlignmentFile::open` (T1, T2, T3, T12a)
+    // -----------------------------------------------------------------
+    use std::fs::File;
+
+    use noodles_bam as bam;
+    use noodles_core::Position as RecordPosition;
+    use noodles_sam::alignment::RecordBuf;
+    use noodles_sam::alignment::io::Write as _;
+    use noodles_sam::alignment::record::MappingQuality;
+    use noodles_sam::alignment::record::cigar::Op;
+    use noodles_sam::alignment::record::cigar::op::Kind;
+    use noodles_sam::alignment::record_buf::{QualityScores, Sequence};
+    use tempfile::TempDir;
+
+    use crate::ng::reference_info::{ReferenceSource, read_reference_info};
+    use crate::pileup::per_sample::cram_files::{ContigSpec, build_fasta};
+
+    /// The fixture reference: two contigs of different lengths, so a
+    /// permutation of the `@SQ` list is detectable on *name* and a re-labelling
+    /// on *length*.
+    const FIXTURE_CONTIGS: [(&str, usize); 2] = [("chr1", 100), ("chr2", 200)];
+
+    fn fixture_reference(with_digests: bool) -> (TempDir, ReferenceInfo) {
+        let specs: Vec<ContigSpec> = FIXTURE_CONTIGS
+            .iter()
+            .map(|(name, length)| ContigSpec {
+                name: (*name).to_string(),
+                length: *length as u64,
+            })
+            .collect();
+        let (dir, fasta) = build_fasta(&specs).expect("build fasta");
+
+        // The `Fasta` arm reads the genome and carries real per-contig digests;
+        // the `Fai` arm cannot, so its digests are `None` and the MD5 half of
+        // reconciliation is a no-op. T2 needs both.
+        let source = if with_digests {
+            ReferenceSource::Fasta {
+                fasta: fasta.clone(),
+                fai: None,
+            }
+        } else {
+            ReferenceSource::Fai(crate::ng::reference_info::sibling_fai_path(&fasta))
+        };
+        let reference = read_reference_info(source).expect("read reference");
+        (dir, reference)
+    }
+
+    /// A header whose `@SQ` list is `contigs`, with `SO:coordinate` and one
+    /// read group naming `NA12878` unless overridden.
+    fn bam_header(contigs: &[(&str, usize, Option<&str>)]) -> sam::Header {
+        header(Some("coordinate"), contigs, &[("rg1", Some("NA12878"))])
+    }
+
+    fn matching_contigs() -> Vec<(&'static str, usize, Option<&'static str>)> {
+        FIXTURE_CONTIGS
+            .iter()
+            .map(|(name, length)| (*name, *length, None))
+            .collect()
+    }
+
+    fn a_record(reference_sequence_id: usize, start: usize) -> RecordBuf {
+        RecordBuf::builder()
+            .set_name(b"read-1")
+            .set_reference_sequence_id(reference_sequence_id)
+            .set_mapping_quality(MappingQuality::new(60).expect("mapq in range"))
+            .set_alignment_start(RecordPosition::try_from(start).unwrap())
+            .set_cigar([Op::new(Kind::Match, 10)].into_iter().collect())
+            .set_sequence(Sequence::from(vec![b'A'; 10]))
+            .set_quality_scores(QualityScores::from(vec![30u8; 10]))
+            .build()
+    }
+
+    /// Write a BAM with `header` and build its index next to it, so
+    /// `AlignmentFile::open` finds a real indexed file on disk.
+    fn indexed_bam(header: &sam::Header) -> (TempDir, PathBuf) {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("sample.bam");
+
+        let mut writer = bam::io::Writer::new(File::create(&path).expect("create bam"));
+        writer.write_header(header).expect("write header");
+        if !header.reference_sequences().is_empty() {
+            writer
+                .write_alignment_record(header, &a_record(0, 1))
+                .expect("write record");
+        }
+        writer.try_finish().expect("finish");
+
+        preflight_alignment_indexes(std::slice::from_ref(&path), true).expect("build index");
+        (dir, path)
+    }
+
+    /// An opened fixture **plus the temp dirs its files live in**.
+    ///
+    /// The dirs are returned rather than dropped at helper exit because they
+    /// own the BAM and the reference on disk: drop them and the handle points
+    /// at deleted files. Today's assertions would survive that (the index is
+    /// already parsed in memory), but the first test that actually *queries*
+    /// the file would fail somewhere far from the cause.
+    struct OpenedFixture {
+        file: Result<AlignmentFile, AlignmentFileError>,
+        _reference_dir: TempDir,
+        _bam_dir: TempDir,
+    }
+
+    fn open_fixture(
+        contigs: &[(&str, usize, Option<&str>)],
+        reference_has_digests: bool,
+    ) -> OpenedFixture {
+        open_fixture_with_header(&bam_header(contigs), reference_has_digests)
+    }
+
+    fn open_fixture_with_header(
+        header: &sam::Header,
+        reference_has_digests: bool,
+    ) -> OpenedFixture {
+        let (reference_dir, reference) = fixture_reference(reference_has_digests);
+        let (bam_dir, path) = indexed_bam(header);
+        OpenedFixture {
+            file: AlignmentFile::open(&path, &reference, ReadFilterConfig::default(), false),
+            _reference_dir: reference_dir,
+            _bam_dir: bam_dir,
+        }
+    }
+
+    /// The `ContigReconcile` detail for a header that should fail check 2.
+    fn reconcile_detail(
+        contigs: &[(&str, usize, Option<&str>)],
+        reference_has_digests: bool,
+    ) -> String {
+        match open_fixture(contigs, reference_has_digests)
+            .file
+            .expect_err("must not open")
+        {
+            AlignmentFileError::ContigReconcile { detail, .. } => detail,
+            other => panic!("expected ContigReconcile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_matching_file_opens_and_exposes_its_sample_and_digests() {
+        let fixture = open_fixture(&matching_contigs(), false);
+        let file = fixture.file.as_ref().expect("the file matches");
+
+        assert_eq!(file.sample_name(), "NA12878");
+        assert_eq!(
+            file.sq_md5s().len(),
+            2,
+            "one slot per contig, indexed by ContigId"
+        );
+        assert!(
+            file.sq_md5s().iter().all(Option::is_none),
+            "this fixture's @SQ lines carry no M5, which is ordinary input"
+        );
+    }
+
+    /// **T1 — the permutation hole, closed.**
+    ///
+    /// `@SQ` lists the reference's contigs in the wrong order. Every `ref_id`
+    /// still *resolves*, which is why the check this replaces let it through
+    /// and then fetched the wrong contig for every read. Order-aware equality
+    /// catches it on the first transposed name.
+    ///
+    /// Mutation-verified below by
+    /// `a_resolves_only_check_accepts_the_permutation_this_gate_rejects`.
+    #[test]
+    fn t1_a_permuted_sq_list_is_rejected_naming_the_first_transposed_contig() {
+        let permuted = vec![("chr2", 200, None), ("chr1", 100, None)];
+
+        let detail = reconcile_detail(&permuted, false);
+
+        assert_eq!(
+            detail, "name disagreement at index 0 ('chr2' vs 'chr1')",
+            "the first transposed position, file value before reference value"
+        );
+    }
+
+    /// **Why T1 needs an ordered comparison — the superseded probe, recorded.**
+    ///
+    /// `ReadFilter::new`'s check asks only "does every `@SQ` index resolve in
+    /// the reference?", fetching each contig and accepting if the fetch
+    /// succeeds. Run here against the permuted header, it **passes** — order is
+    /// never consulted, so the file goes on to fetch the wrong contig for every
+    /// read.
+    ///
+    /// **This is documentation, not the mutation guard.** It does not call
+    /// `AlignmentFile::open`, so gutting the gate's comparison would leave it
+    /// green; T1 is what catches that. The real mutation was performed against
+    /// the gate itself during B2 — the `first_disagreement` call was replaced
+    /// with a resolves-only length check and T1 duly failed — and this test is
+    /// the standing record of *what* the old check did, so the reason the gate
+    /// is stricter does not have to be taken on trust.
+    #[test]
+    fn the_superseded_resolves_only_probe_cannot_see_order() {
+        use crate::ng::ref_seq::{InMemoryRefSeq, RefSeq};
+        use crate::ng::types::ContigId;
+
+        let (_reference_dir, reference) = fixture_reference(false);
+        let permuted = bam_header(&[("chr2", 200, None), ("chr1", 100, None)]);
+
+        // The superseded check: fetch every contig the file's `@SQ` list can
+        // name, and accept if each one resolves. Order is never consulted.
+        let reference_bases = InMemoryRefSeq::from_contigs(
+            FIXTURE_CONTIGS
+                .iter()
+                .map(|(_, length)| vec![b'A'; *length])
+                .collect(),
+        );
+        let mut probe = Vec::new();
+        let every_contig_resolves = (0..permuted.reference_sequences().len()).all(|index| {
+            reference_bases
+                .fetch_into(ContigId(index as u32), 1, 0, &mut probe)
+                .is_ok()
+        });
+        assert!(
+            every_contig_resolves,
+            "every @SQ index of the permuted file resolves — so the old probe \
+             accepts it, and then every read fetches the wrong contig"
+        );
+
+        // The gate's own comparison rejects that very same header.
+        assert!(
+            contig_list(&permuted)
+                .first_disagreement(&reference.contig_list())
+                .is_err(),
+            "the ordered comparison must reject what the probe accepted"
+        );
+    }
+
+    /// **T2 — name, length and count mismatches**, each naming the right field
+    /// and index.
+    #[test]
+    fn t2_name_length_and_count_mismatches_are_each_named() {
+        let cases = [
+            (
+                vec![("chrX", 100, None), ("chr2", 200, None)],
+                "name disagreement at index 0",
+            ),
+            (
+                vec![("chr1", 100, None), ("chr2", 999, None)],
+                "length disagreement at index 1",
+            ),
+            (
+                vec![("chr1", 100, None)],
+                "@SQ list length differs (1 vs 2)",
+            ),
+        ];
+
+        for (contigs, expected) in cases {
+            let detail = reconcile_detail(&contigs, false);
+            assert!(
+                detail.contains(expected),
+                "expected {expected:?}, got {detail:?}"
+            );
+        }
+    }
+
+    /// **T2, the digest half.** A wrong `@SQ M5` is caught at open **only**
+    /// when the `ReferenceInfo` in hand carries digests — the `Fasta` arm. Under
+    /// a `.fai`-only table the comparison is a wildcard and the same file opens
+    /// cleanly, which is the behaviour production ships and what makes the
+    /// deferred `check_assembly` (D1) necessary rather than redundant.
+    #[test]
+    fn t2_a_wrong_m5_is_caught_only_when_the_reference_carries_digests() {
+        let wrong_digest = "ffffffffffffffffffffffffffffffff";
+        let contigs = vec![
+            ("chr1", 100, Some(wrong_digest)),
+            ("chr2", 200, Some(wrong_digest)),
+        ];
+
+        let detail = reconcile_detail(&contigs, true);
+        assert!(
+            detail.contains("md5 disagreement at index 0"),
+            "got: {detail}"
+        );
+
+        assert!(
+            open_fixture(&contigs, false).file.is_ok(),
+            "against a .fai-only reference the digest is a wildcard, so the \
+             same file opens — the gap check_assembly closes later"
+        );
+    }
+
+    /// **T3 — `SO` wrong or missing**, rejected before anything else, and the
+    /// message says which it was.
+    #[test]
+    fn t3_a_file_that_is_not_coordinate_sorted_is_rejected_at_open() {
+        let contigs = matching_contigs();
+
+        let queryname = header(Some("queryname"), &contigs, &[("rg1", Some("NA12878"))]);
+        let error = open_fixture_with_header(&queryname, false)
+            .file
+            .expect_err("must not open");
+        match &error {
+            AlignmentFileError::NotCoordinateSorted { sort_order, .. } => assert_eq!(
+                sort_order.as_deref(),
+                Some("queryname"),
+                "carries the observed value as a fact, not pre-quoted prose"
+            ),
+            other => panic!("expected NotCoordinateSorted, got {other:?}"),
+        }
+        assert!(
+            error.to_string().contains("@HD SO is 'queryname'"),
+            "and the rendered message quotes it: {error}"
+        );
+
+        let no_sort_order = header(None, &contigs, &[("rg1", Some("NA12878"))]);
+        let error = open_fixture_with_header(&no_sort_order, false)
+            .file
+            .expect_err("must not open");
+        match &error {
+            AlignmentFileError::NotCoordinateSorted { sort_order, .. } => {
+                assert_eq!(sort_order.as_deref(), None)
+            }
+            other => panic!("expected NotCoordinateSorted, got {other:?}"),
+        }
+        assert!(error.to_string().contains("@HD SO is missing"), "{error}");
+    }
+
+    /// The gate's fail-fast order is spec §3.1's — `SO` → `@SQ` → index → `SM`
+    /// — and it is only observable through a file that fails two checks at
+    /// once. Each boundary gets its own case, so re-ordering any adjacent pair
+    /// fails a test rather than quietly changing which fault a user is told
+    /// about.
+    #[test]
+    fn the_four_checks_run_in_the_specified_order() {
+        // SO before @SQ.
+        let bad_sort_and_bad_contigs = header(
+            Some("queryname"),
+            &[("chrX", 1, None)],
+            &[("rg1", Some("NA12878"))],
+        );
+        assert!(matches!(
+            open_fixture_with_header(&bad_sort_and_bad_contigs, false).file,
+            Err(AlignmentFileError::NotCoordinateSorted { .. })
+        ));
+
+        // @SQ before the index: bad contigs on a BAM with no index at all.
+        let bad_contigs = bam_header(&[("chrX", 1, None)]);
+        assert!(matches!(
+            open_unindexed_with_header(&bad_contigs).1,
+            Err(AlignmentFileError::ContigReconcile { .. })
+        ));
+
+        // The index before @RG SM: no index and no sample.
+        let no_sample = header(Some("coordinate"), &matching_contigs(), &[]);
+        assert!(matches!(
+            open_unindexed_with_header(&no_sample).1,
+            Err(AlignmentFileError::Index { .. })
+        ));
+    }
+
+    /// Write a BAM with **no** index beside it and try to open it. Returns the
+    /// temp dirs so the file outlives the call.
+    fn open_unindexed_with_header(
+        header: &sam::Header,
+    ) -> (
+        (TempDir, TempDir),
+        Result<AlignmentFile, AlignmentFileError>,
+    ) {
+        let (reference_dir, reference) = fixture_reference(false);
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("unindexed.bam");
+
+        let mut writer = bam::io::Writer::new(File::create(&path).expect("create"));
+        writer.write_header(header).expect("write header");
+        if !header.reference_sequences().is_empty() {
+            writer
+                .write_alignment_record(header, &a_record(0, 1))
+                .expect("write record");
+        }
+        writer.try_finish().expect("finish");
+
+        let opened = AlignmentFile::open(&path, &reference, ReadFilterConfig::default(), false);
+        ((reference_dir, dir), opened)
+    }
+
+    /// **T12a — one file naming two samples.** The cross-file half (two files
+    /// naming different samples) is `SampleReads`' T12b.
+    #[test]
+    fn t12a_a_file_whose_read_groups_name_two_samples_is_rejected_at_open() {
+        let contigs = matching_contigs();
+        let two_samples = header(
+            Some("coordinate"),
+            &contigs,
+            &[("rg1", Some("NA12878")), ("rg2", Some("NA12892"))],
+        );
+
+        match open_fixture_with_header(&two_samples, false)
+            .file
+            .expect_err("must not open")
+        {
+            AlignmentFileError::MultipleSampleNames { names, .. } => {
+                assert_eq!(names, vec!["NA12878", "NA12892"])
+            }
+            other => panic!("expected MultipleSampleNames, got {other:?}"),
+        }
+    }
+
+    /// The gate's mapping of `SampleNames::MissingTag`, and the `Some` branch
+    /// of `MissingSampleName`'s message — the only non-trivial formatting in
+    /// the new variant, and until now exercised by nothing.
+    #[test]
+    fn a_read_group_with_no_sm_tag_is_rejected_naming_that_read_group() {
+        let contigs = matching_contigs();
+        let untagged = header(Some("coordinate"), &contigs, &[("rg1", None)]);
+
+        let error = open_fixture_with_header(&untagged, false)
+            .file
+            .expect_err("must not open");
+        match &error {
+            AlignmentFileError::MissingSampleName { read_group, .. } => {
+                assert_eq!(read_group.as_deref(), Some("rg1"))
+            }
+            other => panic!("expected MissingSampleName, got {other:?}"),
+        }
+        assert!(
+            error.to_string().contains("@RG 'rg1' has no SM tag"),
+            "{error}"
+        );
+    }
+
+    /// The other half of "exactly one sample": a file with no `@RG` at all
+    /// cannot say whose reads it holds, so the sample layer would have nothing
+    /// to agree on.
+    #[test]
+    fn a_file_naming_no_sample_is_rejected_at_open() {
+        let contigs = matching_contigs();
+        let no_read_groups = header(Some("coordinate"), &contigs, &[]);
+
+        match open_fixture_with_header(&no_read_groups, false)
+            .file
+            .expect_err("must not open")
+        {
+            AlignmentFileError::MissingSampleName { read_group, .. } => {
+                assert_eq!(read_group, None)
+            }
+            other => panic!("expected MissingSampleName, got {other:?}"),
+        }
+    }
+
+    /// A missing index is an error, not a silent whole-file scan — and with the
+    /// build flag it is repaired instead.
+    #[test]
+    fn a_missing_index_is_rejected_unless_the_caller_asks_for_one() {
+        let header = bam_header(&matching_contigs());
+        let (dirs, opened) = open_unindexed_with_header(&header);
+
+        assert!(
+            matches!(opened, Err(AlignmentFileError::Index { .. })),
+            "an unindexed file is an error, never a silent whole-file scan"
+        );
+
+        // The same file in the same place — only the caller's policy differs.
+        let (_reference_dir, bam_dir) = &dirs;
+        let (_fresh_reference_dir, reference) = fixture_reference(false);
+        let path = bam_dir.path().join("unindexed.bam");
+        assert!(
+            AlignmentFile::open(&path, &reference, ReadFilterConfig::default(), true).is_ok(),
+            "with build_index_if_missing the index is created next to the file"
+        );
+    }
+
     #[test]
     fn hex_nibble_rejects_the_characters_bordering_each_valid_range() {
         for character in [b'/', b':', b'`', b'g', b'@', b'G'] {
