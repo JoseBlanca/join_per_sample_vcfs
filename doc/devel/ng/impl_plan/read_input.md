@@ -145,7 +145,7 @@ what a whole-file `BamRecordSource` scan filtered to the same region returns —
 order. This is the step whose failure is silent (a missed chunk edge is a wrong genotype, not a
 crash), so it lands alone with that oracle green. *Depends:* C1. *Source:* spec §3.2/§3.3, arch §4.
 
-**C3. `OrderVerified`.**  ☐ **Own commit — do not bundle.**
+**C3. `OrderVerified`.**  ✅ **Own commit — do not bundle.**
 The adapter comparing each read's `GenomePosition` against the previous, hard-erroring
 `OutOfOrderRead { previous, current }` on a **strict** decrease. State lives in the iterator, not the
 handle. Tests **T4a** (planted position regression; mutation-verify that removing the check lets it
