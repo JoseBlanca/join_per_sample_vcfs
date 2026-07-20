@@ -84,20 +84,20 @@ sample-name check, the k-way merge, and the merge-free single-file arm.
 
 ### Milestone A — vocabulary, scaffold, and the two `filtering.rs` extensions
 
-**A1. `GenomePosition` in `types.rs`.**  ☐
+**A1. `GenomePosition` in `types.rs`.**  ✅
 `pub struct GenomePosition { pub contig: ContigId, pub position: Position }` with the standard
 derives; **`Ord` derived so field order is genome order**. Doc comment says what the value *is* (one
 base, genome-wide) and that a bare `Position` does not identify a base. Unit test: sorting a shuffled
 vector yields contig-major, position-minor order. A shared-vocabulary addition, so it lands alone.
 *Source:* arch `sample_reads.md` §1.1, `ng_step_interfaces.md` §1.
 
-**A2. Scaffold `read/input/`.**  ☐
+**A2. Scaffold `read/input/`.**  ✅
 `src/ng/read/input/{mod.rs, open_bam.rs, region_query.rs, merge.rs}` with `#[cfg(test)]` blocks;
 `pub mod input;` in `read/mod.rs`. Declare `AlignmentFileError` and `IngestError` with their variants
 and doc comments, no logic. *Depends:* A1. *Source:* arch `alignment_file.md` §Module home + §2,
 arch `sample_reads.md` §2.
 
-**A3. Extend `read/filtering.rs`: probe-free construction + buffer hand-off.**  ☐
+**A3. Extend `read/filtering.rs`: probe-free construction + buffer hand-off.**  ✅
 Two additions, both ng-owned (not production edits): (a) a constructor that **skips** `new`'s
 per-contig resolve probe — that probe is O(contigs) reference fetches, and building a `ReadFilter`
 per region query would pay it ~10⁶ times, while the open gate proves something strictly stronger;
