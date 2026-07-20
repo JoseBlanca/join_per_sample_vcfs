@@ -38,6 +38,28 @@ impl Position {
     }
 }
 
+/// One base, genome-wide: which contig, and where along it. A [`Position`] on
+/// its own does not identify a base — position 1000 exists on every contig —
+/// which is why so many signatures thread `(contig, position)` as two
+/// parameters. This is that pair given a name, and the point-shaped sibling of
+/// [`GenomeRegion`].
+///
+/// **The derived [`Ord`] is genome order**: contig index first, then position
+/// within it, because that is the field order. That is what lets the type serve
+/// directly as a sort key wherever reads or loci are ordered along the
+/// reference — the read-order guard and the k-way merge are its first uses
+/// (`doc/devel/ng/arch/sample_reads.md` §1.1).
+///
+/// The ordering is only meaningful because every alignment file's `ref_id` was
+/// proved equal to its [`ContigId`] when the file was opened
+/// (`doc/devel/ng/spec/alignment_file.md` §3.1). Without that gate, contig
+/// indices from different files would not be comparable at all.
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct GenomePosition {
+    pub contig: ContigId,
+    pub position: Position,
+}
+
 /// A **physical** piece of DNA: a contig plus a 1-based **inclusive** range
 /// `[start, end]`. No genetic claim — that is what distinguishes it from a
 /// *locus* (`typed_regions.md` §1.1).
@@ -211,6 +233,67 @@ mod tests {
         assert_eq!(BaseQual(93).get(), 93);
         assert_eq!(Bp(150).get(), 150);
         assert_eq!(Position(1).get(), 1);
+    }
+
+    fn genome_position(contig: u32, position: u64) -> GenomePosition {
+        GenomePosition {
+            contig: ContigId(contig),
+            position: Position(position),
+        }
+    }
+
+    /// The whole reason `GenomePosition` is a struct with this field order and
+    /// not a `(Position, ContigId)` pair: sorting must give **genome order** —
+    /// contig-major, position-minor — with no comparator written at the call
+    /// site. A transposed field order would still compile and still sort; it
+    /// would just interleave contigs, which is the failure this test exists to
+    /// catch.
+    #[test]
+    fn sorting_yields_contig_major_position_minor_order() {
+        let mut shuffled = vec![
+            genome_position(2, 5),
+            genome_position(0, 900),
+            genome_position(1, 1),
+            genome_position(0, 7),
+            genome_position(2, 1),
+            genome_position(1, 1000),
+            genome_position(0, 100),
+        ];
+        shuffled.sort();
+
+        assert_eq!(
+            shuffled,
+            vec![
+                genome_position(0, 7),
+                genome_position(0, 100),
+                genome_position(0, 900),
+                genome_position(1, 1),
+                genome_position(1, 1000),
+                genome_position(2, 1),
+                genome_position(2, 5),
+            ],
+            "contig index dominates: contig 2 position 1 sorts after contig 1 position 1000"
+        );
+    }
+
+    /// Equal keys are legal and compare equal — the order guard rejects only a
+    /// strict decrease (`spec/alignment_file.md` §3.2), so `Ord` must report
+    /// `Equal` for a repeated position rather than imposing a tie-break of its
+    /// own, and `Less` for any genuine advance along the genome.
+    #[test]
+    fn ordering_is_equal_for_a_repeated_position_and_strict_otherwise() {
+        use std::cmp::Ordering;
+
+        let read_start = genome_position(3, 42);
+        assert_eq!(read_start.cmp(&genome_position(3, 42)), Ordering::Equal);
+        assert!(
+            read_start < genome_position(3, 43),
+            "later position on same contig"
+        );
+        assert!(
+            read_start < genome_position(4, 1),
+            "later contig, earlier position"
+        );
     }
 
     fn region(start: u64, end: u64) -> GenomeRegion {
