@@ -1059,9 +1059,31 @@ fn finish_locus(
     let new_end = r.start + en as u64;
     let trimmed = &raw_tract[st..en];
 
-    // Copy-number floor — GangSTR computes copies from the ORIGINAL span
-    // (integer division), as an accept-gate after trimming.
-    let ref_copy = (r.end - r.start) / u64::from(r.period);
+    // Copy-number floor, applied to the **trimmed** tract — the one that gets
+    // emitted (owner, 2026-07-20). GangSTR counts copies on the *detected* span
+    // instead, and this followed it until the two were seen to disagree in the
+    // output: a tract admitted on 3 detected copies is reported with the 2 that
+    // survive trimming, so a row breaks the `min_copies` its own file header
+    // announces. Worst for the long motifs, because trimming costs up to a copy
+    // per end whatever the period, and that is a bigger share of a small count —
+    // 52% of period-6 loci and 51% of period-5 were under their floor, against
+    // 2.8% overall (tomato SL4.00). Period 1 was untouched: 6 copies is 6 bases,
+    // and a homopolymer has no ragged end to trim.
+    //
+    // **This gate was dead until now.** `prefilter` applies the same table to the
+    // same detected span before `classify` runs, so nothing could ever reach here
+    // and fail — the walk's own tally read `copy_floor=0` over a whole genome.
+    // Measuring the trimmed tract is what gives it something to do.
+    //
+    // `prefilter` still screens on the detected span, and stays correct as a
+    // coarse pre-screen: trimming only shortens, so anything it drops would fail
+    // here too. It runs before bundling, so leaving it alone also leaves bundle
+    // membership unchanged.
+    //
+    // The cost is a deliberate divergence from the GangSTR port, which spec §8's
+    // oracle leaned on to keep ng's locus set comparable with production's; the
+    // owner accepted that (2026-07-20) and a different check will be found.
+    let ref_copy = (new_end - new_start) / u64::from(r.period);
     if ref_copy < u64::from(p.min_copies.for_period(r.period)) {
         return Err(RejectionReason::CopyFloor);
     }
@@ -2331,6 +2353,59 @@ mod tests {
             "chr1",
             &contig,
             "impure, below floor",
+        );
+    }
+
+    /// **The copy floor counts the trimmed tract, not the detected one.**
+    ///
+    /// A tract can clear the floor on the span the scanner found and fall under it
+    /// once trimming cuts back to whole clean copies. The floor used to be measured
+    /// before that (GangSTR's behaviour), so such a tract was admitted and then
+    /// *reported* with fewer copies than the floor its own file header announced —
+    /// 51% of period-5 loci and 52% of period-6 in tomato SL4.00.
+    ///
+    /// **No fixture reached this before**: the whole suite passed unchanged when the
+    /// measurement moved, which is why this test exists. It deliberately does not run
+    /// the production differential (`assert_agrees_at`) — diverging from production
+    /// here is the point (owner, 2026-07-20).
+    #[test]
+    fn the_copy_floor_counts_the_trimmed_tract_not_the_detected_one() {
+        // Two clean CAGGA copies, then five bases that are not a copy. Detected: 15 bp
+        // = 3 copies at period 5, which clears the catalog floor of 3. Trimmed: the
+        // 10 bp core, = 2 copies, which does not.
+        let contig = [
+            b"GCTAG".as_ref(),
+            b"CAGGACAGGATTTTT".as_ref(),
+            b"TCGAT".as_ref(),
+        ]
+        .concat();
+        let detected = iv(5, 20, 5, 100);
+        let (params, _) = matched_params(0.8, 0, 5);
+
+        assert_eq!(
+            (detected.end - detected.start) / 5,
+            3,
+            "the detected span clears the floor — otherwise this fixture proves nothing"
+        );
+        assert!(
+            classify_whole_contig(vec![detected], "chr1", &contig, &params).is_empty(),
+            "2 trimmed copies against a floor of 3: DROPPED"
+        );
+
+        // Control: the same tract with the period-5 floor at 2 is kept, and kept at
+        // its trimmed span — so the drop above is the floor, not the trim failing or
+        // a flank running out.
+        // The table is periods 1..6 in order, so period 5 is the fifth entry.
+        let lowered = SsrSegmentCriteria {
+            min_copies: MinCopies::new([10, 5, 4, 3, 2, 3], 3),
+            ..params
+        };
+        let kept = classify_whole_contig(vec![detected], "chr1", &contig, &lowered);
+        assert_eq!(kept.len(), 1, "floor of 2: KEPT");
+        assert_eq!(
+            kept[0].end() - kept[0].start() + 1,
+            10,
+            "and it is the trimmed 10 bp core that is emitted, not the detected 15"
         );
     }
 
