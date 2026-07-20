@@ -29,6 +29,12 @@ by document kind:
     content digest + reconstructed index) from a FASTA (optionally checked against a `.fai`) or
     a `.fai` alone; with the MD5s, the fasta↔fai check, a caller-held cache, and a `.fai` writer.
     Builds the `ContigList` every `RefSeq` impl takes but none can build.
+  - [`alignment_file.md`](spec/alignment_file.md) — **one** alignment file: open-and-validate
+    (`SO`, `@SQ`↔reference, index, `@RG SM`) and serve a region as an ordered, filtered read
+    stream. Closes the `@SQ` permutation hole and the sort-order check; step 1's input edge.
+  - [`sample_reads.md`](spec/sample_reads.md) — **the sample**: k files (usually several
+    experiments) merged into one coordinate-ordered stream, with the cross-file checks. Stands
+    on `alignment_file.md`.
 - **`arch/`** — architecture (the shared types and the interfaces implementations
   plug into).
   - [`ng_step_interfaces.md`](arch/ng_step_interfaces.md) — the common domain
@@ -45,11 +51,19 @@ by document kind:
   - [`reference_info.md`](arch/reference_info.md) — the reference-info reader's types &
     interfaces (`ReferenceInfo`/`ContigInfo`, the cache, the writer, the background verify);
     companion to `spec/reference_info.md`. Foundational infra, not a step.
+  - [`alignment_file.md`](arch/alignment_file.md) — `AlignmentFile` (the validated handle),
+    the region-query `RecordSource` impls, the order guard, the reader pool;
+    companion to `spec/alignment_file.md`.
+  - [`sample_reads.md`](arch/sample_reads.md) — `SampleReads`, the argmin merge and its
+    per-read budget; seeds the shared `GenomePosition`. Companion to `spec/sample_reads.md`.
 - **`impl_plan/`** — step-by-step implementation plans (build order, not new design).
   - [`foundations.md`](impl_plan/foundations.md) — the first ng code: skeleton,
     `types.rs` seed, and the `RefSeq` accessor (three impls).
   - [`read_filtering.md`](impl_plan/read_filtering.md) — step 1: the `read/` module,
     the cascade, the `RecordSource`/`RawRecord` seam, the `ReadFilter` iterator.
+  - [`read_input.md`](impl_plan/read_input.md) — step 1's input edge (`read/input/`): the
+    validate-on-open gate, the BAM/CRAM region queries, the order guard, and the k-file
+    merge. Covers both `alignment_file` and `sample_reads`.
   - [`typed_regions.md`](impl_plan/typed_regions.md) — step 3: the catalog rebase/knobs,
     the windowed substrate, and the `region_typing.rs` walk (resident → windowed).
   - [`typed_regions_cli.md`](impl_plan/typed_regions_cli.md) — the `pop_var_caller_exp` /
