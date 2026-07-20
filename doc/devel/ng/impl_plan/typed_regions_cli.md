@@ -162,7 +162,7 @@ T1/T2/T8, arch §4. *Depends:* B2; **precondition: `reference_info` on `main`.**
 
 ### Milestone E — the driver, end to end
 
-**E1. `run_typed_regions`.**  ☐
+**E1. `run_typed_regions`.**  ✅
 Assemble `TypedRegionConfig` from the args (wrapping raw knobs in `Bp`/`Position`),
 `WindowedRefSeq::new`, `TypedRegionIterator::over_regions` (fallible setup — the flank/margin pair
 surfaces here, T3), then **stream** `for r in iter { writer.write_row(r?)?; }` to a `.tmp` file;
@@ -172,7 +172,7 @@ published. A stderr announce line at the start and a `key: k=v` summary from `co
 print **all five** rejection counters, labelled, hardcoding none (T9). *Depends:* B, C, D. *Source:*
 spec §6, arch §4.
 
-**E2. Integration tests — the file, on the anchor fixture.**  ☐
+**E2. Integration tests — the file, on the anchor fixture.**  ✅
 On the anchor FASTA+`.fai`: (1) **round-trip** — written rows parse back field-for-field equal to the
 iterator's output (bundle fixture required); (2) **partition invariant** — concatenated spans
 reconstruct the requested regions; (3) **determinism** — two runs byte-identical; (4) **`--regions`

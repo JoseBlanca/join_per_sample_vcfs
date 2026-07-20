@@ -3,17 +3,16 @@
 //! struct, the `run_typed_regions` driver, and its `#[non_exhaustive]`
 //! error enum.
 //!
-//! **In progress (Milestone D complete).** Here already: the full knob surface
-//! and its `--min-copies`
-//! [parser](crate::pop_var_caller_exp::cli::parsers::parse_min_copies); the
-//! error enum; the output writer ([`write_header`] + [`write_row`], including
-//! the T4 coordinate conversion); and the fallible setup
-//! ([`prepare_walk_inputs`]). Milestone E wires [`run_typed_regions`], which
-//! assembles the config, streams the rows, and joins the reference
-//! verification before publishing.
+//! **Complete.** The knob surface and its
+//! [parsers](crate::pop_var_caller_exp::cli::parsers); the error enum; the
+//! output writer ([`write_header`] + [`write_row`], carrying the T4 coordinate
+//! conversion); the fallible setup ([`prepare_walk_inputs`]); and the driver
+//! ([`run_typed_regions`]), which streams the partition to `<output>.tmp` and
+//! joins the reference verification **before** renaming it into place.
 //! See `doc/devel/ng/impl_plan/typed_regions_cli.md`.
 
-use std::io;
+use std::fs::File;
+use std::io::{self, BufWriter};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -21,22 +20,25 @@ use clap::Args;
 use thiserror::Error;
 
 use crate::fasta::ContigList;
+use crate::ng::WindowedRefSeq;
 use crate::ng::reference_info::{
     ReferenceInfoCache, ReferenceInfoError, VerificationHandle,
     read_reference_verifying_or_creating_fai,
 };
 use crate::ng::region_typing::segment_criteria::{
     DEFAULT_FLANK_BP, DEFAULT_MAX_PERIOD, DEFAULT_MIN_PERIOD, DEFAULT_MIN_PURITY,
-    DEFAULT_MIN_SCORE, MAX_MOTIF_LEN, MinCopies, SsrSegmentCriteria,
+    DEFAULT_MIN_SCORE, MAX_MOTIF_LEN, MinCopies, RejectionCounts, SsrSegmentCriteria,
 };
 use crate::ng::region_typing::{
     DEFAULT_MAX_STR_LEN, DEFAULT_WINDOW_BP, GenomeRegions, RegionKind, TypedRegion,
-    TypedRegionConfig, TypedRegionError,
+    TypedRegionConfig, TypedRegionCounts, TypedRegionError, TypedRegionIterator,
 };
 use crate::ng::tandem_repeat::{
-    DEFAULT_MATCH_REWARD, DEFAULT_MIN_COPIES, DEFAULT_MISMATCH_PENALTY, RepeatInterval, ScanParams,
+    DEFAULT_MATCH_REWARD, DEFAULT_MIN_COPIES, DEFAULT_MISMATCH_PENALTY, PeriodRange,
+    PeriodRangeError, RepeatInterval, ScanParams,
 };
-use crate::ng::types::{ContigId, GenomeRegion};
+use crate::ng::types::{Bp, ContigId, GenomeRegion};
+use crate::pop_var_caller::common::DEFAULT_BUFFERED_IO_CAPACITY;
 use crate::regions::{BedError, ContigBounds};
 
 /// `type-regions` arguments — the authoritative knob list; `run_typed_regions`
@@ -65,11 +67,32 @@ pub struct TypedRegionsArgs {
 
     /// Narrowest STR period classified. One range detects and classifies
     /// (spec §2.2); the default of 1 types homopolymers as period-1 loci.
-    #[arg(long, default_value_t = DEFAULT_MIN_PERIOD, help_heading = "Advanced")]
+    ///
+    /// Bounded at the CLI to 1..=6 — see `max_period` for why that is a usage
+    /// error rather than a propagated one.
+    #[arg(
+        long,
+        default_value_t = DEFAULT_MIN_PERIOD,
+        value_parser = clap::value_parser!(u8).range(1..=MAX_MOTIF_LEN as i64),
+        help_heading = "Advanced"
+    )]
     pub min_period: u8,
 
     /// Widest STR period classified — the microsatellite ceiling.
-    #[arg(long, default_value_t = DEFAULT_MAX_PERIOD, help_heading = "Advanced")]
+    ///
+    /// **Bounded at the CLI, unlike the `--max-str-len`/`--flank-bp` pair.** That
+    /// pair is propagated because the walk refuses it with a real *error* (T3);
+    /// this one is not, because the walk guards the period ceiling with a release
+    /// `assert!` — deliberately, since the knob is swept and sweeps run in
+    /// `--release`. An assert is right for a library invariant and wrong for a
+    /// flag: `--max-period 7` would be a backtrace, and spec §6 says a typo
+    /// deserves a message. So clap rejects it as a usage error before `run`.
+    #[arg(
+        long,
+        default_value_t = DEFAULT_MAX_PERIOD,
+        value_parser = clap::value_parser!(u8).range(1..=MAX_MOTIF_LEN as i64),
+        help_heading = "Advanced"
+    )]
     pub max_period: u8,
 
     /// Satellite cap and scan margin (bp), one field: a tract longer than this
@@ -83,12 +106,31 @@ pub struct TypedRegionsArgs {
     pub window_bp: u64,
 
     /// Flank (bp) a locus needs each side, and the bundle radius (spec §2.4).
-    #[arg(long, default_value_t = DEFAULT_FLANK_BP, help_heading = "Advanced")]
+    ///
+    /// Bounded below at 1 for the same reason as the period range: the walk
+    /// guards `flank_bp >= 1` with a release `assert!` (at 0 every locus fails
+    /// its own flank test), and that guard is reached on the **first window of
+    /// any reference**, so a typo would be an immediate backtrace (spec §6).
+    #[arg(
+        long,
+        default_value_t = DEFAULT_FLANK_BP,
+        value_parser = clap::value_parser!(u64).range(1..),
+        help_heading = "Advanced"
+    )]
     pub flank_bp: u64,
 
     /// Purity floor in `[0, 1]`: a tract matching less than this fraction of a
     /// perfect motif tiling is not classified.
-    #[arg(long, default_value_t = DEFAULT_MIN_PURITY, help_heading = "Advanced")]
+    ///
+    /// Range-checked here because clap has no float range parser and the walk
+    /// guards this with a release `assert!`. `nan` is the case that matters
+    /// most — it parses happily and would otherwise pass *every* tract.
+    #[arg(
+        long,
+        default_value_t = DEFAULT_MIN_PURITY,
+        value_parser = crate::pop_var_caller_exp::cli::parsers::parse_min_purity,
+        help_heading = "Advanced"
+    )]
     pub min_purity: f32,
 
     /// Score floor on the scanner's alignment score (`0` = a no-op for scanner
@@ -142,6 +184,15 @@ pub enum TypedRegionsCliError {
     /// Parsing the `--regions` BED failed.
     #[error("could not read the --regions BED")]
     Bed(#[from] BedError),
+
+    /// `--min-period` exceeds `--max-period`, so the range would scan nothing.
+    ///
+    /// The *bounds* of each flag are clap's to reject (see
+    /// [`TypedRegionsArgs::max_period`]); this is the cross-flag rule, which clap
+    /// cannot express, so it surfaces as an error rather than the panic
+    /// `PeriodRange::new`'s caller would otherwise take (spec §6).
+    #[error("--min-period and --max-period do not form a range")]
+    PeriodRange(#[from] PeriodRangeError),
 
     /// The walk's fallible setup or streaming failed — including the
     /// `--max-str-len`/`--flank-bp` guard, which the walk carries (spec T3).
@@ -479,11 +530,152 @@ pub fn prepare_walk_inputs(
     })
 }
 
-/// Run the walk and write the partition. Wired in Milestone E1, which assembles
-/// the config, opens the reference, streams the rows, and joins `verify` before
-/// the atomic rename.
-pub fn run_typed_regions(_args: &TypedRegionsArgs) -> Result<(), TypedRegionsCliError> {
-    todo!("run_typed_regions is implemented in Milestone E1")
+/// Translate the args into the walk's config.
+///
+/// The only fallible part is the period *range*: each flag's bounds are clap's
+/// to reject, but the cross-flag `min <= max` rule is not something clap can
+/// express, so it surfaces here as an error rather than the panic
+/// `PeriodRange::new`'s caller would otherwise take (spec §6).
+fn walk_config(args: &TypedRegionsArgs) -> Result<TypedRegionConfig, TypedRegionsCliError> {
+    Ok(TypedRegionConfig {
+        scan: ScanParams {
+            match_reward: args.scan_match_reward,
+            mismatch_penalty: args.scan_mismatch_penalty,
+            min_copies: args.scan_min_copies,
+        },
+        max_str_len: Bp(args.max_str_len),
+        window_bp: Bp(args.window_bp),
+        criteria: SsrSegmentCriteria {
+            periods: PeriodRange::new(args.min_period, args.max_period)?,
+            min_purity: args.min_purity,
+            min_score: args.min_score,
+            flank_bp: args.flank_bp,
+            min_copies: args.min_copies,
+        },
+    })
+}
+
+/// `<output>.tmp` — the name the partition is built under before it is published.
+fn tmp_path_for(output: &Path) -> PathBuf {
+    let mut name = output.as_os_str().to_os_string();
+    name.push(".tmp");
+    PathBuf::from(name)
+}
+
+/// Report what the walk tallied, to stderr (spec §6, T9).
+///
+/// **All five rejection counters, labelled, with none of them hard-coded away.**
+/// Four are structurally zero today, but *which* four moves whenever an upstream
+/// stage changes, so the summary states them flatly rather than explaining any
+/// one of them — a hidden zero is worse than an explained one, and prose about
+/// "no impure tracts in this genome" would be a wrong answer wearing a
+/// measurement's clothes. The destructuring is exhaustive so a counter added
+/// later cannot go unreported.
+fn report_counts(counts: &TypedRegionCounts) {
+    // Exhaustive on BOTH structs (no `..`), so a counter added to either cannot
+    // go unreported — the same device `write_header` uses for the config.
+    let TypedRegionCounts {
+        spans,
+        ssr_loci,
+        ssr_bundles,
+        ssr_bundle_bp,
+        generic,
+        satellites,
+        satellite_bp,
+        repeat_bp_with_no_locus,
+        rejected_by_reason,
+    } = counts;
+    let RejectionCounts {
+        copy_floor,
+        purity,
+        compound,
+        no_clean_trim,
+        flank_clamped,
+    } = rejected_by_reason;
+
+    eprintln!(
+        "counts: spans={spans} ssr_loci={ssr_loci} ssr_bundles={ssr_bundles} \
+         ssr_bundle_bp={ssr_bundle_bp} generic={generic} satellites={satellites} \
+         satellite_bp={satellite_bp} repeat_bp_with_no_locus={repeat_bp_with_no_locus}"
+    );
+    // Stated as what it is: these do NOT partition `repeat_bp_with_no_locus`
+    // (overlapping rejected repeats are each charged, and bases with no locus for
+    // a reason that is not a rejection — bundled, capped, out of scope — are in
+    // the total but under no reason here).
+    eprintln!(
+        "rejected_bp (does not partition repeat_bp_with_no_locus): copy_floor={copy_floor} \
+         purity={purity} compound={compound} no_clean_trim={no_clean_trim} \
+         flank_clamped={flank_clamped}"
+    );
+}
+
+/// Run the walk and write the partition.
+///
+/// **Streams** — the walk holds one window and three coordinates, and collecting
+/// a whole-genome partition would put back exactly the memory it exists to avoid
+/// (spec §6). It needs no sort either: the walk emits in genomic order.
+///
+/// **Writes atomically, and the verification joins into that same barrier.** The
+/// rows go to `<output>.tmp`; only a clean `VerificationHandle::join` renames it
+/// into place. Both halves matter and for the same reason — *a wrong file here is
+/// silently valid*: a partition cut off halfway through a chromosome is
+/// indistinguishable from a complete partition of a smaller genome, and one built
+/// against a stale `.fai` is indistinguishable from a correct one. So the join
+/// goes **before** the rename (spec T1, §6), never after.
+pub fn run_typed_regions(args: &TypedRegionsArgs) -> Result<(), TypedRegionsCliError> {
+    // The config depends on nothing but the args, so it is built FIRST: a bad
+    // flag pair should not cost a whole reference read (and, until
+    // `reference_info` grows a way to abandon a handle deliberately, should not
+    // trip the dropped-without-join warning either — see `prepare_walk_inputs`).
+    let config = walk_config(args)?;
+
+    let cache = Arc::new(ReferenceInfoCache::new());
+    let WalkInputs {
+        contigs,
+        regions,
+        verify,
+    } = prepare_walk_inputs(args, &cache)?;
+
+    eprintln!(
+        "type-regions: reference={} regions={} output={}",
+        args.reference.display(),
+        args.regions
+            .as_ref()
+            .map_or_else(|| "<whole genome>".to_string(), |b| b.display().to_string()),
+        args.output.display(),
+    );
+
+    // The reference and the row namer take the same contig table (T8) — the walk
+    // needs it by value, so it is cloned from the one `contig_list()` D1 read.
+    // A clone of one value cannot disagree with itself, which is the property T8
+    // is protecting.
+    let reference = WindowedRefSeq::new(args.reference.clone(), contigs.clone());
+    // Fallible setup: the contig cross-check and the `--max-str-len`/`--flank-bp`
+    // pair both surface here as errors, before any work (spec T3).
+    let mut walk = TypedRegionIterator::over_regions(reference, regions, config.clone())?;
+
+    let tmp_path = tmp_path_for(&args.output);
+    let file = File::create(&tmp_path)?;
+    let mut out = BufWriter::with_capacity(DEFAULT_BUFFERED_IO_CAPACITY, file);
+
+    write_header(&mut out, &args.reference, &config)?;
+    for region in walk.by_ref() {
+        write_row(&mut out, &region?, &contigs)?;
+    }
+
+    // The commit point. The background FASTA check overlapped the whole walk, so
+    // this costs almost nothing — and a stale `.fai` aborts here with the
+    // partition still under its temp name, never published.
+    if let Some(handle) = verify {
+        handle.join()?;
+    }
+
+    let file = out.into_inner().map_err(|e| e.into_error())?;
+    file.sync_all()?;
+    std::fs::rename(&tmp_path, &args.output)?;
+
+    report_counts(walk.counts());
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1101,13 +1293,23 @@ mod tests {
     }
 
     fn args_for(reference: &Path, regions: Option<PathBuf>) -> TypedRegionsArgs {
+        args_for_output(reference, regions, Path::new("out.tsv"))
+    }
+
+    /// Args built by **parsing them**, so every test runs against the same
+    /// defaults resolution a user gets, not a hand-filled struct.
+    fn args_for_output(
+        reference: &Path,
+        regions: Option<PathBuf>,
+        output: &Path,
+    ) -> TypedRegionsArgs {
         let mut argv = vec![
             "pop_var_caller_exp".to_string(),
             "type-regions".to_string(),
             "--reference".to_string(),
             reference.display().to_string(),
             "--output".to_string(),
-            "out.tsv".to_string(),
+            output.display().to_string(),
         ];
         if let Some(bed) = regions {
             argv.push("--regions".to_string());
@@ -1333,6 +1535,391 @@ mod tests {
         handle
             .join()
             .expect("the reference matches its own fresh .fai");
+    }
+
+    // ---- E2: the file, end to end (spec §7, arch §9) --------------------
+
+    /// A two-contig reference with deliberate structure: aperiodic filler, a
+    /// clean `(CAG)*10` locus, two tracts closer than the flank radius (a
+    /// **bundle**, without which the member coordinates are never exercised),
+    /// and a 300 bp array past the satellite cap. Verified to produce all four
+    /// kinds.
+    fn e2e_reference() -> (tempfile::TempDir, PathBuf) {
+        use std::io::Write as _;
+        // 16 bp, aperiodic, and free of any homopolymer run >= 6 — so the filler
+        // itself is never classified at `--min-period 1`.
+        const FILLER: &str = "ACGTTGCAAGCTTGCA";
+
+        let mut ctg1 = String::new();
+        ctg1.push_str(&FILLER.repeat(13));
+        ctg1.push_str(&"CAG".repeat(10)); // a locus
+        ctg1.push_str(&FILLER.repeat(13));
+        ctg1.push_str(&"AT".repeat(10)); // ┐ 16 bp apart, inside the 30 bp
+        ctg1.push_str(FILLER); // │ flank radius, so they
+        ctg1.push_str(&"GACA".repeat(6)); // ┘ bundle rather than classify
+        ctg1.push_str(&FILLER.repeat(13));
+        ctg1.push_str(&"AT".repeat(150)); // 300 bp: past the 100 bp cap
+        ctg1.push_str(&FILLER.repeat(13));
+        let ctg2 = FILLER.repeat(20);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fasta = dir.path().join("ref.fa");
+        let mut file = std::fs::File::create(&fasta).expect("create the FASTA");
+        writeln!(file, ">ctg1\n{ctg1}\n>ctg2\n{ctg2}").expect("write");
+        (dir, fasta)
+    }
+
+    /// The rows of a written partition, header lines skipped.
+    fn read_rows(path: &Path) -> Vec<ParsedRow> {
+        std::fs::read_to_string(path)
+            .expect("the output exists")
+            .lines()
+            .filter(|l| !l.starts_with('#'))
+            .map(parse_row)
+            .collect()
+    }
+
+    /// Drive the walk directly, for the round-trip's other side.
+    fn walk_directly(args: &TypedRegionsArgs) -> (ContigList, Vec<TypedRegion>) {
+        let cache = Arc::new(ReferenceInfoCache::new());
+        let inputs = prepare_walk_inputs(args, &cache).expect("setup");
+        let config = walk_config(args).expect("config");
+        let reference = WindowedRefSeq::new(args.reference.clone(), inputs.contigs.clone());
+        let walk = TypedRegionIterator::over_regions(reference, inputs.regions, config)
+            .expect("the walk starts");
+        let regions = walk.map(|r| r.expect("no read fails")).collect();
+        if let Some(handle) = inputs.verify {
+            handle.join().expect("the fixture's .fai is fresh");
+        }
+        (inputs.contigs, regions)
+    }
+
+    /// **THE ROUND-TRIP, on a real reference through the whole stack** (plan E2,
+    /// spec §7): the rows written to the file parse back equal, field for field,
+    /// to what the iterator itself emitted — including a bundle's members.
+    ///
+    /// C2's oracle pinned the formatter against hand-derived expectations; this
+    /// pins the *file* against the *walk*, so a dropped row, a header line
+    /// miscounted as a row, or a truncated write is caught too.
+    #[test]
+    fn the_written_file_round_trips_against_the_iterators_own_output() {
+        let (dir, fasta) = e2e_reference();
+        let output = dir.path().join("out.tsv");
+        let args = args_for_output(&fasta, None, &output);
+
+        run_typed_regions(&args).expect("the run succeeds");
+        let rows = read_rows(&output);
+        let (contigs, regions) = walk_directly(&args);
+
+        assert_eq!(rows.len(), regions.len(), "one row per emitted region");
+        assert!(!regions.is_empty(), "the fixture produces regions");
+        for (row, region) in rows.iter().zip(&regions) {
+            assert_eq!(row, &row_of(region, &contigs), "row vs the walk's region");
+            // T4's conversion re-derived INLINE, not by calling `hull_to_bed` —
+            // asserting against the helper the row was built with would be
+            // `f(x) == f(x)`, green through any off-by-one edit inside it.
+            assert_eq!(
+                (row.start, row.end),
+                (region.region.start.get() - 1, region.region.end.get()),
+                "the hull's start loses one, its end does not move"
+            );
+        }
+
+        // The fixture must exercise every kind, or the round-trip is weaker than
+        // it looks — a bundle above all (spec §7: "a fixture with a bundle is
+        // required, or the member coordinates are never exercised").
+        let kinds: std::collections::BTreeSet<&str> =
+            rows.iter().map(|r| r.kind.as_str()).collect();
+        for kind in ["generic", "ssr_locus", "ssr_bundle", "satellite"] {
+            assert!(
+                kinds.contains(kind),
+                "the fixture must produce a {kind} row"
+            );
+        }
+        let bundle = rows
+            .iter()
+            .find(|r| r.kind == "ssr_bundle")
+            .expect("a bundle row");
+        assert!(
+            bundle.members.as_ref().is_some_and(|m| m.len() >= 2),
+            "a bundle carries >= 2 members: {bundle:?}"
+        );
+    }
+
+    /// **The partition invariant, in the file** (spec §7): the rows' spans are
+    /// contiguous, non-overlapping, and reconstruct each requested contig end to
+    /// end. This is the test that catches a dropped `generic` row, a header line
+    /// miscounted as a row, or an off-by-one at T4.
+    #[test]
+    fn the_files_spans_reconstruct_the_requested_regions() {
+        let (dir, fasta) = e2e_reference();
+        let output = dir.path().join("out.tsv");
+        let args = args_for_output(&fasta, None, &output);
+        run_typed_regions(&args).expect("the run succeeds");
+
+        let (contigs, _) = walk_directly(&args);
+        let rows = read_rows(&output);
+
+        for entry in &contigs.entries {
+            let spans: Vec<(u64, u64)> = rows
+                .iter()
+                .filter(|r| r.chrom == entry.name)
+                .map(|r| (r.start, r.end))
+                .collect();
+            assert!(!spans.is_empty(), "contig {} has rows", entry.name);
+
+            let mut expected_start = 0;
+            for (start, end) in &spans {
+                assert_eq!(
+                    *start, expected_start,
+                    "contig {}: a gap or overlap at {start}",
+                    entry.name
+                );
+                assert!(end > start, "contig {}: empty span at {start}", entry.name);
+                expected_start = *end;
+            }
+            assert_eq!(
+                expected_start, entry.length,
+                "contig {} must be covered end to end",
+                entry.name
+            );
+        }
+    }
+
+    /// **Determinism** (spec §6): the same reference, regions and config give a
+    /// byte-identical file. The header carries no timestamp and no digest
+    /// precisely so this holds.
+    #[test]
+    fn two_runs_are_byte_identical() {
+        let (dir, fasta) = e2e_reference();
+        let first = dir.path().join("first.tsv");
+        let second = dir.path().join("second.tsv");
+
+        run_typed_regions(&args_for_output(&fasta, None, &first)).expect("run 1");
+        run_typed_regions(&args_for_output(&fasta, None, &second)).expect("run 2");
+
+        assert_eq!(
+            std::fs::read(&first).expect("first"),
+            std::fs::read(&second).expect("second"),
+            "the walk is a pure function of reference + regions + config"
+        );
+    }
+
+    /// **`--regions` read-back** (spec §3.2): the file is a BED our own
+    /// `--regions` accepts, so a selection cut from it walks exactly those spans.
+    /// Otherwise §3.2's claim is an argument rather than a property.
+    ///
+    /// **Feeding the file back WHOLE would prove nothing.** Its rows abut by
+    /// construction (that is the partition invariant), and `RegionSet` coalesces
+    /// abutting spans — so the region set would collapse to one whole-contig
+    /// span per contig, i.e. exactly the whole-genome path, and the test would
+    /// reduce to determinism plus "the BED parsed". So the selection here is
+    /// **non-adjacent** rows (`grep`-ing out the interesting kinds, which is the
+    /// workflow §3.2 exists for), which is the only shape that exercises the
+    /// multi-span path.
+    #[test]
+    fn a_selection_cut_from_the_output_walks_exactly_those_spans() {
+        use std::io::Write as _;
+        let (dir, fasta) = e2e_reference();
+        let first = dir.path().join("first.tsv");
+        run_typed_regions(&args_for_output(&fasta, None, &first)).expect("the first run");
+
+        // The `grep -P '\tsatellite\t'` workflow: pick the non-generic findings,
+        // which the fixture places far apart, so they survive coalescing.
+        let wanted: Vec<(String, u64, u64)> = read_rows(&first)
+            .into_iter()
+            .filter(|r| r.kind == "ssr_locus" || r.kind == "satellite")
+            .map(|r| (r.chrom, r.start, r.end))
+            .collect();
+        assert!(
+            wanted.len() >= 2,
+            "the selection must be more than one span, or coalescing hides the point"
+        );
+
+        let bed = dir.path().join("selection.bed");
+        let mut file = std::fs::File::create(&bed).expect("create the BED");
+        for (chrom, start, end) in &wanted {
+            writeln!(file, "{chrom}\t{start}\t{end}").expect("write");
+        }
+        drop(file);
+
+        let second = dir.path().join("second.tsv");
+        run_typed_regions(&args_for_output(&fasta, Some(bed), &second))
+            .expect("a selection cut from our own output is a valid --regions BED");
+
+        let got: Vec<(String, u64, u64)> = read_rows(&second)
+            .into_iter()
+            .map(|r| (r.chrom, r.start, r.end))
+            .collect();
+        assert_eq!(
+            got, wanted,
+            "the emitted spans are exactly the requested ones — each finding \
+             returned whole, and nothing outside the selection"
+        );
+    }
+
+    /// **The knobs whose library guard is a release `assert!` are bounded at the
+    /// CLI, so a typo is a usage error and never a backtrace** (spec §6).
+    ///
+    /// These bounds are the only thing standing between a user and a panic —
+    /// without them `--max-period 7` trips `classify`'s period-ceiling assert,
+    /// `--flank-bp 0` trips its flank assert on the *first window of any
+    /// reference*, and `--min-purity nan` trips its purity assert (and a NaN
+    /// floor would pass every tract rather than reject impure ones). Deleting
+    /// any of the three `value_parser`s must fail here.
+    #[test]
+    fn knobs_guarded_by_library_asserts_are_usage_errors_at_the_cli() {
+        // The `=` form throughout, so clap reads every case as a VALUE — bare
+        // `--min-purity -0.5` is rejected too, but as an unknown argument (`-0`
+        // parses as a flag), which would be testing clap's tokeniser rather than
+        // these bounds.
+        for bad in [
+            "--max-period=7",    // above MAX_MOTIF_LEN
+            "--min-period=0",    // period 0 is meaningless
+            "--flank-bp=0",      // every locus would fail its own flank test
+            "--min-purity=1.5",  // outside [0, 1]
+            "--min-purity=-0.5", //
+            "--min-purity=nan",  // parses as f32, and would pass every tract
+            "--min-purity=inf",  //
+        ] {
+            let err = Cli::try_parse_from([
+                "pop_var_caller_exp",
+                "type-regions",
+                "--reference",
+                "r.fa",
+                "--output",
+                "o.tsv",
+                bad,
+            ])
+            .expect_err("'{bad}' must be refused at parse time");
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::ValueValidation,
+                "'{bad}' must be a usage failure, not a run panic: {err}"
+            );
+        }
+    }
+
+    /// The cross-flag period rule clap cannot express: `--min-period` above
+    /// `--max-period` is an error from the driver, not the panic
+    /// `PeriodRange::new`'s caller would otherwise take.
+    #[test]
+    fn a_min_period_above_max_period_is_an_error_not_a_panic() {
+        let (dir, fasta) = e2e_reference();
+        let output = dir.path().join("out.tsv");
+        let mut args = args_for_output(&fasta, None, &output);
+        args.min_period = 5;
+        args.max_period = 2;
+
+        match run_typed_regions(&args) {
+            Err(TypedRegionsCliError::PeriodRange(PeriodRangeError::MinExceedsMax {
+                min,
+                max,
+            })) => assert_eq!((min, max), (5, 2), "it names both numbers"),
+            Err(other) => panic!("expected a PeriodRange error, got {other:?}"),
+            Ok(()) => panic!("an empty period range must be refused"),
+        }
+        assert!(!output.exists(), "nothing is published");
+    }
+
+    /// **T3 — the flag pair is a CLI error, not a panic.** `--max-str-len` below
+    /// `--flank-bp` is refused by the walk before any work, and the CLI just
+    /// propagates it: a second check here would be a second place for the rule to
+    /// drift, and the walk's message already carries both numbers.
+    #[test]
+    fn a_margin_narrower_than_the_flank_is_an_error_not_a_panic() {
+        let (dir, fasta) = e2e_reference();
+        let output = dir.path().join("out.tsv");
+        let mut args = args_for_output(&fasta, None, &output);
+        args.max_str_len = 10;
+        args.flank_bp = 30;
+
+        match run_typed_regions(&args) {
+            Err(TypedRegionsCliError::Walk(TypedRegionError::MarginNarrowerThanFlank {
+                max_str_len,
+                flank_bp,
+            })) => {
+                assert_eq!((max_str_len, flank_bp), (10, 30), "it names both numbers");
+            }
+            Err(other) => panic!("expected the walk's flank-pair error, got {other:?}"),
+            Ok(()) => panic!("a margin narrower than the flank must be refused"),
+        }
+        assert!(
+            !output.exists(),
+            "nothing is published when the walk refuses to start"
+        );
+    }
+
+    /// **T1 — a stale `.fai` aborts AT THE JOIN BARRIER, with nothing
+    /// published.** The verification runs beside the walk and is joined at the
+    /// commit point, so a reference that no longer matches its index fails with
+    /// the partition still under its temp name. Joining *after* the rename would
+    /// publish a partition built against a wrong contig table — silently wrong,
+    /// which is the whole reason the barrier sits where it does.
+    ///
+    /// **The staleness is chosen so the walk cannot catch it first.** The
+    /// reference is *extended*, so every span the stale table describes still
+    /// reads cleanly and the walk runs to completion — only the background check,
+    /// which recomputes the whole index, can tell. (A *shrunken* reference aborts
+    /// too, but through the walk's own read: see the companion test, which exists
+    /// so this one is not credited with catching that case.)
+    #[test]
+    fn a_stale_fai_aborts_at_the_join_with_nothing_published() {
+        use std::io::Write as _;
+        let (dir, fasta) = e2e_reference();
+
+        // A first run creates the sibling `.fai`.
+        let warm = dir.path().join("warm.tsv");
+        run_typed_regions(&args_for_output(&fasta, None, &warm)).expect("the first run");
+
+        // Append to the last contig: the stale table still describes readable
+        // spans, so the walk succeeds — but the file no longer matches the index.
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&fasta)
+            .expect("open the FASTA for append");
+        writeln!(file, "ACGTACGTAC").expect("write");
+        drop(file);
+
+        let output = dir.path().join("stale.tsv");
+        let err = run_typed_regions(&args_for_output(&fasta, None, &output))
+            .expect_err("a stale .fai must abort the run");
+        assert!(
+            matches!(err, TypedRegionsCliError::Reference(_)),
+            "the barrier, not the walk, must catch this: {err:?}"
+        );
+        assert!(
+            !output.exists(),
+            "the partition must NOT be published — the join precedes the rename"
+        );
+    }
+
+    /// A reference that has *shrunk* under its index also aborts before
+    /// publishing, but through the walk's own read (`UnexpectedEof`) rather than
+    /// the verification barrier.
+    ///
+    /// Recorded as its own case so the barrier test above cannot be credited
+    /// with catching it: the two failures travel different paths, and only the
+    /// extended-reference case actually exercises the join.
+    #[test]
+    fn a_truncated_reference_also_aborts_before_publishing() {
+        use std::io::Write as _;
+        let (dir, fasta) = e2e_reference();
+        let warm = dir.path().join("warm.tsv");
+        run_typed_regions(&args_for_output(&fasta, None, &warm)).expect("the first run");
+
+        let mut file = std::fs::File::create(&fasta).expect("truncate the FASTA");
+        writeln!(file, ">ctg1\nACGTACGTACGTACGTACGT\n>ctg2\nACGTACGTACGT").expect("write");
+        drop(file);
+
+        let output = dir.path().join("short.tsv");
+        let err = run_typed_regions(&args_for_output(&fasta, None, &output))
+            .expect_err("a reference shorter than its index must abort");
+        assert!(
+            matches!(err, TypedRegionsCliError::Walk(_)),
+            "the walk's own read catches this one: {err:?}"
+        );
+        assert!(!output.exists(), "and still nothing is published");
     }
 
     /// `--min-copies` is accepted when it carries exactly six values.

@@ -54,6 +54,30 @@ pub fn parse_min_copies(s: &str) -> Result<MinCopies, String> {
     Ok(MinCopies::new(by_period, INERT_WIDER_PERIOD_FLOOR))
 }
 
+/// Parse `--min-purity` — a **finite** fraction in `[0, 1]`.
+///
+/// clap can range-check integers but not floats, and the walk guards this knob
+/// with a release `assert!` rather than an error (the knob is swept, and sweeps
+/// run in `--release`). An assert is right for a library invariant and wrong for
+/// a flag, so the bound is enforced here and a typo is a usage failure rather
+/// than a backtrace (spec §6).
+///
+/// **`nan` is the case this exists for.** It parses happily as an `f32`, and a
+/// NaN floor compares false against everything — so rather than rejecting
+/// impure tracts it would pass *every* tract, silently inverting the gate.
+pub fn parse_min_purity(s: &str) -> Result<f32, String> {
+    let value: f32 = s
+        .trim()
+        .parse()
+        .map_err(|_| format!("'{s}' is not a number"))?;
+    if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+        return Err(format!(
+            "--min-purity must be a finite fraction in [0, 1] (e.g. 0.8), got {value}"
+        ));
+    }
+    Ok(value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
