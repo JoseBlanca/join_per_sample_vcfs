@@ -3,9 +3,10 @@
 //! struct, the `run_typed_regions` driver, and its `#[non_exhaustive]`
 //! error enum.
 //!
-//! **In progress (Milestone B).** The full knob surface and the real error
-//! enum are here; the `--min-copies` table parser lands in B3 (it needs its
-//! own `value_parser`), and `run_typed_regions` is wired in Milestone E.
+//! **In progress (Milestone B complete).** The full knob surface — including
+//! the `--min-copies` table and its
+//! [parser](crate::pop_var_caller_exp::cli::parsers::parse_min_copies) — and the
+//! real error enum are here; `run_typed_regions` is wired in Milestone E.
 //! See `doc/devel/ng/impl_plan/typed_regions_cli.md`.
 
 use std::path::PathBuf;
@@ -15,7 +16,8 @@ use thiserror::Error;
 
 use crate::ng::reference_info::ReferenceInfoError;
 use crate::ng::region_typing::segment_criteria::{
-    DEFAULT_FLANK_BP, DEFAULT_MAX_PERIOD, DEFAULT_MIN_PERIOD, DEFAULT_MIN_PURITY, DEFAULT_MIN_SCORE,
+    DEFAULT_FLANK_BP, DEFAULT_MAX_PERIOD, DEFAULT_MIN_PERIOD, DEFAULT_MIN_PURITY,
+    DEFAULT_MIN_SCORE, MinCopies,
 };
 use crate::ng::region_typing::{DEFAULT_MAX_STR_LEN, DEFAULT_WINDOW_BP, TypedRegionError};
 use crate::ng::tandem_repeat::{
@@ -28,8 +30,9 @@ use crate::regions::BedError;
 /// to the library `pub const` that defines it, so the CLI's `Default` tracks the
 /// short-read settings ng ships (spec §2.1, §2.3).
 ///
-/// The `--min-copies` table field is added in B3 together with its own
-/// `value_parser` (a `MinCopies` cannot derive a clap parser on its own).
+/// `--min-copies` is a table rather than a scalar, so it carries its own
+/// [`value_parser`](crate::pop_var_caller_exp::cli::parsers::parse_min_copies)
+/// (a `MinCopies` cannot derive a clap parser on its own).
 #[derive(Debug, Args, Clone)]
 pub struct TypedRegionsArgs {
     /// Reference FASTA. Its `.fai` is read, or created if absent (spec T1).
@@ -79,6 +82,17 @@ pub struct TypedRegionsArgs {
     #[arg(long, default_value_t = DEFAULT_MIN_SCORE, help_heading = "Advanced")]
     pub min_score: i32,
 
+    /// Per-period copy-number floor: exactly six comma-separated values, one per
+    /// period 1..=6. Below its period's floor a tract is not classified as an
+    /// STR. Any other count is a hard parse error.
+    #[arg(
+        long,
+        value_parser = crate::pop_var_caller_exp::cli::parsers::parse_min_copies,
+        default_value = "6,4,4,3,3,3",
+        help_heading = "Advanced"
+    )]
+    pub min_copies: MinCopies,
+
     /// Scanner match reward.
     #[arg(long, default_value_t = DEFAULT_MATCH_REWARD, help_heading = "Advanced")]
     pub scan_match_reward: i32,
@@ -88,7 +102,7 @@ pub struct TypedRegionsArgs {
     pub scan_mismatch_penalty: i32,
 
     /// Scanner minimum copies — a permissive detection floor. The stricter,
-    /// per-period classification floor is `--min-copies` (B3).
+    /// per-period classification floor is --min-copies.
     #[arg(long, default_value_t = DEFAULT_MIN_COPIES, help_heading = "Advanced")]
     pub scan_min_copies: u32,
 }
@@ -167,5 +181,61 @@ mod tests {
         assert_eq!(args.scan_match_reward, 2);
         assert_eq!(args.scan_mismatch_penalty, 7);
         assert_eq!(args.scan_min_copies, 2);
+
+        // The `--min-copies` table resolves through its own value_parser, to the
+        // short-read floors — and to the SAME table the library ships, so a floor
+        // sweep (spec §10) that moves one without the other fails here rather than
+        // silently applying two different defaults.
+        let floors: Vec<u32> = (1..=6).map(|p| args.min_copies.for_period(p)).collect();
+        assert_eq!(floors, vec![6, 4, 4, 3, 3, 3], "the short-read floors");
+        assert_eq!(
+            args.min_copies,
+            MinCopies::default(),
+            "the CLI default must track MinCopies::default()"
+        );
+    }
+
+    /// `--min-copies` is accepted when it carries exactly six values.
+    #[test]
+    fn min_copies_accepts_exactly_six_values() {
+        let cli = Cli::try_parse_from([
+            "pop_var_caller_exp",
+            "type-regions",
+            "--reference",
+            "r.fa",
+            "--output",
+            "o.tsv",
+            "--min-copies",
+            "9,5,4,3,3,3",
+        ])
+        .expect("six values parse");
+        let PopVarCallerExpCommand::TypeRegions(args) = cli.cmd;
+        assert_eq!(args.min_copies.for_period(1), 9);
+        assert_eq!(args.min_copies.for_period(2), 5);
+    }
+
+    /// **A wrong count is a clap usage failure**, not a `run` error — it is
+    /// rejected during parsing, so `run_typed_regions` is never reached
+    /// (spec §2.1).
+    #[test]
+    fn min_copies_with_a_wrong_count_is_a_cli_usage_error() {
+        for bad in ["6,4,4,3,3", "6,4,4,3,3,3,3", "6"] {
+            let err = Cli::try_parse_from([
+                "pop_var_caller_exp",
+                "type-regions",
+                "--reference",
+                "r.fa",
+                "--output",
+                "o.tsv",
+                "--min-copies",
+                bad,
+            ])
+            .expect_err("a wrong count must be rejected at parse time");
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::ValueValidation,
+                "'{bad}' must fail as a value-validation usage error: {err}"
+            );
+        }
     }
 }

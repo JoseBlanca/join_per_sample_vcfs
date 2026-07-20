@@ -111,7 +111,7 @@ const under `help_heading = "Advanced"` — and the `#[non_exhaustive]` error en
 top-level CLI with defaults (mirror `ssr_catalog`'s `parses_through_the_top_level_cli`), asserting the
 resolved defaults are the §2.3 values. *Source:* arch §1, §3; spec §2.1. *Depends:* A1, B1.
 
-**B3. The `--min-copies` value_parser.**  ☐
+**B3. The `--min-copies` value_parser.**  ✅
 In `pop_var_caller_exp/cli/parsers.rs`: parse **exactly six** comma-separated `u32`s → `MinCopies::new([…;6], 3)`
 (the `for_wider_periods` supplied inert); **any other count is a hard parse error**. Wire it as the
 `min_copies` field's `value_parser`. Unit tests: six values parse to the right table; five and seven

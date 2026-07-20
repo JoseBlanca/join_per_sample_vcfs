@@ -5,6 +5,8 @@ use clap::{Parser, Subcommand};
 
 use super::typed_regions::TypedRegionsArgs;
 
+pub mod parsers;
+
 /// Top-level CLI for the `pop_var_caller_exp` binary.
 #[derive(Debug, Parser)]
 #[command(name = "pop_var_caller_exp", version, about, long_about = None)]
