@@ -137,7 +137,7 @@ Compose B1 with `load_alignment_index` and the `@SQ`↔reference comparison via
 shared — never re-parsed. Test: N sequential borrows open the file once; a returned handle is reused.
 *Depends:* B2, A3. *Source:* spec `alignment_file.md` §3.3, arch §1.2.
 
-**C2. `BamRegionSource`.**  ☐ **Own commit — do not bundle.**
+**C2. `BamRegionSource`.**  ✅ **Own commit — do not bundle.**
 Index query → chunks (`BinningIndex::query` on the already-parsed index), seek the borrowed handle
 per chunk, fill the reused buffer, drop non-overlapping records **uncounted**, early-stop past `end`.
 **Oracle (T5):** for a set of regions over a fixture BAM, the indexed query must return *exactly*
