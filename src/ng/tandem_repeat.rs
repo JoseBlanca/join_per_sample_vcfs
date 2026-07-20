@@ -326,6 +326,15 @@ struct RtSeg {
     r: i64,
     start: usize,
     end: usize,
+    /// **Previous-smaller-element link**: `1 +` the index of the nearest segment *below*
+    /// this one whose `l` is smaller, or `0` when there is none. The `+ 1` bias keeps
+    /// "none" representable without an `Option`, and makes the search loop's bound check
+    /// and its jump the same comparison.
+    ///
+    /// This is what lets the search skip rather than scan — see the search loop in
+    /// [`maximal_scoring_subsequences`]. It is free to maintain: the link a segment needs
+    /// is exactly the `j` the search that placed it already found.
+    prev_smaller: usize,
 }
 
 /// Find every **maximal scoring subsequence** of a score sequence (Ruzzo & Tompa 1999),
@@ -359,16 +368,57 @@ fn maximal_scoring_subsequences(
             r,
             start: i,
             end: i,
+            prev_smaller: 0,
         };
         loop {
-            // The rightmost stacked segment whose `l` is smaller than `cur.l`.
-            match stack.iter().rposition(|seg| seg.l < cur.l) {
-                None => break, // Rule 2: no left-smaller segment → `cur` is separate.
+            // The rightmost stacked segment whose `l` is smaller than `cur.l`, found by
+            // **hopping down the previous-smaller chain** instead of scanning.
+            //
+            // Correctness: the chain skips exactly the segments that cannot be the
+            // answer. Everything between `t` and `stack[t].prev_smaller` has `l >= l[t]`,
+            // by that link's definition — so once `l[t] >= cur.l`, none of them is below
+            // `cur.l` either, and the first `t` reached with `l[t] < cur.l` is the
+            // rightmost such segment. Same answer as the scan it replaces.
+            //
+            // **Not a binary search** (tried, reverted, 2026-07-20): the stack's `l`
+            // values are *not* sorted, and Rule 2 is what unsorts them — when nothing is
+            // smaller, `cur` is pushed anyway, landing a smaller `l` above larger ones.
+            // `partition_point` there compiles, passes a `debug_assert` that is compiled
+            // out of release, and silently finds **zero** loci on real sequence.
+            //
+            // Why it was worth doing: the scan measured **139,995,860,286 steps, 7,634
+            // per search, stack depth to 21,683** (tomato 8 Mb fixture, 2026-07-20) and
+            // was ~100% of the walk. The costly case is the Rule-2 miss, which walked the
+            // whole stack to conclude nothing qualified — and a descending stack is the
+            // common shape, since mismatches drift the running total down. That case is
+            // now **one hop**.
+            let mut idx = stack.len();
+            let mut found = None;
+            while idx > 0 {
+                let t = idx - 1;
+                if stack[t].l < cur.l {
+                    found = Some(t);
+                    break;
+                }
+                idx = stack[t].prev_smaller;
+            }
+            match found {
+                None => {
+                    cur.prev_smaller = 0;
+                    break; // Rule 2: no left-smaller segment → `cur` is separate.
+                }
                 Some(j) => {
                     if stack[j].r >= cur.r {
-                        break; // Rule 3: `cur` stays a separate segment to the right.
+                        // Rule 3: `cur` stays a separate segment to the right — and `j`,
+                        // the answer this search just produced, is exactly the link `cur`
+                        // must carry, so maintaining the chain costs nothing.
+                        cur.prev_smaller = j + 1;
+                        break;
                     }
-                    // Rule 4: `cur` absorbs `stack[j..]` — extend its left edge and re-search.
+                    // Rule 4: `cur` absorbs `stack[j..]` — extend its left edge and
+                    // re-search. Truncating cannot invalidate a surviving link: every
+                    // link points strictly below its own segment, so all of them stay
+                    // within the retained prefix.
                     cur.l = stack[j].l;
                     cur.start = stack[j].start;
                     stack.truncate(j);
@@ -454,19 +504,70 @@ pub fn find_tandem_repeats(
     // smaller repeat — the copy floor, downstream, decides if it is significant). No
     // copy-number policy here: purely how much of `iv` the shorter `a` explains.
     out.sort_by_key(|iv| (iv.period, iv.start));
-    let mut kept: Vec<RepeatInterval> = Vec::with_capacity(out.len());
+
+    // Survivors grouped by period, which is what turns the redundancy test from a
+    // rescan of every survivor into a binary search.
+    //
+    // Three facts make the grouping exact rather than a heuristic:
+    //
+    // 1. **Only a shorter, dividing period can eliminate `iv`**, so the search space
+    //    is `divisors(period) \ {period}` — at most `{1, 2, 3}`, for period 6.
+    // 2. **Those lists are already complete** when `iv` is reached: `out` is sorted by
+    //    period first, so every shorter period was processed before it. (The old code
+    //    relied on the same ordering, implicitly.)
+    // 3. **Within one period the tracts are start- AND end-sorted.** Ruzzo–Tompa's
+    //    segments are disjoint by construction, and each tract extends its segment by
+    //    the same `p + 1`, so both endpoints stay monotonic. That is the precondition
+    //    `partition_point` needs.
+    //
+    // Behaviour is unchanged — same predicate, same survivors, same order (flattening
+    // by ascending period reproduces the `(period, start)` sort the old loop kept).
+    //
+    // Why it was worth doing: the old `kept.iter().any(…)` was O(survivors²) per
+    // window, and measured at **28.6% of the walk's total CPU while discarding 707 of
+    // 2,084,637 intervals** (tomato 8 Mb fixture, 2026-07-20) — a near-no-op pass
+    // paying a quadratic price, with up to 26,836 intervals in a single window.
+    let max_period = out.iter().map(|iv| iv.period).max().unwrap_or(0) as usize;
+    let mut by_period: Vec<Vec<RepeatInterval>> = vec![Vec::new(); max_period + 1];
+    let mut kept_len = 0usize;
     for iv in out {
         let iv_len = iv.end - iv.start;
-        let redundant = kept.iter().any(|a| {
-            if a.period >= iv.period || !iv.period.is_multiple_of(a.period) {
-                return false;
+        let mut redundant = false;
+        for shorter in 1..iv.period {
+            if !iv.period.is_multiple_of(shorter) {
+                continue;
             }
-            let overlap = a.end.min(iv.end).saturating_sub(a.start.max(iv.start));
-            overlap * 2 >= iv_len // ≥ 50% of the longer tract
-        });
-        if !redundant {
-            kept.push(iv);
+            let candidates = &by_period[shorter as usize];
+            // The tracts overlapping `iv` are a contiguous run: skip those ending at
+            // or before it starts, stop at the first starting at or after it ends.
+            let first = candidates.partition_point(|a| a.end <= iv.start);
+            for a in &candidates[first..] {
+                if a.start >= iv.end {
+                    break;
+                }
+                // `a` must cover half of `iv`, so a tract shorter than that cannot
+                // qualify however it sits — cheaper than computing the overlap.
+                if (a.end - a.start) * 2 < iv_len {
+                    continue;
+                }
+                let overlap = a.end.min(iv.end).saturating_sub(a.start.max(iv.start));
+                if overlap * 2 >= iv_len {
+                    redundant = true;
+                    break;
+                }
+            }
+            if redundant {
+                break;
+            }
         }
+        if !redundant {
+            kept_len += 1;
+            by_period[iv.period as usize].push(iv);
+        }
+    }
+    let mut kept: Vec<RepeatInterval> = Vec::with_capacity(kept_len);
+    for group in by_period {
+        kept.extend(group);
     }
     kept
 }
