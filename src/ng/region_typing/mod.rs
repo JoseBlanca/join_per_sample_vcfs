@@ -1903,13 +1903,26 @@ mod tests {
 
     /// A contig with one clean isolated (AT)*8 tract: Generic / SsrSegment / Generic.
     /// The smallest case that shows the partition doing its job.
+    ///
+    /// **The flanks must be aperiodic, and the first version's were not** (fixed
+    /// 2026-07-20). They were `(CGCA)*15` — a period-4 tandem repeat — so the contig was
+    /// not "one lone tract" at all: the scanner read the whole thing as a single impure
+    /// period-4 tract (`0..136 p4`, the 16 bp `AT` insert being exactly four periods of
+    /// four) with the `AT` tract nested inside it. The assertion passed only because the
+    /// then-current `is_close` could not see containment, so the nested `AT` came out a
+    /// standalone locus and the enclosing p4 tract was dropped for want of a flank at the
+    /// contig edge — two bugs cancelling. With [`segment_criteria::joins_cluster`] the
+    /// nesting is seen and the honest answer for *that* fixture is one `SsrBundle`, which
+    /// is how the fixture was caught. The flanks below are aperiodic, so the contig now
+    /// holds the one tract this test is named for.
     #[test]
     fn a_lone_tract_partitions_as_generic_locus_generic() {
-        // 60 bp of unique sequence either side, so the default 50 bp flanks fit.
-        let mut bases = b"CGCACGCACGCACGCACGCACGCACGCACGCACGCACGCACGCACGCACGCACGCACGCA".to_vec();
+        // 60 bp of aperiodic sequence either side, so the default 50 bp flanks fit and
+        // nothing in them is itself a tract (see the note above).
+        let mut bases = b"ACGTTGCAAGCTCCTAGGATCGATTGCACGGTACCTGAAGCTTGCACTGATCCGTAGGCA".to_vec();
         let tract_start_0 = bases.len();
         bases.extend_from_slice(b"ATATATATATATATAT"); // 8 copies
-        bases.extend_from_slice(b"CGCACGCACGCACGCACGCACGCACGCACGCACGCACGCACGCACGCACGCACGCACGCA");
+        bases.extend_from_slice(b"TGCATTGGACCTAAGCGTTCAGGCTTACGATCCAGGTTACGATCCAAGTGCTTAGCATCG");
         let len = bases.len() as u64;
 
         let regions = partition_resident("chr1", ContigId(0), &bases, &catalog_config());

@@ -1275,14 +1275,53 @@ fn recompute_purity(tract: &[u8], motif: &[u8]) -> f32 {
     matches as f32 / tract.len() as f32
 }
 
-/// Two records are "close" (bundle candidates) if any of their start/end
-/// coordinates are within `thresh` bp (GangSTR `is_close`, `check_motif=False`;
-/// chrom equality is implicit — these are one contig's records).
-fn is_close(a: &RepeatInterval, b: &RepeatInterval, thresh: u64) -> bool {
-    a.start.abs_diff(b.start) < thresh
-        || a.start.abs_diff(b.end) < thresh
-        || b.start.abs_diff(a.end) < thresh
-        || b.end.abs_diff(a.end) < thresh
+/// Does `next` join a cluster whose members reach as far as `reach`? Yes when fewer
+/// than `thresh` clean bases separate them — **`reach` is the cluster's running maximum
+/// `end`, not its last member's** (see below). `recs` being start-sorted is what makes
+/// one number enough.
+///
+/// # Why a reach, and not GangSTR's four-clause `is_close`
+///
+/// This replaced a direct port of GangSTR's `is_close` (`check_motif=False`) — four
+/// `abs_diff` clauses over the two intervals' start/end pairs, chained pairwise down
+/// the sorted list. **On disjoint input the two agree exactly**, which is all GangSTR
+/// itself can produce: for two disjoint start-sorted intervals the gap is the smallest
+/// of the four endpoint distances, so `gap < thresh` is the only clause that can fire
+/// first. The port was computing this test the long way round.
+///
+/// On **overlapping** input they disagree, and the port was wrong twice over. Both bugs
+/// are the same mistake — measuring *between endpoints* rather than *between the
+/// features* — and both broke spec §2.3's non-overlapping partition, aborting the walk
+/// at `BlockWalk::close_block`'s assertion on both benchmark genomes (2026-07-20):
+///
+/// 1. **Containment was invisible.** A short tract nested deep inside a long one sits
+///    `thresh`-or-more from all four endpoints, so the tightest packing there is scored
+///    as the loosest: the nested tract came out a cleanly-flanked *locus* while its
+///    enclosing tract joined a bundle, whose hull then swallowed the locus. **One repeat
+///    inside another is a bundle** (owner, 2026-07-20) — there are no clean bases
+///    between them at all, so neither can have a flank, which is what the bundle rule is
+///    for (spec §2.4). The same flaw [`crate::ng::region_typing::absorb_into`] documents
+///    for satellites ("noise against a span that can be 2 Mb long"); it bites at 100 bp
+///    too.
+/// 2. **The chain used the last member's `end` as the cluster's reach.** A long tract
+///    that spans *past* its neighbours reaches further than the members following it, so
+///    chaining `recs[j]` to `recs[j+1]` broke the cluster at the first short member even
+///    though later ones were still buried inside the long one. Fixing (1) alone left this
+///    live: `chr1:6739090..6739188 (p4)` bundled the member at `6739096` and then lost
+///    the one at `6739176`, still inside it.
+///
+/// **Reachable only since `min_period` became 1** (2026-07-18, `typed_regions_cli.md`
+/// §2.3): homopolymers nest inside longer-period tracts — a period-1 `C` run inside an
+/// imperfect period-4 tract is what found this — and at `2..=6` nothing classified
+/// period 1, so no nested pair could arise. The spec never specified nesting at all: its
+/// §2.3 argument that nothing overlaps assumes positive inter-tract distance, and §2.4's
+/// membership rule ("another repeat lies within `flank_bp` on either side") already
+/// implies *bundle* for a nested pair, at distance 0.
+fn joins_cluster(reach: u64, next: &RepeatInterval, thresh: u64) -> bool {
+    // `saturating_sub` is the overlap case: `next` starting at or before `reach` gives
+    // a gap of 0, which is always `< thresh` (a zero `thresh` is rejected upstream —
+    // `classify_rejects_a_zero_flank`).
+    next.start.saturating_sub(reach) < thresh
 }
 
 /// Group [`Classified::bundled`] back into its clusters — one `Vec` per bundle.
@@ -1315,12 +1354,20 @@ fn is_close(a: &RepeatInterval, b: &RepeatInterval, thresh: u64) -> bool {
 /// is nothing to have missed. The rule is unconditional again, and the assert with it.
 pub fn bundle_clusters(bundled: &[RepeatInterval], flank_bp: u64) -> Vec<Vec<RepeatInterval>> {
     let mut out: Vec<Vec<RepeatInterval>> = Vec::new();
+    // The open cluster's running maximum `end` — its reach. Not `cluster.last().end`:
+    // a member that spans past the ones after it keeps the cluster open for them
+    // (see [`joins_cluster`]).
+    let mut reach = 0;
     for &iv in bundled {
         match out.last_mut() {
-            Some(cluster) if is_close(cluster.last().expect("non-empty"), &iv, flank_bp) => {
+            Some(cluster) if joins_cluster(reach, &iv, flank_bp) => {
                 cluster.push(iv);
+                reach = reach.max(iv.end);
             }
-            _ => out.push(vec![iv]),
+            _ => {
+                out.push(vec![iv]);
+                reach = iv.end;
+            }
         }
     }
     debug_assert!(
@@ -1355,18 +1402,21 @@ fn split_bundles(
     let n = recs.len();
     let mut i = 0;
     while i < n {
-        if i + 1 < n && is_close(&recs[i], &recs[i + 1], thresh) {
-            // Advance through the whole close cluster; set all of it aside.
-            let mut j = i;
-            while j + 1 < n && is_close(&recs[j], &recs[j + 1], thresh) {
-                j += 1;
-            }
+        // Advance through the whole close cluster, carrying its reach — the running
+        // maximum `end`, so a member spanning past its neighbours keeps the cluster
+        // open for everything still inside it (see [`joins_cluster`]).
+        let mut j = i;
+        let mut reach = recs[i].end;
+        while j + 1 < n && joins_cluster(reach, &recs[j + 1], thresh) {
+            j += 1;
+            reach = reach.max(recs[j].end);
+        }
+        if j > i {
             bundled.extend_from_slice(&recs[i..=j]);
-            i = j + 1;
         } else {
             isolated.push(recs[i]);
-            i += 1;
         }
+        i = j + 1;
     }
     (isolated, bundled)
 }
@@ -3116,53 +3166,72 @@ mod tests {
         );
     }
 
-    /// **Mi6 — `is_close`'s boundary is strict `<`, on every clause that can show it.**
+    /// **Mi6 — [`joins_cluster`]'s boundary is strict `<`.**
     ///
-    /// A `<=` slip otherwise passes the whole suite, differential included: no
-    /// other fixture puts two tracts exactly `thresh` apart. Ported from GangSTR's
+    /// A `<=` slip otherwise passes the whole suite, differential included: no other
+    /// fixture puts two tracts exactly `thresh` apart. Inherited from GangSTR's
     /// `is_close`, where the strictness is the definition.
     ///
-    /// **`is_close` is four `abs_diff` comparisons, and they mask each other**, so
-    /// which fixture you pick decides which clauses you actually pin. Callers hold
-    /// `a.start <= b.start` (`classify` sorts before `drop_bundles`), and that
-    /// constrains what is reachable:
-    ///
-    /// - **Disjoint tracts** put only the *gap* clause (`b.start - a.end`) on the
-    ///   boundary — the other three sit well outside it and stay `false` either
-    ///   way. Verified by mutation: this fixture alone leaves 3 of the 4 mutants
-    ///   alive.
-    /// - **Overlapping equal-length tracts** put *three* clauses on the boundary
-    ///   at once (`b.start - a.start`, `b.start - a.end`, `b.end - a.end` are all
-    ///   `thresh`), so flipping any one of them to `<=` flips the verdict.
-    /// - The **`a.start`/`b.end` clause is unobservable at its boundary**: it needs
-    ///   `b.end == a.start + thresh`, which forces `b.start - a.start < thresh`, so
-    ///   the first clause has already fired. An equivalent mutant — no input kills
-    ///   it, and that is a property of the ported predicate, not a gap here.
+    /// *(This replaces a four-clause fixture. The predicate is now one comparison, so
+    /// there are no clauses left to mask each other — the old test's careful
+    /// three-clauses-at-once fixture, and its note about one clause being an equivalent
+    /// mutant, described a shape that no longer exists. The boundary it pinned is pinned
+    /// here directly. See [`joins_cluster`] for why the four collapsed to one.)*
     #[test]
-    fn is_close_is_strict_at_the_threshold() {
-        // Disjoint: only the gap clause is at the boundary.
-        let a = iv(100, 130, 2, 100);
-        let gap_exactly = iv(180, 210, 2, 100);
+    fn joins_cluster_is_strict_at_the_threshold() {
+        let reach = 130;
         assert!(
-            !is_close(&a, &gap_exactly, 50),
-            "a gap of exactly `thresh` is not close (strict <)"
+            !joins_cluster(reach, &iv(180, 210, 2, 100), 50),
+            "a gap of exactly `thresh` does not join (strict <)"
         );
         assert!(
-            is_close(&a, &(iv(179, 209, 2, 100)), 50),
-            "a gap of thresh - 1 is close"
+            joins_cluster(reach, &iv(179, 209, 2, 100), 50),
+            "a gap of thresh - 1 joins"
         );
+    }
 
-        // Overlapping, equal length: start-start, gap, and end-end are ALL exactly
-        // `thresh`, so this one fixture pins three clauses at once.
-        let long = iv(100, 200, 2, 100);
-        let shifted = iv(150, 250, 2, 100);
+    /// **A tract that starts at or before the cluster's reach joins it, whatever
+    /// `thresh` is** — the containment case that the four-clause `is_close` could not
+    /// see, and the bug that aborted both benchmark genomes (see [`joins_cluster`]).
+    #[test]
+    fn a_tract_inside_the_cluster_always_joins_it() {
+        // Buried deep inside a long member: every endpoint is > thresh away, which is
+        // exactly what fooled the ported predicate.
         assert!(
-            !is_close(&long, &shifted, 50),
-            "three clauses sit exactly at `thresh`; strict < keeps them all false"
+            joins_cluster(1000, &iv(500, 520, 2, 2000), 30),
+            "a tract nested inside the cluster's reach joins it"
         );
+        // Touching the reach exactly: half-open, so this is a gap of 0, not an overlap.
         assert!(
-            is_close(&long, &(iv(149, 249, 2, 100)), 50),
-            "shift one closer and all three fire"
+            joins_cluster(1000, &iv(1000, 1020, 2, 2000), 30),
+            "a tract abutting the reach joins it (gap 0)"
+        );
+    }
+
+    /// **The reach is the cluster's running maximum `end`, not its last member's.**
+    ///
+    /// Fixing containment alone left this live: a long member spans *past* the short
+    /// ones after it, so chaining last-to-next breaks the cluster at the first short
+    /// member while later tracts are still buried in the long one. Coordinates are the
+    /// real `chr1` block that caught it, rebased to 0.
+    #[test]
+    fn a_member_spanning_past_its_neighbour_keeps_the_cluster_open() {
+        let recs = vec![
+            iv(0, 43, 2, 100),    // 6739034..6739077
+            iv(56, 154, 4, 100),  // 6739090..6739188 — the long one
+            iv(62, 105, 2, 100),  // 6739096..6739139 — nested
+            iv(142, 154, 2, 100), // 6739176..6739188 — nested, but 37 bp past the previous
+        ];
+        let (isolated, bundled) = split_bundles(recs, 30);
+        assert!(
+            isolated.is_empty(),
+            "every tract is inside the long member's reach, so none is isolated: {isolated:?}"
+        );
+        assert_eq!(bundled.len(), 4, "all four belong to one cluster");
+        assert_eq!(
+            bundle_clusters(&bundled, 30).len(),
+            1,
+            "and they regroup as ONE cluster, not two"
         );
     }
 
