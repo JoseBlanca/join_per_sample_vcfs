@@ -25,6 +25,9 @@ pub mod merge;
 pub mod open_bam;
 pub mod region_query;
 
+#[cfg(test)]
+pub(crate) mod test_fixtures;
+
 use std::io;
 use std::path::PathBuf;
 
@@ -169,6 +172,24 @@ pub enum AlignmentFileError {
         region.contig.get(), region.start.get(), region.end.get()
     )]
     Region { region: GenomeRegion },
+
+    /// Querying the parsed index for a region's chunks failed.
+    ///
+    /// Distinct from [`Self::Region`]: the region has already been checked
+    /// against the contig table by the time this can fire, so a failure here is
+    /// the *index* being unusable — corrupt or truncated — not the caller
+    /// asking for something silly. Reporting it as a bad region would name the
+    /// wrong culprit and throw away the cause.
+    #[error(
+        "querying the index of '{path}' for contig {} [{}, {}] failed",
+        region.contig.get(), region.start.get(), region.end.get()
+    )]
+    IndexQuery {
+        path: PathBuf,
+        region: GenomeRegion,
+        #[source]
+        source: io::Error,
+    },
 }
 
 /// Sample-level failures — the layer above [`AlignmentFileError`].

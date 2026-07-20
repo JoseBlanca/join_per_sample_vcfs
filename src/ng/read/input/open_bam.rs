@@ -600,52 +600,11 @@ pub(crate) fn sample_names(header: &sam::Header) -> SampleNames {
 
 #[cfg(test)]
 mod tests {
-    use std::num::NonZero;
-
-    use sam::header::record::value::Map;
-    use sam::header::record::value::map::{ReadGroup, ReferenceSequence};
-
     use super::*;
-
-    /// A header builder taking `(sort order, contigs, read groups)`, so each
-    /// test states only the field it is about.
-    fn header(
-        sort_order_value: Option<&str>,
-        contigs: &[(&str, usize, Option<&str>)],
-        read_groups: &[(&str, Option<&str>)],
-    ) -> sam::Header {
-        use sam::header::record::value::map::header::tag::SORT_ORDER;
-        use sam::header::record::value::map::read_group::tag::SAMPLE;
-        use sam::header::record::value::map::reference_sequence::tag::MD5_CHECKSUM;
-
-        let mut hd = Map::<sam::header::record::value::map::Header>::default();
-        if let Some(value) = sort_order_value {
-            hd.other_fields_mut()
-                .insert(SORT_ORDER, value.as_bytes().into());
-        }
-
-        let mut builder = sam::Header::builder().set_header(hd);
-
-        for (name, length, md5) in contigs {
-            let mut sq = Map::<ReferenceSequence>::new(NonZero::new(*length).unwrap());
-            if let Some(md5) = md5 {
-                sq.other_fields_mut()
-                    .insert(MD5_CHECKSUM, md5.as_bytes().into());
-            }
-            builder = builder.add_reference_sequence(*name, sq);
-        }
-
-        for (id, sample) in read_groups {
-            let mut rg = Map::<ReadGroup>::default();
-            if let Some(sample) = sample {
-                rg.other_fields_mut()
-                    .insert(SAMPLE, sample.as_bytes().into());
-            }
-            builder = builder.add_read_group(*id, rg);
-        }
-
-        builder.build()
-    }
+    use crate::ng::read::input::test_fixtures::{
+        FIXTURE_CONTIGS, bam_header, fixture_reference, header, indexed_bam, matching_contigs,
+        one_read, read_named, unindexed_bam,
+    };
 
     // --- @HD SO ---
 
@@ -1005,7 +964,7 @@ mod tests {
                 read_groups: vec![("rg1".to_string(), Some("NA12878".to_string()))],
                 ..HeaderOverrides::default()
             },
-            &[a_record(0, 1)],
+            &[read_named("read-1", 0, 1)],
         )
         .expect("build cram");
 
@@ -1103,94 +1062,10 @@ mod tests {
     // -----------------------------------------------------------------
     // The gate — `AlignmentFile::open` (T1, T2, T3, T12a)
     // -----------------------------------------------------------------
-    use std::fs::File;
-
-    use noodles_bam as bam;
-    use noodles_core::Position as RecordPosition;
-    use noodles_sam::alignment::RecordBuf;
-    use noodles_sam::alignment::io::Write as _;
-    use noodles_sam::alignment::record::MappingQuality;
-    use noodles_sam::alignment::record::cigar::Op;
-    use noodles_sam::alignment::record::cigar::op::Kind;
-    use noodles_sam::alignment::record_buf::{QualityScores, Sequence};
     use tempfile::TempDir;
 
     use crate::ng::reference_info::{ReferenceSource, read_reference_info};
     use crate::pileup::per_sample::cram_files::{ContigSpec, build_fasta};
-
-    /// The fixture reference: two contigs of different lengths, so a
-    /// permutation of the `@SQ` list is detectable on *name* and a re-labelling
-    /// on *length*.
-    const FIXTURE_CONTIGS: [(&str, usize); 2] = [("chr1", 100), ("chr2", 200)];
-
-    fn fixture_reference(with_digests: bool) -> (TempDir, ReferenceInfo) {
-        let specs: Vec<ContigSpec> = FIXTURE_CONTIGS
-            .iter()
-            .map(|(name, length)| ContigSpec {
-                name: (*name).to_string(),
-                length: *length as u64,
-            })
-            .collect();
-        let (dir, fasta) = build_fasta(&specs).expect("build fasta");
-
-        // The `Fasta` arm reads the genome and carries real per-contig digests;
-        // the `Fai` arm cannot, so its digests are `None` and the MD5 half of
-        // reconciliation is a no-op. T2 needs both.
-        let source = if with_digests {
-            ReferenceSource::Fasta {
-                fasta: fasta.clone(),
-                fai: None,
-            }
-        } else {
-            ReferenceSource::Fai(crate::ng::reference_info::sibling_fai_path(&fasta))
-        };
-        let reference = read_reference_info(source).expect("read reference");
-        (dir, reference)
-    }
-
-    /// A header whose `@SQ` list is `contigs`, with `SO:coordinate` and one
-    /// read group naming `NA12878` unless overridden.
-    fn bam_header(contigs: &[(&str, usize, Option<&str>)]) -> sam::Header {
-        header(Some("coordinate"), contigs, &[("rg1", Some("NA12878"))])
-    }
-
-    fn matching_contigs() -> Vec<(&'static str, usize, Option<&'static str>)> {
-        FIXTURE_CONTIGS
-            .iter()
-            .map(|(name, length)| (*name, *length, None))
-            .collect()
-    }
-
-    fn a_record(reference_sequence_id: usize, start: usize) -> RecordBuf {
-        RecordBuf::builder()
-            .set_name(b"read-1")
-            .set_reference_sequence_id(reference_sequence_id)
-            .set_mapping_quality(MappingQuality::new(60).expect("mapq in range"))
-            .set_alignment_start(RecordPosition::try_from(start).unwrap())
-            .set_cigar([Op::new(Kind::Match, 10)].into_iter().collect())
-            .set_sequence(Sequence::from(vec![b'A'; 10]))
-            .set_quality_scores(QualityScores::from(vec![30u8; 10]))
-            .build()
-    }
-
-    /// Write a BAM with `header` and build its index next to it, so
-    /// `AlignmentFile::open` finds a real indexed file on disk.
-    fn indexed_bam(header: &sam::Header) -> (TempDir, PathBuf) {
-        let dir = TempDir::new().expect("tempdir");
-        let path = dir.path().join("sample.bam");
-
-        let mut writer = bam::io::Writer::new(File::create(&path).expect("create bam"));
-        writer.write_header(header).expect("write header");
-        if !header.reference_sequences().is_empty() {
-            writer
-                .write_alignment_record(header, &a_record(0, 1))
-                .expect("write record");
-        }
-        writer.try_finish().expect("finish");
-
-        preflight_alignment_indexes(std::slice::from_ref(&path), true).expect("build index");
-        (dir, path)
-    }
 
     /// An opened fixture **plus the temp dirs its files live in**.
     ///
@@ -1217,7 +1092,7 @@ mod tests {
         reference_has_digests: bool,
     ) -> OpenedFixture {
         let (reference_dir, reference) = fixture_reference(reference_has_digests);
-        let (bam_dir, path) = indexed_bam(header);
+        let (bam_dir, path) = indexed_bam(header, &one_read());
         OpenedFixture {
             file: AlignmentFile::open(&path, &reference, ReadFilterConfig::default(), false),
             _reference_dir: reference_dir,
@@ -1462,17 +1337,12 @@ mod tests {
         Result<AlignmentFile, AlignmentFileError>,
     ) {
         let (reference_dir, reference) = fixture_reference(false);
-        let dir = TempDir::new().expect("tempdir");
-        let path = dir.path().join("unindexed.bam");
-
-        let mut writer = bam::io::Writer::new(File::create(&path).expect("create"));
-        writer.write_header(header).expect("write header");
-        if !header.reference_sequences().is_empty() {
-            writer
-                .write_alignment_record(header, &a_record(0, 1))
-                .expect("write record");
-        }
-        writer.try_finish().expect("finish");
+        let records = if header.reference_sequences().is_empty() {
+            Vec::new()
+        } else {
+            one_read()
+        };
+        let (dir, path) = unindexed_bam(header, &records);
 
         let opened = AlignmentFile::open(&path, &reference, ReadFilterConfig::default(), false);
         ((reference_dir, dir), opened)
@@ -1557,7 +1427,7 @@ mod tests {
         // The same file in the same place — only the caller's policy differs.
         let (_reference_dir, bam_dir) = &dirs;
         let (_fresh_reference_dir, reference) = fixture_reference(false);
-        let path = bam_dir.path().join("unindexed.bam");
+        let path = bam_dir.path().join("sample.bam");
         assert!(
             AlignmentFile::open(&path, &reference, ReadFilterConfig::default(), true).is_ok(),
             "with build_index_if_missing the index is created next to the file"
