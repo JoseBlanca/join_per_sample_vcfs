@@ -2258,6 +2258,84 @@ mod tests {
         );
     }
 
+    /// A contig carrying exactly one repeat run, well clear of the flank
+    /// requirement, with the bases **immediately either side forced** to one the
+    /// run is not made of.
+    ///
+    /// The guard is the point. `filler` contains isolated `A`s, so dropping a
+    /// five-base poly-A into it can land beside one and become a *six*-base run —
+    /// and a floor test whose run is not the length it claims passes for the
+    /// wrong reason. Forcing the neighbours makes the run's length exactly what
+    /// the caller asked for.
+    fn contig_with_one_guarded_run(run: &[u8], guard: u8) -> Vec<u8> {
+        const OFFSET: usize = 200;
+        assert!(
+            !run.contains(&guard),
+            "the guard must not be a base the run is made of, or it could extend it"
+        );
+        let mut bases = filler(OFFSET * 2 + run.len());
+        bases[OFFSET - 1] = guard;
+        bases[OFFSET..OFFSET + run.len()].copy_from_slice(run);
+        bases[OFFSET + run.len()] = guard;
+        bases
+    }
+
+    /// The `SsrSegment`s a default-config walk finds in `bases`.
+    fn loci_at_default(bases: &[u8], case: &str) -> Vec<SsrSegment> {
+        let regions = partition_resident("chr1", ContigId(0), bases, &TypedRegionConfig::default());
+        assert_partitions(&regions, ContigId(0), bases.len() as u64, case);
+        regions
+            .into_iter()
+            .filter_map(|r| match r.kind {
+                RegionKind::SsrSegment(l) => Some(l),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// **The mononucleotide floor is exactly 6** (spec §2.3): five copies fall
+    /// through as `Generic`, six are a period-1 locus.
+    ///
+    /// `a_homopolymer_of_six_or_more_is_a_period_one_locus_at_default` uses a
+    /// 20 bp run — it proves homopolymers are typed at all, but sits far from the
+    /// line and so would stay green through any floor edit. This pins the line
+    /// itself, which is what §10's sweep will move.
+    #[test]
+    fn the_mononucleotide_copy_floor_is_exactly_six() {
+        let below = loci_at_default(&contig_with_one_guarded_run(&[b'A'; 5], b'C'), "poly-A x5");
+        assert!(
+            below.is_empty(),
+            "5 copies is under the mono floor of 6 — the run stays Generic, got {below:?}"
+        );
+
+        let at = loci_at_default(&contig_with_one_guarded_run(&[b'A'; 6], b'C'), "poly-A x6");
+        assert_eq!(at.len(), 1, "6 copies clears the mono floor: {at:?}");
+        assert_eq!(at[0].period(), 1, "a homopolymer is period 1");
+        assert_eq!(at[0].motif().as_bytes(), b"A");
+        assert_eq!(at[0].tract_len(), 6, "the whole run, and only the run");
+    }
+
+    /// **The dinucleotide floor is exactly 4** (spec §2.3): three copies fall
+    /// through, four are a locus.
+    ///
+    /// This is the boundary B1 *moved* — the catalog's floor was 5, so a 4-copy
+    /// dinucleotide used to be `Generic` and is now a locus. Nothing recorded
+    /// that change until this test.
+    #[test]
+    fn the_dinucleotide_copy_floor_is_exactly_four() {
+        let below = loci_at_default(&contig_with_one_guarded_run(b"ATATAT", b'C'), "(AT)x3");
+        assert!(
+            below.is_empty(),
+            "3 copies is under the di floor of 4 — the run stays Generic, got {below:?}"
+        );
+
+        let at = loci_at_default(&contig_with_one_guarded_run(b"ATATATAT", b'C'), "(AT)x4");
+        assert_eq!(at.len(), 1, "4 copies clears the di floor: {at:?}");
+        assert_eq!(at[0].period(), 2);
+        assert_eq!(at[0].motif().as_bytes(), b"AT");
+        assert_eq!(at[0].tract_len(), 8, "four copies of a 2 bp motif");
+    }
+
     /// **A rejected repeat is generic territory, not a hole** (spec §2.2). A
     /// low-copy tract classification turns down must still be *covered* — completeness
     /// is what the invariant is for.
