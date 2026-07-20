@@ -28,9 +28,10 @@ use std::sync::{Arc, Mutex};
 use noodles_bam as bam;
 use noodles_bgzf as bgzf;
 use noodles_cram as cram;
+use noodles_fasta as fasta;
 use noodles_sam as sam;
 
-use crate::bam::alignment_input::MappedRead;
+use crate::bam::alignment_input::{MappedRead, build_fasta_repository};
 use crate::bam::index_preflight::{
     AlignmentFileKind, AlignmentIndex, load_alignment_index, preflight_alignment_indexes,
 };
@@ -43,7 +44,17 @@ use crate::ng::reference_info::ReferenceInfo;
 use crate::ng::types::GenomeRegion;
 
 use super::AlignmentFileError;
-use super::region_query::{BamRegionSource, OrderVerified, RegionSource};
+use super::region_query::{
+    BamRegionSource, CramRegionPlan, CramRegionSource, OrderVerified, RegionPlan, RegionSource,
+};
+
+/// Which planner ran, and its result. Paired with the pooled reader's own
+/// format immediately below; both come from the same path, so they always
+/// agree.
+enum QueryPlan {
+    Bam(RegionPlan),
+    Cram(CramRegionPlan),
+}
 
 /// One opened, **validated** alignment file.
 ///
@@ -94,6 +105,14 @@ pub struct AlignmentFile {
     /// run, so it is worth being able to state rather than assume — T13 asserts
     /// it directly.
     readers_opened: AtomicUsize,
+    /// This CRAM's `.crai` entries, grouped by contig — `crai_by_contig[i]`
+    /// holds contig `i`'s entries in file order. Empty for a BAM.
+    crai_by_contig: Vec<Arc<[cram::crai::Record]>>,
+    /// The reference bases CRAM slice decoding consults, built once at open.
+    ///
+    /// `None` for a BAM, which stores its own sequences and needs no
+    /// reference to decode.
+    reference_repository: Option<fasta::Repository>,
     /// This file's step-1 tally, summed as each region stream ends.
     ///
     /// The `&self` API's answer to `counts()`: a per-read running total would
@@ -129,10 +148,6 @@ struct ReaderHandle {
 /// rather than inside it.
 pub(crate) enum ReaderKind {
     Bam(bam::io::Reader<bgzf::io::Reader<File>>),
-    /// Opened and pooled; **read** from C5, which builds the CRAM region
-    /// source. Until then `reads_in_region` rejects CRAM up front, so this
-    /// reader is created and returned but never driven.
-    #[expect(dead_code, reason = "CramRegionSource (C5) reads through this")]
     Cram(cram::io::Reader<File>),
 }
 
@@ -231,6 +246,11 @@ impl AlignmentFile {
     /// is wrong in several ways reports the most basic fault rather than
     /// whichever check happens to run.
     ///
+    /// A CRAM then needs one more thing before it can be read at all — the
+    /// reference *bases*, to decode against — so the repository is built after
+    /// those four, and a reference that cannot supply one is rejected here
+    /// rather than at the first query.
+    ///
     /// **The `@SQ` check is the permutation fix.** Comparing *in order* against
     /// the reference is what distinguishes this from the resolves-only check it
     /// replaces: a file whose contig list is a re-ordering of the reference's
@@ -293,6 +313,14 @@ impl AlignmentFile {
             })?;
 
         // 3. The index — parsed here, once, and held for the life of the run.
+        //
+        // Building a missing index reaches `noodles_cram::fs::index`, which
+        // decodes *multi-reference* slices against an empty
+        // `fasta::Repository` (marked `// TODO` in noodles 0.93) and therefore
+        // **panics** on a CRAM whose reads are stored as differences from the
+        // reference and whose slices span contigs — plausible on a fragmented
+        // assembly. Building the index outside ng avoids it. Noted here
+        // because this is the only ng call that can reach that path.
         if build_index_if_missing {
             preflight_alignment_indexes(&[path.to_path_buf()], true).map_err(|source| {
                 AlignmentFileError::Index {
@@ -329,6 +357,32 @@ impl AlignmentFile {
             }
         };
 
+        // 5. A CRAM needs the reference *bases* to decode at all, so the
+        //    repository is built here — once — and a reference that cannot
+        //    supply one is a hard error now rather than a mystery at the first
+        //    query.
+        let crai_by_contig = match &index {
+            AlignmentIndex::Crai(crai) => group_crai_by_contig(crai, file_contigs.entries.len()),
+            _ => Vec::new(),
+        };
+
+        let reference_repository = match AlignmentFileKind::from_path(path) {
+            Some(AlignmentFileKind::Cram) => {
+                let fasta = reference.fasta_path.as_deref().ok_or_else(|| {
+                    AlignmentFileError::CramNeedsReferenceFasta {
+                        path: path.to_path_buf(),
+                    }
+                })?;
+                Some(
+                    build_fasta_repository(fasta).map_err(|source| AlignmentFileError::Open {
+                        path: fasta.to_path_buf(),
+                        source: std::io::Error::other(source),
+                    })?,
+                )
+            }
+            _ => None,
+        };
+
         // Free, and only sound now: check 2 proved this order is the
         // reference's, so position i really is `ContigId(i)`.
         let sq_md5s = file_contigs.entries.iter().map(|entry| entry.md5).collect();
@@ -345,6 +399,8 @@ impl AlignmentFile {
             // queried costs no descriptor.
             readers: Mutex::new(Vec::new()),
             readers_opened: AtomicUsize::new(0),
+            crai_by_contig,
+            reference_repository,
             counts: Mutex::new(ReadFilterCounts::default()),
             source_file_index,
         })
@@ -397,33 +453,44 @@ impl AlignmentFile {
         // from — whereas a `?` after the handle is taken would lose that reader
         // silently (`BorrowedReader::take`).
         //
-        // The format check has to come first of all: `plan` reads the index,
-        // and a CRAM file's index is a `.crai`, which the BAM planner cannot
-        // make sense of.
-        if !matches!(
-            AlignmentFileKind::from_path(&self.path),
-            Some(AlignmentFileKind::Bam)
-        ) {
-            return Err(AlignmentFileError::UnsupportedForRegionQuery {
-                path: self.path.to_path_buf(),
-            });
-        }
-        let plan = BamRegionSource::plan(&self.header, &self.index, region, &self.path)?;
+        // The format decides which planner runs, and it has to be decided
+        // first: a CRAM's index is a `.crai`, which the BAM planner cannot read.
+        let plan = match AlignmentFileKind::from_path(&self.path) {
+            Some(AlignmentFileKind::Cram) => QueryPlan::Cram(CramRegionSource::plan(
+                &self.header,
+                &self.crai_by_contig,
+                region,
+            )?),
+            _ => QueryPlan::Bam(BamRegionSource::plan(
+                &self.header,
+                &self.index,
+                region,
+                &self.path,
+            )?),
+        };
 
         let borrowed = self.borrow_reader()?;
         let handle = borrowed.take();
         let ReaderHandle { reader, buffers } = handle;
 
-        let source = match reader {
-            ReaderKind::Bam(reader) => RegionSource::Bam(BamRegionSource::new(
-                reader,
-                &self.header,
-                plan,
-                self.source_file_index,
-            )),
-            ReaderKind::Cram(_) => {
-                unreachable!("the format check above rejects CRAM before any reader is taken")
+        let source = match (reader, plan) {
+            (ReaderKind::Bam(reader), QueryPlan::Bam(plan)) => RegionSource::Bam(
+                BamRegionSource::new(reader, &self.header, plan, self.source_file_index),
+            ),
+            (ReaderKind::Cram(reader), QueryPlan::Cram(plan)) => {
+                RegionSource::Cram(CramRegionSource::new(
+                    reader,
+                    &self.header,
+                    self.reference_repository
+                        .clone()
+                        .expect("open builds a repository for every CRAM"),
+                    plan,
+                    self.source_file_index,
+                ))
             }
+            // Both the reader and the plan are chosen from the same path's
+            // extension, so they cannot disagree.
+            _ => unreachable!("the reader's format and the plan's are both the path's"),
         };
 
         let filter =
@@ -461,8 +528,11 @@ impl AlignmentFile {
     /// are queried — the guarantee the whole per-query cost model rests on
     /// (spec §3.3). With N threads it settles at N.
     ///
-    /// A freshly opened reader is positioned past the header, matching one that
-    /// has been returned to the pool, so the two are interchangeable.
+    /// A freshly opened reader is positioned past the header. A *returned* CRAM
+    /// reader sits wherever its last query stopped, which is harmless only
+    /// because `CramRegionSource` seeks to a container before every read and
+    /// never reads without seeking — the BAM source does the same per chunk.
+    /// Neither source may assume an incoming reader's position.
     fn borrow_reader(&self) -> Result<BorrowedReader<'_>, AlignmentFileError> {
         // The `let` ends the guard's scope, so the lock is released before
         // `open_reader` runs. Written as a `match` scrutinee it would still be
@@ -574,6 +644,43 @@ impl std::fmt::Debug for AlignmentFile {
             .field("readers_opened", &self.readers_opened())
             .finish_non_exhaustive()
     }
+}
+
+/// Bucket a `.crai`'s entries by contig, keeping each contig's entries in file
+/// order. One O(n) pass, at open.
+///
+/// **This replaces a binary search, and the reason is correctness rather than
+/// speed.** Searching assumes the `.crai` is ordered by contig with unplaced
+/// entries last — and that assumption is false for an index noodles itself
+/// writes: within a multi-reference slice it emits entries sorted by
+/// `Option<usize>`, and `None < Some(0)` in Rust, so the unplaced entry comes
+/// *first*. A `partition_point` over an unpartitioned slice returns an
+/// unspecified index, and the walk would then find a foreign entry and report
+/// end-of-input — **losing every read of the region, with no error**.
+///
+/// Grouping assumes nothing about the order between contigs. It also makes the
+/// per-query lookup O(1) rather than O(log n), which matters at one query per
+/// STR locus. Within a contig the file order is kept, because the
+/// container-level early stop does rely on containers ascending by start —
+/// which follows from the file being coordinate-sorted, the same assumption the
+/// BAM early stop makes.
+///
+/// Unplaced entries are dropped: they can never overlap a region.
+pub(crate) fn group_crai_by_contig(
+    index: &cram::crai::Index,
+    contig_count: usize,
+) -> Vec<Arc<[cram::crai::Record]>> {
+    let mut by_contig: Vec<Vec<cram::crai::Record>> = vec![Vec::new(); contig_count];
+
+    for record in index.iter() {
+        if let Some(contig) = record.reference_sequence_id()
+            && contig < contig_count
+        {
+            by_contig[contig].push(record.clone());
+        }
+    }
+
+    by_contig.into_iter().map(Arc::from).collect()
 }
 
 /// Read just the SAM header, dispatching on the file's extension.
@@ -1137,34 +1244,15 @@ mod tests {
         )
         .expect("write an empty crai");
 
-        let reference = read_reference_info(ReferenceSource::Fai(
-            crate::ng::reference_info::sibling_fai_path(&fasta),
-        ))
+        // The `Fasta` arm, because a CRAM can only be decoded against the
+        // bases — see `a_cram_against_a_fai_only_reference_is_refused_at_open`.
+        let reference = read_reference_info(ReferenceSource::Fasta {
+            fasta: fasta.clone(),
+            fai: None,
+        })
         .expect("read reference");
         let file = AlignmentFile::open(&cram_path, &reference, ReadFilterConfig::default(), false)
             .expect("a matching CRAM opens");
-
-        // Querying a CRAM is *not supported yet* — and must say so, rather
-        // than panicking (which it did: `plan` reads the index, and a `.crai`
-        // hit the BAM planner's `unreachable!` before the format was ever
-        // checked) or blaming the caller's region.
-        let region = GenomeRegion {
-            contig: crate::ng::types::ContigId(0),
-            start: crate::ng::types::Position(1),
-            end: crate::ng::types::Position(50),
-        };
-        assert!(
-            matches!(
-                file.reads_in_region(region, reference_bases()),
-                Err(AlignmentFileError::UnsupportedForRegionQuery { .. })
-            ),
-            "a CRAM region query must be a clean error until C5"
-        );
-        assert_eq!(
-            file.readers_opened(),
-            0,
-            "and it must be rejected before any reader is taken"
-        );
 
         let borrowed = file.borrow_reader().expect("borrow a CRAM reader");
         assert!(
@@ -1567,6 +1655,218 @@ mod tests {
             file.counts().high_mismatch_fraction,
             1,
             "the drop seen before abandoning was banked, not lost"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // BAM/CRAM parity (C5) — T8
+    // -----------------------------------------------------------------
+
+    use crate::ng::read::input::test_fixtures::indexed_cram;
+
+    /// A spread of reads with pile-ups, so parity means more than "both
+    /// returned nothing".
+    ///
+    /// One contig, because the CRAM fixture cannot hold more — see
+    /// `test_fixtures::indexed_cram` for why (a noodles indexing limitation,
+    /// not a choice).
+    fn parity_records() -> Vec<RecordBuf> {
+        let mut records = Vec::new();
+        let mut start = 1;
+        while start + 30 < FIXTURE_CONTIGS[0].1 {
+            records.push(read_named_with_length(&format!("r{start}"), 0, start, 30));
+            if start % 20 == 1 {
+                records.push(read_named_with_length(&format!("r{start}_b"), 0, start, 30));
+            }
+            start += 7;
+        }
+        records
+    }
+
+    fn names_from(file: &AlignmentFile, region: GenomeRegion) -> Vec<String> {
+        file.reads_in_region(region, reference_bases())
+            .expect("query")
+            .map(|read| String::from_utf8_lossy(&read.expect("no fatal error").qname).into_owned())
+            .collect()
+    }
+
+    /// **T8 — the same reads written as BAM and as CRAM produce the same
+    /// ordered stream.**
+    ///
+    /// The two containers share nothing below the `RecordSource` seam: BAM
+    /// reads one record at a time from bgzf chunks, CRAM decodes whole
+    /// containers against the reference and walks a `.crai`. Everything above —
+    /// the filter, the order guard — is the same code. So an disagreement here
+    /// is a container-reader bug, which is exactly what this is looking for,
+    /// and BAM is the oracle because it is the simpler reader and was verified
+    /// first against a linear scan (T5).
+    #[test]
+    fn t8_a_cram_yields_the_same_ordered_reads_as_the_same_bam() {
+        let records = parity_records();
+
+        let (_reference_dir, bam_reference) = fixture_reference(false);
+        let (_bam_dir, bam_path) = indexed_bam(&bam_header(&matching_contigs()), &records);
+        let bam = AlignmentFile::open(
+            &bam_path,
+            &bam_reference,
+            ReadFilterConfig::default(),
+            false,
+        )
+        .expect("the BAM opens");
+
+        let (_cram_dir, cram_path, _fasta_dir, fasta) = indexed_cram(&records);
+        let cram_reference = read_reference_info(ReferenceSource::Fasta {
+            fasta: fasta.clone(),
+            fai: None,
+        })
+        .expect("read reference");
+        let cram = AlignmentFile::open(
+            &cram_path,
+            &cram_reference,
+            ReadFilterConfig::default(),
+            false,
+        )
+        .expect("the CRAM opens");
+
+        let regions = [
+            (0u32, 1u64, 100u64),
+            (0, 1, 30),
+            (0, 45, 55),
+            (0, 60, 62),
+            (0, 90, 100),
+        ];
+
+        let mut total = 0;
+        for (contig, start, end) in regions {
+            let region = GenomeRegion {
+                contig: crate::ng::types::ContigId(contig),
+                start: crate::ng::types::Position(start),
+                end: crate::ng::types::Position(end),
+            };
+
+            let from_bam = names_from(&bam, region);
+            let from_cram = names_from(&cram, region);
+
+            assert_eq!(
+                from_cram, from_bam,
+                "BAM and CRAM disagreed for contig {contig} [{start}, {end}]"
+            );
+            total += from_bam.len();
+        }
+
+        assert!(
+            total > 20,
+            "the fixture must actually cover these regions — {total} reads is \
+             too few for the comparison to mean anything"
+        );
+    }
+
+    /// **The owner's rule, enforced at open.** A CRAM stores sequences as
+    /// differences from the reference, so it cannot be decoded from a `.fai`,
+    /// which holds only geometry. That is a hard error the moment the file is
+    /// opened — not a mystery at the first query, and not a silently empty
+    /// stream.
+    #[test]
+    fn a_cram_against_a_fai_only_reference_is_refused_at_open() {
+        let (_cram_dir, cram_path, _fasta_dir, fasta) = indexed_cram(&one_read());
+
+        let fai_only = read_reference_info(ReferenceSource::Fai(
+            crate::ng::reference_info::sibling_fai_path(&fasta),
+        ))
+        .expect("read reference");
+
+        let error = AlignmentFile::open(&cram_path, &fai_only, ReadFilterConfig::default(), false)
+            .expect_err("a CRAM needs the bases");
+        assert!(matches!(
+            error,
+            AlignmentFileError::CramNeedsReferenceFasta { .. }
+        ));
+        assert!(
+            error.to_string().contains("supply the reference FASTA"),
+            "the message must say what to do about it: {error}"
+        );
+    }
+
+    /// A BAM is unaffected — it stores its own sequences, so a `.fai`-only
+    /// reference is perfectly ordinary input for it.
+    #[test]
+    fn a_bam_against_a_fai_only_reference_opens_normally() {
+        let (_reference_dir, _bam_dir, file) =
+            opened_over(&[read_named_with_length("r", 0, 1, 30)]);
+        assert_eq!(file.sample_name(), "NA12878");
+    }
+
+    /// **The `.crai` walk, with more than one entry to walk.**
+    ///
+    /// The parity fixture fits in a single container, so it exercises the
+    /// container decode but none of the walk's control flow. This one spans
+    /// several containers over a long contig, so a query for a slice of it must
+    /// visit some entries, skip others, and **stop early** rather than decoding
+    /// every container to the end — which is the difference between a seek and
+    /// a whole-file scan, ~10⁶ times over.
+    #[test]
+    fn a_multi_container_cram_walks_its_crai_and_stops_early() {
+        use crate::ng::read::input::test_fixtures::multi_container_cram;
+
+        const CONTIG_LENGTH: usize = 400_000;
+        // Comfortably over noodles' 10240 records per container.
+        const READS: usize = 30_000;
+
+        let (_cram_dir, cram_path, _fasta_dir, fasta) = multi_container_cram(CONTIG_LENGTH, READS);
+        let reference = read_reference_info(ReferenceSource::Fasta {
+            fasta: fasta.clone(),
+            fai: None,
+        })
+        .expect("read reference");
+        let file = AlignmentFile::open(&cram_path, &reference, ReadFilterConfig::default(), false)
+            .expect("opens");
+
+        let bases = || InMemoryRefSeq::from_contigs(vec![vec![b'A'; CONTIG_LENGTH]]);
+        let near_the_start = GenomeRegion {
+            contig: crate::ng::types::ContigId(0),
+            start: crate::ng::types::Position(1),
+            end: crate::ng::types::Position(200),
+        };
+
+        let reads: Vec<MappedRead> = file
+            .reads_in_region(near_the_start, bases())
+            .expect("query")
+            .collect::<Result<_, _>>()
+            .expect("no fatal error");
+
+        assert!(
+            !reads.is_empty(),
+            "the region is covered, so the walk must find its container"
+        );
+        for read in &reads {
+            assert!(
+                read.pos <= 200 && read.pos + 29 >= 1,
+                "a read outside the region survived: pos {}",
+                read.pos
+            );
+        }
+
+        // Deep in the covered range, to prove the walk reaches later containers
+        // rather than only ever decoding the first. (Well inside where reads
+        // actually are — the spread stops short of the contig end.)
+        let late_start = (CONTIG_LENGTH as u64 * 3) / 4;
+        let near_the_end = GenomeRegion {
+            contig: crate::ng::types::ContigId(0),
+            start: crate::ng::types::Position(late_start),
+            end: crate::ng::types::Position(late_start + 200),
+        };
+        let late: Vec<MappedRead> = file
+            .reads_in_region(near_the_end, bases())
+            .expect("query")
+            .collect::<Result<_, _>>()
+            .expect("no fatal error");
+        assert!(
+            !late.is_empty(),
+            "the walk must reach the contig's last containers too"
+        );
+        assert!(
+            late[0].pos >= late_start - 30,
+            "and those are genuinely different reads from the first query"
         );
     }
 

@@ -28,15 +28,19 @@
 
 use std::fs::File;
 use std::io;
+use std::io::SeekFrom;
 use std::iter::FusedIterator;
 use std::path::Path;
 use std::sync::Arc;
 
 use noodles_bam as bam;
 use noodles_bgzf as bgzf;
+use noodles_cram as cram;
 use noodles_csi::BinningIndex;
 use noodles_csi::binning_index::index::reference_sequence::bin::Chunk;
+use noodles_fasta as fasta;
 use noodles_sam as sam;
+use noodles_sam::alignment::RecordBuf;
 
 use crate::bam::alignment_input::MappedRead;
 use crate::bam::index_preflight::AlignmentIndex;
@@ -158,21 +162,6 @@ impl<'a> BamRegionSource<'a> {
     pub(crate) fn into_reader(self) -> bam::io::Reader<bgzf::io::Reader<File>> {
         self.reader
     }
-
-    /// Whether this record's reference footprint touches the region.
-    ///
-    /// A record with no mapped position never overlaps. The comparison is on
-    /// `[alignment_start, alignment_end]` — the *footprint*, not the start —
-    /// because a read beginning before the region can still cover it.
-    fn overlaps_region(&self, record: &sam::alignment::RecordBuf) -> bool {
-        match (record.alignment_start(), record.alignment_end()) {
-            (Some(first), Some(last)) => {
-                usize::from(first) as u64 <= self.region.end.get()
-                    && usize::from(last) as u64 >= self.region.start.get()
-            }
-            _ => false,
-        }
-    }
 }
 
 /// The region as a noodles query interval. `None` if the 1-based bounds cannot
@@ -253,12 +242,264 @@ impl RecordSource for BamRegionSource<'_> {
             //    filter's, and charging them to a `DropReason` would make the
             //    tally mean something different for an indexed read than for a
             //    whole-file one.
-            if !on_target_contig || !self.overlaps_region(&buf.record) {
+            if !on_target_contig || !overlaps(&buf.record, self.region) {
                 continue;
             }
 
             return Ok(true);
         }
+    }
+}
+
+/// Which `.crai` entries a CRAM region query has to walk, resolved before any
+/// reader is involved. The sibling of [`RegionPlan`], and split out for the
+/// same reason: nothing fallible may happen after a reader leaves the pool.
+pub(crate) struct CramRegionPlan {
+    /// Just this contig's entries, in file order — see
+    /// [`crate::ng::read::input::open_bam::group_crai_by_contig`] for why the
+    /// grouping is done once at open rather than searched per query.
+    entries: Arc<[cram::crai::Record]>,
+    target_reference_sequence_id: usize,
+    region: GenomeRegion,
+}
+
+/// The reads of one region of a CRAM.
+///
+/// CRAM decodes at **container** granularity — a container holds slices whose
+/// records are decoded together against the reference — so this walks the
+/// `.crai` for containers on the target contig, decodes each, and buffers the
+/// overlapping records. Non-overlapping ones are dropped **uncounted**, as in
+/// the BAM source, and for the same reason.
+///
+/// **The `.crai` walk starts from a binary search, not from entry 0.**
+/// Production rescans the index from the beginning on every call
+/// (`segment_reader.rs`'s `fetch_mapped_reads`), which for a late contig in a
+/// many-contig `.crai` is a repeated O(n) prefix scan — paid once per locus,
+/// ~10⁶ times on the STR path. The `.crai` is sorted by
+/// `(reference_sequence_id, alignment_start)`, so the contig's first entry is
+/// one binary search away, and the forward walk from there is bounded by the
+/// container-level early stop below (spec §3.3).
+pub(crate) struct CramRegionSource<'a> {
+    reader: cram::io::Reader<File>,
+    header: &'a sam::Header,
+    /// The reference bases slice decoding consults. Cheap to clone — it is
+    /// internally shared — and cloned per decode, as noodles requires.
+    repository: fasta::Repository,
+    /// This contig's `.crai` entries, in file order.
+    entries: Arc<[cram::crai::Record]>,
+    /// Cursor into [`Self::entries`].
+    next_index_record: usize,
+    /// The overlapping records of the container last decoded, drained one per
+    /// `read_next` before the next container is touched.
+    pending: std::vec::IntoIter<RecordBuf>,
+    /// The offset last decoded, so a container that appears once per slice is
+    /// decoded once.
+    last_decoded_offset: Option<u64>,
+    target_reference_sequence_id: usize,
+    region: GenomeRegion,
+    source_file_index: usize,
+    done: bool,
+}
+
+impl<'a> CramRegionSource<'a> {
+    /// Pick out the target contig's `.crai` entries. **O(1)** — the grouping
+    /// was done once, at open (`open_bam::group_crai_by_contig`, which also
+    /// explains why this is not a binary search).
+    pub(crate) fn plan(
+        header: &sam::Header,
+        crai_by_contig: &[Arc<[cram::crai::Record]>],
+        region: GenomeRegion,
+    ) -> Result<CramRegionPlan, AlignmentFileError> {
+        let invalid_region = || AlignmentFileError::Region { region };
+
+        let target_reference_sequence_id =
+            usize::try_from(region.contig.get()).map_err(|_| invalid_region())?;
+        if target_reference_sequence_id >= header.reference_sequences().len() || region.is_empty() {
+            return Err(invalid_region());
+        }
+
+        let entries = crai_by_contig
+            .get(target_reference_sequence_id)
+            .cloned()
+            .ok_or_else(invalid_region)?;
+
+        Ok(CramRegionPlan {
+            entries,
+            target_reference_sequence_id,
+            region,
+        })
+    }
+
+    /// Attach a reader to a plan. **Infallible**, so it is safe after the
+    /// pooled handle has been taken.
+    pub(crate) fn new(
+        reader: cram::io::Reader<File>,
+        header: &'a sam::Header,
+        repository: fasta::Repository,
+        plan: CramRegionPlan,
+        source_file_index: usize,
+    ) -> Self {
+        Self {
+            reader,
+            header,
+            repository,
+            entries: plan.entries,
+            next_index_record: 0,
+            pending: Vec::new().into_iter(),
+            last_decoded_offset: None,
+            target_reference_sequence_id: plan.target_reference_sequence_id,
+            region: plan.region,
+            source_file_index,
+            done: false,
+        }
+    }
+
+    pub(crate) fn into_reader(self) -> cram::io::Reader<File> {
+        self.reader
+    }
+
+    /// Walk the `.crai` to the next container that could overlap, decode it,
+    /// and buffer the records that do. `Ok(false)` once the walk is done.
+    fn refill(&mut self) -> io::Result<bool> {
+        loop {
+            let Some(record) = self.entries.get(self.next_index_record).cloned() else {
+                return Ok(false);
+            };
+            self.next_index_record += 1;
+
+            debug_assert_eq!(
+                record.reference_sequence_id(),
+                Some(self.target_reference_sequence_id),
+                "the grouping at open put only this contig's entries here"
+            );
+
+            // Container-level narrowing. Stopping once a container *starts*
+            // past the region is what keeps a tiny locus near the start of a
+            // large contig from walking that contig's whole index tail.
+            if let Some(start) = record.alignment_start() {
+                let container_start = usize::from(start) as u64;
+                if container_start > self.region.end.get() {
+                    return Ok(false);
+                }
+                let span = record.alignment_span() as u64;
+                if span > 0 && container_start + span - 1 < self.region.start.get() {
+                    continue;
+                }
+            }
+
+            // `.crai` offsets are *container* positions and a container may
+            // hold several slices, so a multi-slice container appears as
+            // several entries sharing one offset. Decoding it once per entry
+            // would surface every record again — caught loudly by the order
+            // guard rather than silently inflating depth, but wrong either way.
+            if self.last_decoded_offset == Some(record.offset()) {
+                continue;
+            }
+            self.last_decoded_offset = Some(record.offset());
+
+            let Some(records) = self.decode_container_at(record.offset())? else {
+                // End of stream reached through the index — nothing further.
+                return Ok(false);
+            };
+
+            let overlapping: Vec<RecordBuf> = records
+                .into_iter()
+                .filter(|record| {
+                    record.reference_sequence_id() == Some(self.target_reference_sequence_id)
+                        && overlaps(record, self.region)
+                })
+                .collect();
+
+            if !overlapping.is_empty() {
+                self.pending = overlapping.into_iter();
+                return Ok(true);
+            }
+            // The container was in range but held nothing overlapping — keep
+            // walking rather than reporting end of input.
+        }
+    }
+
+    /// Seek to a container and decode every slice into owned records.
+    /// `Ok(None)` at end of stream (`read_container` reads 0 — the EOF marker).
+    fn decode_container_at(&mut self, offset: u64) -> io::Result<Option<Vec<RecordBuf>>> {
+        self.reader.seek(SeekFrom::Start(offset))?;
+
+        let mut container = cram::io::reader::Container::default();
+        if self.reader.read_container(&mut container)? == 0 {
+            return Ok(None);
+        }
+
+        let compression_header = container.compression_header()?;
+        let mut records = Vec::new();
+        for slice in container.slices() {
+            let slice = slice?;
+            // The decoded block data and the borrowed records live only within
+            // this block; converting to owned `RecordBuf`s here keeps the
+            // result independent of those borrows.
+            let (core_data_src, external_data_srcs) = slice.decode_blocks()?;
+            for record in slice.records(
+                self.repository.clone(),
+                self.header,
+                &compression_header,
+                &core_data_src,
+                &external_data_srcs,
+            )? {
+                records.push(RecordBuf::try_from_alignment_record(self.header, &record)?);
+            }
+        }
+        Ok(Some(records))
+    }
+}
+
+impl RecordSource for CramRegionSource<'_> {
+    type Record = NoodlesRawRecord;
+
+    fn header(&self) -> &sam::Header {
+        self.header
+    }
+
+    fn read_next(&mut self, buf: &mut NoodlesRawRecord) -> io::Result<bool> {
+        if self.done {
+            return Ok(false);
+        }
+
+        buf.source_file_index = self.source_file_index;
+        loop {
+            if let Some(record) = self.pending.next() {
+                // CRAM decodes a whole container at once, so this *moves* an
+                // already-decoded record into the caller's buffer rather than
+                // refilling it in place — the container buffer's allocations
+                // are what get reused. Same seam, different reuse point.
+                buf.record = record;
+                return Ok(true);
+            }
+
+            match self.refill() {
+                Ok(true) => {}
+                Ok(false) => {
+                    self.done = true;
+                    return Ok(false);
+                }
+                Err(error) => {
+                    self.done = true;
+                    return Err(error);
+                }
+            }
+        }
+    }
+}
+
+/// Whether a record's reference footprint touches the region. Shared by both
+/// sources so the two containers cannot disagree about what "overlap" means —
+/// which is precisely what the BAM/CRAM parity oracle (T8) would otherwise be
+/// left to discover.
+fn overlaps(record: &sam::alignment::RecordBuf, region: GenomeRegion) -> bool {
+    match (record.alignment_start(), record.alignment_end()) {
+        (Some(first), Some(last)) => {
+            usize::from(first) as u64 <= region.end.get()
+                && usize::from(last) as u64 >= region.start.get()
+        }
+        _ => false,
     }
 }
 
@@ -324,6 +565,7 @@ impl<I> OrderVerified<I> {
 /// neither format nor container (`arch/alignment_file.md` §4).
 pub(crate) enum RegionSource<'a> {
     Bam(BamRegionSource<'a>),
+    Cram(CramRegionSource<'a>),
 }
 
 impl RegionSource<'_> {
@@ -331,6 +573,7 @@ impl RegionSource<'_> {
     pub(crate) fn into_reader(self) -> super::open_bam::ReaderKind {
         match self {
             Self::Bam(source) => super::open_bam::ReaderKind::Bam(source.into_reader()),
+            Self::Cram(source) => super::open_bam::ReaderKind::Cram(source.into_reader()),
         }
     }
 }
@@ -341,12 +584,14 @@ impl RecordSource for RegionSource<'_> {
     fn header(&self) -> &sam::Header {
         match self {
             Self::Bam(source) => source.header(),
+            Self::Cram(source) => source.header(),
         }
     }
 
     fn read_next(&mut self, buf: &mut NoodlesRawRecord) -> io::Result<bool> {
         match self {
             Self::Bam(source) => source.read_next(buf),
+            Self::Cram(source) => source.read_next(buf),
         }
     }
 }
@@ -421,6 +666,7 @@ mod tests {
     use super::*;
     use crate::bam::index_preflight::load_alignment_index;
     use crate::ng::read::filtering::BamRecordSource;
+    use crate::ng::read::input::open_bam::group_crai_by_contig;
     use crate::ng::read::input::test_fixtures::{bam_header, indexed_bam, read_named};
     use crate::ng::types::{ContigId, Position};
 
@@ -999,6 +1245,243 @@ mod tests {
             guard.next().is_none(),
             "fused: the read after the error is not reachable"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // The CRAM `.crai` walk (C5)
+    // -----------------------------------------------------------------
+
+    /// A `.crai` entry for `contig` covering `[start, start + span - 1]`.
+    fn crai_index(records: Vec<cram::crai::Record>) -> cram::crai::Index {
+        records
+    }
+
+    /// A `.crai` entry for `contig` covering `[start, start + span - 1]`, at
+    /// `offset` — which the tests use to tell entries apart.
+    fn crai_entry(
+        contig: Option<usize>,
+        start: usize,
+        span: usize,
+        offset: u64,
+    ) -> cram::crai::Record {
+        cram::crai::Record::new(
+            contig,
+            noodles_core::Position::new(start),
+            span,
+            offset,
+            0,
+            0,
+        )
+    }
+
+    fn three_contig_header() -> sam::Header {
+        bam_header(&[
+            ("chr1", 100, None),
+            ("chr2", 200, None),
+            ("chr3", 300, None),
+        ])
+    }
+
+    /// **The fix for production's O(n) prefix rescan** — and, more importantly,
+    /// for an ordering assumption that does not hold. A query on a late contig
+    /// must reach that contig's entries without walking (or mis-searching) the
+    /// earlier ones.
+    ///
+    /// Hand-built rather than read from a file, because the file fixture cannot
+    /// hold more than one contig (`test_fixtures::indexed_cram`).
+    #[test]
+    fn the_crai_is_grouped_so_each_contig_sees_only_its_own_entries() {
+        let index = crai_index(vec![
+            crai_entry(Some(0), 1, 50, 100),
+            crai_entry(Some(0), 51, 50, 200),
+            crai_entry(Some(1), 1, 100, 300),
+            crai_entry(Some(1), 101, 100, 400),
+            crai_entry(Some(2), 1, 300, 500),
+        ]);
+        let grouped = group_crai_by_contig(&index, 3);
+        let header = three_contig_header();
+
+        for (contig, expected_offsets) in [
+            (0u32, vec![100u64, 200]),
+            (1, vec![300, 400]),
+            (2, vec![500]),
+        ] {
+            let plan =
+                CramRegionSource::plan(&header, &grouped, region(contig, 1, 10)).expect("plan");
+            let offsets: Vec<u64> = plan.entries.iter().map(|e| e.offset()).collect();
+            assert_eq!(offsets, expected_offsets, "contig {contig}");
+        }
+    }
+
+    /// **The ordering assumption a binary search would have made, violated by
+    /// noodles itself.** Within a multi-reference slice, `fs::index` sorts by
+    /// `Option<usize>` — and `None < Some(0)` — so the *unplaced* entry is
+    /// emitted first. A `partition_point` over that is unspecified, and the
+    /// walk would then meet a foreign entry and report end-of-input, losing
+    /// every read of the region with no error at all.
+    ///
+    /// Grouping assumes nothing about order, so an interleaved index is fine.
+    #[test]
+    fn an_unplaced_entry_before_the_placed_ones_does_not_hide_a_contig() {
+        let index = crai_index(vec![
+            crai_entry(Some(0), 1, 50, 100),
+            crai_entry(None, 1, 0, 150),
+            crai_entry(Some(1), 1, 100, 300),
+        ]);
+        let grouped = group_crai_by_contig(&index, 3);
+
+        let plan = CramRegionSource::plan(&three_contig_header(), &grouped, region(1, 1, 10))
+            .expect("plan");
+        let offsets: Vec<u64> = plan.entries.iter().map(|e| e.offset()).collect();
+        assert_eq!(
+            offsets,
+            vec![300],
+            "contig 1's entry must be found even though an unplaced entry \
+             precedes it — the case that silently returned nothing before"
+        );
+
+        // And the unplaced entry belongs to no contig at all.
+        for (contig, entries) in grouped.iter().enumerate() {
+            assert!(
+                entries.iter().all(|e| e.reference_sequence_id().is_some()),
+                "an unplaced entry leaked into contig {contig}"
+            );
+        }
+    }
+
+    /// A contig with no entries yields an empty walk rather than someone
+    /// else's entries.
+    #[test]
+    fn a_contig_absent_from_the_crai_has_an_empty_walk() {
+        let index = crai_index(vec![
+            crai_entry(Some(0), 1, 50, 100),
+            crai_entry(Some(2), 1, 300, 500),
+        ]);
+        let grouped = group_crai_by_contig(&index, 3);
+
+        let plan = CramRegionSource::plan(&three_contig_header(), &grouped, region(1, 1, 10))
+            .expect("plan");
+        assert!(plan.entries.is_empty());
+    }
+
+    /// **The CRAM container-level early stop, with a discriminating
+    /// assertion.** Draining a region near the start of a long contig must
+    /// leave most of the `.crai` unwalked; a test that only checked the reads
+    /// were right would pass with the stop deleted, because deleting it changes
+    /// the *work*, not the answer — a whole-file decode per region, ~10⁶ times.
+    ///
+    /// Driven through `CramRegionSource` directly, since the cursor is not
+    /// visible once the source is wrapped in the filter and the order guard.
+    #[test]
+    fn the_crai_walk_stops_once_it_passes_the_region() {
+        use crate::ng::read::input::test_fixtures::multi_container_cram;
+
+        const CONTIG_LENGTH: usize = 400_000;
+        let (_cram_dir, cram_path, _fasta_dir, fasta) = multi_container_cram(CONTIG_LENGTH, 30_000);
+
+        let index = load_alignment_index(&cram_path).expect("load crai");
+        let repository =
+            crate::bam::alignment_input::build_fasta_repository(&fasta).expect("repository");
+        let header_for_plan = bam_header(&[("chr1", CONTIG_LENGTH, None)]);
+        let grouped = group_crai_by_contig(
+            match &index {
+                AlignmentIndex::Crai(crai) => crai,
+                _ => panic!("a .cram must carry a .crai"),
+            },
+            1,
+        );
+        assert!(
+            grouped[0].len() > 1,
+            "the fixture must span several containers, or there is nothing to \
+             stop short of — got {}",
+            grouped[0].len()
+        );
+
+        let mut reader = cram::io::Reader::new(File::open(&cram_path).expect("open"));
+        let parsed_header = reader.read_header().expect("read header");
+
+        let plan =
+            CramRegionSource::plan(&header_for_plan, &grouped, region(0, 1, 200)).expect("plan");
+        let total_entries = plan.entries.len();
+        let mut source = CramRegionSource::new(reader, &parsed_header, repository, plan, 0);
+
+        let mut buf = NoodlesRawRecord::default();
+        let mut seen = 0;
+        while source.read_next(&mut buf).expect("read") {
+            seen += 1;
+        }
+
+        assert!(seen > 0, "the region is covered");
+        assert!(
+            source.next_index_record < total_entries,
+            "the walk consumed all {total_entries} entries for a 200 bp region \
+             of a 400 kb contig — it decoded to the end instead of stopping"
+        );
+    }
+
+    /// The span-based skip: a container that ends *before* the region must be
+    /// stepped over without being decoded. Observable as the cursor advancing
+    /// past entries that produced no reads.
+    #[test]
+    fn the_crai_walk_skips_containers_that_end_before_the_region() {
+        use crate::ng::read::input::test_fixtures::multi_container_cram;
+
+        const CONTIG_LENGTH: usize = 400_000;
+        let (_cram_dir, cram_path, _fasta_dir, fasta) = multi_container_cram(CONTIG_LENGTH, 30_000);
+
+        let index = load_alignment_index(&cram_path).expect("load crai");
+        let repository =
+            crate::bam::alignment_input::build_fasta_repository(&fasta).expect("repository");
+        let header_for_plan = bam_header(&[("chr1", CONTIG_LENGTH, None)]);
+        let grouped = group_crai_by_contig(
+            match &index {
+                AlignmentIndex::Crai(crai) => crai,
+                _ => panic!("a .cram must carry a .crai"),
+            },
+            1,
+        );
+
+        let mut reader = cram::io::Reader::new(File::open(&cram_path).expect("open"));
+        let parsed_header = reader.read_header().expect("read header");
+
+        // A region in the *last* stretch of the contig: every earlier container
+        // ends before it and must be skipped rather than decoded.
+        let late = (CONTIG_LENGTH as u64 * 3) / 4;
+        let plan = CramRegionSource::plan(&header_for_plan, &grouped, region(0, late, late + 200))
+            .expect("plan");
+        let mut source = CramRegionSource::new(reader, &parsed_header, repository, plan, 0);
+
+        let mut buf = NoodlesRawRecord::default();
+        let mut seen = 0;
+        while source.read_next(&mut buf).expect("read") {
+            seen += 1;
+        }
+
+        assert!(seen > 0, "the late region is covered");
+        assert!(
+            source.last_decoded_offset.is_some(),
+            "at least one container was decoded"
+        );
+    }
+
+    #[test]
+    fn a_cram_region_naming_a_contig_the_header_lacks_is_an_error() {
+        let grouped = group_crai_by_contig(&crai_index(vec![crai_entry(Some(0), 1, 50, 0)]), 3);
+        assert!(matches!(
+            CramRegionSource::plan(&three_contig_header(), &grouped, region(9, 1, 10)),
+            Err(AlignmentFileError::Region { .. })
+        ));
+    }
+
+    /// The CRAM planner rejects an inverted or empty region, as the BAM one
+    /// does — the two must not disagree about what a valid region is.
+    #[test]
+    fn a_cram_planner_rejects_an_inverted_region() {
+        let grouped = group_crai_by_contig(&crai_index(vec![crai_entry(Some(0), 1, 50, 0)]), 3);
+        assert!(matches!(
+            CramRegionSource::plan(&three_contig_header(), &grouped, region(0, 500, 100)),
+            Err(AlignmentFileError::Region { .. })
+        ));
     }
 
     #[test]

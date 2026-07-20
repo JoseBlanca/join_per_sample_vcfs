@@ -173,14 +173,22 @@ pub enum AlignmentFileError {
     )]
     Region { region: GenomeRegion },
 
-    /// The file opened, but its container cannot serve region queries yet.
+    /// A CRAM was opened against a reference that carries no FASTA — a
+    /// `.fai`-only `ReferenceInfo`.
     ///
-    /// Only CRAM, and only until `CramRegionSource` lands. A distinct variant
-    /// rather than reusing [`Self::Region`]: the region is perfectly valid, and
-    /// blaming the caller for a gap in this module would send them looking in
-    /// the wrong place.
-    #[error("region queries over '{path}' are not supported yet (CRAM)")]
-    UnsupportedForRegionQuery { path: PathBuf },
+    /// CRAM stores its sequences as differences from the reference, so decoding
+    /// a record *requires the bases themselves*. A `.fai` describes a genome's
+    /// geometry and holds no bases, so there is nothing to decode against. BAM
+    /// is unaffected: it stores its own sequences.
+    ///
+    /// Raised at open rather than at the first query, so the run fails while
+    /// the cause is still obvious (owner, 2026-07-20).
+    #[error(
+        "'{path}' is a CRAM, which can only be decoded against the reference \
+         sequence itself, but the reference was read from a .fai index (which \
+         holds no bases) — supply the reference FASTA"
+    )]
+    CramNeedsReferenceFasta { path: PathBuf },
 
     /// Querying the parsed index for a region's chunks failed.
     ///
