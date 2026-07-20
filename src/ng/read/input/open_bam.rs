@@ -22,8 +22,11 @@
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use noodles_bam as bam;
+use noodles_bgzf as bgzf;
 use noodles_cram as cram;
 use noodles_sam as sam;
 
@@ -31,7 +34,7 @@ use crate::bam::index_preflight::{
     AlignmentFileKind, AlignmentIndex, load_alignment_index, preflight_alignment_indexes,
 };
 use crate::fasta::{ContigEntry, ContigList};
-use crate::ng::read::filtering::ReadFilterConfig;
+use crate::ng::read::filtering::{NoodlesRawRecord, ReadFilterBuffers, ReadFilterConfig};
 use crate::ng::reference_info::ReferenceInfo;
 
 use super::AlignmentFileError;
@@ -46,9 +49,8 @@ use super::AlignmentFileError;
 ///
 /// The parsed index is owned here and lives for the whole run: a region query
 /// is an in-memory lookup plus a seek, never a file open or an index parse
-/// (spec §3.3). Not `Clone` — it owns an index, and will own a reader pool;
-/// sharing is by reference.
-#[derive(Debug)]
+/// (spec §3.3). Not `Clone` — it owns an index and a reader pool; sharing is
+/// by reference.
 pub struct AlignmentFile {
     path: PathBuf,
     /// Kept for the region query, which resolves a contig to a `ref_id` and
@@ -74,6 +76,96 @@ pub struct AlignmentFile {
     /// for the whole run, not the caller's per region.
     #[expect(dead_code, reason = "reads_in_region (C4) builds the filter from this")]
     filter_config: ReadFilterConfig,
+    /// Idle readers and their scratch, borrowed per query and returned on
+    /// `Drop`. A `Mutex` so `reads_in_region` can take `&self` (spec §3.3).
+    ///
+    /// The lock only ever guards a `Vec` pop or push — never a read, and never
+    /// a file open (see `borrow_reader`) — so it is held for a few instructions
+    /// and never across iteration.
+    readers: Mutex<Vec<ReaderHandle>>,
+    /// How many readers have actually been opened, ever.
+    ///
+    /// The pool's whole purpose is that this stays tiny however many queries
+    /// run, so it is worth being able to state rather than assume — T13 asserts
+    /// it directly.
+    readers_opened: AtomicUsize,
+}
+
+/// One idle reader positioned past the header, **plus the scratch its next
+/// query will reuse**.
+///
+/// Pooling the buffers with the reader is what keeps a region query
+/// allocation-free: a fresh `ReadFilter` per query would otherwise allocate a
+/// record buffer and a reference-fetch buffer ~10⁶ times (spec §3.3). The index
+/// and the header are deliberately *not* here — they stay on `AlignmentFile`,
+/// shared, so no pooled reader ever re-parses them.
+struct ReaderHandle {
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the region query (C2) reads through this")
+    )]
+    reader: ReaderKind,
+    #[expect(dead_code, reason = "the region query (C4) lends these to the filter")]
+    buffers: ReadFilterBuffers<NoodlesRawRecord>,
+}
+
+/// A reader for whichever container this file is.
+///
+/// One pool holding an enum, rather than production's split `BamFile` /
+/// `CramFile` (`segment_reader.rs`): ng has a single `AlignmentFile` for both
+/// formats because a caller asking for a region does not care which it is, so
+/// splitting the pool would mean splitting the type above it too. Arch §7 left
+/// this open and flagged it for revisiting when the CRAM container cache lands
+/// — that cache is per-worker and *not* pooled, so it will sit beside this
+/// rather than inside it.
+enum ReaderKind {
+    #[expect(dead_code, reason = "BamRegionSource (C2) seeks this")]
+    Bam(bam::io::Reader<bgzf::io::Reader<File>>),
+    #[expect(dead_code, reason = "CramRegionSource (C5) seeks this")]
+    Cram(cram::io::Reader<File>),
+}
+
+/// A reader borrowed from the pool, returned when this drops.
+///
+/// The handle is an `Option` purely so `Drop` can move it out — `drop` gets
+/// `&mut self` and cannot take ownership otherwise. Returning on `Drop` rather
+/// than at the end of a successful read is what makes the error and early-exit
+/// paths safe: a caller that abandons a region stream half-way still gives the
+/// reader back.
+struct BorrowedReader<'a> {
+    file: &'a AlignmentFile,
+    handle: Option<ReaderHandle>,
+}
+
+impl BorrowedReader<'_> {
+    /// Take the handle's parts, leaving the borrow to return an empty slot.
+    ///
+    /// Used when the parts are moved into a region stream that will hand them
+    /// back itself; the `Drop` below then has nothing to return.
+    ///
+    /// **Must be the last, infallible step.** Taking the handle severs it from
+    /// this borrow, so the obligation to return it transfers to whatever
+    /// receives it. A `?` between here and the point that obligation is
+    /// re-established loses a reader silently — the pool would just open
+    /// another, and only `readers_opened` climbing would show it. Do every
+    /// fallible part of building a region stream *before* calling this.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the region query (C2) takes the parts this way")
+    )]
+    fn take(mut self) -> ReaderHandle {
+        self.handle
+            .take()
+            .expect("a borrowed reader always holds its handle until taken")
+    }
+}
+
+impl Drop for BorrowedReader<'_> {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            self.file.return_handle(handle);
+        }
+    }
 }
 
 impl AlignmentFile {
@@ -182,6 +274,11 @@ impl AlignmentFile {
             sample_name,
             sq_md5s,
             filter_config,
+            // Empty: the first query opens the first reader. `open` itself
+            // never leaves one behind, so a file that is opened and never
+            // queried costs no descriptor.
+            readers: Mutex::new(Vec::new()),
+            readers_opened: AtomicUsize::new(0),
         })
     }
 
@@ -198,6 +295,123 @@ impl AlignmentFile {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Take an idle reader from the pool, opening one only if the pool is
+    /// empty.
+    ///
+    /// This is the only place the file is ever opened after `AlignmentFile::open`,
+    /// so in a single-threaded run it happens exactly once however many regions
+    /// are queried — the guarantee the whole per-query cost model rests on
+    /// (spec §3.3). With N threads it settles at N.
+    ///
+    /// A freshly opened reader is positioned past the header, matching one that
+    /// has been returned to the pool, so the two are interchangeable.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the region query (C2) borrows through this")
+    )]
+    fn borrow_reader(&self) -> Result<BorrowedReader<'_>, AlignmentFileError> {
+        // The `let` ends the guard's scope, so the lock is released before
+        // `open_reader` runs. Written as a `match` scrutinee it would still be
+        // held inside the `None` arm — temporaries live to the end of the whole
+        // `match` — and every other thread would block for the length of a file
+        // open plus a header read, serializing at exactly the point the pool
+        // exists to keep parallel. Production takes the same care
+        // (`segment_reader.rs` `borrow_handle`, via an early return).
+        let pooled = self.lock_pool().pop();
+        let handle = match pooled {
+            Some(handle) => handle,
+            None => self.open_reader()?,
+        };
+        Ok(BorrowedReader {
+            file: self,
+            handle: Some(handle),
+        })
+    }
+
+    fn return_handle(&self, handle: ReaderHandle) {
+        self.lock_pool().push(handle);
+    }
+
+    /// Open a reader and skip its header, leaving it where a returned one would
+    /// be. The header is read and discarded: this file already holds the parsed
+    /// one, and the reader has to be advanced past it either way.
+    fn open_reader(&self) -> Result<ReaderHandle, AlignmentFileError> {
+        let open_error = |source: std::io::Error| AlignmentFileError::Open {
+            path: self.path.clone(),
+            source,
+        };
+
+        let reader = match AlignmentFileKind::from_path(&self.path) {
+            Some(AlignmentFileKind::Bam) => {
+                let mut reader = bam::io::reader::Builder
+                    .build_from_path(&self.path)
+                    .map_err(open_error)?;
+                reader.read_header().map_err(open_error)?;
+                ReaderKind::Bam(reader)
+            }
+            Some(AlignmentFileKind::Cram) => {
+                let file = File::open(&self.path).map_err(open_error)?;
+                let mut reader = cram::io::Reader::new(file);
+                reader.read_header().map_err(open_error)?;
+                ReaderKind::Cram(reader)
+            }
+            // `open` already rejected any other extension, so this is
+            // reachable only if the path changed kind underneath us. Reported
+            // the same way `read_header` reports it, rather than as a CRAM
+            // magic-number failure.
+            None => {
+                return Err(open_error(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "expected a '.bam' or '.cram' extension",
+                )));
+            }
+        };
+
+        self.readers_opened.fetch_add(1, Ordering::Relaxed);
+        Ok(ReaderHandle {
+            reader,
+            buffers: ReadFilterBuffers::default(),
+        })
+    }
+
+    /// Lock the pool, recovering the guard if a panic elsewhere poisoned the
+    /// mutex.
+    ///
+    /// The lock only ever guards a `Vec` pop or push, neither of which can
+    /// unwind, so this type's own code cannot poison it. Recovering rather than
+    /// panicking keeps a poison introduced elsewhere from cascading into every
+    /// later query — and, on the return path, from silently dropping the reader.
+    fn lock_pool(&self) -> std::sync::MutexGuard<'_, Vec<ReaderHandle>> {
+        self.readers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// How many readers this file has opened, ever — one per concurrent caller,
+    /// not one per query.
+    fn readers_opened(&self) -> usize {
+        self.readers_opened.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn pooled_readers(&self) -> usize {
+        self.lock_pool().len()
+    }
+}
+
+/// Hand-written so the reader pool does not have to be `Debug` (noodles'
+/// readers are not), and so the output says what identifies the file rather
+/// than dumping a parsed index.
+impl std::fmt::Debug for AlignmentFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AlignmentFile")
+            .field("path", &self.path)
+            .field("sample_name", &self.sample_name)
+            .field("contigs", &self.sq_md5s.len())
+            .field("readers_opened", &self.readers_opened())
+            .finish_non_exhaustive()
     }
 }
 
@@ -662,6 +876,203 @@ mod tests {
                 .entries
                 .is_empty()
         );
+    }
+
+    // -----------------------------------------------------------------
+    // The reader pool (C1)
+    // -----------------------------------------------------------------
+
+    /// **The guarantee the per-query cost model rests on.** Ten sequential
+    /// borrows must open the file *once*: each returns its reader on drop, and
+    /// the next takes that one back rather than opening another. If this
+    /// regressed, ~10⁶ STR region queries would become ~10⁶ file opens, and
+    /// nothing about the *answers* would change — which is why it is asserted
+    /// rather than assumed.
+    #[test]
+    fn sequential_borrows_open_the_file_once_and_reuse_the_reader() {
+        let fixture = open_fixture(&matching_contigs(), false);
+        let file = fixture.file.as_ref().expect("opens");
+
+        assert_eq!(
+            file.readers_opened(),
+            0,
+            "opening the file opens no reader — a file that is never queried \
+             costs no descriptor"
+        );
+        assert_eq!(file.pooled_readers(), 0);
+
+        for _ in 0..10 {
+            let borrowed = file.borrow_reader().expect("borrow");
+            assert_eq!(
+                file.pooled_readers(),
+                0,
+                "while borrowed, the pool is empty — the handle is out on loan"
+            );
+            drop(borrowed);
+            assert_eq!(file.pooled_readers(), 1, "and comes back on drop");
+        }
+
+        assert_eq!(
+            file.readers_opened(),
+            1,
+            "ten borrows, one open — the pool did its job"
+        );
+    }
+
+    /// Two borrows held *at once* need two readers, because a handle out on
+    /// loan cannot be lent again. Both come back, so the pool ends up holding
+    /// both — which is what lets N threads query one file concurrently.
+    #[test]
+    fn concurrent_borrows_each_get_their_own_reader_and_all_return() {
+        let fixture = open_fixture(&matching_contigs(), false);
+        let file = fixture.file.as_ref().expect("opens");
+
+        let first = file.borrow_reader().expect("borrow");
+        let second = file.borrow_reader().expect("borrow");
+        assert_eq!(
+            file.readers_opened(),
+            2,
+            "the pool was empty for the second"
+        );
+
+        drop(first);
+        drop(second);
+        assert_eq!(file.pooled_readers(), 2);
+
+        // A third borrow now reuses rather than opening a third.
+        let third = file.borrow_reader().expect("borrow");
+        assert_eq!(file.readers_opened(), 2);
+        drop(third);
+    }
+
+    /// The pool exists so `reads_in_region(&self)` can be called from several
+    /// threads at once, and none of the tests above actually does that. Each
+    /// thread must get a reader of its own, and every one must come back: a
+    /// handle lost under contention would leak a descriptor per query, and a
+    /// lock held across the file open would show up here as a hang rather than
+    /// a failure.
+    #[test]
+    fn borrows_from_many_threads_each_get_a_reader_and_all_return() {
+        const THREADS: usize = 8;
+
+        let fixture = open_fixture(&matching_contigs(), false);
+        let file = fixture.file.as_ref().expect("opens");
+
+        std::thread::scope(|scope| {
+            for _ in 0..THREADS {
+                scope.spawn(|| {
+                    let borrowed = file.borrow_reader().expect("borrow");
+                    // Hold it long enough that the borrows genuinely overlap.
+                    std::thread::yield_now();
+                    drop(borrowed);
+                });
+            }
+        });
+
+        let opened = file.readers_opened();
+        assert!(
+            (1..=THREADS).contains(&opened),
+            "at most one reader per concurrent borrow, at least one overall; \
+             got {opened}"
+        );
+        assert_eq!(
+            file.pooled_readers(),
+            opened,
+            "every reader opened came back — none lost on any path"
+        );
+    }
+
+    /// The CRAM arm of `open_reader`, which no other test reaches. It also
+    /// pins the interchangeability claim the borrow rests on: a freshly opened
+    /// reader must be positioned past the header, exactly where a returned one
+    /// would be, or the two could not be pooled together.
+    #[test]
+    fn a_cram_file_pools_readers_the_same_way() {
+        use crate::pileup::per_sample::cram_files::{HeaderOverrides, build_cram};
+
+        let specs: Vec<ContigSpec> = FIXTURE_CONTIGS
+            .iter()
+            .map(|(name, length)| ContigSpec {
+                name: (*name).to_string(),
+                length: *length as u64,
+            })
+            .collect();
+        let (_fasta_dir, fasta) = build_fasta(&specs).expect("build fasta");
+        let (_cram_dir, cram_path) = build_cram(
+            &fasta,
+            &specs,
+            &HeaderOverrides {
+                read_groups: vec![("rg1".to_string(), Some("NA12878".to_string()))],
+                ..HeaderOverrides::default()
+            },
+            &[a_record(0, 1)],
+        )
+        .expect("build cram");
+
+        // The gate requires an index. This test is about pooling, not querying,
+        // so an empty `.crai` is enough — C5 builds real ones.
+        cram::crai::fs::write(
+            cram_path.with_extension("cram.crai"),
+            &cram::crai::Index::default(),
+        )
+        .expect("write an empty crai");
+
+        let reference = read_reference_info(ReferenceSource::Fai(
+            crate::ng::reference_info::sibling_fai_path(&fasta),
+        ))
+        .expect("read reference");
+        let file = AlignmentFile::open(&cram_path, &reference, ReadFilterConfig::default(), false)
+            .expect("a matching CRAM opens");
+
+        let borrowed = file.borrow_reader().expect("borrow a CRAM reader");
+        assert!(
+            matches!(
+                borrowed.handle.as_ref().map(|h| &h.reader),
+                Some(ReaderKind::Cram(_))
+            ),
+            "a .cram path yields a CRAM reader, not the BAM fallback"
+        );
+        drop(borrowed);
+
+        assert_eq!(file.readers_opened(), 1);
+        assert_eq!(file.pooled_readers(), 1);
+    }
+
+    /// A failed open must not count, or `readers_opened` stops meaning
+    /// "readers that exist" and T13's assertion becomes unfalsifiable.
+    #[test]
+    fn a_failed_open_does_not_count_as_an_opened_reader() {
+        let fixture = open_fixture(&matching_contigs(), false);
+        let file = fixture.file.as_ref().expect("opens");
+
+        // Delete the BAM out from under the handle, then ask for a reader.
+        std::fs::remove_file(file.path()).expect("remove the bam");
+
+        assert!(file.borrow_reader().is_err(), "the file is gone");
+        assert_eq!(
+            file.readers_opened(),
+            0,
+            "the counter tracks readers that exist, not attempts"
+        );
+    }
+
+    /// `take()` is how a region stream adopts the parts; the borrow must then
+    /// return nothing, or the same reader would be pushed back twice and handed
+    /// to two callers at once.
+    #[test]
+    fn a_taken_handle_is_not_also_returned_by_the_borrow() {
+        let fixture = open_fixture(&matching_contigs(), false);
+        let file = fixture.file.as_ref().expect("opens");
+
+        let handle = file.borrow_reader().expect("borrow").take();
+        assert_eq!(
+            file.pooled_readers(),
+            0,
+            "the borrow returned nothing — the stream owns the handle now"
+        );
+
+        file.return_handle(handle);
+        assert_eq!(file.pooled_readers(), 1, "and the stream hands it back");
     }
 
     // --- the hex decoder's edges ---
