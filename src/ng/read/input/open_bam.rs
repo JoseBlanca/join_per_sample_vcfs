@@ -121,7 +121,12 @@ impl AlignmentFile {
         //    The file is the left operand so the message reads "file value vs
         //    reference value", the direction a user needs: the reference is the
         //    authority and the file is the thing that is wrong.
-        let file_contigs = contig_list(&header);
+        let file_contigs =
+            contig_list(&header).map_err(|bad| AlignmentFileError::MalformedMd5 {
+                path: path.to_path_buf(),
+                contig: bad.contig,
+                detail: bad.detail,
+            })?;
         file_contigs
             .first_disagreement(&reference.contig_list())
             .map_err(|detail| AlignmentFileError::ContigReconcile {
@@ -243,48 +248,64 @@ pub(crate) fn sort_order(header: &sam::Header) -> Option<String> {
 /// catches a permutation. Building it in header order is therefore load-bearing
 /// rather than incidental.
 ///
-/// **A malformed `M5` is read as absent, not as an error — this module's
-/// call, not the spec's.** Spec §3.1 rules only on a *missing* `M5`: never an
-/// error, never a warning, because refusing or nagging would punish an ordinary
-/// file for not offering a bonus check. A tag that is present but not 32 hex
-/// characters is not quite that case — it is a header its writer got wrong —
-/// but it cannot yield a digest either, so treating it the same keeps a stray
-/// bad tag from being more fatal than the opportunistic check is worth. The
-/// file is still fully validated on name, length and order.
-///
-/// The cost is that nothing downstream can tell the two apart: `Option` has no
-/// room for "present but unreadable", so a file whose digests are *all*
-/// malformed silently reports as untagged and wrong-assembly detection switches
-/// off unremarked. Production instead rejects the file
-/// (`AlignmentInputError::MalformedMd5`). If that blind spot matters, the fix
-/// belongs with `check_assembly` (step D1): count the unreadable tags and let
-/// `AssemblyCheck` report "verified 17 of 18, 1 unreadable" — informative
-/// without becoming fatal.
-pub(crate) fn contig_list(header: &sam::Header) -> ContigList {
+/// **A missing `M5` is fine; a malformed one is fatal.** Spec §3.1 settles the
+/// missing case: never an error, never a warning, because the digest check is
+/// opportunistic and refusing a file for not offering a bonus would punish the
+/// common case. A tag that is *present* but not 32 hex characters is a
+/// different thing — a header its writer got wrong — and reading it as absent
+/// would pass an error silently. The caller turns this into
+/// `MalformedMd5`, naming the contig.
+pub(crate) fn contig_list(header: &sam::Header) -> Result<ContigList, MalformedMd5Tag> {
     let entries = header
         .reference_sequences()
         .iter()
-        .map(|(name, reference_sequence)| ContigEntry {
-            name: String::from_utf8_lossy(name.as_ref()).into_owned(),
-            length: usize::from(reference_sequence.length()) as u64,
-            md5: md5_tag(reference_sequence),
+        .map(|(name, reference_sequence)| {
+            let name = String::from_utf8_lossy(name.as_ref()).into_owned();
+            Ok(ContigEntry {
+                length: usize::from(reference_sequence.length()) as u64,
+                md5: md5_tag(reference_sequence).map_err(|detail| MalformedMd5Tag {
+                    contig: name.clone(),
+                    detail,
+                })?,
+                name,
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>, _>>()?;
 
-    ContigList { entries }
+    Ok(ContigList { entries })
 }
 
-/// The `M5` tag of one `@SQ` entry, decoded from hex. `None` when the tag is
-/// absent *or* unparseable — see [`contig_list`] for why those are one case.
+/// An `@SQ` line whose `M5` tag could not be read as a digest. Carries the
+/// facts; the path and the phrasing belong to the caller's error.
+#[derive(Debug)]
+pub(crate) struct MalformedMd5Tag {
+    pub(crate) contig: String,
+    pub(crate) detail: String,
+}
+
+/// The `M5` tag of one `@SQ` entry, decoded from hex.
+///
+/// `Ok(None)` = no tag, which is ordinary. `Err(detail)` = a tag that is there
+/// but unreadable, which is not.
 fn md5_tag(
     reference_sequence: &sam::header::record::value::Map<
         sam::header::record::value::map::ReferenceSequence,
     >,
-) -> Option<[u8; 16]> {
+) -> Result<Option<[u8; 16]>, String> {
     use sam::header::record::value::map::reference_sequence::tag::MD5_CHECKSUM;
 
-    let hex = reference_sequence.other_fields().get(&MD5_CHECKSUM)?;
-    decode_md5_hex(hex.as_ref())
+    let Some(hex) = reference_sequence.other_fields().get(&MD5_CHECKSUM) else {
+        return Ok(None);
+    };
+    let hex = hex.as_ref();
+
+    decode_md5_hex(hex).map(Some).ok_or_else(|| {
+        if hex.len() != 32 {
+            format!("expected 32 hex characters, got {}", hex.len())
+        } else {
+            "contains a non-hex character".to_string()
+        }
+    })
 }
 
 /// Decode 32 hex characters into the 16 digest bytes they spell. `None` for any
@@ -332,42 +353,31 @@ pub(crate) enum SampleNames {
 /// First-seen rather than sorted, so a message lists the names the way the file
 /// does and a reader can find them.
 ///
-/// **When a file is wrong in two ways at once, [`SampleNames::Several`] wins.**
-/// A header can both name two samples and contain an `@RG` with no `SM`, and
-/// the precedence is a deliberate choice rather than whichever the loop meets
-/// first: "this file holds two samples" is the more consequential diagnosis, so
-/// scanning finishes before deciding. Production reports whichever anomaly
-/// comes first in header order
-/// ([`extract_single_sample_name`](crate::bam::alignment_input)), which can hide
-/// the two-sample fact behind a missing tag on a later read group.
+/// **The first fault in header order is the one reported**, matching
+/// production: a file that both names two samples and has an `@RG` with no `SM`
+/// stops at whichever comes first. Both are fatal at open and both are fixed by
+/// correcting the header, so ranking them would add a rule to explain without
+/// changing what the user does about it.
 pub(crate) fn sample_names(header: &sam::Header) -> SampleNames {
     use sam::header::record::value::map::read_group::tag::SAMPLE;
 
     let mut distinct: Vec<String> = Vec::new();
-    let mut first_untagged: Option<String> = None;
 
     for (read_group_id, read_group) in header.read_groups() {
-        match read_group.other_fields().get(&SAMPLE) {
-            Some(raw) => {
-                let sample = String::from_utf8_lossy(raw.as_ref()).into_owned();
-                if !distinct.contains(&sample) {
-                    distinct.push(sample);
-                }
-            }
-            None => {
-                first_untagged.get_or_insert_with(|| {
-                    String::from_utf8_lossy(read_group_id.as_ref()).into_owned()
-                });
-            }
+        let Some(raw) = read_group.other_fields().get(&SAMPLE) else {
+            return SampleNames::MissingTag {
+                read_group_id: String::from_utf8_lossy(read_group_id.as_ref()).into_owned(),
+            };
+        };
+        let sample = String::from_utf8_lossy(raw.as_ref()).into_owned();
+        if !distinct.contains(&sample) {
+            distinct.push(sample);
+        }
+        if distinct.len() > 1 {
+            return SampleNames::Several(distinct);
         }
     }
 
-    if distinct.len() > 1 {
-        return SampleNames::Several(distinct);
-    }
-    if let Some(read_group_id) = first_untagged {
-        return SampleNames::MissingTag { read_group_id };
-    }
     match distinct.into_iter().next() {
         Some(name) => SampleNames::One(name),
         None => SampleNames::NoReadGroups,
@@ -457,7 +467,8 @@ mod tests {
             Some("coordinate"),
             &[("chr2", 200, None), ("chr1", 100, None)],
             &[],
-        ));
+        ))
+        .expect("no M5 tags to be malformed");
 
         let names: Vec<&str> = contigs.entries.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(
@@ -479,7 +490,8 @@ mod tests {
                 ("chr2", 200, None),
             ],
             &[],
-        ));
+        ))
+        .expect("both tags are well formed");
 
         assert_eq!(
             contigs.entries[0].md5,
@@ -495,28 +507,66 @@ mod tests {
         );
     }
 
-    /// A malformed digest is deliberately read as *absent* rather than
-    /// rejected, so the contig is skipped by the assembly check exactly as an
-    /// untagged one is. Documented on `contig_list`; asserted here so the
-    /// choice is visible rather than implicit.
+    /// A malformed digest is a **hard error**, not a silently-absent one.
+    /// Reading it as absent would pass a real defect silently — and a file
+    /// whose tags were all malformed would look untagged, switching
+    /// wrong-assembly detection off with nobody told.
     #[test]
-    fn a_malformed_m5_is_read_as_absent() {
-        for bad in [
-            "",
-            "abc",
-            "zzzz56789abcdef0123456789abcdef0",
-            &"a".repeat(33),
-        ] {
-            let contigs = contig_list(&header(
-                Some("coordinate"),
-                &[("chr1", 100, Some(bad))],
-                &[],
-            ));
-            assert_eq!(
-                contigs.entries[0].md5, None,
-                "malformed M5 {bad:?} should read as absent"
+    fn a_malformed_m5_is_rejected_naming_the_contig_and_the_reason() {
+        let wrong_length = contig_list(&header(
+            Some("coordinate"),
+            &[("chr1", 100, Some("abc"))],
+            &[],
+        ))
+        .expect_err("a three-character digest is malformed");
+        assert_eq!(wrong_length.contig, "chr1");
+        assert_eq!(wrong_length.detail, "expected 32 hex characters, got 3");
+
+        let not_hex = contig_list(&header(
+            Some("coordinate"),
+            &[("chr2", 200, Some("zzzz56789abcdef0123456789abcdef0"))],
+            &[],
+        ))
+        .expect_err("a non-hex character is malformed");
+        assert_eq!(not_hex.contig, "chr2");
+        assert_eq!(not_hex.detail, "contains a non-hex character");
+
+        for bad in ["", &"a".repeat(33)] {
+            assert!(
+                contig_list(&header(
+                    Some("coordinate"),
+                    &[("chr1", 100, Some(bad))],
+                    &[]
+                ))
+                .is_err(),
+                "malformed M5 {bad:?} must be rejected"
             );
         }
+    }
+
+    /// The same fault through the gate, so the path and the phrasing are
+    /// covered too — and so it is unmistakable that this rejects the *file*,
+    /// not merely the tag.
+    #[test]
+    fn the_gate_rejects_a_file_with_a_malformed_m5() {
+        let contigs = vec![("chr1", 100, Some("not-a-digest")), ("chr2", 200, None)];
+
+        let error = open_fixture(&contigs, false)
+            .file
+            .expect_err("must not open");
+        match &error {
+            AlignmentFileError::MalformedMd5 { contig, detail, .. } => {
+                assert_eq!(contig, "chr1");
+                assert_eq!(detail, "expected 32 hex characters, got 12");
+            }
+            other => panic!("expected MalformedMd5, got {other:?}"),
+        }
+        assert!(
+            error
+                .to_string()
+                .contains("@SQ 'chr1' has a malformed M5 tag"),
+            "{error}"
+        );
     }
 
     // --- @RG SM ---
@@ -573,22 +623,33 @@ mod tests {
         ));
     }
 
-    /// Two faults at once, and the precedence is deliberate: naming two samples
-    /// is the more consequential diagnosis, so it must not be hidden behind a
-    /// missing tag on a later read group. This is where ng diverges from
-    /// production's first-anomaly-wins, so it is pinned rather than left to
-    /// whichever branch the loop reaches first.
+    /// Two faults at once: the **first in header order** is reported, matching
+    /// production. Both orderings are pinned so the rule is the loop's stated
+    /// behaviour rather than an accident of where the checks sit.
     #[test]
-    fn two_distinct_names_outrank_a_later_missing_sm_tag() {
-        let names = sample_names(&header(
+    fn the_first_sample_fault_in_header_order_is_the_one_reported() {
+        let second_name_comes_first = sample_names(&header(
             Some("coordinate"),
             &[],
             &[("rg1", Some("A")), ("rg2", Some("B")), ("rg3", None)],
         ));
-        match names {
+        match second_name_comes_first {
             SampleNames::Several(names) => assert_eq!(names, vec!["A", "B"]),
-            _ => panic!("the two-sample fact must win over the missing tag"),
+            _ => panic!("the second distinct name appears before the untagged group"),
         }
+
+        let missing_tag_comes_first = sample_names(&header(
+            Some("coordinate"),
+            &[],
+            &[("rg1", Some("A")), ("rg2", None), ("rg3", Some("B"))],
+        ));
+        assert!(
+            matches!(
+                missing_tag_comes_first,
+                SampleNames::MissingTag { read_group_id } if read_group_id == "rg2"
+            ),
+            "the untagged group appears before the second distinct name"
+        );
     }
 
     #[test]
@@ -597,6 +658,7 @@ mod tests {
         // on length rather than on anything subtler.
         assert!(
             contig_list(&header(Some("coordinate"), &[], &[]))
+                .expect("no tags at all")
                 .entries
                 .is_empty()
         );
@@ -850,6 +912,7 @@ mod tests {
         // The gate's own comparison rejects that very same header.
         assert!(
             contig_list(&permuted)
+                .expect("no M5 tags")
                 .first_disagreement(&reference.contig_list())
                 .is_err(),
             "the ordered comparison must reject what the probe accepted"

@@ -89,6 +89,23 @@ pub enum AlignmentFileError {
     #[error("alignment file '{path}' does not match the reference contig table: {detail}")]
     ContigReconcile { path: PathBuf, detail: String },
 
+    /// An `@SQ` line carries an `M5` tag that is not a 32-character hex digest.
+    ///
+    /// A *missing* `M5` is ordinary input and never an error (spec §3.1) — the
+    /// digest check is opportunistic, and refusing a file for not offering a
+    /// bonus would punish the common case. A **malformed** one is different: it
+    /// is a header its writer got wrong, and reading it as absent would hide a
+    /// real defect. Worse, it would hide it *silently and completely* — a file
+    /// whose digests are all malformed would report as untagged, and
+    /// wrong-assembly detection would switch off with nobody told. Errors are
+    /// not passed silently, so this is fatal at open.
+    #[error("alignment file '{path}': @SQ '{contig}' has a malformed M5 tag ({detail})")]
+    MalformedMd5 {
+        path: PathBuf,
+        contig: String,
+        detail: String,
+    },
+
     /// The index is missing or unparseable (spec §3.1, check 3).
     #[error("loading the index for alignment file '{path}' failed")]
     Index {
