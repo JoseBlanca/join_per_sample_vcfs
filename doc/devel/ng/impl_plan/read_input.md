@@ -111,13 +111,13 @@ source. *Depends:* A2. *Source:* arch `alignment_file.md` §5 (decision 2), §1.
 
 ### Milestone B — the open gate (validation before any read)
 
-**B1. Header extraction, pure.**  ☐
+**B1. Header extraction, pure.**  ✅
 Read `@HD SO`, the `@SQ` list (name + length + `M5`), and the `@RG SM` set off a noodles
 `sam::Header` — ng's own, since production's are private. Returns the pieces the gate needs; no file
 I/O, so it unit-tests against hand-built headers. Tests: missing/other `SO`; two distinct `SM`s;
 `@SQ` with and without `M5`. *Depends:* A2. *Source:* spec `alignment_file.md` §3.1, arch §5.
 
-**B2. `AlignmentFile::open` — the gate.**  ☐
+**B2. `AlignmentFile::open` — the gate.**  ✅
 Compose B1 with `load_alignment_index` and the `@SQ`↔reference comparison via
 `ContigList::first_disagreement` against `ReferenceInfo::contig_list()`; capture `sq_md5s` by
 `ContigId`; store the parsed index. Fail-fast, in this order: `SO` → `@SQ` → index → `SM`. Tests
