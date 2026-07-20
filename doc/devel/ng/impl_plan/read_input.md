@@ -131,7 +131,7 @@ Compose B1 with `load_alignment_index` and the `@SQ`↔reference comparison via
 
 ### Milestone C — serving a region (the silent-failure zone)
 
-**C1. The reader pool.**  ☐
+**C1. The reader pool.**  ✅
 `ReaderHandle` (reader + `record_buf` + `ref_buf`) and the `Mutex<Vec<ReaderHandle>>` on
 `AlignmentFile`; borrow-or-open, return on `Drop`. The index and header stay outside the handle,
 shared — never re-parsed. Test: N sequential borrows open the file once; a returned handle is reused.
