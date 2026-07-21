@@ -187,7 +187,7 @@ digests; a contig is compared only when **both** sides carry one; returns
 
 ### Milestone E — the sample layer
 
-**E1. `SampleReads::open` + the sample-name agreement.**  ☐
+**E1. `SampleReads::open` + the sample-name agreement.**  ✅
 Open k files through `AlignmentFile::open`, then check they all name one sample; wrap any per-file
 error with its `source_file_index`. Test **T12b** (two files, different `SM` → `SampleNameMismatch`
 before any read). *Depends:* B2. *Source:* spec `sample_reads.md` §3.1, arch §3.
