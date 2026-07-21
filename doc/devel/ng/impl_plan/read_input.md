@@ -174,7 +174,7 @@ C4. *Source:* spec §3.2/§3.3, arch §4.
 
 ### Milestone D — the deferred assembly check
 
-**D1. `check_assembly`.**  ☐
+**D1. `check_assembly`.**  ✅
 The pure comparison of captured `@SQ M5` tags against a verified `ReferenceInfo`'s per-contig
 digests; a contig is compared only when **both** sides carry one; returns
 `AssemblyCheck { compared, total }`. Missing `M5` is **never** an error and never a warning. Test
