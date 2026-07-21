@@ -32,10 +32,12 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::bam::errors::AlignmentIndexError;
-use crate::ng::read::filtering::ReadFilterError;
+use crate::ng::read::filtering::{ReadFilterConfig, ReadFilterCounts, ReadFilterError};
 use crate::ng::reference_info::ReferenceInfo;
 use crate::ng::types::{GenomePosition, GenomeRegion};
 use crate::pop_var_caller::common::format_md5_hex;
+
+use open_bam::AlignmentFile;
 
 /// Everything that can go wrong for **one** alignment file.
 ///
@@ -316,6 +318,150 @@ pub fn check_assembly(
     })
 }
 
+/// One sample's files, opened and cross-validated. Built once, queried per
+/// region.
+///
+/// **A sample is usually several files, sometimes one.** The dominant reason
+/// for several is that the same sample was *sequenced in several experiments* —
+/// separate runs, libraries, often separate projects — rather than a per-lane
+/// or per-chromosome split. That shapes everything here: per-experiment files
+/// span the same coordinate range, so the merge interleaves at essentially
+/// every position and ties are routine; they carry different read groups and
+/// chemistries, so "are these really all the same sample?" is a live question;
+/// and "how did each file behave?" is worth reporting separately.
+///
+/// This layer does exactly three things — check what can only be checked
+/// *across* files, merge k ordered streams into one, and present an entry point
+/// whose one-file and k-file arms are indistinguishable. It contains **no
+/// reader logic**: opening, validating, seeking and filtering are
+/// [`AlignmentFile`](open_bam::AlignmentFile)'s.
+///
+/// Not `Clone` — it owns k files, each owning a reader pool.
+#[derive(Debug)]
+pub struct SampleReads {
+    files: Vec<AlignmentFile>,
+    /// The one name all k files agree on.
+    sample_name: String,
+}
+
+impl SampleReads {
+    /// Open every file, validating each, then check they all name one sample.
+    /// Both happen before any read flows.
+    ///
+    /// Each file is opened with its position in `paths` as its
+    /// `source_file_index`, so every read it yields carries the tag — which is
+    /// **downstream-meaningful, not just provenance**: because the usual reason
+    /// for several files is several experiments, the file index is the sample's
+    /// *batch* label, the grouping a per-batch error model keys on.
+    ///
+    /// A per-file failure is wrapped with the index of the file that raised it,
+    /// so a message can always name the culprit.
+    pub fn open(
+        paths: &[PathBuf],
+        reference: &ReferenceInfo,
+        filter_config: ReadFilterConfig,
+        build_index_if_missing: bool,
+    ) -> Result<Self, IngestError> {
+        if paths.is_empty() {
+            return Err(IngestError::NoFiles);
+        }
+
+        let files = paths
+            .iter()
+            .enumerate()
+            .map(|(source_file_index, path)| {
+                AlignmentFile::open_as(
+                    path,
+                    reference,
+                    filter_config,
+                    build_index_if_missing,
+                    source_file_index,
+                )
+                .map_err(|source| IngestError::File {
+                    source_file_index,
+                    source,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let sample_name = agreed_sample_name(&files)?;
+
+        Ok(Self { files, sample_name })
+    }
+
+    /// The one sample all this sample's files name.
+    pub fn sample_name(&self) -> &str {
+        &self.sample_name
+    }
+
+    /// How many files this sample has. Parallel to `MappedRead::source_file_index`.
+    pub fn file_count(&self) -> usize {
+        self.files.len()
+    }
+
+    /// Each file's step-1 tally, indexed to match `source_file_index` — **never
+    /// summed**.
+    ///
+    /// Drop rates are a per-experiment property: one bad run shows up as a
+    /// single file with an anomalous MAPQ or mismatch drop rate, and summing
+    /// erases exactly that signal. A caller that wants a total can add them up;
+    /// this refuses to decide that for them.
+    pub fn counts(&self) -> Vec<ReadFilterCounts> {
+        self.files.iter().map(AlignmentFile::counts).collect()
+    }
+
+    /// What the deferred assembly check needs, per file: the path, and the
+    /// `@SQ M5` tags captured at its open.
+    ///
+    /// Forwarded rather than merged, because a disagreement has to name *which
+    /// file* is aligned to the wrong assembly. The caller feeds each pair to
+    /// [`check_assembly`] once it has joined `reference_info`'s background
+    /// verification.
+    ///
+    /// Shaped as pairs rather than as spec §3.4's bare `sq_md5s`, because
+    /// `check_assembly` needs both halves and this is its only consumer —
+    /// and because handing out the `AlignmentFile`s themselves would let a
+    /// caller query one file directly, skipping the merge and the
+    /// same-file-twice check that are this type's whole reason to exist.
+    pub fn assembly_inputs(&self) -> impl Iterator<Item = (&Path, &[Option<[u8; 16]>])> {
+        self.files.iter().map(|file| (file.path(), file.sq_md5s()))
+    }
+}
+
+/// The single sample name the files agree on, or the disagreement.
+///
+/// Each file's own `@RG SM` was validated at its open; what cannot live there,
+/// because it is not a property of a single file, is **agreement**. This guard
+/// earns its keep precisely because of the several-experiments reality: when
+/// the files are per-lane splits of one run, pulling in a foreign file is
+/// unlikely, but when they are separate experiments gathered by hand from
+/// different projects, **grabbing the wrong file is the realistic failure
+/// mode** — and the `SM` agreement is the only thing that catches it.
+fn agreed_sample_name(files: &[AlignmentFile]) -> Result<String, IngestError> {
+    let mut distinct: Vec<String> = Vec::new();
+    for file in files {
+        if !distinct.iter().any(|name| name == file.sample_name()) {
+            distinct.push(file.sample_name().to_string());
+        }
+    }
+
+    // Nit: destructured rather than matched on `len()`, so there is no
+    // unreachable `expect` to reason about.
+    match distinct.as_slice() {
+        [name] => Ok(name.clone()),
+        // **Every** file is listed, not just the offenders, and the two vectors
+        // are built from the same iteration so they stay parallel: the user has
+        // to see which path claims which name to know which one is the stray.
+        _ => Err(IngestError::SampleNameMismatch {
+            files: files.iter().map(|file| file.path().to_path_buf()).collect(),
+            names: files
+                .iter()
+                .map(|file| file.sample_name().to_string())
+                .collect(),
+        }),
+    }
+}
+
 /// Sample-level failures — the layer above [`AlignmentFileError`].
 ///
 /// The two own variants are the checks that can only be made *across* files.
@@ -342,6 +488,14 @@ pub enum IngestError {
         files: Vec<PathBuf>,
         names: Vec<String>,
     },
+
+    /// `SampleReads::open` was given no files.
+    ///
+    /// A sample with no files has no reads and no name, so there is nothing to
+    /// build — and reporting it as a name *mismatch*, which is where zero files
+    /// would otherwise land, would blame the wrong thing entirely.
+    #[error("a sample must have at least one alignment file")]
+    NoFiles,
 
     /// The identical read surfaced from two files, which means the caller
     /// passed the same file twice (or two files with overlapping content).
@@ -405,6 +559,213 @@ mod tests {
             "alignment file '/data/sample.bam' is not sorted: \
              a read at contig 2 position 120 follows one at contig 2 position 5000"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // SampleReads::open (E1) — T12b
+    // -----------------------------------------------------------------
+
+    use tempfile::TempDir;
+
+    use crate::ng::read::input::test_fixtures::{
+        fixture_reference, header, indexed_bam, matching_contigs, read_named_with_length,
+    };
+
+    /// An indexed BAM whose one read group names `sample`.
+    fn bam_naming(sample: &str) -> (TempDir, PathBuf) {
+        bam_naming_with_reads(sample, 1)
+    }
+
+    fn bam_naming_with_reads(sample: &str, reads: usize) -> (TempDir, PathBuf) {
+        let records: Vec<_> = (0..reads)
+            .map(|i| read_named_with_length(&format!("r{i}"), 0, 1 + i, 30))
+            .collect();
+        indexed_bam(
+            &header(
+                Some("coordinate"),
+                &matching_contigs(),
+                &[("rg1", Some(sample))],
+            ),
+            &records,
+        )
+    }
+
+    /// **T12b — two files naming different samples, rejected at `open`, before
+    /// any read.**
+    ///
+    /// The single-file half is `alignment_file`'s T12a. This is the check that
+    /// cannot live one layer down, because agreement is not a property of any
+    /// one file — and it is the one that catches the realistic mistake:
+    /// gathering a sample's experiments by hand from different projects and
+    /// picking up a stray.
+    #[test]
+    fn t12b_files_naming_different_samples_are_rejected_at_open() {
+        let (_reference_dir, reference) = fixture_reference(false);
+        let (_first_dir, first) = bam_naming("NA12878");
+        let (_second_dir, second) = bam_naming("NA12892");
+
+        let error = SampleReads::open(
+            &[first.clone(), second.clone()],
+            &reference,
+            ReadFilterConfig::default(),
+            false,
+        )
+        .expect_err("two samples is not one sample");
+
+        match &error {
+            IngestError::SampleNameMismatch { files, names } => {
+                assert_eq!(files, &[first, second]);
+                assert_eq!(names, &["NA12878".to_string(), "NA12892".to_string()]);
+            }
+            other => panic!("expected SampleNameMismatch, got {other:?}"),
+        }
+
+        // The message has to pair each path with what it claims, or the user
+        // cannot tell which file is the stray.
+        let message = error.to_string();
+        assert!(message.contains("NA12878"), "{message}");
+        assert!(message.contains("NA12892"), "{message}");
+    }
+
+    #[test]
+    fn files_agreeing_on_one_sample_open_and_expose_it() {
+        let (_reference_dir, reference) = fixture_reference(false);
+        let (_first_dir, first) = bam_naming("NA12878");
+        let (_second_dir, second) = bam_naming("NA12878");
+
+        let sample = SampleReads::open(
+            &[first, second],
+            &reference,
+            ReadFilterConfig::default(),
+            false,
+        )
+        .expect("both name the same sample");
+
+        assert_eq!(sample.sample_name(), "NA12878");
+        assert_eq!(sample.file_count(), 2);
+    }
+
+    /// A per-file failure is wrapped with **which** file failed — with k files
+    /// gathered from k projects, "one of them is not coordinate-sorted" is not
+    /// a usable message.
+    #[test]
+    fn a_per_file_failure_names_the_file_that_raised_it() {
+        let (_reference_dir, reference) = fixture_reference(false);
+        let (_good_dir, good) = bam_naming("NA12878");
+        let (_bad_dir, bad) = indexed_bam(
+            &header(
+                Some("queryname"),
+                &matching_contigs(),
+                &[("rg1", Some("NA12878"))],
+            ),
+            &[read_named_with_length("r", 0, 1, 30)],
+        );
+
+        let error = SampleReads::open(&[good, bad], &reference, ReadFilterConfig::default(), false)
+            .expect_err("the second file is not coordinate-sorted");
+
+        match error {
+            IngestError::File {
+                source_file_index,
+                source: AlignmentFileError::NotCoordinateSorted { .. },
+            } => assert_eq!(source_file_index, 1, "the second file, not the first"),
+            other => panic!("expected File{{1, NotCoordinateSorted}}, got {other:?}"),
+        }
+    }
+
+    /// Counts stay **per file**, never summed: a bad run shows up as one file
+    /// with an anomalous drop rate, and summing erases exactly that signal.
+    ///
+    /// The files are given *different* read counts on purpose. Asserting only
+    /// that there are k tallies would pass against an implementation returning
+    /// the summed total k times — which is precisely the shape spec §3.3 argues
+    /// against.
+    #[test]
+    fn counts_are_reported_per_file_and_not_summed() {
+        let (_reference_dir, reference) = fixture_reference(false);
+        let (_first_dir, first) = bam_naming_with_reads("NA12878", 3);
+        let (_second_dir, second) = bam_naming_with_reads("NA12878", 1);
+
+        let sample = SampleReads::open(
+            &[first, second],
+            &reference,
+            ReadFilterConfig::default(),
+            false,
+        )
+        .expect("opens");
+
+        // Nothing has been read yet, so both tallies start empty — the counts
+        // are per *query*, folded in as each stream ends.
+        let counts = sample.counts();
+        assert_eq!(counts.len(), 2, "one tally per file");
+        assert!(counts.iter().all(|tally| tally.kept == 0));
+
+        assert_eq!(
+            sample.assembly_inputs().count(),
+            2,
+            "and one (path, digests) pair per file"
+        );
+    }
+
+    /// **Three files, the stray in the middle.** A two-file test cannot tell a
+    /// correctly-ordered `names` vector from a reversed one; this can, and it
+    /// is what pins `files` and `names` being parallel.
+    #[test]
+    fn the_mismatch_lists_every_file_in_order_so_the_stray_is_identifiable() {
+        let (_reference_dir, reference) = fixture_reference(false);
+        let (_a_dir, a) = bam_naming("NA12878");
+        let (_stray_dir, stray) = bam_naming("NA12892");
+        let (_b_dir, b) = bam_naming("NA12878");
+
+        let error = SampleReads::open(
+            &[a.clone(), stray.clone(), b.clone()],
+            &reference,
+            ReadFilterConfig::default(),
+            false,
+        )
+        .expect_err("one stray is enough");
+
+        match &error {
+            IngestError::SampleNameMismatch { files, names } => {
+                assert_eq!(files, &[a, stray, b]);
+                assert_eq!(
+                    names,
+                    &[
+                        "NA12878".to_string(),
+                        "NA12892".to_string(),
+                        "NA12878".to_string()
+                    ],
+                    "names must be parallel to files, not the distinct set"
+                );
+            }
+            other => panic!("expected SampleNameMismatch, got {other:?}"),
+        }
+    }
+
+    /// A one-file sample is ordinary — the arm `SampleReads` exists to make
+    /// indistinguishable from the k-file one.
+    #[test]
+    fn a_single_file_sample_opens() {
+        let (_reference_dir, reference) = fixture_reference(false);
+        let (_dir, only) = bam_naming("NA12878");
+
+        let sample = SampleReads::open(&[only], &reference, ReadFilterConfig::default(), false)
+            .expect("one file is a sample");
+        assert_eq!(sample.file_count(), 1);
+        assert_eq!(sample.sample_name(), "NA12878");
+    }
+
+    /// Zero files is not a sample. Reported as such, rather than falling
+    /// through to a name *mismatch* with two empty lists — which would blame
+    /// the wrong thing and render as a truncated sentence.
+    #[test]
+    fn a_sample_with_no_files_is_rejected_as_such() {
+        let (_reference_dir, reference) = fixture_reference(false);
+
+        let error = SampleReads::open(&[], &reference, ReadFilterConfig::default(), false)
+            .expect_err("no files is not a sample");
+        assert!(matches!(error, IngestError::NoFiles));
+        assert!(error.to_string().contains("at least one"), "{error}");
     }
 
     // -----------------------------------------------------------------
