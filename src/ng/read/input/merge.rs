@@ -73,13 +73,6 @@ pub struct MergedRegionReads<'a, R: RawRefSeq> {
 }
 
 impl<'a, R: RawRefSeq> MergedRegionReads<'a, R> {
-    // Built by `SampleReads::reads_in_region` from step E3; until then only
-    // this module's own tests construct one. `expect`, so the build fails
-    // naming this line once E3 makes it live.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "SampleReads::reads_in_region (E3) builds this")
-    )]
     pub(crate) fn new(streams: Vec<RegionReads<'a, R>>) -> Self {
         let k = streams.len();
         Self {

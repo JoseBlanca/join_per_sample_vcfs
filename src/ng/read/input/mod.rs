@@ -37,6 +37,10 @@ use crate::ng::reference_info::ReferenceInfo;
 use crate::ng::types::{GenomePosition, GenomeRegion};
 use crate::pop_var_caller::common::format_md5_hex;
 
+use crate::bam::alignment_input::MappedRead;
+use crate::ng::ref_seq::RawRefSeq;
+
+use merge::MergedRegionReads;
 use open_bam::AlignmentFile;
 
 /// Everything that can go wrong for **one** alignment file.
@@ -410,6 +414,62 @@ impl SampleReads {
         self.files.iter().map(AlignmentFile::counts).collect()
     }
 
+    /// Every read of the sample overlapping `region`, coordinate-ordered
+    /// across all files.
+    ///
+    /// `&self` for the same reason `AlignmentFile::reads_in_region` is: the
+    /// per-file pools make concurrent queries possible without a signature
+    /// change.
+    ///
+    /// **`make_reference` is a factory, not an accessor and not a `Clone`
+    /// bound** — arch §7 left this as an impl-time confirmation, and the impls
+    /// settle it. `RawRefSeq` implementations are *stateful readers*:
+    /// `WindowedRefSeq` holds an open per-contig reader behind a `RefCell` and
+    /// is `Send` but not `Sync`, precisely because each worker is meant to own
+    /// one. So:
+    ///
+    /// - `R: Clone` cannot be satisfied — neither impl is `Clone`, and cloning
+    ///   an open file reader per query would be the wrong thing even if it
+    ///   were.
+    /// - `&R` is not available either (there is no `impl RawRefSeq for &T`),
+    ///   and it would make the k chains share one file cursor, which is exactly
+    ///   what passing the accessor per query exists to avoid.
+    ///
+    /// A factory gives each per-file chain its own, which is what the type
+    /// actually requires. The caller writes one closure.
+    pub fn reads_in_region<R, F>(
+        &self,
+        region: GenomeRegion,
+        mut make_reference: F,
+    ) -> Result<SampleRegionReads<'_, R>, IngestError>
+    where
+        R: RawRefSeq,
+        F: FnMut() -> R,
+    {
+        let mut streams = Vec::with_capacity(self.files.len());
+        for (source_file_index, file) in self.files.iter().enumerate() {
+            let stream = file
+                .reads_in_region(region, make_reference())
+                .map_err(|source| IngestError::File {
+                    source_file_index,
+                    source,
+                })?;
+            streams.push(stream);
+        }
+
+        // **The single-file arm is the *absence* of a merge, not a merge with
+        // k = 1.** A one-file sample pays no merge machinery at all, and the
+        // two arms are unified by an enum rather than `Box<dyn Iterator>`:
+        // dynamic dispatch is opaque to the optimiser, so the whole per-read
+        // chain would stop being inlined at the boundary — on the hottest loop
+        // in the module (spec §3.4).
+        Ok(if streams.len() == 1 {
+            SampleRegionReads::Single(streams.pop().expect("length checked as 1"))
+        } else {
+            SampleRegionReads::Merged(MergedRegionReads::new(streams))
+        })
+    }
+
     /// What the deferred assembly check needs, per file: the path, and the
     /// `@SQ M5` tags captured at its open.
     ///
@@ -427,6 +487,56 @@ impl SampleReads {
         self.files.iter().map(|file| (file.path(), file.sq_md5s()))
     }
 }
+
+/// One sample's reads for a region: the per-file chain when there is one file,
+/// the merge when there are several.
+///
+/// An **enum, never `Box<dyn Iterator>`**. The cost of dynamic dispatch here is
+/// not mainly the indirect call but that it is opaque to the optimiser: a boxed
+/// iterator cannot be inlined into the consumer's loop, so the whole per-read
+/// chain stops being optimised across the boundary — on a path carrying
+/// millions of reads through ~10⁶ region queries. The `match` below is a
+/// predictable branch that inlines away, and it is no more code to write.
+///
+/// It lives with the entry point rather than inside `merge`, because the
+/// single-file arm is the *absence* of a merge, not a variant of one.
+// The variants differ in size because a `RegionReads` carries the whole
+// per-file chain inline while a `MergedRegionReads` carries `Vec`s. Boxing the
+// larger one is the usual remedy and is the wrong trade here: this value is
+// built **once per region query** and then iterated over millions of reads, so
+// the size difference costs one stack slot per query, while a `Box` would add a
+// pointer chase to every `next()` on the hottest loop in the module. That is
+// the same reasoning that rules out `Box<dyn Iterator>` two paragraphs up.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "built once per query, iterated per read; boxing would move the \
+              cost to the hot path"
+)]
+pub enum SampleRegionReads<'a, R: RawRefSeq> {
+    /// One file: the per-file chain, verbatim. No merge exists.
+    Single(open_bam::RegionReads<'a, R>),
+    Merged(merge::MergedRegionReads<'a, R>),
+}
+
+impl<R: RawRefSeq> Iterator for SampleRegionReads<'_, R> {
+    type Item = Result<MappedRead, IngestError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            // The one-file sample has exactly one file, so its index is 0 —
+            // and its reads already carry that as `source_file_index`.
+            Self::Single(stream) => stream.next().map(|item| {
+                item.map_err(|source| IngestError::File {
+                    source_file_index: 0,
+                    source,
+                })
+            }),
+            Self::Merged(stream) => stream.next(),
+        }
+    }
+}
+
+impl<R: RawRefSeq> std::iter::FusedIterator for SampleRegionReads<'_, R> {}
 
 /// The single sample name the files agree on, or the disagreement.
 ///
@@ -766,6 +876,156 @@ mod tests {
             .expect_err("no files is not a sample");
         assert!(matches!(error, IngestError::NoFiles));
         assert!(error.to_string().contains("at least one"), "{error}");
+    }
+
+    // -----------------------------------------------------------------
+    // SampleRegionReads (E3) — T11
+    // -----------------------------------------------------------------
+
+    use crate::ng::read::input::test_fixtures::{FIXTURE_CONTIGS, bam_header};
+    use crate::ng::ref_seq::InMemoryRefSeq;
+
+    fn reference_bases() -> InMemoryRefSeq {
+        InMemoryRefSeq::from_contigs(
+            FIXTURE_CONTIGS
+                .iter()
+                .map(|(_, length)| vec![b'A'; *length])
+                .collect(),
+        )
+    }
+
+    fn whole_first_contig() -> GenomeRegion {
+        GenomeRegion {
+            contig: ContigId(0),
+            start: Position(1),
+            end: Position(FIXTURE_CONTIGS[0].1 as u64),
+        }
+    }
+
+    fn sample_over(paths: &[PathBuf]) -> (TempDir, SampleReads) {
+        let (reference_dir, reference) = fixture_reference(false);
+        let sample = SampleReads::open(paths, &reference, ReadFilterConfig::default(), false)
+            .expect("opens");
+        (reference_dir, sample)
+    }
+
+    fn drain(sample: &SampleReads) -> Vec<(String, usize)> {
+        sample
+            .reads_in_region(whole_first_contig(), reference_bases)
+            .expect("query")
+            .map(|item| {
+                let read = item.expect("no fatal error");
+                (
+                    String::from_utf8_lossy(&read.qname).into_owned(),
+                    read.source_file_index,
+                )
+            })
+            .collect()
+    }
+
+    /// **T11 — the caller cannot tell the arms apart.**
+    ///
+    /// A one-file sample yields exactly what the same file yields as one of two
+    /// inputs whose other file is empty over the region — asserted through the
+    /// same `SampleRegionReads` type, so the merge-free arm is provably
+    /// equivalent rather than merely believed to be.
+    #[test]
+    fn t11_the_single_file_arm_matches_the_merged_arm() {
+        let reads = [
+            read_named_with_length("r1", 0, 1, 30),
+            read_named_with_length("r2", 0, 30, 30),
+            read_named_with_length("r3", 0, 60, 30),
+        ];
+        let (_only_dir, only) = indexed_bam(&bam_header(&matching_contigs()), &reads);
+        // Empty over contig 0: its only read is on the *second* contig.
+        let (_empty_dir, empty) = indexed_bam(
+            &bam_header(&matching_contigs()),
+            &[read_named_with_length("elsewhere", 1, 1, 30)],
+        );
+
+        let (_a_dir, single) = sample_over(std::slice::from_ref(&only));
+        let (_b_dir, merged) = sample_over(&[only, empty]);
+
+        assert!(
+            matches!(
+                single.reads_in_region(whole_first_contig(), reference_bases),
+                Ok(SampleRegionReads::Single(_))
+            ),
+            "one file must take the merge-free arm"
+        );
+        assert!(
+            matches!(
+                merged.reads_in_region(whole_first_contig(), reference_bases),
+                Ok(SampleRegionReads::Merged(_))
+            ),
+            "two files must take the merge"
+        );
+
+        assert_eq!(
+            drain(&single),
+            drain(&merged),
+            "the arms are indistinguishable to the caller"
+        );
+        assert_eq!(drain(&single).len(), 3);
+    }
+
+    /// **Carried from E1**: a read from file `i` must carry
+    /// `source_file_index == i`. The tag is the sample's *batch* label — the
+    /// grouping a per-batch error model keys on — so it is load-bearing rather
+    /// than provenance, and nothing proved it until the reads could be read.
+    #[test]
+    fn each_read_carries_the_index_of_the_file_it_came_from() {
+        let (_first_dir, first) = indexed_bam(
+            &bam_header(&matching_contigs()),
+            &[
+                read_named_with_length("a1", 0, 1, 30),
+                read_named_with_length("a2", 0, 50, 30),
+            ],
+        );
+        let (_second_dir, second) = indexed_bam(
+            &bam_header(&matching_contigs()),
+            &[read_named_with_length("b1", 0, 25, 30)],
+        );
+
+        let (_dir, sample) = sample_over(&[first, second]);
+        let reads = drain(&sample);
+
+        assert_eq!(
+            reads,
+            vec![
+                ("a1".to_string(), 0),
+                ("b1".to_string(), 1),
+                ("a2".to_string(), 0),
+            ],
+            "every read tagged with its own file, through the merge"
+        );
+    }
+
+    /// The single-file arm wraps its errors with index 0, so a caller matching
+    /// on `IngestError::File` sees the same shape from both arms.
+    #[test]
+    fn the_single_file_arm_wraps_its_errors_like_the_merged_one() {
+        let (_reference_dir, reference) = fixture_reference(false);
+        let (_dir, path) = indexed_bam(
+            &bam_header(&matching_contigs()),
+            &[read_named_with_length("r", 0, 1, 30)],
+        );
+        let sample = SampleReads::open(&[path], &reference, ReadFilterConfig::default(), false)
+            .expect("opens");
+
+        // A region naming a contig the reference does not have.
+        let nonexistent = GenomeRegion {
+            contig: ContigId(9),
+            start: Position(1),
+            end: Position(10),
+        };
+        match sample.reads_in_region(nonexistent, reference_bases) {
+            Err(IngestError::File {
+                source_file_index, ..
+            }) => assert_eq!(source_file_index, 0),
+            Err(other) => panic!("expected a wrapped per-file error, got {other:?}"),
+            Ok(_) => panic!("a region naming an absent contig must not plan"),
+        }
     }
 
     // -----------------------------------------------------------------
