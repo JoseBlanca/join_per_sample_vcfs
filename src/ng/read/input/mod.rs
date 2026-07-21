@@ -29,11 +29,13 @@ pub mod region_query;
 pub(crate) mod test_fixtures;
 
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::bam::errors::AlignmentIndexError;
 use crate::ng::read::filtering::ReadFilterError;
+use crate::ng::reference_info::ReferenceInfo;
 use crate::ng::types::{GenomePosition, GenomeRegion};
+use crate::pop_var_caller::common::format_md5_hex;
 
 /// Everything that can go wrong for **one** alignment file.
 ///
@@ -209,6 +211,111 @@ pub enum AlignmentFileError {
     },
 }
 
+/// What [`check_assembly`] found: how many contigs could be compared, out of
+/// how many there are.
+///
+/// Returned as **information, not a complaint**. `compared == 0` is ordinary —
+/// it means no contig carried a digest on both sides — and a caller that
+/// ignores this is behaving correctly. It exists so a caller that wants to say
+/// "assembly verified for 18 of 24 contigs" can, rather than having to imply a
+/// guarantee it does not have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AssemblyCheck {
+    /// Contigs where **both** sides carried a digest and the two agreed.
+    pub compared: usize,
+    /// Contigs in the reference — the denominator, so `compared` can be read
+    /// as a fraction of the genome actually verified.
+    pub total: usize,
+}
+
+/// A contig whose `@SQ M5` disagrees with the reference's digest: the file is
+/// aligned to a **different assembly** with the same contig names and lengths.
+///
+/// A separate type rather than an [`AlignmentFileError`] variant, because
+/// [`check_assembly`] runs long after the streams are gone — so this can never
+/// appear as a stream item, and a variant of that enum would be unreachable
+/// there (spec §4).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "alignment file '{path}' is aligned to a different assembly: contig \
+     '{contig}' has M5 {} but the reference's is {}",
+    format_md5_hex(*observed),
+    format_md5_hex(*expected)
+)]
+pub struct AssemblyMismatch {
+    pub path: PathBuf,
+    pub contig: String,
+    pub expected: [u8; 16],
+    pub observed: [u8; 16],
+}
+
+/// Compare the `@SQ M5` tags captured at open against a **verified**
+/// `ReferenceInfo` — the one carrying real per-contig digests, available once
+/// the caller has joined `reference_info`'s background verification.
+///
+/// **Why this is deferred rather than done at open.** With a `.fai` present,
+/// `reference_info` hands back the cheap table immediately and verifies the
+/// genome on a background thread, so the `ReferenceInfo` a file is opened
+/// against usually carries no digests at all. Waiting for them would mean
+/// blocking startup on a whole-genome read. Instead the tags are captured for
+/// free at open and compared here, at the point the caller joins that
+/// verification — before anything is published. A wrong-assembly run therefore
+/// wastes its work before aborting, which is the right trade for something
+/// catastrophic and rare (spec §3.1).
+///
+/// **A contig is compared only when both sides carry a digest**, and a contig
+/// that carries none on either side is skipped, not failed. Many BAM/CRAMs have
+/// no `M5` at all, and a `.fai`-only reference has none either; refusing or
+/// nagging would punish the common case for missing an opportunistic extra
+/// check. (A *malformed* tag is a different matter and was already rejected at
+/// open, so everything reaching here is absent or valid.)
+///
+/// `observed` is indexed by `ContigId`, parallel to `verified.contigs` — which
+/// the open gate guarantees, having proved the file's `@SQ` list *is* the
+/// reference's contig table.
+pub fn check_assembly(
+    path: &Path,
+    observed: &[Option<[u8; 16]>],
+    verified: &ReferenceInfo,
+) -> Result<AssemblyCheck, AssemblyMismatch> {
+    // The open gate proves the file's `@SQ` list *is* the reference's contig
+    // table, so these are parallel. Checked because this is `pub` and takes two
+    // loose slices: if they ever diverged, pair `i` would compare the file's
+    // contig against a *different* reference contig — missing a real mismatch,
+    // or naming the wrong contig in the error.
+    debug_assert_eq!(
+        observed.len(),
+        verified.contigs.len(),
+        "observed digests must be parallel to the reference's contigs"
+    );
+
+    let mut compared = 0;
+
+    for (observed_digest, contig) in observed.iter().zip(verified.contigs.iter()) {
+        let (Some(observed_digest), Some(expected)) = (observed_digest, contig.md5) else {
+            continue;
+        };
+
+        if *observed_digest != expected {
+            return Err(AssemblyMismatch {
+                path: path.to_path_buf(),
+                contig: contig.name.clone(),
+                expected,
+                observed: *observed_digest,
+            });
+        }
+        compared += 1;
+    }
+
+    Ok(AssemblyCheck {
+        compared,
+        // The reference's count, not the number of pairs walked: if the two
+        // slices disagree in length — which the open gate rules out — the
+        // shortfall shows up as `compared < total` rather than vanishing.
+        total: verified.contigs.len(),
+    })
+}
+
 /// Sample-level failures — the layer above [`AlignmentFileError`].
 ///
 /// The two own variants are the checks that can only be made *across* files.
@@ -298,6 +405,178 @@ mod tests {
             "alignment file '/data/sample.bam' is not sorted: \
              a read at contig 2 position 120 follows one at contig 2 position 5000"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // check_assembly (D1) — T2b
+    // -----------------------------------------------------------------
+    use crate::ng::reference_info::ContigInfo;
+
+    fn contig(name: &str, md5: Option<[u8; 16]>) -> ContigInfo {
+        ContigInfo {
+            name: name.to_string(),
+            length: 100,
+            offset: 0,
+            line_bases: 60,
+            line_width: 61,
+            md5,
+        }
+    }
+
+    fn verified_reference(digests: &[Option<[u8; 16]>]) -> ReferenceInfo {
+        ReferenceInfo {
+            md5: None,
+            contigs: digests
+                .iter()
+                .enumerate()
+                .map(|(i, md5)| contig(&format!("chr{}", i + 1), *md5))
+                .collect(),
+            fasta_path: None,
+        }
+    }
+
+    const A: [u8; 16] = [0xaa; 16];
+    const B: [u8; 16] = [0xbb; 16];
+
+    /// **T2b, the fault it exists to catch.** A file aligned to a different
+    /// assembly with the same contig names and lengths passes every check at
+    /// open — that is exactly why this check is worth having, and why
+    /// production, which trusts the `@SQ M5`, cannot make it.
+    #[test]
+    fn t2b_a_disagreeing_digest_names_the_contig_and_both_values() {
+        let error = check_assembly(
+            Path::new("/data/sample.bam"),
+            &[Some(A), Some(B)],
+            &verified_reference(&[Some(A), Some(A)]),
+        )
+        .expect_err("the second contig disagrees");
+
+        assert_eq!(error.contig, "chr2");
+        assert_eq!(error.expected, A);
+        assert_eq!(error.observed, B);
+
+        // Asserted whole, because the mistake worth catching is transposing
+        // `expected` and `observed` in the message: that inverts the diagnosis
+        // and sends the user after the wrong artefact, while leaving every
+        // "contains" assertion green.
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "alignment file '/data/sample.bam' is aligned to a different \
+                 assembly: contig 'chr2' has M5 {} but the reference's is {}",
+                "bb".repeat(16),
+                "aa".repeat(16)
+            )
+        );
+    }
+
+    /// **T2b, the ordinary case.** A file with no `M5` tags at all is not a
+    /// fault — it simply cannot be checked. `compared == 0` says so plainly
+    /// rather than implying a guarantee that was never obtained.
+    #[test]
+    fn t2b_a_file_without_digests_is_not_an_error_and_reports_nothing_compared() {
+        let check = check_assembly(
+            Path::new("/data/sample.bam"),
+            &[None, None, None],
+            &verified_reference(&[Some(A), Some(A), Some(A)]),
+        )
+        .expect("no tags is ordinary input");
+
+        assert_eq!(
+            check,
+            AssemblyCheck {
+                compared: 0,
+                total: 3
+            }
+        );
+    }
+
+    /// **T2b, the partial case.** `compared` counts exactly the contigs that
+    /// could be checked — so "verified 2 of 3" is a statement a caller can make
+    /// truthfully.
+    #[test]
+    fn t2b_compared_counts_exactly_the_contigs_both_sides_carry() {
+        let check = check_assembly(
+            Path::new("/data/sample.bam"),
+            &[Some(A), None, Some(A)],
+            &verified_reference(&[Some(A), Some(A), Some(A)]),
+        )
+        .expect("the tagged contigs agree");
+        assert_eq!(
+            check,
+            AssemblyCheck {
+                compared: 2,
+                total: 3
+            }
+        );
+
+        // And symmetrically: a digest on the file's side is useless if the
+        // reference has none, which is the whole `.fai`-only situation.
+        let check = check_assembly(
+            Path::new("/data/sample.bam"),
+            &[Some(A), Some(A), Some(A)],
+            &verified_reference(&[Some(A), None, None]),
+        )
+        .expect("only the first contig is comparable");
+        assert_eq!(
+            check,
+            AssemblyCheck {
+                compared: 1,
+                total: 3
+            }
+        );
+    }
+
+    /// The headline case a caller wants to report: everything tagged, all
+    /// agreeing, so `compared == total`.
+    #[test]
+    fn a_fully_tagged_agreeing_file_reports_every_contig_verified() {
+        let check = check_assembly(
+            Path::new("/data/sample.bam"),
+            &[Some(A), Some(A), Some(A)],
+            &verified_reference(&[Some(A), Some(A), Some(A)]),
+        )
+        .expect("all agree");
+        assert_eq!(
+            check,
+            AssemblyCheck {
+                compared: 3,
+                total: 3
+            }
+        );
+    }
+
+    /// A `.fai`-only reference carries no digests at all, so nothing is
+    /// comparable and nothing is claimed — the case that makes this check
+    /// *deferred* rather than redundant with the one at open.
+    #[test]
+    fn nothing_is_comparable_against_a_fai_only_reference() {
+        let check = check_assembly(
+            Path::new("/data/sample.bam"),
+            &[Some(A), Some(B)],
+            &verified_reference(&[None, None]),
+        )
+        .expect("a .fai has no digests to disagree with");
+        assert_eq!(
+            check,
+            AssemblyCheck {
+                compared: 0,
+                total: 2
+            }
+        );
+    }
+
+    /// The first disagreement wins, so the message names the earliest contig
+    /// rather than an arbitrary one.
+    #[test]
+    fn the_first_disagreeing_contig_is_the_one_reported() {
+        let error = check_assembly(
+            Path::new("/data/sample.bam"),
+            &[Some(B), Some(B)],
+            &verified_reference(&[Some(A), Some(A)]),
+        )
+        .expect_err("both disagree");
+        assert_eq!(error.contig, "chr1");
     }
 
     /// The colliding read's name is what lets a user grep the inputs and

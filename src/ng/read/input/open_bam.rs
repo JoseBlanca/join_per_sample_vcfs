@@ -1870,6 +1870,64 @@ mod tests {
         );
     }
 
+    /// **T2b's sequencing half.** The digest check is deferred *on purpose*:
+    /// the reference a file is opened against usually carries no digests yet
+    /// (they arrive from a background genome pass), so waiting for them would
+    /// block startup on a whole-genome read.
+    ///
+    /// The file here is aligned to the **wrong assembly** — its `@SQ M5` tags
+    /// disagree with the reference's real digests — and the whole point is that
+    /// it opens anyway, streams its reads anyway, and is caught only at the end.
+    ///
+    /// Note what this can and cannot pin. Moving the comparison *into* `open`
+    /// would not fail this test — and that is not a gap, it is the argument
+    /// for deferring: `open` receives the `.fai`-arm reference, which carries
+    /// no digests, so a check there would compare nothing and let the wrong
+    /// assembly through regardless of where it sits. What is pinned is the
+    /// sequence — the file opens, reads flow, and the fault is still caught —
+    /// and that the catching is real (blinding `check_assembly`'s comparison
+    /// fails this test).
+    #[test]
+    fn t2b_the_assembly_check_runs_after_the_reads_have_flowed() {
+        use crate::ng::read::input::check_assembly;
+
+        let wrong_digest = "ffffffffffffffffffffffffffffffff";
+        let contigs: Vec<(&str, usize, Option<&str>)> = FIXTURE_CONTIGS
+            .iter()
+            .map(|(name, length)| (*name, *length, Some(wrong_digest)))
+            .collect();
+
+        // Opened against a `.fai`-only reference, which carries no digests — so
+        // the gate's own comparison is a wildcard and the wrong assembly sails
+        // through.
+        let (_reference_dir, reference) = fixture_reference(false);
+        let (_bam_dir, path) = indexed_bam(
+            &bam_header(&contigs),
+            &[read_named_with_length("r", 0, 1, 30)],
+        );
+        let file = AlignmentFile::open(&path, &reference, ReadFilterConfig::default(), false)
+            .expect("a wrong M5 is a wildcard against a .fai-only reference");
+
+        let reads: Vec<MappedRead> = file
+            .reads_in_region(whole_first_contig(), reference_bases())
+            .expect("query")
+            .collect::<Result<_, _>>()
+            .expect("reads flow even though the assembly is wrong");
+        assert_eq!(
+            reads.len(),
+            1,
+            "the reads flowed first — startup never blocked"
+        );
+
+        // Only now, against a reference read through the FASTA arm and so
+        // carrying real digests, does the fault surface.
+        let (_verified_dir, verified) = fixture_reference(true);
+        let error = check_assembly(file.path(), file.sq_md5s(), &verified)
+            .expect_err("the wrong assembly is caught, after the fact");
+        assert_eq!(error.contig, "chr1");
+        assert_eq!(error.observed, [0xff; 16]);
+    }
+
     // --- the hex decoder's edges ---
 
     /// The four malformed cases above put the bad character early or vary the
