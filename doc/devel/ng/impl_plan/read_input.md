@@ -192,7 +192,7 @@ Open k files through `AlignmentFile::open`, then check they all name one sample;
 error with its `source_file_index`. Test **T12b** (two files, different `SM` → `SampleNameMismatch`
 before any read). *Depends:* B2. *Source:* spec `sample_reads.md` §3.1, arch §3.
 
-**E2. `MergedRegionReads` — the argmin merge.**  ☐ **Own commit — do not bundle.**
+**E2. `MergedRegionReads` — the argmin merge.**  ✅ **Own commit — do not bundle.**
 Heads as `Option<MappedRead>` with **keys held beside them** in a parallel array; linear argmin, ties
 to the lowest file index; emit with `Option::take` and refill only the winning slot. The
 same-file-twice check runs **only on a tie**, comparing `flag` before `qname`. Tests **T6**
