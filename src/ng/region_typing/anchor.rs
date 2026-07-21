@@ -253,14 +253,23 @@ fn the_walk_reproduces_the_golden_catalog_through_the_shipping_stack() {
 
     // The catalog's settings, pinned explicitly rather than to whatever `Default` is —
     // or this starts failing the first time someone moves a floor and reads a *result*
-    // as a bug.
+    // as a bug. As of spec §2.3 ng's `Default` carries the short-read floors, not the
+    // catalog's, so the three knobs this used to inherit from `Default` — the period
+    // scope, the copy floors, and the satellite cap — are now pinned to the catalog's
+    // build settings here (spec §8.1: `MIN_PERIOD`/`MAX_PERIOD` = 2..=6, copy floors
+    // `[10,5,4,3,3,3]`, satellite cap 1 kb). `min_purity`/`min_score`/`flank_bp` still
+    // come from the `.cat` header.
+    use crate::ng::region_typing::segment_criteria::{MinCopies, SsrSegmentCriteria};
+    use crate::ng::tandem_repeat::PeriodRange;
     let config = TypedRegionConfig {
-        criteria: crate::ng::region_typing::segment_criteria::SsrSegmentCriteria {
+        criteria: SsrSegmentCriteria {
             min_purity: cat_params.min_purity,
             min_score: cat_params.min_score,
             flank_bp: u64::from(cat_params.flank_bp),
-            ..Default::default()
+            periods: PeriodRange::new(2, 6).expect("2..=6 is a valid period range"),
+            min_copies: MinCopies::new([10, 5, 4, 3, 3, 3], 3),
         },
+        max_str_len: Bp(1000),
         ..TypedRegionConfig::default()
     };
 

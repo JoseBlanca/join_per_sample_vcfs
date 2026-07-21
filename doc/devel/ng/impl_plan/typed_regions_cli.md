@@ -95,7 +95,7 @@ A1.
 
 ### Milestone B — the input surface (Args, parser, defaults)
 
-**B1. Apply the §2.3 short-read defaults to the library consts.**  ☐ — **own commit; oracle: the ng
+**B1. Apply the §2.3 short-read defaults to the library consts.**  ✅ — **own commit; oracle: the ng
 test suite green after re-pinning.**
 Edit `DEFAULT_MIN_PERIOD` 2→1, `DEFAULT_FLANK_BP` 50→30, `DEFAULT_MAX_STR_LEN` 1000→100,
 `MinCopies::default()` `[10,5,4,3,3,3]`→`[6,4,4,3,3,3]`; delete
@@ -104,14 +104,14 @@ to `--min-period 2` and add the "homopolymer is a period-1 locus" test; pin the 
 `min_copies`/`max_str_len` from its header (`typed_regions.md` §8.1). *Source:* spec §2.3. *Depends:* —
 (library-only; independent of A).
 
-**B2. `TypedRegionsArgs` + `TypedRegionsCliError`.**  ☐
+**B2. `TypedRegionsArgs` + `TypedRegionsCliError`.**  ✅
 The `Args` struct — `--reference`/`--output`/`--regions` + every knob `default_value_t` the `DEFAULT_*`
 const under `help_heading = "Advanced"` — and the `#[non_exhaustive]` error enum (`Reference`,
 `ContigTooLong`, `Bed`, `Walk`, `Output`; `#[from]` where it fits). No logic. Test: parses through the
 top-level CLI with defaults (mirror `ssr_catalog`'s `parses_through_the_top_level_cli`), asserting the
 resolved defaults are the §2.3 values. *Source:* arch §1, §3; spec §2.1. *Depends:* A1, B1.
 
-**B3. The `--min-copies` value_parser.**  ☐
+**B3. The `--min-copies` value_parser.**  ✅
 In `pop_var_caller_exp/cli/parsers.rs`: parse **exactly six** comma-separated `u32`s → `MinCopies::new([…;6], 3)`
 (the `for_wider_periods` supplied inert); **any other count is a hard parse error**. Wire it as the
 `min_copies` field's `value_parser`. Unit tests: six values parse to the right table; five and seven
@@ -124,13 +124,13 @@ B2.
 
 ### Milestone C — the output writer (the heart)
 
-**C1. The header block.**  ☐
+**C1. The header block.**  ✅
 Write `## key: value` lines from the *resolved* `TypedRegionConfig` (every knob, fixed key order),
 then the `#`-prefixed column header. **No `date`, no `reference_md5`** (determinism). Unit test:
 byte-identical across two calls; every config knob appears; `window_bp` present. *Source:* spec §3.4,
 §6; arch §5. *Depends:* B2.
 
-**C2. The row formatter + the T4 coordinate conversion.**  ☐ — **own commit, do not bundle; round-trip
+**C2. The row formatter + the T4 coordinate conversion.**  ✅ — **own commit, do not bundle; round-trip
 oracle green before and after.**
 `TypedRegion` → one BED row: typed columns with `.` for absent; `motif` via `str::from_utf8` on a bound
 `motif()` (T6); `copies` = `tract_len()/period()`, fractional (T5); `purity` from `purity_fraction()`;
@@ -146,7 +146,7 @@ round-trip unit test over hand-built `Generic`/`Satellite`/`SsrSegment`/`SsrBund
 
 ### Milestone D — the fallible setup assembly
 
-**D1. Reference read + contig table + region set.**  ☐
+**D1. Reference read + contig table + region set.**  ✅
 `read_reference_verifying_or_creating_fai(&cache, args.reference.clone())?` (one held
 `Arc<ReferenceInfoCache>`) → `(Arc<ReferenceInfo>, Option<VerificationHandle>)`; keep the handle for
 E1. `info.contig_list()` → one `ContigList`, used **twice** (T8): `WindowedRefSeq::new` and
@@ -162,7 +162,7 @@ T1/T2/T8, arch §4. *Depends:* B2; **precondition: `reference_info` on `main`.**
 
 ### Milestone E — the driver, end to end
 
-**E1. `run_typed_regions`.**  ☐
+**E1. `run_typed_regions`.**  ✅
 Assemble `TypedRegionConfig` from the args (wrapping raw knobs in `Bp`/`Position`),
 `WindowedRefSeq::new`, `TypedRegionIterator::over_regions` (fallible setup — the flank/margin pair
 surfaces here, T3), then **stream** `for r in iter { writer.write_row(r?)?; }` to a `.tmp` file;
@@ -172,7 +172,7 @@ published. A stderr announce line at the start and a `key: k=v` summary from `co
 print **all five** rejection counters, labelled, hardcoding none (T9). *Depends:* B, C, D. *Source:*
 spec §6, arch §4.
 
-**E2. Integration tests — the file, on the anchor fixture.**  ☐
+**E2. Integration tests — the file, on the anchor fixture.**  ✅
 On the anchor FASTA+`.fai`: (1) **round-trip** — written rows parse back field-for-field equal to the
 iterator's output (bundle fixture required); (2) **partition invariant** — concatenated spans
 reconstruct the requested regions; (3) **determinism** — two runs byte-identical; (4) **`--regions`

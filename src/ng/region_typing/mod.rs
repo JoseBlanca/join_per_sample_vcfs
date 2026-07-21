@@ -234,10 +234,14 @@ pub struct TypedRegionConfig {
     pub criteria: SsrSegmentCriteria,
 }
 
-/// The satellite cap and detection margin: **1 kb**, comfortably above any real
-/// STR locus. Spec §10 asks whether it is right; it is a parameter, so the
-/// experiment can answer.
-pub const DEFAULT_MAX_STR_LEN: u64 = 1000;
+/// The satellite cap and detection margin: **100 bp** (spec §2.3). This one
+/// field is both — a tract longer than the cap is a `Satellite`, not an STR,
+/// and the window fetches core ± this margin. With 150 bp reads a read spans a
+/// tract plus an anchor each side only up to ~`read_len − 2·flank_bp` ≈ 90 bp,
+/// so past ~100 bp the STR route has nothing to offer. A round number at that
+/// read-length limit, not a measured one — soft, and the point of the knob is
+/// to sweep it (spec §10).
+pub const DEFAULT_MAX_STR_LEN: u64 = 100;
 
 /// The walk's window core: **100 kb**. Memory only — it must never change the
 /// output.
@@ -1657,23 +1661,55 @@ mod tests {
     use super::*;
     use crate::ng::ref_seq::{InMemoryRefSeq, RefSeq};
 
-    /// `Default` is the catalog's settings, for spec §8's comparability — so the
-    /// oracle compares like with like. Pinned against the **literals**, not
-    /// against the consts that define it: asserting `periods.min() ==
-    /// DEFAULT_SCAN_MIN_PERIOD` would compare a constant with itself and could not
-    /// fail (the same tautology the A2 review caught in `SsrSegmentCriteria`).
+    /// `Default` is the **short-read** settings now (spec §2.3), not the catalog's —
+    /// which is what the golden oracles pin explicitly (see [`catalog_config`]).
+    /// Pinned against the **literals**, not against the consts that define it:
+    /// asserting `periods.min() == DEFAULT_MIN_PERIOD` would compare a constant with
+    /// itself and could not fail (the same tautology the A2 review caught).
     #[test]
-    fn default_config_is_the_catalogs_settings() {
+    fn default_config_is_the_short_read_settings() {
         let c = TypedRegionConfig::default();
-        // One period range now (scanner detects = classification accepts), and it
-        // lives in `criteria` — the scanner honours it, so there is no separate scan
-        // range to over-scan (`the_scan_range...` guard retired with the two fields).
-        assert_eq!(c.criteria.periods.min(), 2, "the catalog's di.. floor");
-        assert_eq!(c.criteria.periods.max(), 6, "..to hexa ceiling");
-        assert_eq!(c.max_str_len, Bp(1000), "the 1 kb satellite cap");
+        // One period range (scanner detects = classification accepts), living in
+        // `criteria`. §2.3 lowered the floor to 1: a qualifying homopolymer is a
+        // period-1 STR locus.
+        assert_eq!(
+            c.criteria.periods.min(),
+            1,
+            "period-1 homopolymers classified"
+        );
+        assert_eq!(c.criteria.periods.max(), 6, "..to the hexa ceiling");
+        assert_eq!(c.max_str_len, Bp(100), "the short-read satellite cap");
         assert_eq!(c.window_bp, Bp(100_000), "100 kb window");
         assert_eq!(c.scan, ScanParams::default());
         assert_eq!(c.criteria, SsrSegmentCriteria::default());
+        // The short-read copy-number floors `[6,4,4,3,3,3]` (§2.3): the mono floor
+        // drops to 6 (Illumina read-artifact onset), the di floor to 4.
+        let floors: Vec<u32> = (1..=6)
+            .map(|p| c.criteria.min_copies.for_period(p))
+            .collect();
+        assert_eq!(floors, vec![6, 4, 4, 3, 3, 3], "the short-read floors");
+    }
+
+    /// The catalog's settings — what [`TypedRegionConfig::default`] carried before
+    /// spec §2.3 moved `Default` to the short-read floors. The `.cat` parity oracle
+    /// and the walk-mechanic tests below were written against these (di..hexa,
+    /// copy floors `[10,5,4,3,3,3]`, a **50 bp** flank/bundle radius, a **1 kb**
+    /// satellite cap), so they pin them explicitly now that `Default` no longer
+    /// supplies them (spec §8.1: the oracle must be pinned to the catalog's
+    /// settings, not to whatever `Default` is).
+    fn catalog_config() -> TypedRegionConfig {
+        use crate::ng::tandem_repeat::PeriodRange;
+        use segment_criteria::MinCopies;
+        TypedRegionConfig {
+            max_str_len: Bp(1000),
+            criteria: SsrSegmentCriteria {
+                periods: PeriodRange::new(2, 6).expect("2..=6 is a valid period range"),
+                min_copies: MinCopies::new([10, 5, 4, 3, 3, 3], 3),
+                flank_bp: 50,
+                ..SsrSegmentCriteria::default()
+            },
+            ..TypedRegionConfig::default()
+        }
     }
 
     #[test]
@@ -1867,17 +1903,29 @@ mod tests {
 
     /// A contig with one clean isolated (AT)*8 tract: Generic / SsrSegment / Generic.
     /// The smallest case that shows the partition doing its job.
+    ///
+    /// **The flanks must be aperiodic, and the first version's were not** (fixed
+    /// 2026-07-20). They were `(CGCA)*15` — a period-4 tandem repeat — so the contig was
+    /// not "one lone tract" at all: the scanner read the whole thing as a single impure
+    /// period-4 tract (`0..136 p4`, the 16 bp `AT` insert being exactly four periods of
+    /// four) with the `AT` tract nested inside it. The assertion passed only because the
+    /// then-current `is_close` could not see containment, so the nested `AT` came out a
+    /// standalone locus and the enclosing p4 tract was dropped for want of a flank at the
+    /// contig edge — two bugs cancelling. With [`segment_criteria::joins_cluster`] the
+    /// nesting is seen and the honest answer for *that* fixture is one `SsrBundle`, which
+    /// is how the fixture was caught. The flanks below are aperiodic, so the contig now
+    /// holds the one tract this test is named for.
     #[test]
     fn a_lone_tract_partitions_as_generic_locus_generic() {
-        // 60 bp of unique sequence either side, so the default 50 bp flanks fit.
-        let mut bases = b"CGCACGCACGCACGCACGCACGCACGCACGCACGCACGCACGCACGCACGCACGCACGCA".to_vec();
+        // 60 bp of aperiodic sequence either side, so the default 50 bp flanks fit and
+        // nothing in them is itself a tract (see the note above).
+        let mut bases = b"ACGTTGCAAGCTCCTAGGATCGATTGCACGGTACCTGAAGCTTGCACTGATCCGTAGGCA".to_vec();
         let tract_start_0 = bases.len();
         bases.extend_from_slice(b"ATATATATATATATAT"); // 8 copies
-        bases.extend_from_slice(b"CGCACGCACGCACGCACGCACGCACGCACGCACGCACGCACGCACGCACGCACGCACGCA");
+        bases.extend_from_slice(b"TGCATTGGACCTAAGCGTTCAGGCTTACGATCCAGGTTACGATCCAAGTGCTTAGCATCG");
         let len = bases.len() as u64;
 
-        let regions =
-            partition_resident("chr1", ContigId(0), &bases, &TypedRegionConfig::default());
+        let regions = partition_resident("chr1", ContigId(0), &bases, &catalog_config());
         assert_partitions(&regions, ContigId(0), len, "lone tract");
 
         let kinds: Vec<_> = regions
@@ -1915,7 +1963,7 @@ mod tests {
     fn a_long_array_is_one_satellite_and_swallows_the_locus_inside_it() {
         let mut bases = filler(60);
         for _ in 0..1000 {
-            bases.extend_from_slice(b"AT"); // 2 kb, over the 1 kb cap
+            bases.extend_from_slice(b"AT"); // 2 kb, well over the satellite cap
         }
         bases.extend(filler(60));
         let len = bases.len() as u64;
@@ -1997,7 +2045,7 @@ mod tests {
         assert_eq!(
             runs[0].len(),
             1200,
-            "over the 1 kb cap, though neither tract alone is"
+            "over the satellite cap, though neither tract alone is"
         );
     }
 
@@ -2086,8 +2134,7 @@ mod tests {
         bases[100..126].copy_from_slice(b"ATATATATGGGGGGGGGGATATATAT");
         let len = bases.len() as u64;
 
-        let regions =
-            partition_resident("chr1", ContigId(0), &bases, &TypedRegionConfig::default());
+        let regions = partition_resident("chr1", ContigId(0), &bases, &catalog_config());
         assert_partitions(&regions, ContigId(0), len, "impure tract");
         assert!(
             !regions
@@ -2104,8 +2151,7 @@ mod tests {
         // never admissible (D1's trap).
         let mut bases = filler(240);
         bases[100..126].copy_from_slice(b"ATATATATATATATATATATATATAT");
-        let regions =
-            partition_resident("chr1", ContigId(0), &bases, &TypedRegionConfig::default());
+        let regions = partition_resident("chr1", ContigId(0), &bases, &catalog_config());
         assert_eq!(
             kinds_of(&regions),
             vec!["generic", "locus", "generic"],
@@ -2114,7 +2160,10 @@ mod tests {
     }
 
     /// **A homopolymer is `Generic` at periods 2..=6** (spec §8's fixture list): nothing
-    /// classifies period 1, and the bases are still covered.
+    /// classifies period 1, and the bases are still covered. Pinned at the catalog's
+    /// period scope explicitly via [`catalog_config`] — as of spec §2.3 ng's `Default`
+    /// is `--min-period 1`, where a homopolymer IS a locus
+    /// (`a_homopolymer_of_six_or_more_is_a_period_one_locus_at_default` pins that).
     ///
     /// `prefilter` is what removes it, and **the whole homopolymer, not just its period-1
     /// label** — the 2026-07-17 ordering fix. A poly-A tiles under `AA`, `AAA`, `AAAAA`, so
@@ -2135,8 +2184,7 @@ mod tests {
         bases[180..204].copy_from_slice(b"CAGCAGCAGCAGCAGCAGCAGCAG");
         let len = bases.len() as u64;
 
-        let regions =
-            partition_resident("chr1", ContigId(0), &bases, &TypedRegionConfig::default());
+        let regions = partition_resident("chr1", ContigId(0), &bases, &catalog_config());
         assert_partitions(&regions, ContigId(0), len, "homopolymer");
 
         let loci: Vec<_> = regions
@@ -2173,7 +2221,7 @@ mod tests {
         // rejections for one homopolymer, because its period-2/3/5 aliases each reached
         // `classify` separately. A rejection count that moves with the number of divisors of
         // a run's length is not measuring anything.
-        let counts = counts_over(&bases, 100_000);
+        let counts = counts_over_with(&bases, catalog_config());
         assert_eq!(
             counts.rejected_by_reason,
             RejectionCounts::default(),
@@ -2183,12 +2231,130 @@ mod tests {
         );
     }
 
+    /// **At `Default` (spec §2.3) a homopolymer of ≥ 6 bp IS a period-1 STR locus** —
+    /// the mirror of `a_homopolymer_is_generic_and_does_not_take_its_neighbour_with_it`.
+    /// `--min-period 1` with a mononucleotide copy floor of 6 is the short-read
+    /// default, so a poly-A run routes to STR handling instead of falling through as
+    /// `Generic`. §2.3 flags this as the change that most alters the partition —
+    /// genomes are dense in homopolymers, so expect many more `SsrSegment`s.
+    #[test]
+    fn a_homopolymer_of_six_or_more_is_a_period_one_locus_at_default() {
+        let mut bases = filler(300);
+        // 20 bp of poly-A, clean aperiodic flanks ≥ 30 bp either side (the default
+        // flank is 30). At `--min-period 1` this is a period-1 locus.
+        bases[100..120].copy_from_slice(&[b'A'; 20]);
+        let len = bases.len() as u64;
+
+        let regions =
+            partition_resident("chr1", ContigId(0), &bases, &TypedRegionConfig::default());
+        assert_partitions(&regions, ContigId(0), len, "homopolymer at default");
+
+        let loci: Vec<_> = regions
+            .iter()
+            .filter_map(|r| match &r.kind {
+                RegionKind::SsrSegment(l) => Some(l),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            loci.len(),
+            1,
+            "the poly-A is a single period-1 locus at Default: {:#?}",
+            kinds_of(&regions)
+        );
+        assert_eq!(loci[0].period(), 1, "period 1 — a homopolymer");
+        assert_eq!(loci[0].motif().as_bytes(), b"A", "the homopolymer's motif");
+        assert!(
+            loci[0].start() >= 100 && loci[0].start() <= 105,
+            "the locus is the poly-A run at ~101 (1-based), not a cascade artefact: {}",
+            loci[0].start()
+        );
+    }
+
+    /// A contig carrying exactly one repeat run, well clear of the flank
+    /// requirement, with the bases **immediately either side forced** to one the
+    /// run is not made of.
+    ///
+    /// The guard is the point. `filler` contains isolated `A`s, so dropping a
+    /// five-base poly-A into it can land beside one and become a *six*-base run —
+    /// and a floor test whose run is not the length it claims passes for the
+    /// wrong reason. Forcing the neighbours makes the run's length exactly what
+    /// the caller asked for.
+    fn contig_with_one_guarded_run(run: &[u8], guard: u8) -> Vec<u8> {
+        const OFFSET: usize = 200;
+        assert!(
+            !run.contains(&guard),
+            "the guard must not be a base the run is made of, or it could extend it"
+        );
+        let mut bases = filler(OFFSET * 2 + run.len());
+        bases[OFFSET - 1] = guard;
+        bases[OFFSET..OFFSET + run.len()].copy_from_slice(run);
+        bases[OFFSET + run.len()] = guard;
+        bases
+    }
+
+    /// The `SsrSegment`s a default-config walk finds in `bases`.
+    fn loci_at_default(bases: &[u8], case: &str) -> Vec<SsrSegment> {
+        let regions = partition_resident("chr1", ContigId(0), bases, &TypedRegionConfig::default());
+        assert_partitions(&regions, ContigId(0), bases.len() as u64, case);
+        regions
+            .into_iter()
+            .filter_map(|r| match r.kind {
+                RegionKind::SsrSegment(l) => Some(l),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// **The mononucleotide floor is exactly 6** (spec §2.3): five copies fall
+    /// through as `Generic`, six are a period-1 locus.
+    ///
+    /// `a_homopolymer_of_six_or_more_is_a_period_one_locus_at_default` uses a
+    /// 20 bp run — it proves homopolymers are typed at all, but sits far from the
+    /// line and so would stay green through any floor edit. This pins the line
+    /// itself, which is what §10's sweep will move.
+    #[test]
+    fn the_mononucleotide_copy_floor_is_exactly_six() {
+        let below = loci_at_default(&contig_with_one_guarded_run(&[b'A'; 5], b'C'), "poly-A x5");
+        assert!(
+            below.is_empty(),
+            "5 copies is under the mono floor of 6 — the run stays Generic, got {below:?}"
+        );
+
+        let at = loci_at_default(&contig_with_one_guarded_run(&[b'A'; 6], b'C'), "poly-A x6");
+        assert_eq!(at.len(), 1, "6 copies clears the mono floor: {at:?}");
+        assert_eq!(at[0].period(), 1, "a homopolymer is period 1");
+        assert_eq!(at[0].motif().as_bytes(), b"A");
+        assert_eq!(at[0].tract_len(), 6, "the whole run, and only the run");
+    }
+
+    /// **The dinucleotide floor is exactly 4** (spec §2.3): three copies fall
+    /// through, four are a locus.
+    ///
+    /// This is the boundary B1 *moved* — the catalog's floor was 5, so a 4-copy
+    /// dinucleotide used to be `Generic` and is now a locus. Nothing recorded
+    /// that change until this test.
+    #[test]
+    fn the_dinucleotide_copy_floor_is_exactly_four() {
+        let below = loci_at_default(&contig_with_one_guarded_run(b"ATATAT", b'C'), "(AT)x3");
+        assert!(
+            below.is_empty(),
+            "3 copies is under the di floor of 4 — the run stays Generic, got {below:?}"
+        );
+
+        let at = loci_at_default(&contig_with_one_guarded_run(b"ATATATAT", b'C'), "(AT)x4");
+        assert_eq!(at.len(), 1, "4 copies clears the di floor: {at:?}");
+        assert_eq!(at[0].period(), 2);
+        assert_eq!(at[0].motif().as_bytes(), b"AT");
+        assert_eq!(at[0].tract_len(), 8, "four copies of a 2 bp motif");
+    }
+
     /// **A rejected repeat is generic territory, not a hole** (spec §2.2). A
     /// low-copy tract classification turns down must still be *covered* — completeness
     /// is what the invariant is for.
     #[test]
     fn a_rejected_repeat_leaves_no_hole() {
-        // (AT)*3 — below the period-2 copy floor of 5.
+        // (AT)*3 — below the period-2 copy floor (4 at the short-read Default).
         let mut bases = vec![b'C'; 60];
         bases.extend_from_slice(b"ATATAT");
         bases.extend(std::iter::repeat_n(b'G', 60));
@@ -2304,8 +2470,7 @@ mod tests {
         // [60,80), [110,130), [160,180): each gap 30 bp; A→C is 80 bp apart.
         let bases = contig_with_tracts_at(&[60, 110, 160], 300);
         let len = bases.len() as u64;
-        let regions =
-            partition_resident("chr1", ContigId(0), &bases, &TypedRegionConfig::default());
+        let regions = partition_resident("chr1", ContigId(0), &bases, &catalog_config());
         assert_partitions(&regions, ContigId(0), len, "three chained tracts");
 
         let bundles: Vec<_> = regions
@@ -2373,7 +2538,7 @@ mod tests {
     #[test]
     fn a_low_copy_repeat_is_generic_not_a_bundle() {
         let mut bases = filler(240);
-        // (AT)*3 — below the period-2 copy floor of 5, and isolated.
+        // (AT)*3 — below the period-2 copy floor (4 at the short-read Default), and isolated.
         bases[100..106].copy_from_slice(b"ATATAT");
         let len = bases.len() as u64;
         let regions =
@@ -2453,14 +2618,21 @@ mod tests {
         let golden = golden_reader.read_all().unwrap();
         assert!(!golden.is_empty(), "the golden catalog must have loci");
 
-        // ng's walk at the SAME settings, pinned explicitly.
+        // ng's walk at the SAME settings, pinned explicitly. As of spec §2.3 ng's
+        // `Default` carries the short-read floors, not the catalog's, so the period
+        // scope, copy floors, and satellite cap are pinned to the catalog's build
+        // settings here (§8.1); `min_purity`/`min_score`/`flank_bp` come from the
+        // `.cat` header.
         let config = TypedRegionConfig {
             criteria: SsrSegmentCriteria {
                 min_purity: cat_params.min_purity,
                 min_score: cat_params.min_score,
                 flank_bp: u64::from(cat_params.flank_bp),
-                ..SsrSegmentCriteria::default()
+                periods: crate::ng::tandem_repeat::PeriodRange::new(2, 6)
+                    .expect("2..=6 is a valid period range"),
+                min_copies: segment_criteria::MinCopies::new([10, 5, 4, 3, 3, 3], 3),
             },
+            max_str_len: Bp(1000),
             ..TypedRegionConfig::default()
         };
 
@@ -2594,7 +2766,11 @@ mod tests {
     ///   design cut it to 24 members of 30.
     #[test]
     fn a_bed_returns_the_same_findings_the_whole_genome_run_does() {
-        let config = TypedRegionConfig::default();
+        // The satellite-chain fixtures below are tuned to the catalog's 50 bp
+        // bundle radius and 1 kb cap, so this pins them explicitly (spec §2.3
+        // moved `Default` off those values). The BED-invariance property under
+        // test is config-independent; the fixture geometry is not.
+        let config = catalog_config();
 
         // --- the 3 kb array: a satellite three times the old margin ---
         let bases = contig_with_a_long_array();
@@ -2611,7 +2787,14 @@ mod tests {
 
         // Ask about 200 bp of its left end. The satellite comes back WHOLE — all 3 kb,
         // past both requested edges, identical to the whole-genome region.
-        let got = walk_bed(&bases, &[(1100, 1300)], 333);
+        let got = walk_bed_with(
+            &bases,
+            &[(1100, 1300)],
+            TypedRegionConfig {
+                window_bp: Bp(333),
+                ..catalog_config()
+            },
+        );
         let sat = got
             .iter()
             .find(|r| matches!(r.kind, RegionKind::Satellite))
@@ -2644,7 +2827,14 @@ mod tests {
              only where they abut and every run here is 20 bp: {whole:#?}"
         );
 
-        let got = walk_bed(&bases, &[(900, 1200)], 333);
+        let got = walk_bed_with(
+            &bases,
+            &[(900, 1200)],
+            TypedRegionConfig {
+                window_bp: Bp(333),
+                ..catalog_config()
+            },
+        );
         let (hull, tracts) = got
             .iter()
             .find_map(|r| match &r.kind {
@@ -3105,7 +3295,7 @@ mod tests {
                 err,
                 TypedRegionError::MarginNarrowerThanFlank {
                     max_str_len: 10,
-                    flank_bp: 50
+                    flank_bp: 30
                 }
             ),
             "and it names both numbers, so the message says which flag to move: {err}"
@@ -3298,10 +3488,18 @@ mod tests {
 
     /// Walk a fixture and hand back the finished tally.
     fn counts_over(bases: &[u8], window_bp: u64) -> TypedRegionCounts {
-        let config = TypedRegionConfig {
-            window_bp: Bp(window_bp),
-            ..TypedRegionConfig::default()
-        };
+        counts_over_with(
+            bases,
+            TypedRegionConfig {
+                window_bp: Bp(window_bp),
+                ..TypedRegionConfig::default()
+            },
+        )
+    }
+
+    /// Tally the walk's counters at an explicit config. `counts_over` is this at
+    /// `Default`.
+    fn counts_over_with(bases: &[u8], config: TypedRegionConfig) -> TypedRegionCounts {
         let mut iter =
             TypedRegionIterator::over_contig(reference_over("chr1", bases), ContigId(0), config)
                 .expect("valid contig");
@@ -3548,7 +3746,12 @@ mod tests {
     // ---- E2: scan wider than you emit ------------------------------------
 
     /// Walk `bases` restricted to the 1-based inclusive spans `want`.
-    fn walk_bed(bases: &[u8], want: &[(u64, u64)], window_bp: u64) -> Vec<TypedRegion> {
+    /// Walk a BED at an explicit config. `walk_bed` is this at `Default`.
+    fn walk_bed_with(
+        bases: &[u8],
+        want: &[(u64, u64)],
+        config: TypedRegionConfig,
+    ) -> Vec<TypedRegion> {
         let requested: Vec<GenomeRegion> = want
             .iter()
             .map(|&(s, e)| GenomeRegion {
@@ -3557,14 +3760,21 @@ mod tests {
                 end: Position(e),
             })
             .collect();
-        let config = TypedRegionConfig {
-            window_bp: Bp(window_bp),
-            ..TypedRegionConfig::default()
-        };
         TypedRegionIterator::over_spans(reference_over("chr1", bases), requested, config)
             .expect("valid spans")
             .collect::<Result<_, _>>()
             .expect("no read fails")
+    }
+
+    fn walk_bed(bases: &[u8], want: &[(u64, u64)], window_bp: u64) -> Vec<TypedRegion> {
+        walk_bed_with(
+            bases,
+            want,
+            TypedRegionConfig {
+                window_bp: Bp(window_bp),
+                ..TypedRegionConfig::default()
+            },
+        )
     }
 
     /// **BED-invariance — the acceptance test** (spec §2.5): *"whether a base is STR /

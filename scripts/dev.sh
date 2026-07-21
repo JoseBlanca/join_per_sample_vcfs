@@ -10,6 +10,11 @@
 # tools that embed cwd into state files (Claude auto-memory, cargo target
 # fingerprints, editor configs).
 #
+# $HOME/genomes is additionally bind-mounted read-only when it exists, so
+# benchmark references resolve inside the container at their host paths.
+# Override the location with DEV_GENOMES_DIR; add one more path with
+# DEV_EXTRA_MOUNT.
+#
 # Supported runtimes (picked in this order):
 #   1. podman          — Linux dev box (rootless OK).
 #   2. container       — Apple's container CLI on macOS
@@ -50,20 +55,41 @@ fi
 MOUNT_SPEC="$PROJECT_DIR:$PROJECT_DIR"
 [[ "$RUNTIME" == podman ]] && MOUNT_SPEC="$MOUNT_SPEC:z"
 
-# Opt-in extra read-only bind mount for data that lives outside the
-# project tree (e.g. reference genomes at $HOME/genomes). Same path
-# inside the container as on the host, matching the convention used
-# for the project mount. Single path only; rerun with a different
-# value if you need a different mount.
+# Read-only bind mounts for data that lives outside the project tree.
+# Same path inside the container as on the host, matching the convention
+# used for the project mount.
+#
+# They stay **read-only** on purpose: the sandbox property worth keeping
+# is not "the container sees only the project" but "the container can
+# only *write* to the project". Reference genomes are read, never
+# written, so `ro` costs nothing and preserves that guarantee.
 EXTRA_MOUNTS=()
+add_ro_mount() {
+    local path="$1"
+    local opts="ro"
+    [[ "$RUNTIME" == podman ]] && opts="${opts},z"
+    EXTRA_MOUNTS+=(-v "${path}:${path}:${opts}")
+}
+
+# Reference genomes are mounted by default when present. Benchmark
+# configs point at $HOME/genomes/... (e.g. benchmarks/tomato1's
+# S_lycopersicum_chromosomes.4.00.fa), so requiring an env var to reach
+# them made every reference-touching run a two-step affair.
+DEV_GENOMES_DIR="${DEV_GENOMES_DIR:-$HOME/genomes}"
+[[ -d "$DEV_GENOMES_DIR" ]] && add_ro_mount "$DEV_GENOMES_DIR"
+
+# Opt-in additional mount for data living somewhere else again. Single
+# path only; rerun with a different value if you need a different mount.
 if [[ -n "${DEV_EXTRA_MOUNT:-}" ]]; then
     if [[ ! -d "$DEV_EXTRA_MOUNT" ]]; then
         echo "Error: DEV_EXTRA_MOUNT='$DEV_EXTRA_MOUNT' is not a directory." >&2
         exit 1
     fi
-    EXTRA_OPTS="ro"
-    [[ "$RUNTIME" == podman ]] && EXTRA_OPTS="${EXTRA_OPTS},z"
-    EXTRA_MOUNTS+=(-v "${DEV_EXTRA_MOUNT}:${DEV_EXTRA_MOUNT}:${EXTRA_OPTS}")
+    # Skip if it duplicates the genomes mount — bind-mounting the same
+    # path twice is an error on Apple container.
+    if [[ "$DEV_EXTRA_MOUNT" != "$DEV_GENOMES_DIR" ]]; then
+        add_ro_mount "$DEV_EXTRA_MOUNT"
+    fi
 fi
 
 # Only request a TTY when stdin actually is one; -t fails when invoked
