@@ -209,7 +209,7 @@ the other empty — asserted through the same type, so the arms are provably ind
 **Pin here:** whether the per-file reference accessor needs `R: Clone` or `&R` — arch §7's other
 impl-time confirmation. *Depends:* E1, E2. *Source:* spec §3.4, arch §3.
 
-**E4. The merge's per-read budget bench.**  ☐
+**E4. The merge's per-read budget bench.**  ✅
 **T14:** a synthetic k-file stream asserting zero per-read allocations and no `MappedRead` clone in
 the merge loop (counting allocator or `dhat`). Worth its own step because this failure is invisible
 to every correctness test — a stray `clone()` costs throughput without changing an output byte.
