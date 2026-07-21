@@ -201,7 +201,7 @@ same-file-twice check runs **only on a tie**, comparing `flag` before `qname`. T
 survive — the case the cheap-first comparison order must not get wrong). A mis-ordered merge is the
 third silent failure here. *Depends:* A1, C4. *Source:* spec §3.2, arch §4.
 
-**E3. `SampleRegionReads` — the two arms.**  ☐
+**E3. `SampleRegionReads` — the two arms.**  ✅
 The `Single | Merged` enum (never `Box<dyn Iterator>`), `reads_in_region(&self)` building one chain
 per file and a merge only when k > 1, plus `counts()` (per file, never summed) and `sq_md5s()`.
 Test **T11**: a one-file sample yields exactly what the same file yields as one of two inputs with
