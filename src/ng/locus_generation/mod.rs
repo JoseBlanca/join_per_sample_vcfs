@@ -16,8 +16,8 @@
 
 use crate::ng::read::input::{IngestError, SampleReads};
 use crate::ng::ref_seq::RefSeqError;
-use crate::ng::region_typing::TypedRegionError;
-use crate::ng::region_typing::segment_criteria::Motif;
+use crate::ng::region_typing::segment_criteria::{Motif, SsrSegment};
+use crate::ng::region_typing::{RegionKind, TypedRegion, TypedRegionError};
 use crate::ng::types::GenomeRegion;
 use crate::pileup_record::ChainId;
 
@@ -271,6 +271,204 @@ pub enum LocusGenerationError {
     Reference(#[from] RefSeqError),
 }
 
+/// The running tally — "no silent caps": every region and every base is accounted for, so
+/// "how much genome does this caller not cover, and how much of that is temporary?" is
+/// answerable from the counts alone. The base counters are the other half of why `SsrBundle`
+/// and `Satellite` exist as types rather than holes (spec §7).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LocusCounts {
+    /// Typed regions dispatched — the total, which partitions **exactly** into
+    /// `regions_handled` plus the two unhandled counters (spec §13.2).
+    pub regions_in: u64,
+    /// Regions routed to a filled generator, whatever number of loci it then emitted
+    /// (including zero). With the two unhandled counters this sums to `regions_in`.
+    pub regions_handled: u64,
+    /// Loci emitted, across every generator. **Not** a region count — one handled region
+    /// yields zero, one, or many.
+    pub loci_emitted: u64,
+    /// Regions that produced no loci because no generator is filled for their kind.
+    /// **Temporary** by construction.
+    pub unhandled_not_implemented: u64,
+    /// The bases those `unhandled_not_implemented` regions cover.
+    pub unhandled_not_implemented_bp: u64,
+    /// Regions deliberately outside scope (satellites). **Permanent.**
+    pub unhandled_out_of_scope: u64,
+    /// The bases those `unhandled_out_of_scope` regions cover.
+    pub unhandled_out_of_scope_bp: u64,
+}
+
+impl LocusCounts {
+    /// Charge one unhandled region, of `bp` bases, to the counter its reason names — the one
+    /// place the two kinds of nothing are kept apart (spec §5, §7).
+    fn record_unhandled(&mut self, reason: UnhandledReason, bp: u64) {
+        match reason {
+            UnhandledReason::NotImplemented => {
+                self.unhandled_not_implemented += 1;
+                self.unhandled_not_implemented_bp += bp;
+            }
+            UnhandledReason::OutOfScope => {
+                self.unhandled_out_of_scope += 1;
+                self.unhandled_out_of_scope_bp += bp;
+            }
+        }
+    }
+}
+
+/// One region kind's generator, or the reason it has none.
+///
+/// A **trait object** so a generator can be swapped per run without the dispatcher being
+/// generic over each kind's concrete type — the lab's `Box<dyn _>` choice
+/// (`ng_step_interfaces.md` §4). `Unfilled` carries the reason the dispatcher accounts by:
+/// the `NoLoci` configuration kept as data, so plugging in a real generator is a one-line
+/// change at the set (spec §5).
+///
+/// The trait object carries **no `Send` bound**: v1 is single-threaded (arch §9). If a
+/// `GeneratorSet` is ever moved onto a producer thread rather than built per thread, this
+/// becomes `dyn LocusGenerator<S> + Send` — a deliberate omission now, not an oversight.
+pub enum GeneratorSlot<S> {
+    /// A generator supplied for this kind.
+    Generator(Box<dyn LocusGenerator<S>>),
+    /// No generator; account every region of this kind to the reason.
+    Unfilled(UnhandledReason),
+}
+
+impl<S> GeneratorSlot<S> {
+    /// Begin a region on this slot: reset a real generator, or account the region as
+    /// unhandled. Returns whether a generator is filled, so the dispatcher knows whether
+    /// there are loci to pull.
+    fn begin(&mut self, region: GenomeRegion, bp: u64, counts: &mut LocusCounts) -> bool {
+        match self {
+            GeneratorSlot::Generator(generator) => {
+                generator.begin_segment(region);
+                true
+            }
+            GeneratorSlot::Unfilled(reason) => {
+                counts.record_unhandled(*reason, bp);
+                false
+            }
+        }
+    }
+
+    /// The next locus from a filled slot. An unfilled slot yields `None` — though the
+    /// dispatcher never asks one, since [`begin`](Self::begin) reported it not filled.
+    fn next(
+        &mut self,
+        segment: &S,
+        reads: &SampleReads,
+    ) -> Result<Option<SampleLocusObservations>, LocusGenerationError> {
+        match self {
+            GeneratorSlot::Generator(generator) => generator.next_locus(segment, reads),
+            GeneratorSlot::Unfilled(_) => Ok(None),
+        }
+    }
+}
+
+/// The set of generators the dispatcher routes to — one slot per region kind — plus the
+/// running tally and the one-region-at-a-time cursor.
+///
+/// `Satellite` has no slot: it is out of scope for the whole caller and always accounted
+/// `OutOfScope` (spec §5). The other three kinds each hold a [`GeneratorSlot`]. This is the
+/// `GeneratorSet` the arch left as an impl-time confirmation, pinned here; the payload types
+/// for `Generic` and `SsrBundle` are `()` for now and refine when those generators land.
+pub struct GeneratorSet {
+    ssr: GeneratorSlot<SsrSegment>,
+    generic: GeneratorSlot<()>,
+    ssr_bundle: GeneratorSlot<()>,
+    counts: LocusCounts,
+    /// The region whose generator is mid-stream, if any. `None` between regions.
+    current: Option<TypedRegion>,
+}
+
+impl GeneratorSet {
+    /// A set with a generator (or a reason) chosen for each kind.
+    pub fn new(
+        ssr: GeneratorSlot<SsrSegment>,
+        generic: GeneratorSlot<()>,
+        ssr_bundle: GeneratorSlot<()>,
+    ) -> Self {
+        Self {
+            ssr,
+            generic,
+            ssr_bundle,
+            counts: LocusCounts::default(),
+            current: None,
+        }
+    }
+
+    /// A set with no real generator — every kind falls back to its `NoLoci` reason, which is
+    /// what this shape ships (spec §2): `SsrSegment` / `Generic` / `SsrBundle` are
+    /// `NotImplemented` until a generator is supplied; `Satellite` is always `OutOfScope`.
+    pub fn all_unimplemented() -> Self {
+        Self::new(
+            GeneratorSlot::Unfilled(UnhandledReason::NotImplemented),
+            GeneratorSlot::Unfilled(UnhandledReason::NotImplemented),
+            GeneratorSlot::Unfilled(UnhandledReason::NotImplemented),
+        )
+    }
+
+    /// The running tally — readable at any point, final once the stream is exhausted.
+    pub fn counts(&self) -> &LocusCounts {
+        &self.counts
+    }
+
+    /// Begin a region: count it, and ready its generator if one is filled. Every region is
+    /// counted in `regions_in`; a handled kind also in `regions_handled`, an unfilled kind in
+    /// its unhandled counter. Infallible — resetting a generator cannot fail (spec §4).
+    ///
+    /// Call only after the previous region is drained (`next_locus` returned `None`); calling
+    /// over an undrained region silently abandons its remaining loci. The iterator upholds
+    /// this, which is why it is a documented contract rather than a runtime guard.
+    pub fn begin_region(&mut self, region: TypedRegion) {
+        self.counts.regions_in += 1;
+        let bp = region.region.len();
+        // Copied out (GenomeRegion is Copy) only for readability, so `region` can still move
+        // into `current` below.
+        let geometry = region.region;
+        let filled = match &region.kind {
+            RegionKind::Satellite => {
+                self.counts
+                    .record_unhandled(UnhandledReason::OutOfScope, bp);
+                false
+            }
+            RegionKind::SsrSegment(_) => self.ssr.begin(geometry, bp, &mut self.counts),
+            RegionKind::Generic => self.generic.begin(geometry, bp, &mut self.counts),
+            RegionKind::SsrBundle { .. } => self.ssr_bundle.begin(geometry, bp, &mut self.counts),
+        };
+        if filled {
+            self.counts.regions_handled += 1;
+        }
+        self.current = filled.then_some(region);
+    }
+
+    /// The next locus of the region begun by [`begin_region`](Self::begin_region), or `None`
+    /// once it — or an unfilled/absent region — has no more. After a `None` the caller pulls
+    /// the next region and calls `begin_region` again. Holds **one region at a time**: no
+    /// buffer of loci (spec §6).
+    pub fn next_locus(
+        &mut self,
+        reads: &SampleReads,
+    ) -> Result<Option<SampleLocusObservations>, LocusGenerationError> {
+        let Some(region) = self.current.take() else {
+            return Ok(None);
+        };
+        let produced = match &region.kind {
+            RegionKind::SsrSegment(segment) => self.ssr.next(segment, reads),
+            RegionKind::Generic => self.generic.next(&(), reads),
+            RegionKind::SsrBundle { .. } => self.ssr_bundle.next(&(), reads),
+            // Satellite is never made current — begin_region reports it unfilled.
+            RegionKind::Satellite => Ok(None),
+        }?;
+        match produced {
+            Some(locus) => {
+                self.counts.loci_emitted += 1;
+                self.current = Some(region); // more may follow; keep driving it.
+                Ok(Some(locus))
+            }
+            None => Ok(None),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -350,6 +548,195 @@ mod tests {
         let out = LocusGenerator::<()>::next_locus(&mut generator, &(), &reads).unwrap();
         assert!(out.is_none(), "NoLoci produces no locus");
         assert_eq!(generator.reason, UnhandledReason::OutOfScope);
+    }
+
+    fn typed(kind: RegionKind, start: u64, end: u64) -> TypedRegion {
+        TypedRegion {
+            region: region(start, end),
+            kind,
+        }
+    }
+
+    fn an_ssr_segment(start: u64, end: u64) -> RegionKind {
+        RegionKind::SsrSegment(
+            SsrSegment::new("chr1".into(), start, end, Motif::new(b"AT").unwrap(), 1.0).unwrap(),
+        )
+    }
+
+    fn a_bundle() -> RegionKind {
+        use crate::ng::tandem_repeat::RepeatInterval;
+        RegionKind::SsrBundle {
+            tracts: vec![RepeatInterval {
+                start: 99,
+                end: 160,
+                period: 2,
+                score: 10,
+            }]
+            .into_boxed_slice(),
+        }
+    }
+
+    /// Drive one region through the dispatcher to exhaustion, collecting its loci.
+    fn drain_region(
+        set: &mut GeneratorSet,
+        region: TypedRegion,
+        reads: &SampleReads,
+    ) -> Vec<SampleLocusObservations> {
+        set.begin_region(region);
+        let mut out = Vec::new();
+        while let Some(locus) = set.next_locus(reads).unwrap() {
+            out.push(locus);
+        }
+        out
+    }
+
+    /// Every kind is accounted, and the two kinds of nothing land in **different** counters
+    /// — the check that §5's distinction survives contact with code (spec §13.1, §13.3).
+    #[test]
+    fn all_unimplemented_accounts_every_kind_and_keeps_the_two_nothings_apart() {
+        let (_reference_dir, _bam_dir, reads) = sample_reads_over_fixture();
+        let mut set = GeneratorSet::all_unimplemented();
+
+        // Distinct spans so the base counters are individually checkable.
+        for region in [
+            typed(RegionKind::Generic, 1, 10),      // 10 bp → NotImplemented
+            typed(an_ssr_segment(20, 25), 20, 25),  // 6 bp → NotImplemented
+            typed(a_bundle(), 100, 160),            // 61 bp → NotImplemented
+            typed(RegionKind::Satellite, 200, 400), // 201 bp → OutOfScope
+        ] {
+            assert!(
+                drain_region(&mut set, region, &reads).is_empty(),
+                "an unimplemented set emits no loci"
+            );
+        }
+
+        let counts = set.counts();
+        assert_eq!(counts.regions_in, 4);
+        assert_eq!(counts.regions_handled, 0);
+        assert_eq!(counts.loci_emitted, 0);
+        assert_eq!(counts.unhandled_not_implemented, 3);
+        assert_eq!(counts.unhandled_not_implemented_bp, 10 + 6 + 61);
+        assert_eq!(counts.unhandled_out_of_scope, 1);
+        assert_eq!(counts.unhandled_out_of_scope_bp, 201);
+        // Nothing is unaccounted for: regions_in partitions exactly (spec §13.2).
+        assert_eq!(
+            counts.regions_in,
+            counts.regions_handled
+                + counts.unhandled_not_implemented
+                + counts.unhandled_out_of_scope,
+        );
+    }
+
+    /// A generator emitting a fixed number of loci per segment — a stand-in for a real one,
+    /// so the filled-slot path (loci counted, region *handled* not *unhandled*) is exercised
+    /// even though this shape ships only `NoLoci`. Generic over the segment type so it fits
+    /// any kind's slot, which is what lets one routing test distinguish the three.
+    struct FixedCountGenerator {
+        per_segment: u32,
+        remaining: u32,
+    }
+
+    impl<S> LocusGenerator<S> for FixedCountGenerator {
+        fn begin_segment(&mut self, _region: GenomeRegion) {
+            self.remaining = self.per_segment;
+        }
+
+        fn next_locus(
+            &mut self,
+            _segment: &S,
+            _reads: &SampleReads,
+        ) -> Result<Option<SampleLocusObservations>, LocusGenerationError> {
+            if self.remaining == 0 {
+                return Ok(None);
+            }
+            self.remaining -= 1;
+            Ok(Some(locus(region(1, 1), Vec::new())))
+        }
+    }
+
+    fn generator(per_segment: u32) -> GeneratorSlot<()> {
+        GeneratorSlot::Generator(Box::new(FixedCountGenerator {
+            per_segment,
+            remaining: 0,
+        }))
+    }
+
+    /// Each kind reaches **its own** slot (spec §13.1). Distinguishable generators (2 / 3 / 5
+    /// loci per segment) make a mis-route show up as the wrong count, which indistinguishable
+    /// `NoLoci` slots could not.
+    #[test]
+    fn each_kind_routes_to_its_own_slot() {
+        let (_reference_dir, _bam_dir, reads) = sample_reads_over_fixture();
+        let mut set = GeneratorSet::new(
+            GeneratorSlot::Generator(Box::new(FixedCountGenerator {
+                per_segment: 2,
+                remaining: 0,
+            })),
+            generator(3),
+            generator(5),
+        );
+
+        assert_eq!(
+            drain_region(&mut set, typed(an_ssr_segment(20, 25), 20, 25), &reads).len(),
+            2,
+            "SsrSegment → the ssr slot"
+        );
+        assert_eq!(
+            drain_region(&mut set, typed(RegionKind::Generic, 1, 10), &reads).len(),
+            3,
+            "Generic → the generic slot"
+        );
+        assert_eq!(
+            drain_region(&mut set, typed(a_bundle(), 100, 160), &reads).len(),
+            5,
+            "SsrBundle → the bundle slot"
+        );
+        assert_eq!(
+            drain_region(&mut set, typed(RegionKind::Satellite, 200, 400), &reads).len(),
+            0,
+            "Satellite has no slot"
+        );
+
+        let counts = set.counts();
+        assert_eq!(counts.regions_in, 4);
+        assert_eq!(counts.regions_handled, 3);
+        assert_eq!(counts.loci_emitted, 2 + 3 + 5);
+        assert_eq!(counts.unhandled_out_of_scope, 1);
+        assert_eq!(counts.unhandled_not_implemented, 0);
+        assert_eq!(
+            counts.regions_in,
+            counts.regions_handled
+                + counts.unhandled_not_implemented
+                + counts.unhandled_out_of_scope,
+        );
+    }
+
+    /// A filled slot's region is *handled*: its loci are counted and it never touches the
+    /// unhandled counters — the other side of the dispatch from the NoLoci case.
+    #[test]
+    fn a_filled_slot_counts_its_loci_and_is_not_unhandled() {
+        let (_reference_dir, _bam_dir, reads) = sample_reads_over_fixture();
+        let mut set = GeneratorSet::new(
+            GeneratorSlot::Generator(Box::new(FixedCountGenerator {
+                per_segment: 2,
+                remaining: 0,
+            })),
+            GeneratorSlot::Unfilled(UnhandledReason::NotImplemented),
+            GeneratorSlot::Unfilled(UnhandledReason::NotImplemented),
+        );
+
+        let loci = drain_region(&mut set, typed(an_ssr_segment(20, 25), 20, 25), &reads);
+        assert_eq!(loci.len(), 2, "the generator's two loci per segment");
+
+        let counts = set.counts();
+        assert_eq!(counts.regions_in, 1);
+        assert_eq!(counts.regions_handled, 1);
+        assert_eq!(counts.loci_emitted, 2);
+        assert_eq!(
+            counts.unhandled_not_implemented, 0,
+            "a handled region is not unhandled"
+        );
+        assert_eq!(counts.unhandled_out_of_scope, 0);
     }
 
     /// The types compose into a locus of each kind — a smoke test that the shared
