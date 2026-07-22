@@ -1777,13 +1777,13 @@ mod tests {
         // parses as a flag), which would be testing clap's tokeniser rather than
         // these bounds.
         for bad in [
-            "--max-period=7",       // above MAX_MOTIF_LEN
-            "--min-period=0",       // period 0 is meaningless
-            "--flank-bp=0", // every locus would fail its own flank test
-            "--min-purity=1.5",     // outside [0, 1]
-            "--min-purity=-0.5",    //
-            "--min-purity=nan",     // parses as f32, and would pass every tract
-            "--min-purity=inf",     //
+            "--max-period=7",    // above MAX_MOTIF_LEN
+            "--min-period=0",    // period 0 is meaningless
+            "--flank-bp=0",      // every locus would fail its own flank test
+            "--min-purity=1.5",  // outside [0, 1]
+            "--min-purity=-0.5", //
+            "--min-purity=nan",  // parses as f32, and would pass every tract
+            "--min-purity=inf",  //
         ] {
             let err = Cli::try_parse_from([
                 "pop_var_caller_exp",
@@ -1842,11 +1842,7 @@ mod tests {
                 max_str_len,
                 bundle_threshold: flank_bp,
             })) => {
-                assert_eq!(
-                    (max_str_len, flank_bp),
-                    (10, 30),
-                    "it names both numbers"
-                );
+                assert_eq!((max_str_len, flank_bp), (10, 30), "it names both numbers");
             }
             Err(other) => panic!("expected the walk's flank-pair error, got {other:?}"),
             Ok(()) => panic!("a margin narrower than the flank must be refused"),
