@@ -80,7 +80,7 @@ pub struct TypedRegionsArgs {
 
     /// Widest STR period classified — the microsatellite ceiling.
     ///
-    /// **Bounded at the CLI, unlike the `--max-str-len`/`--bundle-threshold` pair.** That
+    /// **Bounded at the CLI, unlike the `--max-str-len`/`--flank-bp` pair.** That
     /// pair is propagated because the walk refuses it with a real *error* (T3);
     /// this one is not, because the walk guards the period ceiling with a release
     /// `assert!` — deliberately, since the knob is swept and sweeps run in
@@ -96,7 +96,7 @@ pub struct TypedRegionsArgs {
     pub max_period: u8,
 
     /// Satellite cap and scan margin (bp), one field: a tract longer than this
-    /// is a `Satellite`, not an STR. Must be `>= --bundle-threshold` (the walk enforces
+    /// is a `Satellite`, not an STR. Must be `>= --flank-bp` (the walk enforces
     /// it, spec T3).
     #[arg(long, default_value_t = DEFAULT_MAX_STR_LEN, help_heading = "Advanced")]
     pub max_str_len: u64,
@@ -108,7 +108,7 @@ pub struct TypedRegionsArgs {
     /// Flank (bp) a locus needs each side, and the bundle radius (spec §2.4).
     ///
     /// Bounded below at 1 for the same reason as the period range: the walk
-    /// guards `bundle_threshold >= 1` with a release `assert!` (at 0 every locus fails
+    /// guards `flank_bp >= 1` with a release `assert!` (at 0 every locus fails
     /// its own flank test), and that guard is reached on the **first window of
     /// any reference**, so a typo would be an immediate backtrace (spec §6).
     #[arg(
@@ -117,7 +117,7 @@ pub struct TypedRegionsArgs {
         value_parser = clap::value_parser!(u64).range(1..),
         help_heading = "Advanced"
     )]
-    pub bundle_threshold: u64,
+    pub flank_bp: u64,
 
     /// Purity floor in `[0, 1]`: a tract matching less than this fraction of a
     /// perfect motif tiling is not classified.
@@ -166,7 +166,7 @@ pub struct TypedRegionsArgs {
 /// Errors from the `type-regions` subcommand. The house pattern: a
 /// `#[non_exhaustive]` `thiserror` enum, `#[from]` where a single source type
 /// identifies the failure. `main_exp` walks the source chain to render it (spec
-/// §6). **Not** a `--max-str-len`/`--bundle-threshold` variant — the walk's
+/// §6). **Not** a `--max-str-len`/`--flank-bp` variant — the walk's
 /// [`TypedRegionError`] already carries both numbers (spec T3).
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -195,7 +195,7 @@ pub enum TypedRegionsCliError {
     PeriodRange(#[from] PeriodRangeError),
 
     /// The walk's fallible setup or streaming failed — including the
-    /// `--max-str-len`/`--bundle-threshold` guard, which the walk carries (spec T3).
+    /// `--max-str-len`/`--flank-bp` guard, which the walk carries (spec T3).
     #[error("the typed-region walk failed")]
     Walk(#[from] TypedRegionError),
 
@@ -273,7 +273,9 @@ pub fn write_header<W: io::Write>(
         periods,
         min_purity,
         min_score,
-        bundle_threshold,
+        // The CLI knob is `--flank-bp` (it also sizes the STR read flank); region typing
+        // consumes it as its bundle radius, so the field is `bundle_threshold`.
+        bundle_threshold: flank_bp,
         min_copies,
     } = criteria;
     let ScanParams {
@@ -289,7 +291,7 @@ pub fn write_header<W: io::Write>(
     writeln!(out, "## max_period: {}", periods.max())?;
     writeln!(out, "## max_str_len: {}", max_str_len.get())?;
     writeln!(out, "## window_bp: {}", window_bp.get())?;
-    writeln!(out, "## bundle_threshold: {bundle_threshold}")?;
+    writeln!(out, "## flank_bp: {flank_bp}")?;
     writeln!(out, "## min_purity: {min_purity}")?;
     writeln!(out, "## min_score: {min_score}")?;
     writeln!(out, "## min_copies: {}", format_min_copies(min_copies))?;
@@ -549,7 +551,8 @@ fn walk_config(args: &TypedRegionsArgs) -> Result<TypedRegionConfig, TypedRegion
             periods: PeriodRange::new(args.min_period, args.max_period)?,
             min_purity: args.min_purity,
             min_score: args.min_score,
-            bundle_threshold: args.bundle_threshold,
+            // `--flank-bp` feeds region typing's bundle radius (flank ≤ bundle threshold).
+            bundle_threshold: args.flank_bp,
             min_copies: args.min_copies,
         },
     })
@@ -650,7 +653,7 @@ pub fn run_typed_regions(args: &TypedRegionsArgs) -> Result<(), TypedRegionsCliE
     // A clone of one value cannot disagree with itself, which is the property T8
     // is protecting.
     let reference = WindowedRefSeq::new(args.reference.clone(), contigs.clone());
-    // Fallible setup: the contig cross-check and the `--max-str-len`/`--bundle-threshold`
+    // Fallible setup: the contig cross-check and the `--max-str-len`/`--flank-bp`
     // pair both surface here as errors, before any work (spec T3).
     let mut walk = TypedRegionIterator::over_regions(reference, regions, config.clone())?;
 
@@ -708,7 +711,7 @@ mod tests {
         assert_eq!(args.max_period, 6);
         assert_eq!(args.max_str_len, 100, "short-read satellite cap");
         assert_eq!(args.window_bp, 100_000);
-        assert_eq!(args.bundle_threshold, 30, "short-read flank");
+        assert_eq!(args.flank_bp, 30, "short-read flank");
         assert_eq!(args.min_purity, 0.8);
         assert_eq!(args.min_score, 0);
         assert_eq!(args.scan_match_reward, 2);
@@ -760,7 +763,7 @@ mod tests {
             "max_period",
             "max_str_len",
             "window_bp",
-            "bundle_threshold",
+            "flank_bp",
             "min_purity",
             "min_score",
             "min_copies",
@@ -790,7 +793,7 @@ mod tests {
             "## max_period: 6",
             "## max_str_len: 100",
             "## window_bp: 100000",
-            "## bundle_threshold: 30",
+            "## flank_bp: 30",
             "## min_purity: 0.8",
             "## min_score: 0",
             "## min_copies: 6,4,4,3,3,3",
@@ -871,7 +874,7 @@ mod tests {
             "## min_period: 2",
             "## max_period: 5",
             "## max_str_len: 250",
-            "## bundle_threshold: 44",
+            "## flank_bp: 44",
             "## min_copies: 9,8,7,6,5,4",
         ] {
             assert!(
@@ -1763,7 +1766,7 @@ mod tests {
     ///
     /// These bounds are the only thing standing between a user and a panic —
     /// without them `--max-period 7` trips `classify`'s period-ceiling assert,
-    /// `--bundle-threshold 0` trips its flank assert on the *first window of any
+    /// `--flank-bp 0` trips its flank assert on the *first window of any
     /// reference*, and `--min-purity nan` trips its purity assert (and a NaN
     /// floor would pass every tract rather than reject impure ones). Deleting
     /// any of the three `value_parser`s must fail here.
@@ -1776,7 +1779,7 @@ mod tests {
         for bad in [
             "--max-period=7",       // above MAX_MOTIF_LEN
             "--min-period=0",       // period 0 is meaningless
-            "--bundle-threshold=0", // every locus would fail its own flank test
+            "--flank-bp=0", // every locus would fail its own flank test
             "--min-purity=1.5",     // outside [0, 1]
             "--min-purity=-0.5",    //
             "--min-purity=nan",     // parses as f32, and would pass every tract
@@ -1823,7 +1826,7 @@ mod tests {
     }
 
     /// **T3 — the flag pair is a CLI error, not a panic.** `--max-str-len` below
-    /// `--bundle-threshold` is refused by the walk before any work, and the CLI just
+    /// `--flank-bp` is refused by the walk before any work, and the CLI just
     /// propagates it: a second check here would be a second place for the rule to
     /// drift, and the walk's message already carries both numbers.
     #[test]
@@ -1832,15 +1835,15 @@ mod tests {
         let output = dir.path().join("out.tsv");
         let mut args = args_for_output(&fasta, None, &output);
         args.max_str_len = 10;
-        args.bundle_threshold = 30;
+        args.flank_bp = 30;
 
         match run_typed_regions(&args) {
             Err(TypedRegionsCliError::Walk(TypedRegionError::MarginNarrowerThanFlank {
                 max_str_len,
-                bundle_threshold,
+                bundle_threshold: flank_bp,
             })) => {
                 assert_eq!(
-                    (max_str_len, bundle_threshold),
+                    (max_str_len, flank_bp),
                     (10, 30),
                     "it names both numbers"
                 );

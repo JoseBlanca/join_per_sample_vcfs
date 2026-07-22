@@ -57,7 +57,7 @@ pub struct TypedRegionsArgs {
     pub max_period: u8,                   // DEFAULT_MAX_PERIOD
     pub max_str_len: u64,                 // DEFAULT_MAX_STR_LEN
     pub window_bp: u64,                   // DEFAULT_WINDOW_BP   (memory only; not a comparison key)
-    pub bundle_threshold: u64,                    // DEFAULT_BUNDLE_THRESHOLD
+    pub flank_bp: u64,                    // DEFAULT_BUNDLE_THRESHOLD
     pub min_purity: f32,                  // DEFAULT_MIN_PURITY
     pub min_score: i32,                   // DEFAULT_MIN_SCORE
     pub min_copies: MinCopies,            // parsed by cli/parsers.rs (§2 below)
@@ -68,7 +68,7 @@ pub struct TypedRegionsArgs {
 ```
 
 **Contract.** `TypedRegionsArgs` is a plain clap `Args`; it holds no invariant of its own. The one
-cross-knob rule — `max_str_len >= bundle_threshold` — is **not** checked here: the walk refuses the pair with
+cross-knob rule — `max_str_len >= flank_bp` — is **not** checked here: the walk refuses the pair with
 `TypedRegionError::MarginNarrowerThanFlank` before any work
 ([`mod.rs:884-889`](../../../../src/ng/region_typing/mod.rs)), so a second CLI check would be a second
 place to drift (spec T3). Every knob is a flag, so no user input may panic (spec §6).
@@ -104,7 +104,7 @@ pub enum TypedRegionsCliError {
 ```
 
 **Contract.** Every variant states when it fires (per-variant doc, per `RefSeqError`'s shape). **Not**
-a `--max-str-len`/`--bundle-threshold` variant — `TypedRegionError::MarginNarrowerThanFlank` already carries
+a `--max-str-len`/`--flank-bp` variant — `TypedRegionError::MarginNarrowerThanFlank` already carries
 both numbers (spec T3). No `anyhow` in the CLI path (spec §6).
 
 ## 4. Interfaces
