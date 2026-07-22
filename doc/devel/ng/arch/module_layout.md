@@ -39,7 +39,7 @@ src/ng/
 │                       TypedRegion { region, kind } (SsrSegment/SsrBundle/Generic/Satellite). A
 │                       concrete iterator, no trait (no bake-off). Spec ../spec/typed_regions.md;
 │                       arch typed_regions.md
-├── locus/            – the locus generators: turn one typed region into a sample's loci.
+├── locus_generation/ – the locus generators: turn one typed region into a sample's loci.
 │                       LocusGenerator<S> trait + one impl per segment kind, side by side —
 │                       a step folder, because alternatives per kind are expected.
 │                        · mod.rs   – SampleLocusObservations, ObservedSequence, LocusGenerator,
@@ -66,7 +66,7 @@ src/ng/
 ```
 
 (Steps 5 — STR read-class / spanning — and the read-class machinery live inside
-`allele_candidates/` or `locus/ssr.rs`; see *Open items*.)
+`allele_candidates/` or `locus_generation/ssr.rs`; see *Open items*.)
 
 ## Organizing principles
 
@@ -93,7 +93,7 @@ two sibling folders. This bends "one folder per step" while keeping its intent: 
 
 **2. STR-ness is not a separate subtree.** An STR candidate generator is just
 `allele_candidates/rung_ladder.rs` sitting next to the generic `allele_candidates/assembly.rs`, just
-as `locus/ssr.rs` sits next to `locus/pileup/`; the region's kind decides which runs. We do **not**
+as `locus_generation/ssr.rs` sits next to `locus_generation/pileup/`; the region's kind decides which runs. We do **not**
 split the pipeline into
 `ssr/` vs `generic/` — that would scatter each step's variants across two trees and make
 the per-step comparison awkward. STR-ness is a property of certain *implementations*, not
@@ -152,20 +152,20 @@ it, and bench *judges* it. Swapping one part and re-running is the unit of work.
 ### The locus stream — where `SampleLocusObservations` is born
 
 `pipeline.rs` is orchestration only; the per-locus units it drives come from a **locus
-stream** (`ng_proposal.md` §1, *The locus stream*). `locus/` mints every locus, whatever
+stream** (`ng_proposal.md` §1, *The locus stream*). `locus_generation/` mints every locus, whatever
 its kind, which is what keeps SNP / indel / STR at one level:
 
 ```
 region_typing/  types the reference into TypedRegions (reference-based; spec ../spec/typed_regions.md)
-   └─▶ locus/ dispatches each region on its kind to the generator that handles it:
-        ├─ SsrSegment → locus/ssr.rs     → 1 locus, defined from the reference
-        ├─ Generic    → locus/pileup/    → many loci, split from the data
+   └─▶ locus_generation/ dispatches each region on its kind to the generator that handles it:
+        ├─ SsrSegment → locus_generation/ssr.rs     → 1 locus, defined from the reference
+        ├─ Generic    → locus_generation/pileup/    → many loci, split from the data
         └─ Satellite / SsrBundle → NoLoci → 0 loci, counted with a reason
              └─▶ one stream of SampleLocusObservations
                   └─▶ pipeline.rs feeds it to the per-locus core (steps 6–9)
 ```
 
-**`locus/` is a step folder** — it owns the `LocusGenerator<S>` trait and every
+**`locus_generation/` is a step folder** — it owns the `LocusGenerator<S>` trait and every
 implementation of it, side by side, which is what principle 1 asks for. ng is an
 experimental caller and more than one generator per kind is expected; the segment type
 is a parameter on the trait so two generators for the *same* kind stay interchangeable
@@ -174,7 +174,7 @@ is a parameter on the trait so two generators for the *same* kind stay interchan
 *This reverses this doc's earlier call* that `pileup/` was infrastructure with "no
 swappable-trait bake-off surface of its own", sitting at the tree's top level beside
 `pipeline.rs` and `bench/`. It has one: the pileup is a `LocusGenerator` like any other,
-and it lives inside `locus/` with its siblings. Recorded rather than quietly changed
+and it lives inside `locus_generation/` with its siblings. Recorded rather than quietly changed
 because the old placement is what the tree above used to show.
 
 The related open question is **resolved**: `pileup/` is **built from** step 2's
@@ -211,10 +211,10 @@ serialization when memory forces it or when the evidence types stop churning.
 ## Open items
 
 - **Where step 5 (STR read-class / spanning) lives** — it is STR-only and feeds candidate
-  generation; likely a submodule of `allele_candidates/` or of `locus/ssr.rs`, not its own
+  generation; likely a submodule of `allele_candidates/` or of `locus_generation/ssr.rs`, not its own
   top-level step folder. Decide when the STR path is built.
 - **How much of the production `pileup/walker/` lifts** into an in-memory context, versus a
-  lean rewrite that calls its decompose/active-set core. Decide when `locus/pileup/` is
+  lean rewrite that calls its decompose/active-set core. Decide when `locus_generation/pileup/` is
   built. (*The subsume-or-compose half of this item is closed:* the pileup is **built from**
   step 2's `ReadPreparer`, per `../spec/read_preparation.md` §2.)
 - **Feature-gating.** If ng grows heavy, gate it behind a `cargo` feature so the production

@@ -35,6 +35,12 @@ by document kind:
   - [`sample_reads.md`](spec/sample_reads.md) — **the sample**: k files (usually several
     experiments) merged into one coordinate-ordered stream, with the cross-file checks. Stands
     on `alignment_file.md`.
+  - [`locus_generation.md`](spec/locus_generation.md) — the shared shape of locus generation:
+    typed regions → **a sample's loci** (`SampleLocusObservations`), the `LocusGenerator` contract,
+    the dispatcher. Joins the typed-region walk to read ingestion; ships only the `NoLoci` generator.
+  - [`locus_generation_ssr.md`](spec/locus_generation_ssr.md) — the first generator (STR): one
+    tract segment → one locus, adapting production `src/ssr/pileup/` and carrying partial (censored)
+    observations the old path dropped.
 - **`arch/`** — architecture (the shared types and the interfaces implementations
   plug into).
   - [`ng_step_interfaces.md`](arch/ng_step_interfaces.md) — the common domain
@@ -56,6 +62,12 @@ by document kind:
     companion to `spec/alignment_file.md`.
   - [`sample_reads.md`](arch/sample_reads.md) — `SampleReads`, the argmin merge and its
     per-read budget; seeds the shared `GenomePosition`. Companion to `spec/sample_reads.md`.
+  - [`locus_generation.md`](arch/locus_generation.md) — the shared locus-generation types &
+    interfaces (`SampleLocusObservations`, `ObservedSequence`, `LocusGenerator<S>`, the dispatcher,
+    `NoLoci`); companion to `spec/locus_generation.md`.
+  - [`locus_generation_ssr.md`](arch/locus_generation_ssr.md) — the STR generator's types &
+    interfaces (`SsrLocus`, `SsrGenerator`, the reservoir cap and its traps); companion to
+    `spec/locus_generation_ssr.md`.
 - **`impl_plan/`** — step-by-step implementation plans (build order, not new design).
   - [`foundations.md`](impl_plan/foundations.md) — the first ng code: skeleton,
     `types.rs` seed, and the `RefSeq` accessor (three impls).
@@ -71,6 +83,13 @@ by document kind:
     the `run_typed_regions` driver.
   - [`reference_info.md`](impl_plan/reference_info.md) — the reference-info reader: types →
     `.fai` reader → FASTA pass (the heart) → writer → cache → the two entry points.
+  - [`locus_generation.md`](impl_plan/locus_generation.md) — the shared locus-generation shape:
+    the `locus_generation/` module, the locus types, `LocusGenerator<S>` + `NoLoci`, the
+    dispatcher, and the iterator (proven with the count-only generator). Ships no real generator.
+  - [`locus_generation_ssr.md`](impl_plan/locus_generation_ssr.md) — the STR generator: the
+    prerequisite `flank_bp`→`bundle_threshold` rename, `SsrLocus` + margin fetch, the ported
+    reservoir cap, the fetch→align→tally transform, and byte parity vs production. Gated on the
+    ng STR aligner.
 
 This mirrors the repo-wide `doc/devel/{specs,architecture,implementation_plans}`
 convention but scoped to ng, so the growing set of ng docs stays together.

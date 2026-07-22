@@ -8,7 +8,8 @@ Inherits the locus type, the contract, the dispatch and the error model from
 [src/ssr/pileup/](src/ssr/pileup/). Naming: **STR** in prose, `ssr` in code — and the per-read
 operation is **`align_read`**: on the STR path it is a pair-HMM alignment, not the left-align+BAQ
 "preparation" the generic path does. `read_preparation_ssr.md` still specs it as the `ReadPreparer`
-trait's `prepare_read`; that name should be reconciled to `align_read` for the STR path.*
+trait's `prepare_read`; that name should be reconciled to `align_read` for the STR path.
+Code-facing companion: [../arch/locus_generation_ssr.md](../arch/locus_generation_ssr.md).*
 
 ---
 
@@ -299,7 +300,7 @@ observations are new behaviour with no oracle: they are measured, not verified.
   consumption (§3).
 - **A second STR generator.** The contract exists so alternatives can sit side by side
   (`locus_generation.md` §4); GangSTR-style realignment of every read against a synthetic repeat
-  reference is the recorded candidate (`read_preparation_ssr.md` §6). **Home: `src/ng/locus/`**,
+  reference is the recorded candidate (`read_preparation_ssr.md` §6). **Home: `src/ng/locus_generation/`**,
   beside this one.
 - **Widening policy for long alleles** — inherited from production; whether it stays fixed or becomes
   a knob is the aligner's call (`read_preparation_ssr.md` §8).

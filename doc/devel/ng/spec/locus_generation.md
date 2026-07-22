@@ -7,7 +7,8 @@ preamble; each segment kind's generator gets its own spec, the first being
 ([typed_regions.md](typed_regions.md)) and on read ingestion ([sample_reads.md](sample_reads.md),
 [alignment_file.md](alignment_file.md) — built on the `ng-read-ingestion` line; not in this worktree's
 tree, so its citations were verified against that worktree).
-Naming: **STR** in prose, `ssr` in code.*
+Naming: **STR** in prose, `ssr` in code. Code-facing companion:
+[../arch/locus_generation.md](../arch/locus_generation.md) (the types and interfaces).*
 
 ---
 
@@ -423,11 +424,11 @@ question the manager needs answered separately from "what will it never cover?" 
 the STR generator, so `SsrSegment` does real work while `Generic` and `SsrBundle` fall to
 `NotImplemented` and `Satellite` to `OutOfScope`.
 
-**Module layout.** `src/ng/locus/` — a folder, per `module_layout.md` principle 1: a step whose
+**Module layout.** `src/ng/locus_generation/` — a folder, per `module_layout.md` principle 1: a step whose
 implementations compete keeps its trait and every implementation side by side.
 
 ```
-src/ng/locus/
+src/ng/locus_generation/
   mod.rs      – SampleLocusObservations, ObservedSequence, LocusGenerator, the dispatcher, NoLoci
   ssr.rs      – the STR generator (locus_generation_ssr.md)
   pileup/     – the generic generator (deferred, §11)
@@ -542,11 +543,14 @@ not it has merged.
    re-query, so nothing should later "tidy" that state onto the handle.
 3. **Depth capping stays out.** Confirming, not requesting: capping is a generator's decision (§4).
    Two caps would compose into a silently different kept set.
-4. **A contig present in the reference but absent from a sample's `@SQ` header must yield zero reads,
-   not an error.** Ordinary on scaffold-rich assemblies and on cohorts mapped against different
-   header subsets. If it errors, §6's model makes it fatal and the sample truncates at the first such
-   locus — one benign header difference costing every locus after it. *Leaning:* zero reads, since a
-   contig with no alignments is an absence of evidence, not a broken run. **Confirm before code.**
+4. **Reference and `@SQ` must match exactly — resolved (owner, 2026-07-22), and already enforced
+   upstream.** The reads were mapped against this reference, so each file's `@SQ` list must equal the
+   reference contig list — names, lengths, order — which read ingestion checks at file open
+   ([src/ng/read/input/open_bam.rs:243](src/ng/read/input/open_bam.rs#L243)). A contig in the
+   reference but absent from a sample's `@SQ` is therefore rejected there and never reaches this
+   step, so there is no per-locus "zero reads vs. error" case for this step to handle. *This
+   supersedes the earlier "zero reads" lean*, which assumed header subsets were ordinary; the
+   ingestion contract requires exact equality instead.
 
 **Nothing here blocks this step.** Item 1 is a cost, not a correctness problem, and can land on
 either branch.
@@ -587,7 +591,7 @@ neither.
 
 ## 11. Deferred, with a recommended home
 
-- **The pileup generator** for `Generic` regions — `src/ng/locus/pileup/`, its own spec. It also owns
+- **The pileup generator** for `Generic` regions — `src/ng/locus_generation/pileup/`, its own spec. It also owns
   the `chain_ids` question of §3 (carry cross-locus read identifiers, or drop compound haplotypes) and
   adds the read-position-bias fields (`placed_left`, `placed_start`) to `ObservedSequence` — generic-only,
   omitted from the shared type because a tract makes them degenerate (§3).
@@ -601,7 +605,7 @@ neither.
 - **A generator for `SsrBundle`** — it records at least depth per position, so a bundle's bases stop
   being a hole in the depth profile the windowed statistics slide over. Whether it also emits
   observed sequences is open. Routed to `NoLoci { NotImplemented }` meanwhile, with its bases counted,
-  so the gap stays visible until it is filled. **Home: `src/ng/locus/`**, beside the STR generator.
+  so the gap stays visible until it is filled. **Home: `src/ng/locus_generation/`**, beside the STR generator.
 - **The cohort merge** — many samples' loci into cohort loci, by overlap (§3). **Home: the cohort
   spec.** Its one requirement on this step is that a locus carry enough to be projected onto a wider
   span.
@@ -639,16 +643,15 @@ neither.
   kind, each variant carrying its own extras (§3) — which also restores `ng_step_interfaces.md`'s
   "STR-awareness is a type, not a convention". Purity joins `SsrDetail` when the interrupted-repeat
   work needs it, with no further type change.
-- **Does a generator ever need to see more than one region at a time?** Every generator here is
-  handed one segment. A pileup that wants to call across a segment boundary — an indel spanning the
-  join between a `Generic` stretch and an adjacent tract — would not fit. *Leaning:* it does not,
-  because the typed-region tiling is gap-free so the neighbouring region is generated next and the
-  merge reconciles by overlap anyway. *What would settle it:* the pileup generator's design.
-  **Confirm before the second generator is built** — it is the one assumption in §4's contract that a
-  later generator could invalidate.
-- **A contig in the reference but absent from a sample's `@SQ` header — zero reads or an error?** A
-  dependency on `SampleReads` behaviour, stated in full as §8 item 4 (leaning: zero reads; confirm
-  before code). Noted here too so it is visible to a reader scanning the open questions.
+- **Does a generator ever need to see more than one region at a time? — resolved: no (owner,
+  2026-07-22).** Each genomic segment is resolved independently, so no generator needs cross-segment
+  context: the typed-region tiling is gap-free, the neighbouring region is generated next, and the
+  merge reconciles by overlap. A pileup wanting to call across a segment boundary (an indel spanning
+  the join between a `Generic` stretch and an adjacent tract) reconciles at the merge, not by
+  widening this contract. This confirms §4's one-segment contract.
+- **A contig in the reference but absent from a sample's `@SQ` header — resolved: cannot occur.**
+  Reference and `@SQ` must match exactly, enforced at read ingestion — stated in full as §8 item 4.
+  Noted here too so it is visible to a reader scanning the open questions.
 
 ---
 
