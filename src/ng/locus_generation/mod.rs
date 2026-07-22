@@ -469,6 +469,86 @@ impl GeneratorSet {
     }
 }
 
+/// Lazily turns a typed-region stream into a sample's loci — the public surface of locus
+/// generation.
+///
+/// Holds **no buffer of loci**: it drives the current region one locus at a time via the
+/// [`GeneratorSet`], and only when that region is exhausted pulls the next from the stream,
+/// so exactly one locus is resident regardless of how many a region yields (spec §6, §9).
+/// Loci come out in the stream's order, which is coordinate order (spec §2).
+///
+/// Generic over the region stream `T` so a `Vec` can stand in for the real
+/// `TypedRegionIterator` in tests. The generator set is a concrete [`GeneratorSet`] — the
+/// per-run swap lives in its trait-object slots, not in a type parameter.
+pub struct SampleLocusObservationsIterator<T> {
+    regions: T,
+    reads: SampleReads,
+    generators: GeneratorSet,
+    /// Latched on clean exhaustion or a fatal error — the fused contract.
+    done: bool,
+}
+
+impl<T> SampleLocusObservationsIterator<T> {
+    /// `regions` is the typed-region stream, `reads` the sample's reads, `generators` the set
+    /// the dispatcher routes to (spec §6). (No `LocusConfig` yet — it lands when it has a
+    /// field; an empty one would be a dormant lever.)
+    pub fn new(regions: T, reads: SampleReads, generators: GeneratorSet) -> Self {
+        Self {
+            regions,
+            reads,
+            generators,
+            done: false,
+        }
+    }
+
+    /// The running tally — current at any point, final once the stream is exhausted.
+    pub fn counts(&self) -> &LocusCounts {
+        self.generators.counts()
+    }
+}
+
+impl<T> Iterator for SampleLocusObservationsIterator<T>
+where
+    T: Iterator<Item = Result<TypedRegion, TypedRegionError>>,
+{
+    type Item = Result<SampleLocusObservations, LocusGenerationError>;
+
+    /// Pull loci from the current region; when it is exhausted, take the next region and
+    /// begin it. A fatal error — from a generator or the upstream walk — is yielded once as
+    /// `Some(Err(_))` and then the iterator is done, so `?` makes it un-ignorable rather than
+    /// a silent end of stream (spec §6).
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+        loop {
+            match self.generators.next_locus(&self.reads) {
+                Ok(Some(locus)) => return Some(Ok(locus)),
+                Err(error) => {
+                    self.done = true;
+                    return Some(Err(error));
+                }
+                Ok(None) => match self.regions.next() {
+                    None => {
+                        self.done = true;
+                        return None;
+                    }
+                    Some(Err(error)) => {
+                        self.done = true;
+                        return Some(Err(error.into()));
+                    }
+                    Some(Ok(region)) => self.generators.begin_region(region),
+                },
+            }
+        }
+    }
+}
+
+impl<T> std::iter::FusedIterator for SampleLocusObservationsIterator<T> where
+    T: Iterator<Item = Result<TypedRegion, TypedRegionError>>
+{
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -737,6 +817,219 @@ mod tests {
             "a handled region is not unhandled"
         );
         assert_eq!(counts.unhandled_out_of_scope, 0);
+    }
+
+    /// A generator that emits `per_segment` loci per segment, each carrying the segment's own
+    /// coordinates — so the output echoes region order (for the order check) and a region
+    /// yielding *several* loci is exercised through the iterator (spec §13.4).
+    struct EchoGenerator {
+        per_segment: u32,
+        remaining: u32,
+        region: Option<GenomeRegion>,
+    }
+
+    impl EchoGenerator {
+        fn new(per_segment: u32) -> Self {
+            Self {
+                per_segment,
+                remaining: 0,
+                region: None,
+            }
+        }
+    }
+
+    impl<S> LocusGenerator<S> for EchoGenerator {
+        fn begin_segment(&mut self, region: GenomeRegion) {
+            self.remaining = self.per_segment;
+            self.region = Some(region);
+        }
+
+        fn next_locus(
+            &mut self,
+            _segment: &S,
+            _reads: &SampleReads,
+        ) -> Result<Option<SampleLocusObservations>, LocusGenerationError> {
+            if self.remaining == 0 {
+                return Ok(None);
+            }
+            self.remaining -= 1;
+            Ok(Some(locus(
+                self.region.expect("begin_segment ran first"),
+                Vec::new(),
+            )))
+        }
+    }
+
+    fn echo_slot(per_segment: u32) -> GeneratorSlot<()> {
+        GeneratorSlot::Generator(Box::new(EchoGenerator::new(per_segment)))
+    }
+
+    /// A generator that emits one locus, then fails — so a fatal generator error *after* a
+    /// locus has already been yielded is exercised (distinct from the upstream-stream error).
+    struct FailAfterOneGenerator {
+        emitted: bool,
+    }
+
+    impl<S> LocusGenerator<S> for FailAfterOneGenerator {
+        fn begin_segment(&mut self, _region: GenomeRegion) {
+            self.emitted = false;
+        }
+
+        fn next_locus(
+            &mut self,
+            _segment: &S,
+            _reads: &SampleReads,
+        ) -> Result<Option<SampleLocusObservations>, LocusGenerationError> {
+            if !self.emitted {
+                self.emitted = true;
+                return Ok(Some(locus(region(1, 1), Vec::new())));
+            }
+            Err(LocusGenerationError::Reads(IngestError::NoFiles))
+        }
+    }
+
+    /// The iterator drains a multi-kind stream and accounts every region, yielding nothing
+    /// when all kinds are unimplemented — the shape run on its own (spec §2, §13.2, §13.3).
+    #[test]
+    fn the_iterator_drains_and_accounts_a_multi_kind_stream() {
+        let (_reference_dir, _bam_dir, reads) = sample_reads_over_fixture();
+        let regions = vec![
+            Ok(typed(RegionKind::Generic, 1, 10)),
+            Ok(typed(an_ssr_segment(20, 25), 20, 25)),
+            Ok(typed(RegionKind::Satellite, 200, 400)),
+        ];
+        let mut iterator = SampleLocusObservationsIterator::new(
+            regions.into_iter(),
+            reads,
+            GeneratorSet::all_unimplemented(),
+        );
+
+        assert!(
+            iterator.next().is_none(),
+            "an unimplemented run emits no loci"
+        );
+
+        let counts = iterator.counts();
+        assert_eq!(counts.regions_in, 3);
+        assert_eq!(counts.unhandled_not_implemented, 2);
+        assert_eq!(counts.unhandled_out_of_scope, 1);
+        assert_eq!(
+            counts.regions_in,
+            counts.regions_handled
+                + counts.unhandled_not_implemented
+                + counts.unhandled_out_of_scope,
+        );
+    }
+
+    /// Emitted loci are in coordinate order across a multi-region, multi-kind stream — the
+    /// output-order contract (spec §2, §13.4).
+    #[test]
+    fn loci_come_out_in_coordinate_order_across_kinds() {
+        let (_reference_dir, _bam_dir, reads) = sample_reads_over_fixture();
+        let regions = vec![
+            Ok(typed(RegionKind::Generic, 1, 10)),
+            Ok(typed(an_ssr_segment(20, 25), 20, 25)),
+            Ok(typed(a_bundle(), 100, 160)),
+        ];
+        let set = GeneratorSet::new(
+            GeneratorSlot::Generator(Box::new(EchoGenerator::new(1))),
+            echo_slot(1),
+            echo_slot(1),
+        );
+        let iterator = SampleLocusObservationsIterator::new(regions.into_iter(), reads, set);
+
+        let starts: Vec<u64> = iterator
+            .map(|item| item.unwrap().region.start.get())
+            .collect();
+        assert_eq!(
+            starts,
+            vec![1, 20, 100],
+            "one locus per region, in the stream's coordinate order"
+        );
+    }
+
+    /// A region yielding **several** loci streams them all, in order, before the next region
+    /// — the iterator's "keep driving the same region across successive polls" branch, which
+    /// spec §13.4 names explicitly.
+    #[test]
+    fn a_region_yielding_several_loci_streams_them_all_before_advancing() {
+        let (_reference_dir, _bam_dir, reads) = sample_reads_over_fixture();
+        let regions = vec![
+            Ok(typed(RegionKind::Generic, 1, 10)), // generic slot → 3 loci at start=1
+            Ok(typed(an_ssr_segment(20, 25), 20, 25)), // ssr slot → 2 loci at start=20
+        ];
+        let set = GeneratorSet::new(
+            GeneratorSlot::Generator(Box::new(EchoGenerator::new(2))),
+            echo_slot(3),
+            GeneratorSlot::Unfilled(UnhandledReason::NotImplemented),
+        );
+        let iterator = SampleLocusObservationsIterator::new(regions.into_iter(), reads, set);
+
+        let starts: Vec<u64> = iterator
+            .map(|item| item.unwrap().region.start.get())
+            .collect();
+        // The first region's 3 loci in full, then the second's 2 — none dropped, none early.
+        assert_eq!(starts, vec![1, 1, 1, 20, 20]);
+    }
+
+    /// A fatal generator error — after a locus has already been yielded — is surfaced once,
+    /// then the iterator fuses. Distinct from the upstream-stream error path (spec §6).
+    #[test]
+    fn a_generator_error_mid_region_is_fatal_and_fuses() {
+        let (_reference_dir, _bam_dir, reads) = sample_reads_over_fixture();
+        let regions = vec![
+            Ok(typed(an_ssr_segment(20, 25), 20, 25)),
+            Ok(typed(RegionKind::Generic, 1, 10)),
+        ];
+        let set = GeneratorSet::new(
+            GeneratorSlot::Generator(Box::new(FailAfterOneGenerator { emitted: false })),
+            GeneratorSlot::Unfilled(UnhandledReason::NotImplemented),
+            GeneratorSlot::Unfilled(UnhandledReason::NotImplemented),
+        );
+        let mut iterator = SampleLocusObservationsIterator::new(regions.into_iter(), reads, set);
+
+        assert!(
+            matches!(iterator.next(), Some(Ok(_))),
+            "the one locus before the failure"
+        );
+        match iterator.next() {
+            Some(Err(LocusGenerationError::Reads(_))) => {}
+            other => panic!("expected a fatal generator error, got {other:?}"),
+        }
+        assert!(
+            iterator.next().is_none(),
+            "fused after the generator error — the second region is never reached"
+        );
+    }
+
+    /// A fatal upstream error is yielded once, wrapped, then the iterator is done — a failure
+    /// never looks like clean end-of-stream, and the iterator is fused (spec §6).
+    #[test]
+    fn a_stream_error_is_fatal_and_the_iterator_fuses() {
+        let (_reference_dir, _bam_dir, reads) = sample_reads_over_fixture();
+        let regions = vec![
+            Ok(typed(RegionKind::Generic, 1, 10)),
+            Err(TypedRegionError::MarginNarrowerThanFlank {
+                max_str_len: 1,
+                flank_bp: 2,
+            }),
+            Ok(typed(RegionKind::Generic, 20, 30)),
+        ];
+        let mut iterator = SampleLocusObservationsIterator::new(
+            regions.into_iter(),
+            reads,
+            GeneratorSet::all_unimplemented(),
+        );
+
+        match iterator.next() {
+            Some(Err(LocusGenerationError::TypedRegion(_))) => {}
+            other => panic!("expected a fatal wrapped TypedRegion error, got {other:?}"),
+        }
+        assert!(
+            iterator.next().is_none(),
+            "fused: nothing after the fatal error"
+        );
+        assert!(iterator.next().is_none(), "still fused on a repeated poll");
     }
 
     /// The types compose into a locus of each kind — a smoke test that the shared
