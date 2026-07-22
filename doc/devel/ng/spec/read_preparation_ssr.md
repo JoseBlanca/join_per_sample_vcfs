@@ -222,7 +222,7 @@ new observation class is worthless if selection still drops its inputs upstream.
 
 - **Tract tally (dedup into per-sequence counts) → the STR gatherer.** `Exact` observations
   aggregate into a `Vec<(tract_bytes, depth)>` — the STR-path counterpart of the pileup walker,
-  producing `LocusEvidence`. Aggregation across reads is not a per-read preparation step.
+  producing `SampleLocusObservations`. Aggregation across reads is not a per-read preparation step.
   **`LowerBound` observations do not dedup the same way** and the gatherer must say how it carries
   them: a bound of "≥ k units" is compatible with *many* alleles, so it cannot collapse into the
   exact-sequence count table without losing its meaning. Deciding that representation is the

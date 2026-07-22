@@ -58,8 +58,8 @@ step. **Production does not move.**
 
 - **The generic join** — the pileup splitting a `Generic` region into loci from the data. The next
   slice; `pileup/`'s own spec.
-- **The STR gatherer** — fetch → prepare → tally an `SsrLocus` into `LocusEvidence`; a region-driven
-  `RecordSource`. Its own spec (spec §9).
+- **The STR locus generator** — fetch → prepare → tally an `SsrLocus` into `SampleLocusObservations`. Specced in
+  `../spec/locus_generation_ssr.md`.
 - **Bundle disposal** — what a consumer does with an `SsrBundle` (spec §10). The gatherer's call; this
   plan only *emits* the region.
 - **The experiments** — period × length routing frontier, flank size, satellite cap (spec §10). Config
@@ -529,8 +529,8 @@ commit — the Revision's guarantee is only worth what it is verified by.
 
 - **The pileup / generic join** — splitting a `Generic` region into loci from the data (`pileup/`'s
   spec); it owns "what counts as a generic locus", the bake-off this step declined to fake.
-- **The STR gatherer** — `SsrLocus` region → `LocusEvidence` (fetch + prepare + tally), and the
-  region-driven `RecordSource` it needs. Its own spec.
+- **The STR locus generator** — `SsrLocus` region → `SampleLocusObservations` (fetch + prepare + tally), reading
+  its reads through `SampleReads`. Specced in `../spec/locus_generation_ssr.md`.
 - **Bundle disposal** — the `SsrBundle` consumer (spec §10); the gatherer's call.
 - **The routing/threshold experiments** — period × length, flank size, satellite cap (spec §10); config
   sweeps on the finished walk, scored on the standards, not build order.

@@ -177,7 +177,7 @@ genome
        • an STR stretch is blessed as a locus, 1:1           → reference-defined locus
        • a non-STR stretch is walked by the pileup, which
          splits it into loci and gathers each one's reads    → data-defined loci
-  ─▶ one stream of loci, each carrying its LocusEvidence
+  ─▶ one stream of loci, each a SampleLocusObservations
   ─▶ consumed uniformly by the per-locus core (steps 6–9)    → a variant, or discarded
 ```
 
@@ -185,7 +185,7 @@ Three things this makes explicit:
 
 - **Two loci-minting mechanisms, one downstream contract.** Downstream of the stream,
   nothing knows or cares whether a locus came from the catalog or from the pileup — it
-  sees a `LocusKind` carrying `LocusEvidence`. That uniformity *is* "the three markers
+  sees a `SampleLocusObservations`. That uniformity *is* "the three markers
   at one level": SNP and indel are not separate branches, they are both outcomes of
   *generic* loci; the marker type is a property of the emitted variant, not a parallel
   pipeline. The router is the single fork, and everything after the stream is shared.
@@ -204,7 +204,7 @@ Three things this makes explicit:
   algorithm and gets its own module (it *is* our production `pileup/walker/`, the reuse
   target). And *what counts as a non-STR locus* — a single position, an active-region
   window, a haplotype window grown to a fixpoint — is itself a swappable axis the lab
-  will bake off, so "define the locus/window" and "gather its evidence" stay
+  will compare head-to-head, so "define the locus/window" and "gather its evidence" stay
   conceptually separable even where an implementation fuses them.
 
 **Analyse each step, but measure end-to-end.** The steps are coupled (priors,
@@ -214,6 +214,13 @@ rest fixed, judge by the whole pipeline against the standards (§2). And a step 
 only "done" when its contract is narrow enough that a competing implementation —
 or one lifted from freebayes/GATK/HipSTR — drops in. That is what makes both the
 cross-caller bake-off and the eventual port-back (§3) real.
+
+**Jargon, once — a *bake-off*.** Exactly the comparison just described, run
+head-to-head: two or more implementations of one step, the same data, the same
+standards, everything else in the pipeline held constant, and the winner decided by
+measurement rather than argument. The term is borrowed from cooking competitions and is
+used throughout the ng documents for this; where it appears, it means nothing more than
+"swap one implementation, hold the rest, measure."
 
 ---
 

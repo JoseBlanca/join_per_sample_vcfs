@@ -71,15 +71,15 @@ gatherer *is* the preparation — each takes a prepared read as input.
 This resolves the standing open question in `module_layout.md` (*"does `pileup/` subsume the
 generic path's step 2, or is it built from it?"*): **built from it.** `ReadPreparer` is a real step;
 the pileup (generic) and the tract tally (STR) are its consumers, one step upstream of where the
-two paths converge at `LocusEvidence`.
+two paths converge at `SampleLocusObservations` (`locus_generation.md` §3).
 
 ```
-generic:  MappedRead ─prepare▶ PreparedRead ─▶ pileup walker ─▶ LocusEvidence
-STR:      MappedRead ─prepare▶ SsrTractObs    ─▶ tract tally    ─▶ LocusEvidence ─▶ Lr (step 7)
-                                                                  └── the paths converge here ──┘
+generic:  MappedRead ─prepare▶ PreparedRead ─▶ pileup generator ─▶ SampleLocusObservations
+STR:      MappedRead ─prepare▶ SsrTractObs  ─▶ STR generator    ─▶ SampleLocusObservations ─▶ Lr (step 7)
+                                                                   └── the paths converge here ──┘
 ```
 
-Because the paths only converge at `LocusEvidence`, the prepared read is **inherently
+Because the paths only converge at `SampleLocusObservations`, the prepared read is **inherently
 pre-convergence and path-specific** — which is exactly why forcing a single output type here
 (an earlier draft's `LocusRead` enum) was wrong, and why the trait keeps the output path-owned
 (§3). (Contrast step 6, candidate generation, where generic and STR legitimately share one
@@ -110,7 +110,7 @@ pub trait ReadPreparer {
 
     /// The per-read prepared observation this implementation emits — path-owned:
     /// `PreparedRead` (generic) or `SsrTractObs` (STR). The two converge only downstream, at
-    /// `LocusEvidence`, never here.
+    /// `SampleLocusObservations`, never here.
     type Prepared;
 
     /// Prepare one filtered read. The implementation **holds its own reference accessors**

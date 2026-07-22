@@ -35,14 +35,19 @@ src/ng/
 │                          file — no bake-off; wraps the bam/alignment_input filters)
 │                        · mod.rs + left_align_baq.rs / reassembly.rs / pair_hmm.rs –
 │                          step 2: ReadPreparer trait + its swappable impls, side by side
-├── region_typing.rs  – step 3  the typed-region generator: walks the reference and cuts it into
-│                       TypedRegion { region, kind } (SsrLocus/SsrBundle/Generic/Satellite). A
+├── region_typing/    – step 3  the typed-region generator: walks the reference and cuts it into
+│                       TypedRegion { region, kind } (SsrSegment/SsrBundle/Generic/Satellite). A
 │                       concrete iterator, no trait (no bake-off). Spec ../spec/typed_regions.md;
 │                       arch typed_regions.md
-├── pileup/           – the non-STR loci+evidence generator (NOT a step — infrastructure,
-│                       like pipeline.rs/bench). Walks each non-STR stretch, splits it
-│                       into loci, and gathers each locus' evidence → LocusEvidence.
-│                       Reuse target: the production pileup/walker/. See *The locus stream*.
+├── locus/            – the locus generators: turn one typed region into a sample's loci.
+│                       LocusGenerator<S> trait + one impl per segment kind, side by side —
+│                       a step folder, because alternatives per kind are expected.
+│                        · mod.rs   – SampleLocusObservations, ObservedSequence, LocusGenerator,
+│                          the dispatch match, NoLoci (the count-only generator)
+│                        · ssr.rs   – the STR generator (../spec/locus_generation_ssr.md)
+│                        · pileup/  – the generic generator: walks a non-STR stretch, splits
+│                          it into loci from the data. Reuse target: production pileup/walker/.
+│                       Spec ../spec/locus_generation.md. See *The locus stream*.
 ├── pre_pass/         – step 4  Caller, SampleSummarizer, CohortEstimator + impls
 ├── allele_candidates/ – step 6  CandidateGenerator + impls (rung_ladder [STR], assembly [generic])
 ├── likelihood/       – step 7  ReadLikelihood + impls (stutter models, pair-HMM)
@@ -55,12 +60,13 @@ src/ng/
 ├── allele_representation/ – step 12 AlleleRepresentation
 ├── quality/          – step 13 QualityModel
 │
-├── pipeline.rs       – the CallerRecipe + the driver that runs it end-to-end (single-phase)
+├── pipeline.rs       – the CallerRecipe + the driver that runs it end-to-end (per-sample
+│                       stage, then the cohort gather; the artifact between them is in memory)
 └── bench/            – the standards harness: gold / silver / synthetic scoring
 ```
 
 (Steps 5 — STR read-class / spanning — and the read-class machinery live inside
-`allele_candidates/` or the STR gatherer; see *Open items*.)
+`allele_candidates/` or `locus/ssr.rs`; see *Open items*.)
 
 ## Organizing principles
 
@@ -86,8 +92,9 @@ two sibling folders. This bends "one folder per step" while keeping its intent: 
 `ReadPreparer` implementations still sit side by side within `read/`.
 
 **2. STR-ness is not a separate subtree.** An STR candidate generator is just
-`allele_candidates/rung_ladder.rs` sitting next to the generic `allele_candidates/assembly.rs`; the
-router (step 3) decides which runs per locus. We do **not** split the pipeline into
+`allele_candidates/rung_ladder.rs` sitting next to the generic `allele_candidates/assembly.rs`, just
+as `locus/ssr.rs` sits next to `locus/pileup/`; the region's kind decides which runs. We do **not**
+split the pipeline into
 `ssr/` vs `generic/` — that would scatter each step's variants across two trees and make
 the per-step comparison awkward. STR-ness is a property of certain *implementations*, not
 a top-level division. (STR domain *types* — `SsrMotif`, `SsrPeriod`, `SsrLocus` — still
@@ -134,40 +141,57 @@ Nothing else in the tree changes — that locality is the point.
 - **`CallerRecipe`** (in `pipeline.rs`; defined in `ng_step_interfaces.md` §4) names one
   impl per step — it *is* one experiment ("freebayes candidates + HipSTR stutter
   likelihood + our cohort prior").
-- **`pipeline.rs`** drives a recipe over its inputs, single-phase, in memory.
+- **`pipeline.rs`** drives a recipe over its inputs: a per-sample stage producing each
+  sample's loci, then the cohort gather that merges them — the artifact in between held in
+  memory, not written (see *Crate boundary*).
 - **`bench/`** scores the pipeline's output against the standards and reports the frontier.
 
 So: the step folders provide the *parts*, the recipe *selects* a set, the pipeline *runs*
 it, and bench *judges* it. Swapping one part and re-running is the unit of work.
 
-### The locus stream — where `LocusEvidence` is born
+### The locus stream — where `SampleLocusObservations` is born
 
 `pipeline.rs` is orchestration only; the per-locus units it drives come from a **locus
-stream** (`ng_proposal.md` §1, *The locus stream*). Two modules mint loci, one stream
-consumes them, keeping SNP / indel / STR at one level:
+stream** (`ng_proposal.md` §1, *The locus stream*). `locus/` mints every locus, whatever
+its kind, which is what keeps SNP / indel / STR at one level:
 
 ```
-region_typing.rs  types the reference into TypedRegions (reference-based; spec ../spec/typed_regions.md)
-   ├─ STR stretch     → a locus, 1:1, defined from the reference (no reads needed)
-   └─ non-STR stretch → pileup/ walks it, splits it into loci, gathers each one's
-                        evidence (data-defined)
-        └─▶ one stream of LocusKind, each carrying LocusEvidence
-             └─▶ pipeline.rs feeds it to the per-locus core (steps 6–9)
+region_typing/  types the reference into TypedRegions (reference-based; spec ../spec/typed_regions.md)
+   └─▶ locus/ dispatches each region on its kind to the generator that handles it:
+        ├─ SsrSegment → locus/ssr.rs     → 1 locus, defined from the reference
+        ├─ Generic    → locus/pileup/    → many loci, split from the data
+        └─ Satellite / SsrBundle → NoLoci → 0 loci, counted with a reason
+             └─▶ one stream of SampleLocusObservations
+                  └─▶ pipeline.rs feeds it to the per-locus core (steps 6–9)
 ```
 
-So `pileup/` is where a non-STR locus and its `LocusEvidence` are actually built — a
-real algorithm (the reused `pileup/walker/`), not driver glue. It is deliberately **not
-a step folder**: it has no swappable-trait bake-off surface of its own (like
-`pipeline.rs` and `bench/`). *Open design question when `pileup/` is built:* whether it
-subsumes the generic path's step-2 (`ReadPreparer`) and locus-windowing, or is built from
-them — i.e. how much of the generic path opts out of the per-step bake-off in favour of
-the one battle-tested walker (see *Open items*).
+**`locus/` is a step folder** — it owns the `LocusGenerator<S>` trait and every
+implementation of it, side by side, which is what principle 1 asks for. ng is an
+experimental caller and more than one generator per kind is expected; the segment type
+is a parameter on the trait so two generators for the *same* kind stay interchangeable
+(`../spec/locus_generation.md` §4).
+
+*This reverses this doc's earlier call* that `pileup/` was infrastructure with "no
+swappable-trait bake-off surface of its own", sitting at the tree's top level beside
+`pipeline.rs` and `bench/`. It has one: the pileup is a `LocusGenerator` like any other,
+and it lives inside `locus/` with its siblings. Recorded rather than quietly changed
+because the old placement is what the tree above used to show.
+
+The related open question is **resolved**: `pileup/` is **built from** step 2's
+`ReadPreparer`, not a subsumer of it (`../spec/read_preparation.md` §2 — *compose, not
+subsume*). The generic path does not opt out of the per-step bake-off.
 
 ## Crate boundary and the port-back
 
-ng stays a single-phase module inside `pop_var_caller` (spec §3): no `.psp` split, one
-thread, reuse freely. The module tree here is the
-*research* home; the production modules remain the *scaling* home.
+ng stays a module inside `pop_var_caller` (spec §3): one thread, reuse freely. The module
+tree here is the *research* home; the production modules remain the *scaling* home.
+
+**On the per-sample/cohort split — revised.** This doc originally said "no `.psp` split,
+single-phase". ng does adopt production's two-level *shape* — per-sample stage → artifact →
+cohort gather — because a `SampleLocusObservations` is one sample's and cohort loci are built by merging
+many (`../spec/locus_generation.md` §3). What it does **not** adopt yet is the `.psp` file:
+the seam is the load-bearing thing, so the artifact starts in memory and gains a
+serialization when memory forces it or when the evidence types stop churning.
 
 ## Naming to confirm
 
@@ -187,15 +211,12 @@ thread, reuse freely. The module tree here is the
 ## Open items
 
 - **Where step 5 (STR read-class / spanning) lives** — it is STR-only and feeds candidate
-  generation; likely a submodule of `allele_candidates/` or the STR gatherer, not its own top-level
-  step folder. Decide when the STR path is built.
-- **`pileup/` — subsume or compose?** When the non-STR pileup is built, decide whether it
-  *subsumes* the generic path's step-2 (`ReadPreparer`) and locus-windowing into one reused
-  walker (so the generic path largely opts out of the per-step bake-off), or is *built
-  from* the swappable step-2/window traits. The asymmetry — generic = one battle-tested
-  engine, STR = finely decomposed research surface — may be exactly right, but it should be
-  a deliberate choice. Also: how much of the production `pileup/walker/` lifts into a
-  single-phase, in-memory context vs a lean rewrite that calls its decompose/active-set core.
+  generation; likely a submodule of `allele_candidates/` or of `locus/ssr.rs`, not its own
+  top-level step folder. Decide when the STR path is built.
+- **How much of the production `pileup/walker/` lifts** into an in-memory context, versus a
+  lean rewrite that calls its decompose/active-set core. Decide when `locus/pileup/` is
+  built. (*The subsume-or-compose half of this item is closed:* the pileup is **built from**
+  step 2's `ReadPreparer`, per `../spec/read_preparation.md` §2.)
 - **Feature-gating.** If ng grows heavy, gate it behind a `cargo` feature so the production
   build need not compile the lab. Decide once there is code to gate.
 - **`bench/` vs the existing `benchmarks/` tree.** `benchmarks/` holds data + scripts; the

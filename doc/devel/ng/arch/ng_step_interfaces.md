@@ -139,13 +139,13 @@ there is no invariant to protect, so a checked constructor would be ceremony.
 These are the payloads passed step→step; every step impl consumes and produces them.
 
 ```rust
-/// One sample's evidence at one locus — the per-locus, per-sample unit, and the
-/// currency of the **locus stream** (spec §1, *The locus stream*). A locus enters the
-/// stream from one of two mints, but downstream steps consume this type identically —
-/// that uniformity is what keeps SNP / indel / STR at one level:
-///   • an **STR** locus is reference-defined (the catalog blesses a tract 1:1);
-///   • a **generic** locus is data-defined (the `pileup/` module walks a non-STR
-///     stretch, splits it into loci, and gathers each one's reads).
+/// SUPERSEDED by `../spec/locus_generation.md` §3, which specced this step against both
+/// built tracks and renamed the type `SampleLocusObservations`. Three things changed, kept here
+/// because the sketch shows what was wrong: it **borrowed** its reads, where the real
+/// type must be owned (it is what a cohort stage merges and an artifact writes); it
+/// carried a `sample` field, redundant in a stream that has exactly one sample; and its
+/// per-read shape suited neither path, since both aggregate before emitting. The
+/// replacement is a region plus a path-owned observations enum.
 pub struct LocusEvidence<'a> {
     pub sample: SampleId,
     pub reads: &'a [LocusRead],   // step-2 prepared reads (STR path) / pileup output (generic)
@@ -162,18 +162,19 @@ pub struct LocusRead {
                                      // fraction (<1) — the freebayes lever we mean to test
 }
 
-/// The router's verdict for a locus (spec step 3). This is what makes STR-awareness
-/// a *type*, not a convention: only `Ssr` carries a motif/period/borders.
+/// What kind of locus this is — the per-locus core routes on it (steps 6, 12). This is what
+/// makes STR-awareness a *type*, not a convention. **Now defined concretely in
+/// `../spec/locus_generation.md` §3, which supersedes this sketch:** it names three kinds
+/// (bundles *do* produce loci — depth at least), and `Ssr` carries an `SsrDetail` (motif +
+/// the fetched reference flanks), not the id/period/ref_units sketched here — the id is gone
+/// (identity is coordinates), and period/ref_units are derivable from the motif and the
+/// locus's reference bases. It is a field of `SampleLocusObservations`, not a separate router
+/// output.
+#[non_exhaustive]
 pub enum LocusKind {
-    Generic(GenomeRegion),
-    Ssr(SsrLocus),
-}
-pub struct SsrLocus {
-    pub id: LocusId,
-    pub span: GenomeRegion,           // the tract, without flanks
-    pub motif: SsrMotif,
-    pub period: SsrPeriod,
-    pub ref_units: SsrRepeatUnits,
+    Generic,
+    Ssr(SsrDetail),
+    SsrBundle,
 }
 
 /// The candidate allele set at a locus (step 6). REF is always present at `ref_idx`.
@@ -247,7 +248,7 @@ pub trait ReadPreparer {
     type Locus;
     /// The per-read prepared observation — PATH-OWNED (no single unified type): PreparedRead
     /// (generic, reused from pileup/walker) or SsrTractObs (STR). The two converge only
-    /// downstream, at LocusEvidence.
+    /// downstream, at SampleLocusObservations.
     type Prepared;
     /// Realign/delimit one read. The impl HOLDS its own RefSeq/RawRefSeq accessors and fetches
     /// around the read's span — there is no window argument (production's process_read takes
@@ -266,7 +267,7 @@ Design settled across three specs: the shared contract
 `SsrTractObs`, consumed by the tract tally + step-7 likelihood) paths. Read prep **composes**
 with the gatherer, it is not subsumed (resolving the `module_layout.md` open question). The
 trait's output is **path-owned** (`type Prepared`), not a single unified type — the two paths
-converge only downstream at `LocusEvidence`. There is **no window argument**: the preparer holds
+converge only downstream at `SampleLocusObservations`. There is **no window argument**: the preparer holds
 its own `RefSeq`/`RawRefSeq` accessors and fetches around each read's span (as step 1's
 `ReadFilter` does), and the only per-call context is the routed locus (`type Locus`) — `()` on the
 generic path, `SsrLocus` on the STR path.
@@ -277,14 +278,16 @@ generic path, `SsrLocus` on the STR path.
 `route_locus(&RefWindow) -> LocusKind` fork. The step-3 spec and its arch doc retired all of it:
 step 3 has no bake-off (its variation is config, and active-region detection is data-driven and
 lives inside the pileup), so it is a **concrete iterator**, `TypedRegionIterator`, not a trait. Its
-output is `TypedRegion { region, kind }`, with `kind` a `RegionKind`: `SsrLocus` / `SsrBundle` /
+output is `TypedRegion { region, kind }`, with `kind` a `RegionKind`: `SsrSegment` / `SsrBundle` /
 `Generic` / `Satellite`. `LocusRouter`, `LocusSource`, and `RefWindow` are retired.
 
 **`LocusKind` is *not* retired — it is a different type at a different stage.** `RegionKind` (above)
-classifies a *region of the reference*, four ways. `LocusKind` (below, and steps 6/12) classifies a
-*locus to genotype*, two ways — `Ssr` or `Generic`. A `Generic` region is split by the pileup into
-many generic loci; an `SsrLocus` region is one Ssr locus; bundles and satellites are not loci at
-all. So step 3 no longer *outputs* `LocusKind`, but the per-locus core still consumes it.
+classifies a *region of the reference*, four ways. `LocusKind` (defined in
+`../spec/locus_generation.md` §3, and consumed by steps 6/12) classifies a *locus to genotype*, three
+ways — `Generic`, `Ssr`, `SsrBundle`. A `Generic` region is split by the pileup into many generic
+loci; an `SsrSegment` region is one `Ssr` locus; a bundle becomes a `SsrBundle` locus (depth at
+least); only satellites are not loci at all. So step 3 no longer *outputs* `LocusKind`, but the
+per-locus core still consumes it — off `SampleLocusObservations.kind`.
 
 Real interface: [`typed_regions.md`](typed_regions.md); spec: [`../spec/typed_regions.md`](../spec/typed_regions.md).
 
@@ -304,7 +307,7 @@ pub trait Caller {
     /// implementation that must NOT depend on the parameters being estimated — it uses
     /// a crude base-quality ε̂, not the fitted ε. `None` where it makes no call; the call
     /// carries its own quality, so "confident" is a property of the call, not a return type.
-    fn call(&self, evidence: &LocusEvidence) -> Option<GenotypeCall>;
+    fn call(&self, locus: &SampleLocusObservations) -> Option<GenotypeCall>;
 }
 
 /// Per sample (Stage 1). From this sample's confident rough calls, compute the
@@ -337,7 +340,7 @@ panel is in memory at once. `SampleSummary` here is the ng counterpart of the ex
 ### Step 6 — candidate allele generation
 ```rust
 pub trait CandidateGenerator {
-    fn generate_candidates(&self, evidence: &[LocusEvidence], locus: &LocusKind,
+    fn generate_candidates(&self, evidence: &[SampleLocusObservations], locus: &LocusKind,
                            params: &ModelParams) -> AlleleCandidates;
 }
 ```
@@ -442,7 +445,7 @@ generation + HipSTR stutter likelihood + our cohort prior" is one `CallerRecipe`
   STR sit at one level: step 3 segments the genome into STR / non-STR stretches, an STR
   stretch is a locus 1:1 (reference-defined), a non-STR stretch is split into loci and
   evidenced by the `pileup/` module (data-defined), and both feed one uniform stream of
-  `LocusEvidence` that the per-locus core consumes identically. The router is the *only*
+  `SampleLocusObservations` that the per-locus core consumes identically. The router is the *only*
   principled fork; SNP and indel are both generic loci, not separate branches. `pileup/`
   is first-class infrastructure (the reused `pileup/walker/`), not a step trait — see the
   step-3 note above and `module_layout.md`. ng is **not** "STR-first" as a design; that
@@ -505,7 +508,7 @@ were not freshly re-read.
 | ~~`RefWindow`~~ | — | **retired** (step-3 spec §6): its only consumer was `route_locus`, which is gone. The generator holds its own accessor and fetches for itself; production's `RefSpan` names a sequence-carrying span if one is ever wanted. Closes `LocusWindow` too |
 | `RefSeq` + `RawRefSeq` (traits) | `ChromRefFetcher` + `MultiChromRefFetcher` + `RepositoryRefFetcher` + `StreamingChromRefFetcher` + `ManualEvictChromRefFetcher` ([fasta/fetcher.rs](../../../../src/fasta/fetcher.rs)) | **consolidate** into `RefSeq` (universal canonical fetch) + the `RawRefSeq` capability + an inherent `evict_before` (no silent no-ops); reuse the fetcher impls behind them. Spec: [`../spec/ref_seq.md`](../spec/ref_seq.md) |
 | `MappedRead` | `MappedRead` ([bam/alignment_input.rs](../../../../src/bam/alignment_input.rs)) | reuse as-is (the step-2 input) |
-| `LocusRead` (prepared-read output) | — (name retired) | refined by the read-preparation specs into **path-owned** types — `PreparedRead` (generic) + `SsrTractObs` (STR); there is no single unified type (they converge downstream at `LocusEvidence`). **Correction:** an earlier row here called production's `PreparedRead` "a different concept (a decoded walker read)" and said not to reuse the name — the production survey disproved that: it *is* the generic step-2 output, field for field, so ng **reuses it as-is** (may want hoisting out of `pileup/walker/`). Downstream sketches that still say `LocusRead` reconcile when their steps are specced |
+| `LocusRead` (prepared-read output) | — (name retired) | refined by the read-preparation specs into **path-owned** types — `PreparedRead` (generic) + `SsrTractObs` (STR); there is no single unified type (they converge downstream at `SampleLocusObservations`). **Correction:** an earlier row here called production's `PreparedRead` "a different concept (a decoded walker read)" and said not to reuse the name — the production survey disproved that: it *is* the generic step-2 output, field for field, so ng **reuses it as-is** (may want hoisting out of `pileup/walker/`). Downstream sketches that still say `LocusRead` reconcile when their steps are specced |
 | `AlleleCandidates` | `CandidateSet` ([ssr/cohort/candidate_set.rs](../../../../src/ssr/cohort/candidate_set.rs)) | rename |
 | `SampleSummary` | ≈ the `.psp` `SampleSummary` ([sample_summary/](../../../../src/sample_summary/)) | reuse / align |
 | `ModelParams` | ≈ the SSR chemistry param set ([ssr/cohort/param_estimation.rs](../../../../src/ssr/cohort/param_estimation.rs)) + per-individual `F` | assemble from both levels |
