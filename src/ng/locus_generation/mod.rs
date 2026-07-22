@@ -48,6 +48,55 @@ pub struct SampleLocusObservations {
     pub kind: LocusKind,
 }
 
+impl SampleLocusObservations {
+    /// Read depth at each position of `region`, in order — **derived, not stored**.
+    ///
+    /// A [`Complete`](ReadCoverage::Complete) observation counts its `num_obs` at every
+    /// position; a [`PartialLeft(n)`](ReadCoverage::PartialLeft) at the leftmost `n`, a
+    /// [`PartialRight(n)`](ReadCoverage::PartialRight) at the rightmost `n`. The returned
+    /// vector has exactly `region.len()` entries.
+    ///
+    /// This is *observation* depth and only exact per locus: it omits reads that
+    /// covered the tract but anchored no border (they are in
+    /// [`reads_without_observation`](Self::reads_without_observation), a scalar with no
+    /// positions), and overlapping loci on the generic path double-count if summed. The
+    /// paralog filter owns both caveats (spec §3, §11).
+    pub fn num_obs_along_locus(&self) -> Vec<u32> {
+        let len = self.region.len() as usize;
+        let mut depth = vec![0u32; len];
+        for obs in &self.observed_sequences {
+            // A partial's covered extent cannot exceed the locus length — that is a
+            // producer invariant, enforced where `ReadCoverage` is minted (the STR
+            // generator). Here we *clamp* rather than `debug_assert`: this is a
+            // consumer-side derivation run over whole cohorts, and a debug-only guard
+            // compiles out of the release build this repo actually runs (a trap it has
+            // recorded hitting twice). Clamping keeps the derivation panic-free on any
+            // input; a bad extent is caught at the producer, not here.
+            let (from, to) = match obs.read_coverage {
+                ReadCoverage::Complete => (0, len),
+                ReadCoverage::PartialLeft(n) => (0, (n as usize).min(len)),
+                ReadCoverage::PartialRight(n) => (len - (n as usize).min(len), len),
+            };
+            for slot in &mut depth[from..to] {
+                *slot = slot.saturating_add(obs.num_obs);
+            }
+        }
+        depth
+    }
+
+    /// The observations a likelihood may score directly — the
+    /// [`Complete`](ReadCoverage::Complete) ones.
+    ///
+    /// A partial is a lower bound that mis-scores as a *short* allele until a censored
+    /// likelihood models it (step 7), so reaching the partials is a deliberate act:
+    /// this iterator is the guard (spec §3).
+    pub fn complete_observations(&self) -> impl Iterator<Item = &ObservedSequence> + '_ {
+        self.observed_sequences
+            .iter()
+            .filter(|obs| obs.read_coverage == ReadCoverage::Complete)
+    }
+}
+
 /// One distinct sequence the reads showed at a locus, with its support.
 ///
 /// The fields between `num_obs` and `chain_ids` are the per-read moments the SNP
@@ -146,6 +195,32 @@ mod tests {
         }
     }
 
+    /// An observation of `bases` with `num_obs` reads at a given coverage — the moment
+    /// fields are irrelevant to the depth derivation, so they are fixed.
+    fn obs(bases: &[u8], read_coverage: ReadCoverage, num_obs: u32) -> ObservedSequence {
+        ObservedSequence {
+            bases: Box::from(bases),
+            read_coverage,
+            num_obs,
+            num_fwd: 0,
+            q_sum: 0.0,
+            mapq_sum: 0,
+            mapq_sum_sq: 0,
+            chain_ids: Vec::new(),
+        }
+    }
+
+    fn locus(region: GenomeRegion, observed: Vec<ObservedSequence>) -> SampleLocusObservations {
+        SampleLocusObservations {
+            region,
+            reference_bases: Box::from(&b""[..]),
+            observed_sequences: observed,
+            reads_without_observation: 0,
+            reads_discarded_by_cap: 0,
+            kind: LocusKind::Generic,
+        }
+    }
+
     /// The types compose into a locus of each kind — a smoke test that the shared
     /// shape holds together before the contract and dispatcher land on it.
     #[test]
@@ -218,5 +293,91 @@ mod tests {
         };
         assert_ne!(complete, partial);
         assert_ne!(complete.read_coverage, partial.read_coverage);
+    }
+
+    /// Depth derives correctly from read-coverage (spec §13.5): the vector has
+    /// `region.len()` entries; a `Complete` raises every position, a `PartialLeft(n)`
+    /// only the leftmost `n`, a `PartialRight(n)` only the rightmost `n`. A 10-position
+    /// locus with one complete (×3), one left-partial reaching 4 (×2), one right-partial
+    /// reaching 3 (×5).
+    #[test]
+    fn depth_derives_from_read_coverage() {
+        let l = locus(
+            region(1, 10),
+            vec![
+                obs(b"AAAAAAAAAA", ReadCoverage::Complete, 3),
+                obs(b"AAAA", ReadCoverage::PartialLeft(4), 2),
+                obs(b"AAA", ReadCoverage::PartialRight(3), 5),
+            ],
+        );
+        // positions:            1  2  3  4  5  6  7  8  9 10
+        //   complete ×3:        3  3  3  3  3  3  3  3  3  3
+        //   left(4)  ×2:       +2 +2 +2 +2  .  .  .  .  .  .
+        //   right(3) ×5:        .  .  .  .  .  .  . +5 +5 +5
+        assert_eq!(l.num_obs_along_locus(), vec![5, 5, 5, 5, 3, 3, 3, 8, 8, 8],);
+    }
+
+    /// A single-base locus (a candidate SNP) has one depth position, raised by every
+    /// complete observation over it.
+    #[test]
+    fn single_base_locus_has_one_depth_position() {
+        let l = locus(
+            region(42, 42),
+            vec![
+                obs(b"A", ReadCoverage::Complete, 7),
+                obs(b"T", ReadCoverage::Complete, 2),
+            ],
+        );
+        assert_eq!(l.num_obs_along_locus(), vec![9]);
+    }
+
+    /// No observations → depth is zero at every position, still `region.len()` long
+    /// (the zero-coverage locus is a real one, not an absent one).
+    #[test]
+    fn no_observations_is_all_zero_full_length() {
+        assert_eq!(
+            locus(region(1, 4), Vec::new()).num_obs_along_locus(),
+            vec![0; 4]
+        );
+    }
+
+    /// A partial claiming to reach further than the locus is long is clamped, not an
+    /// out-of-bounds index — the defensive guard, on **both** ends. The right arm's
+    /// clamp is what keeps `len - n` from underflowing, so it is exercised too.
+    #[test]
+    fn partial_reach_beyond_locus_is_clamped() {
+        let left = locus(
+            region(1, 3),
+            vec![obs(b"AAA", ReadCoverage::PartialLeft(9), 4)],
+        );
+        assert_eq!(left.num_obs_along_locus(), vec![4, 4, 4]);
+
+        let right = locus(
+            region(1, 3),
+            vec![obs(b"AAA", ReadCoverage::PartialRight(9), 4)],
+        );
+        assert_eq!(right.num_obs_along_locus(), vec![4, 4, 4]);
+    }
+
+    /// `complete_observations()` yields only the complete entries — the guard that a
+    /// partial (a lower bound) is never scored as an exact allele.
+    #[test]
+    fn complete_observations_excludes_partials() {
+        let l = locus(
+            region(1, 6),
+            vec![
+                obs(b"ATATAT", ReadCoverage::Complete, 4),
+                obs(b"ATATAT", ReadCoverage::PartialLeft(6), 2),
+                obs(b"ATGTAT", ReadCoverage::Complete, 3),
+                obs(b"ATAT", ReadCoverage::PartialRight(4), 1),
+            ],
+        );
+        // Both completes, and only the completes — a partial is never scored as exact.
+        let complete: Vec<&[u8]> = l
+            .complete_observations()
+            .map(|o| o.bases.as_ref())
+            .collect();
+        assert_eq!(complete, vec![&b"ATATAT"[..], &b"ATGTAT"[..]]);
+        assert_eq!(l.complete_observations().count(), 2);
     }
 }
