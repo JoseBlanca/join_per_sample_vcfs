@@ -104,14 +104,14 @@ vs `PartialLeft` of identical `bases` stay distinct entries. *Depends:* A2. *Sou
 
 ### Milestone B — the contract, `NoLoci`, and the dispatcher (the heart)
 
-**☐ B1. `LocusGenerator<S>` + `NoLoci` + `UnhandledReason`.**
+**✅ B1. `LocusGenerator<S>` + `NoLoci` + `UnhandledReason`.** *(also `LocusGenerationError`, pulled forward from C1 — the trait signature needs it.)*
 The trait (`begin_segment`, `next_locus`, `S` a trait parameter not an associated type — arch §2);
 `NoLoci { reason: UnhandledReason }` with `UnhandledReason::{OutOfScope, NotImplemented}`, and
 `impl<S> LocusGenerator<S> for NoLoci` (counts the segment and its bases, emits nothing). *Depends:*
 A. *Source:* spec §4, §5, arch §2, §3. Verified: `NoLoci` over a segment yields `None` and tallies
 the bases; the reason is carried, not fixed.
 
-**☐ B2. The dispatcher + `LocusConfig` / `LocusCounts`.**
+**✅ B2. The dispatcher + `LocusCounts`.** *(GeneratorSet with trait-object slots collapses the arch `<T,G>` to concrete; `LocusConfig` deferred — an empty struct is a dormant lever.)*
 The exhaustive `match` over `RegionKind` routing each branch's payload to the generator supplied
 for it, with `Satellite → NoLoci { OutOfScope }` and every unfilled kind → `NoLoci { NotImplemented }`
 (spec §5); `LocusCounts` (regions/loci + the two `unhandled_*` counters and their `_bp`);
@@ -127,11 +127,11 @@ generic region.
 
 ### Milestone C — the public iterator (plumbing) + the acceptance anchor
 
-**☐ C1. `LocusGenerationError`.**
+**✅ C1. `LocusGenerationError`.** *(landed in B1.)*
 `#[non_exhaustive]` wrapping `TypedRegionError` / `IngestError` / `RefSeqError` — this step mints
 no error of its own (arch §4). *Depends:* B. *Source:* spec §6, arch §4.
 
-**☐ C2. `SampleLocusObservationsIterator<T, G>`.**
+**✅ C2. `SampleLocusObservationsIterator<T>`.** *(concrete GeneratorSet; no config param.)*
 `new(regions, reads, generators, config)`; `Iterator` with
 `Item = Result<SampleLocusObservations, LocusGenerationError>` — pull a region, `begin_segment`,
 call `next_locus` until `None`, then the next region; **no buffer of loci**; `counts()` running
@@ -139,7 +139,7 @@ tally; fused, fatal-in-stream (`Some(Err(_))` once then `None`). Mirrors `TypedR
 *Depends:* C1. *Source:* spec §6, arch §4. Verified: iterate a small multi-region fixture; a
 seeded upstream error surfaces as `Some(Err(_))` once then `None`.
 
-**☐ C3. The acceptance anchor.**
+**✅ C3. The acceptance anchor.**
 Over a multi-region, multi-kind fixture (all routed to `NoLoci`): `regions_in` reconciles against
 loci emitted plus `unhandled_not_implemented` plus `unhandled_out_of_scope`, and the two `_bp`
 counters sum to the bases those regions cover; loci come out in **coordinate order** across kinds;
