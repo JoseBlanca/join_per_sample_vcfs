@@ -46,11 +46,21 @@ same-primitive quantities is that **the compiler refuses to mix them**.
 
 ```rust
 pub struct ContigId(pub u32);       // index into the contig table
-pub struct Position(pub u64);       // 1-based reference position (matches VCF/SAM/IGV and the production engine)
+pub struct Position(pub u64);       // 1-based reference position *within* a contig — not genome-unique on its own
+pub struct GenomePosition { pub contig: ContigId, pub position: Position } // one base, genome-wide
 pub struct GenomeRegion { pub contig: ContigId, pub start: Position, pub end: Position } // 1-based inclusive [start, end]
 pub struct SsrMotif(Box<[u8]>);     // the repeat unit, phase-faithful (STR)
 pub struct SsrPeriod(u8);           // motif length in bp, the repeat period (STR); >= 1, validated
 ```
+
+**`Position` alone does not identify a base; `GenomePosition` does.** A bare `Position` is
+meaningful only once a contig is known, which is why so many signatures thread
+`(contig, position)` as two parameters. `GenomePosition` is that pair given a name — the
+point-shaped sibling of `GenomeRegion`, and the type any "where in the genome" value should
+use. Its derived `Ord` **is genome order** (contig index, then position), which is what makes
+it usable directly as a sort key wherever reads or loci are ordered along the reference.
+First real use: the read-order guard and the k-way merge
+([`alignment_file.md`](alignment_file.md), [`sample_reads.md`](sample_reads.md)).
 
 ### Lengths & deltas — the unit distinction that bit us
 

@@ -38,7 +38,7 @@ fn main() {
         }
     }
     let mut rows: Vec<(&Vec<u8>, (u32, u32))> = pooled.iter().map(|(s, v)| (s, *v)).collect();
-    rows.sort_by(|a, b| b.1.0.cmp(&a.1.0));
+    rows.sort_by_key(|row| std::cmp::Reverse(row.1.0));
     println!(
         "# start={target} n_samples_with_reads={n_samples_present} n_distinct_seq={}",
         rows.len()

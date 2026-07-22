@@ -13,8 +13,15 @@
 //! This is the deliberate, documented deviation from the "one folder per step"
 //! rule in `doc/devel/ng/arch/module_layout.md` principle 1 — see
 //! `doc/devel/ng/spec/read_filtering.md` §2.1.
+//!
+//! [`input`] joins them as step 1's **input edge** rather than a step of its
+//! own: opening and validating an alignment file, serving a region as an
+//! ordered stream, and merging a sample's several files into one. It feeds
+//! [`filtering`] — its region readers are the `RecordSource` the filter
+//! consumes — so it belongs beside it (`module_layout.md` principle 1, note b).
 
 pub mod filtering;
+pub mod input;
 
 pub use filtering::{
     BamRecordSource, CramRecordSource, NoodlesRawRecord, RawRecord, ReadFilter, ReadFilterConfig,

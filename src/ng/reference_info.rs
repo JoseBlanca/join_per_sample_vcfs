@@ -79,6 +79,18 @@ pub struct ReferenceInfo {
     /// is `contigs[i]`, spec §5 T1). One source of truth for name/length/geometry/md5, so
     /// there is nothing to keep in step.
     pub contigs: Vec<ContigInfo>,
+    /// The FASTA this was read from, when it was read from one.
+    ///
+    /// `None` for a `.fai`-only read, and that absence is **meaningful rather
+    /// than incidental**: a `.fai` describes a genome's geometry but holds no
+    /// bases, so a consumer that needs the sequence itself — CRAM decoding is
+    /// the one that exists — cannot proceed from it. Carrying the path lets
+    /// such a consumer build a `fasta::Repository`, and lets it fail with a
+    /// clear message when it cannot (owner, 2026-07-20).
+    ///
+    /// Not used for anything this module does; it is provenance passed through
+    /// for consumers that need to go back to the bases.
+    pub fasta_path: Option<PathBuf>,
 }
 
 impl ReferenceInfo {
@@ -379,7 +391,12 @@ fn read_fai(path: &Path) -> Result<ReferenceInfo, ReferenceInfoError> {
             md5: None,
         });
     }
-    Ok(ReferenceInfo { md5: None, contigs })
+    Ok(ReferenceInfo {
+        md5: None,
+        contigs,
+        // A `.fai` holds no bases, so there is no FASTA to hand on.
+        fasta_path: None,
+    })
 }
 
 /// A `.fai` field-guard failure, as a `FaiRead` carrying a synthesised `InvalidData` error
@@ -408,6 +425,14 @@ const FASTA_PASS_BUFFER_SIZE: usize = 64 * 1024;
 /// the index agrees with itself (spec §3.3 — the circular check). One buffer, never a whole
 /// contig.
 fn read_fasta(path: &Path) -> Result<ReferenceInfo, ReferenceInfoError> {
+    let mut info = read_fasta_bases(path)?;
+    // The bases came from here, so a consumer that needs them (CRAM decoding)
+    // can get back to them.
+    info.fasta_path = Some(path.to_path_buf());
+    Ok(info)
+}
+
+fn read_fasta_bases(path: &Path) -> Result<ReferenceInfo, ReferenceInfoError> {
     let mut file = File::open(path).map_err(|source| ReferenceInfoError::FastaRead {
         path: path.to_path_buf(),
         source,
@@ -707,6 +732,8 @@ impl<'a> FastaPass<'a> {
         Ok(ReferenceInfo {
             md5: Some(digest),
             contigs: self.contigs,
+            // Filled in by the callers that know which FASTA was read.
+            fasta_path: None,
         })
     }
 
@@ -967,7 +994,22 @@ pub fn read_fai_verify_in_background(
 ) -> Result<(Arc<ReferenceInfo>, VerificationHandle), ReferenceInfoError> {
     // Foreground: the cheap `.fai` read, available immediately (names/lengths/geometry, no
     // digests). A missing or malformed `.fai` surfaces synchronously.
-    let info = cache.get_or_read(ReferenceSource::Fai(fai.clone()))?;
+    let cached = cache.get_or_read(ReferenceSource::Fai(fai.clone()))?;
+
+    // The cached value is keyed on `Fai(..)` and so carries no FASTA path — correctly, since
+    // a caller who asked for a `.fai` alone has no FASTA. *This* caller does, and a consumer
+    // that needs the bases (CRAM decoding) would otherwise be told to "supply the reference
+    // FASTA" when it just had. Fill the field in on a clone rather than in the cache, so the
+    // pure-`.fai` entry stays truthful for whoever shares it.
+    let info = if cached.fasta_path.is_none() {
+        Arc::new(ReferenceInfo {
+            fasta_path: Some(fasta.clone()),
+            md5: cached.md5,
+            contigs: cached.contigs.clone(),
+        })
+    } else {
+        cached
+    };
 
     // Background: verify the FASTA against the `.fai` through the cache (§3.3 + §3.4), so the
     // verified result — and its error — reach the caller via `join`, and the cache is
@@ -1050,6 +1092,7 @@ mod tests {
                     md5: None,
                 },
             ],
+            fasta_path: None,
         }
     }
 
@@ -1819,6 +1862,7 @@ mod tests {
         ReferenceInfo {
             md5: None,
             contigs: Vec::new(),
+            fasta_path: None,
         }
     }
 

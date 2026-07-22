@@ -128,6 +128,39 @@ pub struct ReadFilterCounts {
 }
 
 impl ReadFilterCounts {
+    /// Add another tally into this one, counter by counter.
+    ///
+    /// Destructured exhaustively rather than field-by-field, so a counter added
+    /// to this struct later must be routed here explicitly or this stops
+    /// compiling — the same guard `record_drop`'s exhaustive `match` gives the
+    /// `DropReason` mapping. A tally that silently stopped summing one reason
+    /// would under-report drops without failing anything.
+    pub(crate) fn add(&mut self, other: &Self) {
+        let Self {
+            kept,
+            duplicate,
+            low_mapq,
+            supplementary,
+            secondary,
+            unmapped,
+            qc_fail,
+            too_short,
+            high_mismatch_fraction,
+            bad_cigar,
+        } = other;
+
+        self.kept += kept;
+        self.duplicate += duplicate;
+        self.low_mapq += low_mapq;
+        self.supplementary += supplementary;
+        self.secondary += secondary;
+        self.unmapped += unmapped;
+        self.qc_fail += qc_fail;
+        self.too_short += too_short;
+        self.high_mismatch_fraction += high_mismatch_fraction;
+        self.bad_cigar += bad_cigar;
+    }
+
     /// Tally one drop against its counter. The exhaustive `match` is the guard for
     /// the documented `DropReason` ↔ `ReadFilterCounts` 1:1 mapping: adding a
     /// `DropReason` variant without a counter here is a compile error, so the two
@@ -555,8 +588,11 @@ pub enum ReadFilterError {
     /// record (the unmapped flag clear yet no position).
     #[error("decoding an alignment record failed")]
     Decode(#[source] io::Error),
-    /// Filter #8's reference fetch failed. `ReadFilter::new` validates contigs up
-    /// front, so this signals corrupt input or a read past a contig end.
+    /// Filter #8's reference fetch failed. For a filter built by
+    /// `ReadFilter::new`, contigs were validated up front, so this signals
+    /// corrupt input or a read past a contig end; for one built by
+    /// `with_validated_contigs`, it can also mean the caller's contig guarantee
+    /// did not actually hold.
     #[error("reference access failed during filtering")]
     Reference(#[source] RefSeqError),
 }
@@ -593,6 +629,29 @@ pub struct ReadFilter<S: RecordSource, R> {
     done: bool,
 }
 
+/// The two buffers a [`ReadFilter`] pass reuses: the record buffer it refills
+/// per read, and the scratch filter #8 fetches reference bases into.
+///
+/// They are grouped into one value so a caller that owns them across many
+/// passes can hand them in and take them back as a unit. That is what the
+/// region-query path does: it keeps these beside each pooled reader and lends
+/// them to a fresh per-region filter, so serving ~10⁶ region queries allocates
+/// two buffers per reader rather than two per query
+/// (`doc/devel/ng/arch/alignment_file.md` §1.2).
+///
+/// A whole-file pass has no such caller, so [`ReadFilter::new`] just builds
+/// these itself.
+///
+/// `pub(crate)` rather than `pub`, like the hand-off methods that use it: the
+/// only sanctioned caller is ng's own region-query path.
+#[derive(Debug, Default)]
+pub(crate) struct ReadFilterBuffers<Rec> {
+    /// The single record buffer refilled by every [`RecordSource::read_next`].
+    pub(crate) record_buf: Rec,
+    /// Reused scratch for filter #8's reference fetch.
+    pub(crate) ref_buf: Vec<u8>,
+}
+
 impl<S: RecordSource, R: RawRefSeq> ReadFilter<S, R> {
     /// Fail-fast setup: validate that every contig in the source header's `@SQ`
     /// list resolves in the reference, then seed the reused record buffer. A
@@ -612,15 +671,107 @@ impl<S: RecordSource, R: RawRefSeq> ReadFilter<S, R> {
             let contig = ContigId(u32::try_from(i).expect("contig index fits u32"));
             reference.fetch_into(contig, 1, 0, &mut probe)?;
         }
-        Ok(Self {
+        // The probe *is* the difference between the two constructors, so build
+        // through the other one rather than repeating its field list: that way
+        // they cannot drift into filtering differently.
+        Ok(Self::with_validated_contigs(
             source,
-            record_buf: S::Record::default(),
+            reference,
+            config,
+            ReadFilterBuffers::default(),
+        ))
+    }
+
+    /// The same filter as [`Self::new`], but **without the per-contig resolve
+    /// probe**, and taking its two reused buffers from the caller.
+    ///
+    /// **What the caller must have proved.** `new`'s probe fetches every `@SQ`
+    /// contig to check it resolves in the reference. Use this constructor only
+    /// when that is already known — specifically, when the file's `@SQ` list has
+    /// been proved *equal to* the reference's contig table, name, length and
+    /// order included, as `AlignmentFile::open`'s gate does
+    /// (`doc/devel/ng/spec/alignment_file.md` §3.1). That is strictly stronger
+    /// than "every index resolves": it also rules out the permutation the probe
+    /// happily accepts.
+    ///
+    /// Passing a source whose contigs were never checked has two failure modes,
+    /// and **the quiet one is worse**. A contig missing from the reference
+    /// surfaces as a mid-stream [`ReadFilterError::Reference`], where `new`
+    /// would have failed up front — loud, and recoverable. But a *permuted*
+    /// `@SQ` list resolves on every fetch, so filter #8 compares each read
+    /// against the wrong contig's bases and drops and keeps the wrong reads with
+    /// no error at all. Only the gate's order-included equality rules that out,
+    /// which is why the precondition is equality and not resolvability.
+    ///
+    /// **Why it exists.** The probe costs one reference fetch per contig. That
+    /// is nothing for a whole-file pass, which builds one filter — but the STR
+    /// path builds a filter *per region query*, on the order of 10⁶ of them, so
+    /// the probe would be paid ~10⁶ × the contig count for a property the open
+    /// gate already established once. The buffers come from the caller for the
+    /// same reason: a fresh filter per query would otherwise allocate a record
+    /// buffer and a fetch buffer every time
+    /// (`doc/devel/ng/arch/alignment_file.md` §5).
+    ///
+    /// The guarantee is documented rather than encoded in a typestate: the
+    /// caller that needs this is the one that just ran the gate, and a marker
+    /// type would buy proof only for callers who already have it.
+    ///
+    /// [`Self::new`] is unchanged and stays the right choice everywhere else.
+    pub(crate) fn with_validated_contigs(
+        source: S,
+        reference: R,
+        config: ReadFilterConfig,
+        buffers: ReadFilterBuffers<S::Record>,
+    ) -> Self {
+        Self {
+            source,
+            record_buf: buffers.record_buf,
             reference,
             config,
             counts: ReadFilterCounts::default(),
-            ref_buf: Vec::new(),
+            ref_buf: buffers.ref_buf,
             done: false,
-        })
+        }
+    }
+
+    /// Give the source, the two reused buffers, and the final tally back to
+    /// whoever lent them.
+    ///
+    /// The counterpart to [`Self::with_validated_contigs`]: a pooled caller
+    /// reclaims its reader (inside `source`) and its buffers when a region
+    /// stream ends, so the next query reuses them instead of allocating. The
+    /// counts come out too, because a per-query filter's tally has to be added
+    /// to the file's running total before the filter is dropped — otherwise the
+    /// drops it recorded would vanish with it.
+    ///
+    /// Takes `self` by value, so a caller that must reclaim during `Drop` holds
+    /// the filter as an `Option` and `take()`s it there. Without that, the
+    /// buffers *and* the query's counts are lost on exactly the paths that are
+    /// easiest to forget — an early drop and the error path.
+    pub(crate) fn into_parts(self) -> (S, ReadFilterBuffers<S::Record>, ReadFilterCounts) {
+        // Destructured exhaustively, with no `..`: this function's whole job is
+        // to hand back everything that was lent, so a field added to
+        // `ReadFilter` later must be routed here explicitly or this stops
+        // compiling. The `_` bindings name what is deliberately not returned —
+        // `reference` and `config` are the caller's to rebuild per query, and
+        // `done` is meaningless once the filter is consumed.
+        let Self {
+            source,
+            record_buf,
+            reference: _,
+            config: _,
+            counts,
+            ref_buf,
+            done: _,
+        } = self;
+        (
+            source,
+            ReadFilterBuffers {
+                record_buf,
+                ref_buf,
+            },
+            counts,
+        )
     }
 
     /// The running tally — current counts, final once iteration is exhausted.
@@ -1819,5 +1970,167 @@ mod tests {
 
     fn one_contig_200_header() -> sam::Header {
         contig_header(200)
+    }
+
+    // -----------------------------------------------------------------
+    // The probe-free constructor and the buffer hand-off (read_input A3)
+    // -----------------------------------------------------------------
+
+    /// A mixed batch: two reads that survive the default config, and one each
+    /// dropped pre-decode (duplicate) and by MAPQ. Enough that "same output"
+    /// means the whole cascade agreed, not just that both returned nothing.
+    fn mixed_batch() -> Vec<FakeRecord> {
+        vec![
+            fake(FLAG_PAIRED, 60),
+            fake(FLAG_PAIRED | FLAG_DUPLICATE, 60),
+            fake(FLAG_PAIRED, 0),
+            fake(FLAG_PAIRED, 60),
+        ]
+    }
+
+    /// **The property that makes the probe safe to skip.** `with_validated_contigs`
+    /// exists only to avoid `new`'s O(contigs) probe; it must not change a single
+    /// filtering decision. Run the same records through both constructors and
+    /// require the kept reads *and* the full drop tally to agree.
+    #[test]
+    fn probe_free_constructor_filters_identically_to_new() {
+        let records = mixed_batch();
+
+        let mut probed = ReadFilter::new(
+            FakeSource::new(records.clone(), one_contig_header()),
+            poly_a_ref(30),
+            ReadFilterConfig::default(),
+        )
+        .unwrap();
+        let probed_reads: Vec<MappedRead> = (&mut probed).collect::<Result<_, _>>().unwrap();
+
+        let mut probe_free = ReadFilter::with_validated_contigs(
+            FakeSource::new(records, one_contig_header()),
+            poly_a_ref(30),
+            ReadFilterConfig::default(),
+            ReadFilterBuffers::default(),
+        );
+        let probe_free_reads: Vec<MappedRead> =
+            (&mut probe_free).collect::<Result<_, _>>().unwrap();
+
+        assert_eq!(probe_free_reads.len(), 2, "the two clean reads survive");
+        assert_eq!(
+            probe_free_reads, probed_reads,
+            "same reads, in the same order"
+        );
+        assert_eq!(
+            *probe_free.counts(),
+            *probed.counts(),
+            "and every drop charged to the same reason"
+        );
+    }
+
+    /// Proves the probe is genuinely *skipped* rather than merely passing on
+    /// this fixture: a header naming a contig the reference does not have is
+    /// exactly what `new` rejects up front, so a constructor that still probed
+    /// could not return here at all.
+    ///
+    /// This is also the contract's sharp edge, stated as a test — the caller
+    /// takes on proving the contigs, and `AlignmentFile::open` is what proves
+    /// them.
+    #[test]
+    fn probe_free_constructor_skips_the_contig_probe_new_would_fail() {
+        let two_contig_header = sam::Header::builder()
+            .set_header(Default::default())
+            .add_reference_sequence(
+                "chr1",
+                Map::<ReferenceSequence>::new(NonZero::new(30usize).unwrap()),
+            )
+            .add_reference_sequence(
+                "chr2",
+                Map::<ReferenceSequence>::new(NonZero::new(30usize).unwrap()),
+            )
+            .build();
+
+        // One contig in the reference, two in the header.
+        assert!(
+            ReadFilter::new(
+                FakeSource::new(Vec::new(), two_contig_header.clone()),
+                poly_a_ref(30),
+                ReadFilterConfig::default(),
+            )
+            .is_err(),
+            "new probes every @SQ contig and rejects the missing one"
+        );
+
+        let filter = ReadFilter::with_validated_contigs(
+            FakeSource::new(Vec::new(), two_contig_header),
+            poly_a_ref(30),
+            ReadFilterConfig::default(),
+            ReadFilterBuffers::default(),
+        );
+        assert_eq!(filter.counts().kept, 0);
+    }
+
+    /// The buffers must come back *with their allocations*, since reusing them
+    /// across ~10⁶ region queries is the entire reason they are passed in. A
+    /// hand-off that returned fresh empty buffers would satisfy every
+    /// correctness test and quietly allocate per query.
+    #[test]
+    fn into_parts_returns_the_buffers_with_their_allocations_and_the_tally() {
+        let mut filter = ReadFilter::with_validated_contigs(
+            FakeSource::new(mixed_batch(), one_contig_header()),
+            poly_a_ref(30),
+            ReadFilterConfig::default(),
+            ReadFilterBuffers::default(),
+        );
+        let kept: Vec<MappedRead> = (&mut filter).collect::<Result<_, _>>().unwrap();
+        assert_eq!(kept.len(), 2);
+
+        let (_source, buffers, counts) = filter.into_parts();
+
+        assert_eq!(counts.kept, 2, "the tally survives the hand-off");
+        assert_eq!(counts.duplicate, 1);
+        assert!(
+            buffers.ref_buf.capacity() > 0,
+            "filter #8 fetched into ref_buf, so its allocation must come back \
+             for the next query to reuse"
+        );
+    }
+
+    /// Buffers handed *in* are the ones used, so a caller's pre-grown scratch
+    /// is not silently discarded on the way.
+    ///
+    /// Both buffers are checked, and by different means. `ref_buf`'s capacity
+    /// is observable directly; the record buffer is generic, so it is *marked*
+    /// instead — over an empty source `read_next` never fires, so the mark can
+    /// only survive if the lent buffer was adopted rather than replaced with a
+    /// fresh default. The record buffer is the larger of the two allocations
+    /// (it holds a whole record's sequence, qualities and CIGAR), so losing it
+    /// would be the more expensive slip, and a one-word `S::Record::default()`
+    /// in the constructor is all it would take.
+    #[test]
+    fn with_validated_contigs_adopts_the_lent_buffers() {
+        let mut marked_record = FakeRecord::default();
+        marked_record.read.mapq = 42; // no filtering path writes this back
+
+        let lent = ReadFilterBuffers {
+            record_buf: marked_record,
+            ref_buf: Vec::with_capacity(4096),
+        };
+        let lent_capacity = lent.ref_buf.capacity();
+
+        let filter = ReadFilter::with_validated_contigs(
+            FakeSource::new(Vec::new(), one_contig_header()),
+            poly_a_ref(30),
+            ReadFilterConfig::default(),
+            lent,
+        );
+
+        let (_source, returned, _counts) = filter.into_parts();
+        assert_eq!(
+            returned.ref_buf.capacity(),
+            lent_capacity,
+            "the lent fetch buffer was adopted, not replaced"
+        );
+        assert_eq!(
+            returned.record_buf.read.mapq, 42,
+            "the lent record buffer was adopted, not replaced"
+        );
     }
 }
