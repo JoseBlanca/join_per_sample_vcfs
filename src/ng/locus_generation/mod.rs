@@ -14,6 +14,9 @@
 //! `ssr.rs` (STR), `pileup/` (generic). See `doc/devel/ng/spec/locus_generation.md`
 //! (design) and `doc/devel/ng/arch/locus_generation.md` (types & interfaces).
 
+use crate::ng::read::input::{IngestError, SampleReads};
+use crate::ng::ref_seq::RefSeqError;
+use crate::ng::region_typing::TypedRegionError;
 use crate::ng::region_typing::segment_criteria::Motif;
 use crate::ng::types::GenomeRegion;
 use crate::pileup_record::ChainId;
@@ -182,6 +185,92 @@ pub struct SsrDetail {
     pub right_flank: Box<[u8]>,
 }
 
+/// Generates a sample's loci from one segment of kind `S`, streaming **one locus at a
+/// time**.
+///
+/// `S` is the segment payload the generator consumes — `SsrSegment` for the STR generator.
+/// It is a parameter on the *contract*, not an associated type inside each implementation,
+/// so two generators for the same kind stay interchangeable behind `Box<dyn
+/// LocusGenerator<S>>` (spec §4). A generator holds its own accessors (reference, aligner,
+/// scratch) as fields, so the only per-call context is the segment and the sample's reads.
+pub trait LocusGenerator<S> {
+    /// Start a new segment: reset progress. Does no gathering and cannot fail.
+    fn begin_segment(&mut self, region: GenomeRegion);
+
+    /// The next locus of the segment begun, or `None` once it has no more.
+    ///
+    /// Called repeatedly with the same `segment` until it returns `None`; returning `None`
+    /// immediately is a normal outcome, not a failure. The `segment` must be the one whose
+    /// region was passed to the preceding [`begin_segment`](Self::begin_segment) — the two
+    /// calls are paired, and nothing in the types enforces it. `&mut self` because a
+    /// generator owns reusable scratch (alignment matrices, sampling buffers) that must not
+    /// be reallocated per segment.
+    fn next_locus(
+        &mut self,
+        segment: &S,
+        reads: &SampleReads,
+    ) -> Result<Option<SampleLocusObservations>, LocusGenerationError>;
+}
+
+/// A generator that produces no loci and reports why.
+///
+/// One implementation covers every kind, because it ignores the segment entirely — the
+/// count-only fallback every region kind with no real generator resolves to, so that "we
+/// produce nothing here" is a configuration with a reason attached rather than a silent
+/// gap (spec §5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NoLoci {
+    /// Why this kind produces no loci — the fact the dispatcher accounts by.
+    pub reason: UnhandledReason,
+}
+
+/// **Why** a kind produces no loci — a boundary we chose vs. a gap not yet filled.
+///
+/// Not cosmetic: the two answer different questions ("what will this caller never cover?"
+/// vs "how much does it not cover *yet*?") and must not be added together (spec §5, §7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnhandledReason {
+    /// Deliberately outside the caller's scope — e.g. satellite arrays. Permanent.
+    OutOfScope,
+    /// No generator written yet. Temporary by construction.
+    NotImplemented,
+}
+
+impl<S> LocusGenerator<S> for NoLoci {
+    fn begin_segment(&mut self, _region: GenomeRegion) {}
+
+    fn next_locus(
+        &mut self,
+        _segment: &S,
+        _reads: &SampleReads,
+    ) -> Result<Option<SampleLocusObservations>, LocusGenerationError> {
+        Ok(None)
+    }
+}
+
+/// A fatal, run-level failure of locus generation.
+///
+/// `#[non_exhaustive]`; every variant wraps an upstream error — this step mints none of its
+/// own. A read that yields no observation is a tallied per-read outcome, never an error; an
+/// error means the run is broken (spec §6). A reference fetch can surface two ways — through
+/// the upstream walk ([`TypedRegion`](Self::TypedRegion)) or a generator's own fetch
+/// ([`Reference`](Self::Reference)) — and they stay distinct because they fail in different
+/// places.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum LocusGenerationError {
+    /// The upstream typed-region walk failed.
+    #[error("typed-region walk failed during locus generation")]
+    TypedRegion(#[from] TypedRegionError),
+    /// A read query failed mid-stream, or the alignment input was malformed (the open
+    /// already succeeded upstream; this fires while a generator pulls reads).
+    #[error("read access failed during locus generation")]
+    Reads(#[from] IngestError),
+    /// A reference fetch failed — a broken reference, or a region past a contig end.
+    #[error("reference fetch failed during locus generation")]
+    Reference(#[from] RefSeqError),
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -219,6 +308,48 @@ mod tests {
             reads_discarded_by_cap: 0,
             kind: LocusKind::Generic,
         }
+    }
+
+    /// A minimal real `SampleReads` over the read-ingestion test fixtures — one indexed BAM
+    /// naming one sample, opened against the fixture reference. Constructing `SampleReads`
+    /// needs alignment files, so this is the cheapest honest handle; the `NoLoci` path never
+    /// reads it, but the signature requires one. Returns the temp dirs so they outlive the
+    /// handle.
+    fn sample_reads_over_fixture() -> (tempfile::TempDir, tempfile::TempDir, SampleReads) {
+        use crate::ng::read::filtering::ReadFilterConfig;
+        use crate::ng::read::input::test_fixtures::{
+            fixture_reference, header, indexed_bam, matching_contigs, read_named_with_length,
+        };
+
+        let (reference_dir, reference) = fixture_reference(false);
+        let records = vec![read_named_with_length("r0", 0, 1, 30)];
+        let (bam_dir, bam_path) = indexed_bam(
+            &header(
+                Some("coordinate"),
+                &matching_contigs(),
+                &[("rg1", Some("NA12878"))],
+            ),
+            &records,
+        );
+        let reads = SampleReads::open(&[bam_path], &reference, ReadFilterConfig::default(), false)
+            .expect("the fixture sample opens");
+        (reference_dir, bam_dir, reads)
+    }
+
+    /// `NoLoci` is a `LocusGenerator` for any segment type, emits no locus, and carries its
+    /// reason for the dispatcher to account by (spec §5).
+    #[test]
+    fn no_loci_emits_nothing_and_carries_its_reason() {
+        let (_reference_dir, _bam_dir, reads) = sample_reads_over_fixture();
+        let mut generator = NoLoci {
+            reason: UnhandledReason::OutOfScope,
+        };
+        // Driven over `()` as the segment — NoLoci ignores it, as it does every kind. The
+        // segment type must be named because NoLoci implements the trait for *every* `S`.
+        LocusGenerator::<()>::begin_segment(&mut generator, region(1, 5));
+        let out = LocusGenerator::<()>::next_locus(&mut generator, &(), &reads).unwrap();
+        assert!(out.is_none(), "NoLoci produces no locus");
+        assert_eq!(generator.reason, UnhandledReason::OutOfScope);
     }
 
     /// The types compose into a locus of each kind — a smoke test that the shared
