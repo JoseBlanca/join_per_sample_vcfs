@@ -74,12 +74,12 @@
 //!    dropped before bundling, so a poly-A run cannot bundle-drop a real STR.
 //! 2. **Drop compound-motif loci** — a motif itself internally periodic
 //!    (`ATAT` = `(AT)²`).
-//! 3. **Drop bundles** — any repeat within `flank_bp` of another goes
+//! 3. **Drop bundles** — any repeat within `bundle_threshold` of another goes
 //!    with its whole cluster. (ng keeps the *selection* and rejects the
 //!    *disposal* in A3 — spec §2.4 — but A1 transcribes it as-is.)
 //! 4. **End-trim** to whole-motif boundaries, then the per-period copy floor.
 //! 5. **Recompute purity** from the trimmed tract, then the purity floor.
-//! 6. **The flank check**: clamp `tract ± flank_bp` at the *contig's* ends and drop
+//! 6. **The flank check**: clamp `tract ± bundle_threshold` at the *contig's* ends and drop
 //!    any locus whose flank clamped to zero — a tract with no anchor. Arithmetic
 //!    only; production embeds the bases here, and ng does not (above).
 
@@ -343,12 +343,12 @@ pub const DEFAULT_MIN_PURITY: f32 = 0.8;
 /// costs. The catalog's value.
 pub const DEFAULT_MIN_SCORE: i32 = 0;
 
-/// Flank margin (bp) embedded each side of a tract. The short-read default
-/// (spec §2.3): 30 bp is more than enough unique sequence to anchor a short
-/// read to a locus, where the catalog's inherited 50 was unmeasured. It is
-/// also (spec §2.4) the bundle radius, so lowering it also loosens what
-/// counts as a bundle. Soft, and swept (spec §10).
-pub const DEFAULT_FLANK_BP: u64 = 30;
+/// Bundle radius (bp) — the clean sequence a tract needs either side to be a
+/// locus rather than a bundle member. The short-read default (spec §2.3): 30 bp
+/// is more than enough unique sequence to anchor a short read to a locus, where
+/// the catalog's inherited 50 was unmeasured. Lowering it also loosens what
+/// counts as a bundle (spec §2.4). Soft, and swept (spec §10).
+pub const DEFAULT_BUNDLE_THRESHOLD: u64 = 30;
 
 /// The narrowest period classified by default: **1**, so a qualifying
 /// homopolymer is a period-1 STR locus (spec §2.3). Mononucleotides stutter
@@ -480,19 +480,17 @@ impl Default for MinCopies {
 /// [`min_copies`](Self::min_copies). A config that cannot express
 /// the question is not a config.
 ///
-/// **`bundle_threshold` is gone — it and `flank_bp` were always one number**
-/// (spec §2.4). They are two histories, not two designs: `bundle_threshold` is
-/// GangSTR's `THRESH=50`, ported from a panel builder with **no flank concept at
-/// all**, so over there the number related to nothing; `flank_bp` is ours, the
-/// clean sequence a locus must have either side. Both landed on 50 independently, and
-/// production's documented `bundle_threshold >= flank_bp` invariant records that
-/// coincidence rather than resolving it. **The flank requirement is the
-/// primitive and bundle-ness is derived from it** — a repeat is bundled exactly
-/// when another sits too close for it to have a clean flank — so one number says
-/// it, and the §10 experiment on flank size moves the bundle definition with it
-/// for free. The port-fidelity differential (`matched_params`) pins that the
-/// collapse is safe: it drives production with `bundle_threshold == flank_bp` and
-/// asserts ng's one-number policy still agrees.
+/// **The bundle radius is one number, named [`bundle_threshold`](Self::bundle_threshold)**
+/// (spec §2.4). It carries two histories that coincided: GangSTR's `THRESH=50`, a
+/// panel-builder constant with no flank concept, and ours — the clean sequence a locus needs
+/// either side. Both reached 50 independently (ng's short-read default is now 30, spec §2.3).
+/// They are the same requirement seen twice: a repeat is bundled exactly when another sits
+/// within this radius, i.e. too close for a clean flank — so one number says both, and the
+/// §10 experiment on the radius moves the bundle definition with it. **This name was `flank_bp`
+/// until the STR path claimed it**: the read-anchoring flank the STR locus generator actually
+/// fetches is *its* own `flank_bp`, held `<= bundle_threshold` (`locus_generation_ssr.md`).
+/// The port-fidelity differential (`matched_params`) pins the one-number policy against
+/// production.
 ///
 /// `Default` is ng's short-read values now (spec §2.3), which diverge from the
 /// catalog's; the `.cat` parity oracles pin the catalog's values explicitly (§8.1).
@@ -544,20 +542,19 @@ pub struct SsrSegmentCriteria {
     /// parity ran exactly this way. Inherited knowingly, not by accident;
     /// `classify_at_default_never_rejects_a_score_the_scanner_can_emit` pins it.
     pub min_score: i32,
-    /// How much clean sequence (bp) a tract must have either side to be a locus —
-    /// **and, since A2, the bundle radius too** (spec §2.4; see the type's docs).
-    /// Default: [`DEFAULT_FLANK_BP`].
+    /// The bundle-clustering radius (bp): a tract with another repeat within this
+    /// distance is a bundle **member**, not a locus, because it cannot have a clean
+    /// flank either side (spec §2.4). Default: [`DEFAULT_BUNDLE_THRESHOLD`].
     ///
-    /// One number, two jobs, because they are the same requirement seen twice: a
-    /// locus needs `flank_bp` of clean sequence each side to anchor reads, so a
-    /// repeat with another repeat inside `flank_bp` cannot have one — which is
-    /// what makes it a bundle member rather than a locus. The contig's own end is
-    /// the third face of it ([`RejectionReason::FlankClamped`]).
+    /// One number, two faces of one requirement — bundle membership and clean-flank
+    /// cleanliness — with the contig's own end the third
+    /// ([`RejectionReason::FlankClamped`]).
     ///
-    /// **It is a distance, and nothing here reads the bases it measures** — the
-    /// flank is a test a tract passes, not something a [`SsrSegment`] carries (spec
-    /// §1.2).
-    pub flank_bp: u64,
+    /// **It is a distance, and nothing here reads the bases it measures** — the flank
+    /// is a test a tract passes, not something a [`SsrSegment`] carries (spec §1.2). The
+    /// STR locus generator fetches the actual read-anchoring flank separately, at its own
+    /// `flank_bp <= bundle_threshold` (`locus_generation_ssr.md`).
+    pub bundle_threshold: u64,
 }
 
 impl Default for SsrSegmentCriteria {
@@ -581,7 +578,7 @@ impl Default for SsrSegmentCriteria {
             min_copies: MinCopies::default(),
             min_purity: DEFAULT_MIN_PURITY,
             min_score: DEFAULT_MIN_SCORE,
-            flank_bp: DEFAULT_FLANK_BP,
+            bundle_threshold: DEFAULT_BUNDLE_THRESHOLD,
         }
     }
 }
@@ -744,7 +741,7 @@ pub struct Classified {
     /// The classified STR loci, start-sorted. Exactly what `build_loci` returns.
     pub loci: Vec<SsrSegment>,
     /// The cluster members `build_loci` silently drops — every repeat that
-    /// cleared the period/score/compound gates but sits within `flank_bp` of
+    /// cleared the period/score/compound gates but sits within `bundle_threshold` of
     /// another, so no clean flank can be built around it (spec §2.4).
     ///
     /// **Coordinates are the input's**, i.e. offsets into `bases`, not genomic —
@@ -851,7 +848,7 @@ impl RejectionCounts {
 /// `contig_seq.len()` silently plays two different roles: the bound on what can be
 /// read, **and** the position of the chromosome's end. Hand that code a 100 kb
 /// window and it believes the chromosome ends at your window edge — so it clamps
-/// every flank there and **throws away every locus within `flank_bp` of every
+/// every flank there and **throws away every locus within `bundle_threshold` of every
 /// boundary, a different set for every `window_bp`**. It makes no noise at all
 /// when it does. Splitting the two roles is the fix, and it is the whole reason
 /// this signature exists.
@@ -916,14 +913,14 @@ pub fn classify(
          contig_len must be the CONTIG's length, never the window's",
         bases_start + bases.len() as u64 - 1
     );
-    // `flank_bp = 0` classifies nothing at all, from any input: every tract's own flank
+    // `bundle_threshold = 0` classifies nothing at all, from any input: every tract's own flank
     // test (`ref_start == tract_start`) fires, so every locus is dropped and
     // nothing is even bundled — an empty result, no error, from a knob spec §10
     // plans to sweep. The M7 shape again: the knob appears to move, and instead
     // switches the whole step off.
     assert!(
-        p.flank_bp >= 1,
-        "flank_bp must be at least 1: at 0 every locus fails its own flank test \
+        p.bundle_threshold >= 1,
+        "bundle_threshold must be at least 1: at 0 every locus fails its own flank test \
          and classify silently returns nothing"
     );
     // A NaN `min_purity` bites quietly: every `purity < p.min_purity` comparison
@@ -999,9 +996,9 @@ pub fn classify(
     // 3. drop bundles (on the raw, pre-trim coordinates). Records must be
     //    start-sorted for the streaming clustering.
     kept.sort_by_key(|r| (r.start, r.end));
-    // `flank_bp` IS the bundle radius (spec §2.4) — see `SsrSegmentCriteria`.
+    // `bundle_threshold` IS the bundle radius (spec §2.4) — see `SsrSegmentCriteria`.
     // A3: the cluster members come back rather than being deleted (`Classified`).
-    let (kept, bundled) = split_bundles(kept, p.flank_bp);
+    let (kept, bundled) = split_bundles(kept, p.bundle_threshold);
 
     // 4-5. per record: end-trim + copy floor, recompute purity + floor, embed.
     let mut loci = Vec::with_capacity(kept.len());
@@ -1141,8 +1138,8 @@ fn finish_locus(
     // `.min(contig_seq.len())` because for it the two are the same thing; for a
     // window they are not, and believing the chromosome stops at the window edge is
     // what silently eats every locus near every boundary.
-    let ref_start = tract_start.saturating_sub(p.flank_bp).max(1);
-    let ref_end = (tract_end + p.flank_bp).min(contig_len);
+    let ref_start = tract_start.saturating_sub(p.bundle_threshold).max(1);
+    let ref_end = (tract_end + p.bundle_threshold).min(contig_len);
 
     // Drop a locus whose flank clamped to nothing on either side — a tract
     // abutting base 1 of the contig (empty left flank) or ending on its last base
@@ -1156,7 +1153,7 @@ fn finish_locus(
     // **No bases are read past the tract**, which is what lets the caller hand over
     // exactly the slice it scanned. The flank test above is arithmetic, and the
     // tract's own bytes are in the slice by construction — the interval came from
-    // scanning it. Until 2026-07-17 this read `[tract - flank_bp, tract + flank_bp]`
+    // scanning it. Until 2026-07-17 this read `[tract - bundle_threshold, tract + bundle_threshold]`
     // to embed in the locus, and a tract at the slice's own edge has no such margin:
     // hence two panics here, a second margin on the caller's fetch, and a second
     // reference read per window. All of it served a payload nothing consumed.
@@ -1337,7 +1334,7 @@ fn recompute_purity(tract: &[u8], motif: &[u8]) -> f32 {
 /// imperfect period-4 tract is what found this — and at `2..=6` nothing classified
 /// period 1, so no nested pair could arise. The spec never specified nesting at all: its
 /// §2.3 argument that nothing overlaps assumes positive inter-tract distance, and §2.4's
-/// membership rule ("another repeat lies within `flank_bp` on either side") already
+/// membership rule ("another repeat lies within `bundle_threshold` on either side") already
 /// implies *bundle* for a nested pair, at distance 0.
 fn joins_cluster(reach: u64, next: &RepeatInterval, thresh: u64) -> bool {
     // `saturating_sub` is the overlap case: `next` starting at or before `reach` gives
@@ -1359,7 +1356,7 @@ fn joins_cluster(reach: u64, next: &RepeatInterval, thresh: u64) -> bool {
 /// rule is classification's**, and a second copy of `is_close` is how the two would
 /// drift.
 ///
-/// `flank_bp` must be the same radius [`classify`] was given, or the grouping will
+/// `bundle_threshold` must be the same radius [`classify`] was given, or the grouping will
 /// not match the split.
 ///
 /// # A singleton is a bug, and the walk is what keeps it that way
@@ -1374,7 +1371,10 @@ fn joins_cluster(reach: u64, next: &RepeatInterval, thresh: u64) -> bool {
 /// scanning less than a contig, and it is gone: the scan set is now **whole contigs**
 /// (spec §2.5, owner 2026-07-17), so the only edges are the contig's, beyond which there
 /// is nothing to have missed. The rule is unconditional again, and the assert with it.
-pub fn bundle_clusters(bundled: &[RepeatInterval], flank_bp: u64) -> Vec<Vec<RepeatInterval>> {
+pub fn bundle_clusters(
+    bundled: &[RepeatInterval],
+    bundle_threshold: u64,
+) -> Vec<Vec<RepeatInterval>> {
     let mut out: Vec<Vec<RepeatInterval>> = Vec::new();
     // The open cluster's running maximum `end` — its reach. Not `cluster.last().end`:
     // a member that spans past the ones after it keeps the cluster open for them
@@ -1382,7 +1382,7 @@ pub fn bundle_clusters(bundled: &[RepeatInterval], flank_bp: u64) -> Vec<Vec<Rep
     let mut reach = 0;
     for &iv in bundled {
         match out.last_mut() {
-            Some(cluster) if joins_cluster(reach, &iv, flank_bp) => {
+            Some(cluster) if joins_cluster(reach, &iv, bundle_threshold) => {
                 cluster.push(iv);
                 reach = reach.max(iv.end);
             }
@@ -1476,7 +1476,7 @@ mod tests {
             periods: PeriodRange::new(2, 6).expect("2..=6 is a valid period range"),
             min_purity: 0.8,
             min_score: 0,
-            flank_bp: 50,
+            bundle_threshold: 50,
             min_copies: MinCopies::new([10, 5, 4, 3, 3, 3], 3),
         }
     }
@@ -1968,24 +1968,24 @@ mod tests {
     /// two different questions. Deriving production's from ng's makes that
     /// impossible by construction.
     ///
-    /// **`flank_bp` maps onto *both* of production's knobs**, which is the A2
-    /// collapse stated as code: ng has one number where production has
-    /// `flank_bp` and `bundle_threshold`, and this pair is only equivalent
-    /// because production ships them equal (spec §2.4). This helper sets
-    /// `bundle_threshold: flank_bp` and the differential then asserts the two
-    /// sides still agree — so the differential is itself the evidence the collapse
-    /// costs nothing (the pin that `default_matches_the_frozen_catalog_params`
-    /// used to carry, now that §2.3 deleted that test).
+    /// **ng's `bundle_threshold` maps onto *both* of production's knobs**, which is the
+    /// A2 collapse stated as code: ng has one number where production has `flank_bp` and
+    /// `bundle_threshold`, and this pair is only equivalent because production ships them
+    /// equal (spec §2.4). This helper sets both of production's knobs to the one number
+    /// and the differential then asserts the two sides still agree — so the differential
+    /// is itself the evidence the collapse costs nothing (the pin that
+    /// `default_matches_the_frozen_catalog_params` used to carry, now that §2.3 deleted
+    /// that test).
     fn matched_params(
         min_purity: f32,
         min_score: i32,
-        flank_bp: u32,
+        bundle_threshold: u32,
     ) -> (SsrSegmentCriteria, CatalogParams) {
         (
             SsrSegmentCriteria {
                 min_purity,
                 min_score,
-                flank_bp: u64::from(flank_bp),
+                bundle_threshold: u64::from(bundle_threshold),
                 // `periods` and `min_copies` are pinned to the **catalog's**
                 // values here — di..hexa and `[10,5,4,3,3,3]` — which is what
                 // makes them comparable with production's hardcoded ones at all.
@@ -2001,8 +2001,9 @@ mod tests {
             CatalogParams {
                 min_purity,
                 min_score,
-                flank_bp,
-                bundle_threshold: flank_bp,
+                // ng's one number drives *both* of production's knobs (equal, spec §2.4).
+                flank_bp: bundle_threshold,
+                bundle_threshold,
             },
         )
     }
@@ -2181,9 +2182,9 @@ mod tests {
         bundled.resize(5000, b'G');
         bundled.extend_from_slice(b"ATATATATATATATATATAT"); // 5000..5020
         bundled.resize(5100, b'T');
-        // **At a 50 bp radius, not `params()`'s 5.** A2 collapsed `flank_bp` and
-        // `bundle_threshold` into one number, and this fixture was built for A1's
-        // `flank_bp: 5, bundle_threshold: 50` — its closest pair is 30 bp apart, so
+        // **At a 50 bp radius, not `params()`'s 5.** A2 collapsed production's
+        // `bundle_threshold` and `flank_bp` into ng's one number, and this fixture was built
+        // for A1's `bundle_threshold: 5, flank_bp: 50` — its closest pair is 30 bp apart, so
         // at a radius of 5 nothing bundles and the case silently stops testing the
         // bundle drop. It kept passing because *both sides moved together*: the
         // exact "wrong together, still green" blindness the differential has by
@@ -2619,7 +2620,7 @@ mod tests {
         // = 1-based [901, 1026], so the tract ends **10 bp from the window's right
         // edge** — far less than the 30 bp flank (the short-read Default).
         //
-        // That window used to be illegal: `finish_locus` read the tract ± flank_bp to
+        // That window used to be illegal: `finish_locus` read the tract ± bundle_threshold to
         // embed it, so it panicked and the caller had to fetch a wider slice. Since
         // the locus stopped carrying bases (2026-07-17) the flank is a question about
         // `contig_len`, which the window cannot contradict — so this is exactly the
@@ -2636,7 +2637,7 @@ mod tests {
             win,
             Position(win_start_1),
             Bp(contig.len() as u64),
-            &SsrSegmentCriteria::default(), // flank_bp = 30 (short-read Default)
+            &SsrSegmentCriteria::default(), // bundle_threshold = 30 (short-read Default)
         );
         assert_eq!(
             classified.loci.len(),
@@ -2692,7 +2693,7 @@ mod tests {
     /// flush.** The live mutants are `.max(1)` → `.max(bases_start)` and
     /// `.min(contig_len)` → `.min(bases_end)`: the window's ends instead of the
     /// contig's. Whenever a tract sits *anywhere inside* its window, both forms agree
-    /// (`tract_start - flank_bp` either way), so no ordinary fixture can tell them
+    /// (`tract_start - bundle_threshold` either way), so no ordinary fixture can tell them
     /// apart. They diverge only when the clamp actually bites — a tract starting
     /// exactly at `bases_start`, or ending exactly at `bases_end` — where the mutant
     /// makes `ref_start == tract_start` and reports `FlankClamped`: **the locus
@@ -2842,11 +2843,11 @@ mod tests {
         );
     }
 
-    /// `flank_bp = 0` switches the whole step off — every tract fails its own flank
-    /// test — and spec §10 plans to sweep `flank_bp`. The M7 shape: a knob that
+    /// `bundle_threshold = 0` switches the whole step off — every tract fails its own flank
+    /// test — and spec §10 plans to sweep `bundle_threshold`. The M7 shape: a knob that
     /// appears to move and instead silently returns nothing.
     #[test]
-    #[should_panic(expected = "flank_bp must be at least 1")]
+    #[should_panic(expected = "bundle_threshold must be at least 1")]
     fn classify_rejects_a_zero_flank() {
         let contig = [
             b"CGCGC".as_ref(),
@@ -2855,7 +2856,7 @@ mod tests {
         ]
         .concat();
         let no_flank = SsrSegmentCriteria {
-            flank_bp: 0,
+            bundle_threshold: 0,
             ..params()
         };
         let _ = classify_whole_contig(vec![iv(5, 21, 2, 100)], "chr1", &contig, &no_flank);
@@ -3015,10 +3016,10 @@ mod tests {
         );
     }
 
-    /// **A2 — `flank_bp` really is the bundle radius, and moving it moves bundling.**
+    /// **A2 — `bundle_threshold` really is the bundle radius, and moving it moves bundling.**
     ///
-    /// The collapse's live wire: `drop_bundles(kept, p.flank_bp)`. Deleting that
-    /// argument's link to `flank_bp` — or the bundle drop entirely — must not pass.
+    /// The collapse's live wire: `drop_bundles(kept, p.bundle_threshold)`. Deleting that
+    /// argument's link to `bundle_threshold` — or the bundle drop entirely — must not pass.
     /// Two tracts 30 bp apart: bundled at a 50 bp radius, both classified at 5.
     #[test]
     fn classify_bundles_at_the_flank_radius() {

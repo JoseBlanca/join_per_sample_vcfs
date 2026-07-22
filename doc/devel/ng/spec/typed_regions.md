@@ -214,7 +214,7 @@ transition.
 **And the partition must not depend on `window_bp`** — the window is a memory knob. This is the
 scanner's window-count-invariance gate, extended over classification, and §2.6 earns it.
 
-Nothing overlaps: an classified locus has clean flanks, so the next repeat either way is ≥ `flank_bp`
+Nothing overlaps: an classified locus has clean flanks, so the next repeat either way is ≥ `bundle_threshold`
 off; within a bundle the tracts are *closer* than that, which is why the cluster is one region. A
 bundle's span is the hull of its tracts. Zero-length contigs never reach the walk (`GenomeRegions`
 drops them).
@@ -227,18 +227,20 @@ an **STR bundle**, and the region is typed as one.
 
 Algorithm notes:
 
-- **The threshold is `flank_bp`, and there was never a reason for two knobs.** They are two
-  histories, not two designs. `bundle_threshold` is GangSTR's `THRESH=50` (`2_trim.sh`), ported —
-  and GangSTR's panel build has **no flank concept at all**, so over there the number relates to
-  nothing. `flank_bp` is ours: the clean sequence a locus must have either side. Both landed on 50 independently,
-  and the documented `bundle_threshold >= flank_bp` invariant records that coincidence rather than
-  resolving it. Collapse them — **the flank requirement is the primitive, bundle-ness is derived** —
-  so when we explore what flank the delimiter actually needs (§10), the bundle definition follows
-  for free. It also gives us a reason GangSTR never had: no source comment of theirs says why
-  bundles are dropped at all (§10). The collapse happens in **ng's** `SsrSegmentCriteria` (§5); the
-  catalog keeps both knobs, because production does not move (Revision).
+- **ng collapses production's two knobs into one, named `bundle_threshold`.** They are two
+  histories, not two designs. Production's `bundle_threshold` is GangSTR's `THRESH=50` (`2_trim.sh`),
+  ported — and GangSTR's panel build has **no flank concept at all**, so over there the number relates
+  to nothing. Production's `flank_bp` is the clean sequence a locus must have either side. Both landed
+  on 50 independently, and production's documented `bundle_threshold >= flank_bp` invariant records
+  that coincidence rather than resolving it. ng keeps one number — **the flank requirement is the
+  primitive, bundle-ness is derived** — so when we explore what flank the delimiter actually needs
+  (§10), the bundle definition follows for free. It also gives us a reason GangSTR never had: no
+  source comment of theirs says why bundles are dropped at all (§10). The collapse happens in **ng's**
+  `SsrSegmentCriteria` (§5); the catalog keeps both knobs, because production does not move (Revision).
+  (The STR locus generator later reclaims the name `flank_bp` for the read-anchoring flank it actually
+  fetches, held `<= bundle_threshold` — `locus_generation_ssr.md`.)
 - **Membership is a local test:** a repeat is a bundle member iff another repeat lies within
-  `flank_bp` on either side. The cluster falls out of that — there is no separate transitive rule to
+  `bundle_threshold` on either side. The cluster falls out of that — there is no separate transitive rule to
   implement. It also selects exactly the records `drop_bundles` sets aside today, so §8's oracle is
   unaffected.
 - **The bundle's region is the hull of its tracts** — first start to last end. The gaps between
@@ -252,7 +254,7 @@ Algorithm notes:
 two different wrong ones.**
 
 **The rule: a microsatellite or a bundle too close to a satellite is swallowed by the satellite,
-which expands to cover it.** "Too close" is the flank measure — fewer than `flank_bp` clean bases in
+which expands to cover it.** "Too close" is the flank measure — fewer than `bundle_threshold` clean bases in
 between — and it subsumes containment, so §2.1's "a locus inside a satellite is dropped" is this same
 rule rather than a second one.
 
@@ -281,7 +283,7 @@ run, so the cluster was dropped whole and the bases silently became `Generic`. T
 situation, two different wrong answers, and no fixture had reached either.
 
 **Implementation note (D3):** absorption applies to bundle **members**, before they are clustered.
-That absorbs whole clusters and never part of one (`is_close` implies "within `flank_bp`", so
+That absorbs whole clusters and never part of one (`is_close` implies "within `bundle_threshold`", so
 absorption chains along the cluster), and it is also what keeps the windowed walk correct — a window
 truncates a detection at its slice edge, only an over-cap tract can be truncated, and a truncated
 member would break the cluster re-derivation. Absorbed first, it never reaches it.
@@ -404,16 +406,16 @@ covers it — and anything longer is a satellite, handled in 3).
 > which no slice could answer anyway.
 >
 > *D3 answered this differently and it is worth one line, because the fix that replaced it deleted
-> code rather than adding it. `SsrSegment` used to embed `tract ± flank_bp` of bases, so `classify` read past
+> code rather than adding it. `SsrSegment` used to embed `tract ± bundle_threshold` of bases, so `classify` read past
 > the tract and **panicked** for tracts at the slice's own edge. D3 gave classification a second, wider
-> slice — a `flank_bp` margin on top of the `max_str_len` one, fetched separately, every window —
+> slice — a `bundle_threshold` margin on top of the `max_str_len` one, fetched separately, every window —
 > and called them "two margins, two questions". Dropping the payload (§1.2) dropped the second margin,
 > the second fetch, and both panics: there was only ever one question.*
 
 **2. Tell classification where the contig actually ends.**
 
 The rule ng inherits from `build_loci` works out a locus's right flank as
-`(new_end + flank_bp).min(contig_seq.len())` and throws the
+`(new_end + bundle_threshold).min(contig_seq.len())` and throws the
 locus away if that clamped to nothing — that is how it detects "this tract is at the end of the
 chromosome, there is nothing to anchor against". Hand it a 100 kb slice and `contig_seq.len()` is
 100 kb, so **it believes the chromosome ends at your window edge**: every locus within 50 bp of
@@ -529,12 +531,12 @@ pub struct TypedRegionConfig {
     pub scan: ScanParams,         // the scanner's defaults (2 / 7 / 2)
     pub max_str_len: Bp,       // the satellite cap AND the scan margin — one field because
                                   //   they must be the same number (§2.6). It must also be >=
-                                  //   classification's flank_bp, or a window cannot see a core tract's
+                                  //   classification's bundle_threshold, or a window cannot see a core tract's
                                   //   bundle neighbours — asserted in the walk (D3), because §10
                                   //   sweeps both knobs and sweeps run in release
     pub window_bp: Bp,            // the memory knob; default 100 kb. Must not change the output
     pub criteria: SsrSegmentCriteria,  // ng's own (§5) — ALL of classification's rules, including the
-                                  //   period scope and copy floors the catalog hardcodes. `flank_bp`
+                                  //   period scope and copy floors the catalog hardcodes. `bundle_threshold`
                                   //   (50) is the bundle threshold too, so there is no separate
                                   //   `bundle_threshold` knob (§2.4). Default = the catalog's
                                   //   values, for §8's comparability only
@@ -1273,15 +1275,15 @@ still has to be right is ng's port — and §8.0 pins it against production dire
   No GangSTR source comment ever says *why*; the only note (`# NO NEED TO RUN DEDUP WHEN USING THIS
   SCRIPT`) suggests the four-way `is_close` doubles as dedup, so part of the rule's shape may be an
   artefact of a job we do differently (§2.4). Our own `postprocess.rs:12-15` already ties the
-  threshold to `flank_bp` — §2.4 only takes that sentence seriously enough to make it the definition.
+  threshold to `bundle_threshold` — §2.4 only takes that sentence seriously enough to make it the definition.
 
-- **How much flank does the analysis actually need?** `flank_bp` = 50 is inherited and unmeasured,
+- **How much flank does the analysis actually need?** `bundle_threshold` = 50 is inherited and unmeasured,
   and §2.4 just made it load-bearing: it is now the primitive that *defines* an STR bundle, so
   whatever it is set to decides how much of the genome stops being STR loci. The requirement itself
   is the thing to test — the delimiter anchors on both flank junctions today, but *how much* clean
   sequence it needs to do that reliably is an empirical question, and a smaller answer would turn
   bundles back into loci. **Leaning: keep 50 for v1**; `ssr_bundle_bp` (§3.1) says what it costs.
-  Note the coupling is now a feature: move `flank_bp` and the bundle definition moves with it, which
+  Note the coupling is now a feature: move `bundle_threshold` and the bundle definition moves with it, which
   is the whole point of collapsing the two knobs (§2.4).
 
 - **Is 1 kb the right line between "microsatellite" and "array"?** `max_str_len` is the scanner's

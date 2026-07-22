@@ -197,7 +197,7 @@ pub trait RawRefSeq: RefSeq {
 /// This trait exists for one caller with one need. The typed-region walk must tell
 /// `classify` how long a contig *really* is, and that number cannot be derived from the
 /// window in hand: a slice mistaken for a chromosome makes every flank clamp at the
-/// window edge, which silently throws away every locus within `flank_bp` of every
+/// window edge, which silently throws away every locus within `bundle_threshold` of every
 /// boundary — a different set for every `window_bp`, and no error either way.
 ///
 /// `classify` guards what arithmetic can catch, and its guard is **inherently

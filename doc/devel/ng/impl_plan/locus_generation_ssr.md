@@ -90,7 +90,7 @@ fetch → align → tally → output transform; `SsrGenerator: LocusGenerator<Ss
 
 ### Milestone A — the prerequisite rename (`region_typing`, behaviour-preserving)
 
-**☐ A1. Rename `region_typing`'s `flank_bp` → `bundle_threshold`.**
+**✅ A1. Rename `region_typing`'s `flank_bp` → `bundle_threshold`.**
 The single `SsrSegmentCriteria` field (the collapsed bundle radius,
 [segment_criteria.rs:560](../../../../src/ng/region_typing/segment_criteria.rs#L560)) + its ~88
 call sites, the `region_typing` tests, the CLI arg, and `typed_regions.md` / `typed_regions_cli.md`.

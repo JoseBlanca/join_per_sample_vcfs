@@ -97,7 +97,7 @@ pop_var_caller_exp type-regions --reference ref.fa --output regions.tsv [--regio
 
 Every knob's default is a named `pub const`, cited so nobody re-derives it. **The four rows tagged
 §2.3 carry the short-read defaults the consts do not yet hold** (`--min-period`, `--max-str-len`,
-`--flank-bp`, `--min-copies`): there the citation points at the const *to change*, and §2.3 says what
+`--bundle-threshold`, `--min-copies`): there the citation points at the const *to change*, and §2.3 says what
 to — the consts still ship the catalog values until the CLI slice applies them (kept as record,
 2026-07-19). The other rows already ship the value shown.
 
@@ -106,7 +106,7 @@ to — the consts still ship the catalog values until the CLI slice applies them
 | `--min-period` / `--max-period` | 1 / 6 | `DEFAULT_MIN_PERIOD`, `DEFAULT_MAX_PERIOD` ([`segment_criteria.rs:355-358`](../../../../src/ng/region_typing/segment_criteria.rs)); the STR-detection period range — one flag, §2.2 |
 | `--max-str-len` | 100 | `DEFAULT_MAX_STR_LEN` ([`mod.rs:240`](../../../../src/ng/region_typing/mod.rs)); §2.3 |
 | `--window-bp` | 100 000 | `DEFAULT_WINDOW_BP` ([`mod.rs:244`](../../../../src/ng/region_typing/mod.rs)) |
-| `--flank-bp` | 30 | `DEFAULT_FLANK_BP` ([`segment_criteria.rs:348`](../../../../src/ng/region_typing/segment_criteria.rs)); §2.3 |
+| `--bundle-threshold` | 30 | `DEFAULT_BUNDLE_THRESHOLD` ([`segment_criteria.rs:348`](../../../../src/ng/region_typing/segment_criteria.rs)); §2.3 |
 | `--min-purity` | 0.8 | `DEFAULT_MIN_PURITY` ([`segment_criteria.rs:339`](../../../../src/ng/region_typing/segment_criteria.rs)) |
 | `--min-score` | 0 | `DEFAULT_MIN_SCORE` ([`segment_criteria.rs:344`](../../../../src/ng/region_typing/segment_criteria.rs)) |
 | `--min-copies` | `6,4,4,3,3,3` | `MinCopies::default()` ([`segment_criteria.rs:449-458`](../../../../src/ng/region_typing/segment_criteria.rs)); §2.3 |
@@ -125,7 +125,7 @@ making the user type a value that decides nothing. The `value_parser` lives in t
 place to add to — and builds a `MinCopies` via `MinCopies::new`
 ([`segment_criteria.rs:419-430`](../../../../src/ng/region_typing/segment_criteria.rs)).
 
-**`--max-str-len` must not be smaller than `--flank-bp`**, and the walk rejects the pair with an
+**`--max-str-len` must not be smaller than `--bundle-threshold`**, and the walk rejects the pair with an
 error before it does any work — see T3. The CLI does not need its own check.
 
 ### 2.2 One period range
@@ -155,7 +155,7 @@ at once (`TypedRegionConfig`, [`mod.rs:207-238`](../../../../src/ng/region_typin
 does two things:
 
 - *A tract longer than 100 bp is a `Satellite`, not an STR.* With 150 bp reads, a read spans a tract
-  plus an anchor each side only up to ~`read_len − 2·flank_bp` ≈ `150 − 60 = 90` bp. A tract longer
+  plus an anchor each side only up to ~`read_len − 2·bundle_threshold` ≈ `150 − 60 = 90` bp. A tract longer
   than that cannot be genotyped from a single read whatever we label it, so past ~100 bp the STR route
   has nothing to offer and `Satellite` (*"don't look for loci here"*, spec §2.1) is the honest type.
   100 is a round number at that read-length limit, not a measured one — **soft, and the point of the
@@ -163,7 +163,7 @@ does two things:
 - *The window fetches core ± 100 bp instead of ± 1000.* Cheaper, and still whole: no non-satellite
   repeat can exceed the cap, so the margin always covers one.
 
-**`--flank-bp` 50 → 30.** 30 bp is more than enough unique sequence to anchor a short read to a
+**`--bundle-threshold` 50 → 30.** 30 bp is more than enough unique sequence to anchor a short read to a
 locus; 50 was inherited from GangSTR and unmeasured (spec §10 already flags it as the open question
 *"how much flank does the analysis actually need?"*). It stays the bundle radius too (spec §2.4), so
 lowering it also loosens what counts as a bundle — fewer neighbours are "too close". Soft, and swept.
@@ -296,7 +296,7 @@ files, and a file that cannot say what config made it is noise.
 ## max_period: 6
 ## max_str_len: 100
 ## window_bp: 100000
-## flank_bp: 30
+## bundle_threshold: 30
 ## min_purity: 0.8
 ## min_score: 0
 ## min_copies: 6,4,4,3,3,3
@@ -381,7 +381,7 @@ a test. B2 deleted exactly this shape from ng and recorded the rule: **ng fails 
 (`typed_regions.md` §4). Use `u32::try_from` and surface an error. A >4 Gb contig is unrepresentable
 to `RegionSet` whatever we do, so failing is the honest answer, not a limitation we are choosing.
 
-**T3 — do not re-validate `--max-str-len` against `--flank-bp` in the CLI; just propagate.**
+**T3 — do not re-validate `--max-str-len` against `--bundle-threshold` in the CLI; just propagate.**
 `TypedRegionIterator::over_regions` refuses the pair itself, with
 `TypedRegionError::MarginNarrowerThanFlank` and before any work
 ([`mod.rs`](../../../../src/ng/region_typing/mod.rs)). It used to `assert!` — right when the knobs
@@ -480,7 +480,7 @@ source chain and exits 1, the way `main.rs` does ([`main.rs:30-73`](../../../../
 T7a on sharing that walk rather than copying it. No anyhow in the CLI path. Variants this one needs,
 each a `#[from]` where it can be: `ReferenceInfoError` from reading, verifying, or writing the reference index (T1), the contig-length narrowing (T2), `BedError`
 ([`regions.rs:315-379`](../../../../src/regions.rs)), `TypedRegionError`, and output I/O. **Not** the
-`--max-str-len` / `--flank-bp` pair — `TypedRegionError` already carries it (T3).
+`--max-str-len` / `--bundle-threshold` pair — `TypedRegionError` already carries it (T3).
 
 **Nothing the user can type may panic.** Every knob is a flag now, so each of the walk's config
 guards is reachable from a typo, and a typo deserves a message and exit 1 — not a backtrace. That is

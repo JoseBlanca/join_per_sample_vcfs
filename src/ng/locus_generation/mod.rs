@@ -1011,7 +1011,7 @@ mod tests {
             Ok(typed(RegionKind::Generic, 1, 10)),
             Err(TypedRegionError::MarginNarrowerThanFlank {
                 max_str_len: 1,
-                flank_bp: 2,
+                bundle_threshold: 2,
             }),
             Ok(typed(RegionKind::Generic, 20, 30)),
         ];

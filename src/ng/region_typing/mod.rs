@@ -220,9 +220,9 @@ pub struct TypedRegionConfig {
     /// capture whole any repeat that is not a satellite, so it is exactly the
     /// length at which a repeat becomes one.
     ///
-    /// **It is also constrained from below by [`SsrSegmentCriteria::flank_bp`]**, and
+    /// **It is also constrained from below by [`SsrSegmentCriteria::bundle_threshold`]**, and
     /// [`partition_windowed`] asserts it: the margin is what lets a window see a core
-    /// tract's *neighbours*, and the bundle flank test is a `flank_bp`-radius question.
+    /// tract's *neighbours*, and the bundle flank test is a `bundle_threshold`-radius question.
     /// A margin narrower than that radius would classify tracts as clean loci that a
     /// whole-contig walk bundles — silently, and differently per `window_bp`.
     pub max_str_len: Bp,
@@ -237,7 +237,7 @@ pub struct TypedRegionConfig {
 /// The satellite cap and detection margin: **100 bp** (spec §2.3). This one
 /// field is both — a tract longer than the cap is a `Satellite`, not an STR,
 /// and the window fetches core ± this margin. With 150 bp reads a read spans a
-/// tract plus an anchor each side only up to ~`read_len − 2·flank_bp` ≈ 90 bp,
+/// tract plus an anchor each side only up to ~`read_len − 2·bundle_threshold` ≈ 90 bp,
 /// so past ~100 bp the STR route has nothing to offer. A round number at that
 /// read-length limit, not a measured one — soft, and the point of the knob is
 /// to sweep it (spec §10).
@@ -334,7 +334,7 @@ pub struct TypedRegionCounts {
 /// of it. So a repeat classification turns down for being impure, or low-copy, or
 /// compound simply stays `Generic` — it is not a bundle, and it is certainly not a
 /// hole. Only the *flank test* makes a bundle: a repeat with another repeat within
-/// `flank_bp` of it, which is exactly the set [`segment_criteria::classify`] hands back.
+/// `bundle_threshold` of it, which is exactly the set [`segment_criteria::classify`] hands back.
 pub fn partition_resident(
     chrom: &str,
     contig: ContigId,
@@ -396,9 +396,9 @@ pub fn partition_resident(
 /// # A block, and why the windowed walk can work one at a time
 ///
 /// A *block* is a stretch of repeat structure separated from the next by more than
-/// `flank_bp` of repeat-free sequence. Every rule here has a **radius**, and the block
+/// `bundle_threshold` of repeat-free sequence. Every rule here has a **radius**, and the block
 /// boundary is wider than all of them: runs merge only when they abut (radius 0),
-/// clustering chains members within `flank_bp` (radius `flank_bp`), and swallowing is
+/// clustering chains members within `bundle_threshold` (that radius), and swallowing is
 /// containment (radius 0). So no input outside a block can change anything inside it,
 /// and the partition of a contig is the concatenation of its blocks' partitions.
 ///
@@ -452,7 +452,7 @@ fn resolve_features(
     config: &TypedRegionConfig,
 ) -> Vec<TypedRegion> {
     let max_str_len = config.max_str_len.get();
-    let flank_bp = config.criteria.flank_bp;
+    let bundle_threshold = config.criteria.bundle_threshold;
     let mut features: Vec<TypedRegion> = Vec::new();
 
     // The satellites: over-cap coverage runs — as spans that can still GROW (below).
@@ -479,8 +479,8 @@ fn resolve_features(
     let mut members: Vec<RepeatInterval> = bundled.to_vec();
 
     // **Absorption** (spec §2.4a; see the fn docs). Anything a satellite overlaps *or*
-    // comes within `flank_bp` of is absorbed into it, and the satellite grows to cover
-    // it. Iterated to a fixed point: a satellite that has grown reaches `flank_bp`
+    // comes within `bundle_threshold` of is absorbed into it, and the satellite grows to cover
+    // it. Iterated to a fixed point: a satellite that has grown reaches `bundle_threshold`
     // further than the run it came from, so it can absorb something the run could not.
     //
     // It terminates: each pass either absorbs at least one of a finite set of features
@@ -494,7 +494,7 @@ fn resolve_features(
     //    complete clusters and `bundle_clusters` can regroup them (its precondition:
     //    `bundled` is the concatenation of clusters in coordinate order). If a member
     //    is absorbed, every member chained to it is too: `is_close` implies "within
-    //    `flank_bp`" (each of its four clauses puts a pair of endpoints inside the
+    //    `bundle_threshold`" (each of its four clauses puts a pair of endpoints inside the
     //    radius), so the grown satellite reaches the next member in the chain, and so
     //    on by induction.
     // 2. It is what makes the **windowed** walk correct at all. A window truncates a
@@ -512,9 +512,11 @@ fn resolve_features(
                 start: iv.start + 1,
                 end: iv.end,
             };
-            !absorb_into(&mut satellites, span, flank_bp, &mut absorbed)
+            !absorb_into(&mut satellites, span, bundle_threshold, &mut absorbed)
         });
-        loci.retain(|(span, _)| !absorb_into(&mut satellites, *span, flank_bp, &mut absorbed));
+        loci.retain(|(span, _)| {
+            !absorb_into(&mut satellites, *span, bundle_threshold, &mut absorbed)
+        });
         if !absorbed {
             break;
         }
@@ -532,7 +534,7 @@ fn resolve_features(
     // flank — far too short to hide an over-cap run — so a hull that reaches a satellite
     // has a member that reaches it.
     let clusters: Vec<(CoverageRun, Vec<RepeatInterval>)> =
-        segment_criteria::bundle_clusters(&members, flank_bp)
+        segment_criteria::bundle_clusters(&members, bundle_threshold)
             .into_iter()
             .map(|cluster| {
                 let hull = CoverageRun {
@@ -580,14 +582,14 @@ fn resolve_features(
     features
 }
 
-/// Absorb `span` into any satellite it overlaps or lies within `flank_bp` of: those
+/// Absorb `span` into any satellite it overlaps or lies within `bundle_threshold` of: those
 /// satellites and `span` become **one** span covering all of them, gaps included.
 /// Returns whether it was absorbed (and sets `absorbed`, the fixed-point loop's flag).
 ///
 /// # Why the gap, and not `segment_criteria::is_close`
 ///
-/// This asks a **flank** question — *are there `flank_bp` clean bases between this
-/// feature and the array?* — so the gap is the measure, and `< flank_bp` is strict, as
+/// This asks a **flank** question — *are there `bundle_threshold` clean bases between this
+/// feature and the array?* — so the gap is the measure, and `< bundle_threshold` is strict, as
 /// classification's own gap clause is (`is_close_is_strict_at_the_threshold`).
 ///
 /// `is_close` itself is the wrong tool here despite testing the same relation between
@@ -596,16 +598,16 @@ fn resolve_features(
 /// against a span that can be 2 Mb long, where a locus 20 bp past the end is millions
 /// of bases from the start. The relation is the same; the predicate cannot be.
 ///
-/// The gaps swept in are deliberate: fewer than `flank_bp` bases between two repeats is
+/// The gaps swept in are deliberate: fewer than `bundle_threshold` bases between two repeats is
 /// sequence nothing can be anchored in — the same reasoning that puts a cluster's
 /// internal gaps inside its hull (spec §2.4).
 fn absorb_into(
     satellites: &mut Vec<CoverageRun>,
     span: CoverageRun,
-    flank_bp: u64,
+    bundle_threshold: u64,
     absorbed: &mut bool,
 ) -> bool {
-    // `span.start <= s.end + flank_bp` is "the gap on this side is < flank_bp", and it
+    // `span.start <= s.end + bundle_threshold` is "the gap on this side is < bundle_threshold", and it
     // is also true whenever the two overlap — so containment (a locus *inside* a
     // satellite, spec §2.1's swallow) and adjacency are one rule, not two. They were
     // two, and reading only the hull's start is what made the answer depend on which
@@ -613,7 +615,9 @@ fn absorb_into(
     let touching: Vec<usize> = satellites
         .iter()
         .enumerate()
-        .filter(|(_, s)| span.start <= s.end + flank_bp && s.start <= span.end + flank_bp)
+        .filter(|(_, s)| {
+            span.start <= s.end + bundle_threshold && s.start <= span.end + bundle_threshold
+        })
         .map(|(i, _)| i)
         .collect();
     if touching.is_empty() {
@@ -699,7 +703,7 @@ fn coverage_runs(intervals: &[RepeatInterval]) -> Vec<CoverageRun> {
 /// # How it can be windowed at all: blocks and three carries
 ///
 /// [`resolve_features`] explains the licence — every rule the partition applies has a
-/// radius, and a *block* (repeat structure bounded by more than `flank_bp` of
+/// radius, and a *block* (repeat structure bounded by more than `bundle_threshold` of
 /// repeat-free sequence) is wider than all of them. So the walk holds **one open
 /// block**, resolves it the moment the next feature proves it closed, and carries:
 ///
@@ -720,7 +724,7 @@ fn coverage_runs(intervals: &[RepeatInterval]) -> Vec<CoverageRun> {
 ///   since A3: `classify`'s guard classifies a caller passing the *window's own end* as
 ///   `contig_len` — production's exact mistake, and arithmetically legal, so no
 ///   signature can catch it. Only a caller holding both the reference and the window
-///   can, and this is that caller. Get it wrong and every locus within `flank_bp` of
+///   can, and this is that caller. Get it wrong and every locus within `bundle_threshold` of
 ///   every window boundary silently vanishes, a different set for each `window_bp`.
 /// - **The window geometry comes from [`scan_windowed`]**, not from arithmetic here:
 ///   one copy of the core/margin rules, per spec §6.1.
@@ -736,8 +740,8 @@ fn coverage_runs(intervals: &[RepeatInterval]) -> Vec<CoverageRun> {
 /// `contig_len`, which no slice could answer anyway.
 ///
 /// So there is one margin, spec §2.6's: `max_str_len`, what makes a repeat *segment*
-/// identically. Until 2026-07-17 there was a second — `flank_bp` on top of it — and a
-/// second fetch of every window to get it, because `SsrSegment` embedded `tract ± flank_bp`
+/// identically. Until 2026-07-17 there was a second — `bundle_threshold` on top of it — and a
+/// second fetch of every window to get it, because `SsrSegment` embedded `tract ± bundle_threshold`
 /// of bases and a tract at the slice's own edge could not supply them. Removing the
 /// payload removed the margin, the re-fetch, and the two panics that policed it.
 /// **Collected**, so it holds the contig's regions after all — this is the walk's shape
@@ -876,7 +880,7 @@ impl<R: RawRefSeq + ContigTable + EvictableRefSeq> TypedRegionIterator<R> {
         // **A swept knob that would silently un-bundle** (spec §10 sweeps both of these).
         // The scan's margin is `max_str_len`, so a window sees every repeat within
         // `max_str_len` of its core. The bundle flank test needs to see every repeat
-        // within `flank_bp` of a core repeat. If the margin were the narrower of the two,
+        // within `bundle_threshold` of a core repeat. If the margin were the narrower of the two,
         // a core tract's neighbour could fall outside the window, go unseen, and the tract
         // would be classified as a clean locus instead of bundled — no error, and a
         // different answer for every `window_bp`.
@@ -885,10 +889,10 @@ impl<R: RawRefSeq + ContigTable + EvictableRefSeq> TypedRegionIterator<R> {
         // reachable from a typo — and user input must not panic. The reason it was an
         // `assert!` still holds and is served better here: A2's rule is that a swept
         // knob's guard must survive `--release`, and a `Result` does, unconditionally.
-        if config.max_str_len.get() < config.criteria.flank_bp {
+        if config.max_str_len.get() < config.criteria.bundle_threshold {
             return Err(TypedRegionError::MarginNarrowerThanFlank {
                 max_str_len: config.max_str_len.get(),
-                flank_bp: config.criteria.flank_bp,
+                bundle_threshold: config.criteria.bundle_threshold,
             });
         }
         // Fail now, not in the middle of chromosome 7 (above).
@@ -1029,7 +1033,7 @@ impl<R: RawRefSeq + ContigTable + EvictableRefSeq> TypedRegionIterator<R> {
         // 3. Admit, over **the slice we already scanned** — no second fetch, no second
         //    margin. Admission reads each tract's own bases (motif, purity) and answers
         //    the flank question by arithmetic against `contig_len`, so the scan slice is
-        //    exactly what it needs. Until 2026-07-17 `SsrSegment` embedded tract ± flank_bp of
+        //    exactly what it needs. Until 2026-07-17 `SsrSegment` embedded tract ± bundle_threshold of
         //    bases, which a tract at the slice's own edge could not supply; that cost a
         //    wider re-fetch of every window, and the payload had no consumer.
         let bases_start = plan.fetched.start;
@@ -1521,7 +1525,7 @@ impl BlockWalk {
             .last()
             .expect("the block is open")
             .end
-            .saturating_add(config.criteria.flank_bp)
+            .saturating_add(config.criteria.bundle_threshold)
     }
 
     /// Resolve the open block and emit it, with the generic run that preceded it.
@@ -1650,10 +1654,13 @@ pub enum TypedRegionError {
     /// line, so this is what a typo looks like, and a typo must not panic.
     #[error(
         "max_str_len ({max_str_len}) is the window's detection margin and must not \
-         be narrower than flank_bp ({flank_bp}), the bundle radius: a window that cannot \
+         be narrower than bundle_threshold ({bundle_threshold}), the bundle radius: a window that cannot \
          see a core tract's neighbours would classify them as loci instead of bundling them"
     )]
-    MarginNarrowerThanFlank { max_str_len: u64, flank_bp: u64 },
+    MarginNarrowerThanFlank {
+        max_str_len: u64,
+        bundle_threshold: u64,
+    },
 }
 
 #[cfg(test)]
@@ -1705,7 +1712,7 @@ mod tests {
             criteria: SsrSegmentCriteria {
                 periods: PeriodRange::new(2, 6).expect("2..=6 is a valid period range"),
                 min_copies: MinCopies::new([10, 5, 4, 3, 3, 3], 3),
-                flank_bp: 50,
+                bundle_threshold: 50,
                 ..SsrSegmentCriteria::default()
             },
             ..TypedRegionConfig::default()
@@ -2421,7 +2428,7 @@ mod tests {
     /// have deleted them (spec §2.4).
     #[test]
     fn two_close_tracts_become_one_bundle_carrying_both() {
-        // Tracts at [60,80) and [90,110): a 10 bp gap, well inside flank_bp = 50.
+        // Tracts at [60,80) and [90,110): a 10 bp gap, well inside bundle_threshold = 50.
         let bases = contig_with_tracts_at(&[60, 90], 240);
         let len = bases.len() as u64;
         let regions =
@@ -2463,7 +2470,7 @@ mod tests {
     /// transitivity. There is no separate transitive rule to implement: membership
     /// is the local flank test, and the cluster falls out of it (spec §2.4).
     ///
-    /// A–B–C where A and C are 70 bp apart — further than `flank_bp` — still chain,
+    /// A–B–C where A and C are 70 bp apart — further than `bundle_threshold` — still chain,
     /// because B is close to both.
     #[test]
     fn three_chained_tracts_become_one_bundle_of_three() {
@@ -2484,7 +2491,7 @@ mod tests {
         assert_eq!(
             bundles[0].1.len(),
             3,
-            "all three, though the outer pair is further apart than flank_bp — \
+            "all three, though the outer pair is further apart than bundle_threshold — \
              transitivity is emergent, not a rule"
         );
         // Bounds, not exact edges — the detector's ±1–2 bp phase wobble is its
@@ -2621,13 +2628,13 @@ mod tests {
         // ng's walk at the SAME settings, pinned explicitly. As of spec §2.3 ng's
         // `Default` carries the short-read floors, not the catalog's, so the period
         // scope, copy floors, and satellite cap are pinned to the catalog's build
-        // settings here (§8.1); `min_purity`/`min_score`/`flank_bp` come from the
+        // settings here (§8.1); `min_purity`/`min_score`/`bundle_threshold` come from the
         // `.cat` header.
         let config = TypedRegionConfig {
             criteria: SsrSegmentCriteria {
                 min_purity: cat_params.min_purity,
                 min_score: cat_params.min_score,
-                flank_bp: u64::from(cat_params.flank_bp),
+                bundle_threshold: u64::from(cat_params.bundle_threshold),
                 periods: crate::ng::tandem_repeat::PeriodRange::new(2, 6)
                     .expect("2..=6 is a valid period range"),
                 min_copies: segment_criteria::MinCopies::new([10, 5, 4, 3, 3, 3], 3),
@@ -2948,7 +2955,7 @@ mod tests {
 
     /// Absorption must not depend on the window either: the windowed walk agrees with
     /// the oracle on both arms and both sides. (The absorbed feature and the array are
-    /// within `flank_bp`, so they are one block — this is what pins that.)
+    /// within `bundle_threshold`, so they are one block — this is what pins that.)
     #[test]
     fn absorption_is_window_invariant() {
         for micro_left in [true, false] {
@@ -3181,7 +3188,7 @@ mod tests {
     /// `classify` clamps a locus's flanks at the *contig's* ends and drops a locus whose
     /// flank clamped to nothing. Hand it the **window's** end as the contig's length —
     /// production's exact mistake, and arithmetically legal, so `classify`'s own guard
-    /// cannot catch it — and every locus within `flank_bp` of every window boundary
+    /// cannot catch it — and every locus within `bundle_threshold` of every window boundary
     /// silently vanishes, a different set for each `window_bp`.
     ///
     /// The fixture's tract at 990 straddles the 1000 core edge; the one at 3500 sits in
@@ -3289,20 +3296,20 @@ mod tests {
             ContigId(0),
             &config,
         )
-        .expect_err("a margin narrower than flank_bp is refused");
+        .expect_err("a margin narrower than bundle_threshold is refused");
         assert!(
             matches!(
                 err,
                 TypedRegionError::MarginNarrowerThanFlank {
                     max_str_len: 10,
-                    flank_bp: 30
+                    bundle_threshold: 30
                 }
             ),
             "and it names both numbers, so the message says which flag to move: {err}"
         );
         assert!(
             err.to_string()
-                .contains("must not be narrower than flank_bp"),
+                .contains("must not be narrower than bundle_threshold"),
             "the operator-facing message survives: {err}"
         );
     }
