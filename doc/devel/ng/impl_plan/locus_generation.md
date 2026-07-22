@@ -78,12 +78,12 @@ shape spec ships (spec §2). The first real generator (STR) is
 
 ### Milestone A — the shared types (types, then the one derived method)
 
-**☐ A1. Scaffold the `locus_generation/` module.**
+**✅ A1. Scaffold the `locus_generation/` module.** *(landed with A2, one commit.)*
 `src/ng/locus_generation/mod.rs` with its `#[cfg(test)]` block; wire `pub mod locus_generation;`
 into `ng/mod.rs`. A **folder**, not a file — a step whose implementations compete (module_layout
 principle 1); `ssr.rs` and `pileup/` land in later plans. *Source:* arch §Module home.
 
-**☐ A2. The locus types.**
+**✅ A2. The locus types.**
 `SampleLocusObservations` (owned, no lifetimes), `ObservedSequence`, `ReadCoverage`
 (`Complete` / `PartialLeft(u16)` / `PartialRight(u16)`), and the shared `LocusKind`
 (`Generic` / `Ssr(SsrDetail)` / `SsrBundle`, `#[non_exhaustive]`) + `SsrDetail` (`motif: Motif`
@@ -91,7 +91,7 @@ from `region_typing`, `left_flank` / `right_flank`). Declared here in the shared
 `SampleLocusObservations.kind` names `LocusKind`; the STR generator *fills* `SsrDetail` (plan 2).
 No logic. *Depends:* A1. *Source:* spec §3, arch §1; ng_step_interfaces §2.
 
-**☐ A3. `num_obs_along_locus()` + `complete_observations()`.**
+**✅ A3. `num_obs_along_locus()` + `complete_observations()`.**
 The derived per-position depth (a `Complete` counts at every position, a `PartialLeft(n)` at the
 leftmost `n`, `PartialRight(n)` at the rightmost `n`; length = `region.len()`) and the
 complete-only iterator guard. **Own step** — an off-by-one in the partial-coverage arithmetic is a
