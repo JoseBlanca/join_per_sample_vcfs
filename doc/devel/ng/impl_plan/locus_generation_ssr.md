@@ -103,7 +103,7 @@ reverses the documented collapse (segment_criteria.rs:483). *Source:* spec §7.
 
 ### Milestone B — config, counts, and `SsrLocus` + the margin fetch
 
-**☐ B1. `SsrGeneratorConfig` / counts / the cap constant.**
+**✅ B1. `SsrGeneratorConfig` / counts / the cap constant.**
 `SsrGeneratorConfig { flank_bp: Bp, max_reads_per_locus: Option<u32> }`; `SsrGeneratorCounts` (reads
 fetched/discarded, complete/partial obs, the no-observation reasons); `DEFAULT_SSR_MAX_READS_PER_LOCUS`
 = 1000, **ng's own const, distinct from production's `MAX_READS_PER_LOCUS`** (spec §4); the
@@ -111,7 +111,7 @@ fetched/discarded, complete/partial obs, the no-observation reasons); `DEFAULT_S
 No logic beyond the check. *Depends:* A. *Source:* spec §4, arch §1. Verified: `Default`; the flank
 check rejects `flank_bp > bundle_threshold`.
 
-**☐ B2. `SsrLocus` + the margin fetch.**
+**✅ B2. `SsrLocus` + the margin fetch.**
 `SsrLocus { segment, tract_with_margin_bases, margin_start }`; fetch the tract ± `flank_bp` through
 the generator's own `RefSeq::fetch_into`, **clamped at contig ends** so the span may be shorter than
 `2·flank_bp + tract`, **measuring each flank, never assuming** (spec §2). **Own step** — this is the
