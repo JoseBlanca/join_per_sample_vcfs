@@ -124,7 +124,7 @@ length; each flank measured from the clamp, so a tract near a contig end yields 
 
 ### Milestone C — the reservoir cap (a faithful port, with the seed trap)
 
-**☐ C1. Port `Reservoir` + `locus_seed` — own commit, do not bundle.**
+**✅ C1. Port `Reservoir` + `locus_seed` — own commit, do not bundle.**
 Transcribe production's reservoir sampler and its seed as ng's own, keyed to
 `DEFAULT_SSR_MAX_READS_PER_LOCUS`. **The seed trap:** FNV-1a over the contig **name** bytes folded
 with the **0-based** tract start — feed the name and `start - 1`, **not** the `ContigId` or the
