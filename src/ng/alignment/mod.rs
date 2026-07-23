@@ -16,10 +16,14 @@
 //! Landed so far: [`Alignment`] and [`RepeatSpan`], the two output shapes; [`RepeatGeometry`]
 //! and [`RepeatContext`], which tell a repeat-aware algorithm where the repeat sits and how it
 //! slips; the [`BestPathAligner`] trait they meet at; and the two shared components, the
-//! [`emission`] scoring every aligner uses and the [`stutter`] model. **No algorithm yet** —
-//! those arrive with Milestone B of the plan
-//! `doc/devel/ng/impl_plan/alignment_best_path.md`.
+//! [`emission`] scoring every aligner uses and the [`stutter`] model; and the first
+//! algorithm, [`ssr_best_path_flat_gap`] — the repeat-aware delimiter, which is this
+//! module's **only byte-parity oracle** against production (`delimit_parity`, test-only).
+//! Still to come in the plan `doc/devel/ng/impl_plan/alignment_best_path.md`: banding
+//! (Milestone C), the two-penalty aligner (D), and the affine aligner (E, gated).
 
+#[cfg(test)]
+mod delimit_parity;
 pub mod emission;
 pub mod ssr_best_path_flat_gap;
 pub mod stutter;

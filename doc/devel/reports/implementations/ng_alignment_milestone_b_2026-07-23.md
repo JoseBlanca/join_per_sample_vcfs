@@ -143,3 +143,58 @@ The general lesson, now three steps running: **the code was right and the test w
 step's own tests (`the_classified_span_agrees_with_the_raw_readout`) was a tautology — `align` *is*
 `classify ∘ delimit`, so comparing against `readout.classify()` compares `classify(x)` with
 `classify(x)`, and it passed under the very mutation it was written to catch.
+
+---
+
+## Step B3 — byte-parity against production, the port anchor
+
+**Status:** shipped (reviewed, fixes applied). **Milestone B complete.**
+**Review:** [ng_alignment_b3_2026-07-23.md](../reviews/ng_alignment_b3_2026-07-23.md) — 3 Majors, all
+applied.
+
+### 1. Plan
+
+On the shared fixture, every read whose production result is a `Delimited::Region` must measure the
+**same bytes**; reads production called `BorderOffEnd` must land in a one-flank or no-flank case,
+checked by count since that reclassification has no production oracle. *Source:* spec §10.3, arch
+§Test & bench shape.
+
+### 2. What shipped
+
+[delimit_parity.rs](../../../../src/ng/alignment/delimit_parity.rs) — a **permanent, `#[cfg(test)]`**
+differential harness. A hand-written SplitMix64 over four fixed seeds generates loci (random motifs
+of period 1–6, independently-drawn flank lengths **including zero**) and reads derived from them by
+unit gains and losses, out-of-frame indels, substitutions and end truncations. Both implementations
+run on identical input; ng's shipping code depends on nothing in production.
+
+**Result: 12,000 cases per run, zero divergences** — and a soak at `PVC_PARITY_CASES=50000`
+(200,000 cases, release) is likewise green.
+
+### 3. The review's contribution: the harness could not fail in three ways
+
+The reviewer's job was to ask whether the oracle is real, and answered it by mutating the aligner:
+**5 of 7 mutations were caught, 2 were not.** The fixes:
+
+- **A transposed anchor was invisible** — the failure the aligner's own docs call the whole risk of
+  the widening. Invisible to *parity* by construction, since production's `BorderOffEnd` discarded
+  which flank was missing. Fixed with a **self-consistency** check against ng's own offsets, which
+  is not a tautology. **My first version of that check was itself wrong** and its own test caught it:
+  the implication holds only when the flank exists, because "not anchored" has two causes.
+- **Zero-length flanks were never generated**, which is exactly where B2's widening deliberately
+  disagrees with production — and where the harness would have **panicked on an intentional
+  divergence**. This falsified a claim in B2's own source comment, now corrected. The divergence is
+  asserted rather than tripped over.
+- **A fresh scratch per case** made the only size-varying driver blind to the grow-but-never-clear
+  hazard that becomes live at Milestone C. Hoisted.
+
+### 4. Validation
+
+Container: fmt clean, clippy clean, `cargo test --lib` **2197 passed, 0 failed**. Transposition
+mutation re-run: **fails both parity tests at the first generated case.**
+
+### 5. Recorded gap
+
+**One mutation still slips through**: losing the tract-aware gap-open in the row-0 initialisation
+survives even 200,000 cases. Row 0 is the all-deletion prefix and evidently never changes a measured
+offset on generated input. Stated plainly rather than papered over — parity covers the recurrence
+body, not every cell of the initialisation.

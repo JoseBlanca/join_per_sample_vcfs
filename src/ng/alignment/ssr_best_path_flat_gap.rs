@@ -529,9 +529,14 @@ impl<E: Emission> SsrFlatGapAligner<E> {
             // measurement, which is honest — with no flank in the frame there is nothing to
             // pin the tract's edge against.
             //
-            // This is ng-only and does **not** disturb the parity oracle: production's
-            // `Delimited::Region` makes no measurement claim, and B3 compares the measured
-            // *bytes*, which are unchanged.
+            // **This is a real divergence from production, and B3 asserts it rather than
+            // glossing it.** An earlier version of this comment claimed parity was
+            // "undisturbed"; that was too glib, and only looked true because the parity
+            // fixture generated no zero-length flanks. It does now. Production still answers
+            // `Region` at a flankless edge — its own off-end tests are guarded on the flank
+            // existing — where ng answers a bound. The **bytes** are unchanged wherever ng
+            // reports a span, which is what the parity claim actually covers; what differs is
+            // the *classification*, deliberately.
             left_anchored: left_flank_len > 0 && tract_start != 0,
             right_anchored: right_flank_len > 0 && tract_end != read_len,
         })

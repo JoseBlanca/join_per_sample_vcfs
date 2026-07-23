@@ -143,7 +143,7 @@ Tests: all four `RepeatSpan` cases reachable; a clean repeat measures exactly; a
 collapse to the reference; an interrupted repeat comes out verbatim. *Depends:* B1. *Source:* spec
 §4.2, arch §2.1, §5.
 
-**☐ B3. Byte-parity against production — the port anchor.**
+**✅ B3. Byte-parity against production — the port anchor.**
 On the shared fixture, every read whose production result is a `Delimited::Region` must measure the
 **same bytes** here. Reads production called `BorderOffEnd` must now land in a one-flank or no-flank
 case, and that reclassification is checked by count, since it has no production oracle. *Depends:*
