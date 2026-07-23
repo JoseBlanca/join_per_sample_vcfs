@@ -336,6 +336,17 @@ impl<E: Emission> SsrFlatGapAligner<E> {
 
         // Row 0 — no read base consumed. Begin in Match at the corner; the only reachable
         // cells are deletions of leading reference bases.
+        //
+        // **`gap_open` is consulted at column 1 only, here.** From column 2 on, the match
+        // predecessor `previous[column - 1][MATCH]` is `UNREACHABLE`, so that candidate is
+        // `-inf` and the deletion-extend candidate always wins — the open cost never enters.
+        // And column 1 is inside the tract only when the left flank is empty. So the whole
+        // of row 0's tract-awareness reduces to a single case: **a locus with no left flank**.
+        //
+        // Worth writing down, because it was briefly recorded as a hole in the parity
+        // oracle: a mutation replacing this with the flat flank rate survived 200,000
+        // randomized cases. It survived only because the fixture generated no zero-length
+        // flanks. Once it did, the same mutation failed within ~100 cases.
         previous[0] = [0.0, UNREACHABLE, UNREACHABLE];
         backpointers[0] = [MATCH as u8, MATCH as u8, MATCH as u8];
         for column in 1..=reference_len {

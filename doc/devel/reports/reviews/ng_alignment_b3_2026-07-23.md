@@ -92,13 +92,18 @@ differently-sized reads and frames flow through the same buffers.
 - **The earlier unreproducible divergence** (B1's review) now has ~1M cases of clean evidence behind
   the stale-incremental-artifact explanation.
 
-#### Known remaining gap, recorded
+#### The one remaining gap — **subsequently closed**
 
-**The row-0 initialisation mutation still slips through** even at 200,000 cases. Row 0 is the
-all-deletion prefix, and losing its tract-aware gap-open evidently never changes a measured offset on
-generated input. Recorded rather than papered over: it is a genuine hole in what this oracle can
-detect, and the honest statement is that parity covers the recurrence body, not every cell of the
-initialisation.
+At review time the **row-0 initialisation mutation still slipped through**, even at 200,000 cases,
+and it was recorded as a genuine hole rather than papered over.
+
+**It is now closed, by the zero-flank generation added for finding B3-2.** The reason is
+structural and worth stating, because it is not obvious: row 0's `gap_open` is consulted at
+**column 1 only** — from column 2 on, the match predecessor is `UNREACHABLE`, so the deletion-extend
+candidate always wins and the open cost never enters — and column 1 is inside the tract only when the
+left flank is empty. So the whole of row 0's tract-awareness reduces to one case, *a locus with no
+left flank*, which is exactly what the generator did not produce. Once it did, the same mutation
+failed within ~100 cases. Verified by re-running it; the reasoning is now recorded at the site.
 
 ### 5. Commands to re-verify
 
@@ -109,5 +114,5 @@ initialisation.
 
 ### Author response
 
-All three Majors and both Minors **fixed in this step's commit**; the row-0 gap is recorded above and
-in `PROJECT_STATUS.md`. Audit trail at `tmp/review_2026-07-23_ng-alignment-b3/`.
+All three Majors and both Minors **fixed in this step's commit**. The row-0 gap was recorded as open
+at the time and has since been closed — see above. Audit trail at `tmp/review_2026-07-23_ng-alignment-b3/`.

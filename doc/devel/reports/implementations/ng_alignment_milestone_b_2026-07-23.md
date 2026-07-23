@@ -192,9 +192,38 @@ The reviewer's job was to ask whether the oracle is real, and answered it by mut
 Container: fmt clean, clippy clean, `cargo test --lib` **2197 passed, 0 failed**. Transposition
 mutation re-run: **fails both parity tests at the first generated case.**
 
-### 5. Recorded gap
+### 5. The recorded gap, and its closure
 
-**One mutation still slips through**: losing the tract-aware gap-open in the row-0 initialisation
-survives even 200,000 cases. Row 0 is the all-deletion prefix and evidently never changes a measured
-offset on generated input. Stated plainly rather than papered over — parity covers the recurrence
-body, not every cell of the initialisation.
+At the time of the review **one mutation still slipped through**: losing the tract-aware gap-open in
+the row-0 initialisation survived 200,000 cases. It was stated plainly rather than papered over.
+
+**It closed itself.** Row 0's `gap_open` is consulted at **column 1 only** — from column 2 on the
+match predecessor is `UNREACHABLE`, so the deletion-extend candidate always wins — and column 1 is
+inside the tract only when the left flank is empty. So row 0's tract-awareness reduces to a single
+case: a locus with **no left flank**. That is precisely what the generator did not produce, and
+precisely what finding B3-2 made it produce. Re-running the mutation now fails within ~100 cases.
+
+Two lessons, both already familiar from this plan: the gap was in the *fixture*, not the code; and
+a coverage hole is worth understanding structurally rather than accepting, because the structure
+said exactly which input would close it.
+
+---
+
+## Post-checkpoint follow-ups (owner-delegated)
+
+After Checkpoint B the owner delegated the accumulated open decisions. Four landed as their own
+commits, each validated in the container:
+
+- **`Motif` lifted to `types.rs`** — closing the peer→stage back-reference that put
+  `region_typing` (ng step 3) on `alignment`'s public surface, contradicting its own module doc.
+  `segment_criteria` re-exports, so step 3's callers are untouched.
+- **`FlatEmission::try_new`** — the check is now real in every build profile, not compiled out of
+  release. Arch §3's `Result` ban is justified by per-*cell* cost, which does not reach a
+  once-per-run constructor; arch §3's own escape clause names this remedy.
+- **`ReadBases`** — the read/quality-length precondition is dissolved rather than documented. The
+  three interchangeable `&[u8]` arguments are now two, and the invariant is true by construction.
+  The parity oracle passing unchanged is the evidence the signature change altered no behaviour.
+- **The architecture doc reconciled** with what shipped, and its `Motif`-allocation error removed.
+
+Still open, and correctly so: the `ViterbiScratch` grow-without-clear note, which is **Milestone C's**
+to handle — banding is what creates the hazard, so the fix belongs with it.

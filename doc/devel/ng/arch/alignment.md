@@ -82,8 +82,10 @@ The affine aligner returns a placement plus the operations that got there. **It 
 /// A read placed against a reference stretch: where it starts, and the operations from there.
 pub struct Alignment {
     /// Offset into the reference stretch the aligner was given — not a genome position.
-    pub reference_offset: usize,
-    pub ops: Vec<CigarOp>,
+    /// `u64`, not `usize`: ng speaks one width (as `Bp` and `RepeatInterval` do).
+    pub reference_offset: u64,
+    /// Named `cigar`, matching how the rest of the crate spells this concept.
+    pub cigar: Vec<CigarOp>,
 }
 ```
 
@@ -96,11 +98,11 @@ repeat from a lower bound (spec §8; `../spec/read_preparation_ssr.md` §3):
 /// A span is only a *measurement* when both flanks anchored; otherwise it is a lower bound.
 pub enum RepeatSpan {
     /// Both flanks anchored: the span pins the repeat's length.
-    Between(Range<usize>),
+    Between(Range<u64>),
     /// Only the left flank anchored — the read ran off its own end inside the repeat.
-    FromLeft(Range<usize>),
+    FromLeft(Range<u64>),
     /// Only the right flank anchored.
-    FromRight(Range<usize>),
+    FromRight(Range<u64>),
     /// Neither flank anchored: the read lies wholly inside the repeat. No per-read fact.
     Unanchored,
 }
@@ -110,7 +112,7 @@ pub enum RepeatSpan {
 
 Every repeat-aware algorithm needs to know where the repeat is and how it slips. Both change at every
 locus, so they are a **per-call argument, not constructor state**: holding them would force a new
-aligner per locus across millions of loci, and `Motif` is an allocation. This mirrors production,
+aligner per locus across millions of loci. This mirrors production,
 whose read-likelihood model is a stateless value taking a per-call `ReadScoringContext` (§5).
 
 ```rust
@@ -127,8 +129,8 @@ pub struct RepeatContext<'a> {
 /// from its start. Both flanks may be short or absent when a repeat is near a contig end, so
 /// these are measured, never assumed equal.
 pub struct RepeatGeometry {
-    pub left_flank_len: usize,
-    pub right_flank_len: usize,
+    pub left_flank_len: Bp,
+    pub right_flank_len: Bp,
     /// The repeat unit. Needed only by the algorithms that price whole-unit slips.
     pub motif: Motif,
 }
@@ -171,20 +173,24 @@ not use it (they are pure sequence comparison).
 /// the per-candidate slip level is the genotyping's, not this module's). See spec §5.2 for the
 /// distribution and its two conversion traps.
 pub struct StutterModel {
-    pub equal: f64,
-    pub in_up: f64,
-    pub in_down: f64,
+    // Private, with accessors: the clamps below ARE the contract, and public fields would
+    // let a caller assemble a model that breaks them. Built from a `StutterRates` whose
+    // six fields are *named*, because six positional `f64`s made two transpositions
+    // (`in_up`/`in_down`, `in_geom`/`out_geom`) invisible at every call site.
+    equal: f64,
+    in_up: f64,
+    in_down: f64,
     /// Geometric *success* probability per unit — NOT a continuation probability (spec §5.2).
-    pub in_geom: f64,
-    pub out_up: f64,
-    pub out_down: f64,
-    pub out_geom: f64,
+    in_geom: f64,
+    out_up: f64,
+    out_down: f64,
+    out_geom: f64,
 }
 
 impl StutterModel {
     /// `P(length change)` for a change of `bp_diff` bases on a repeat of period `period`.
     /// Zero beyond the slip cutoff, so an implausibly large slip is not explained away.
-    pub fn probability(&self, bp_diff: i32, period: u8) -> f64;
+    pub fn probability(&self, bp_diff: i64, period: NonZeroU8) -> f64;
 }
 ```
 
@@ -203,16 +209,21 @@ who calls them (spec §7).
 
 ```rust
 /// Line a read up against a reference sequence the single most probable way.
-pub trait BestPathAligner {
+pub trait BestPathAligner: Sized {
     /// Reused matrices and traceback buffer — allocated per worker, never per read.
+    /// `Default` must decide nothing that changes a result: scratch is buffers only.
     type Scratch: Default;
     /// `Alignment` for the affine aligner; `RepeatSpan` for the repeat-aware ones.
     type Output;
-    /// `()` for the affine aligner; `RepeatContext<'_>` for the repeat-aware ones (§2.2).
-    type Context;
+    /// `()` for the affine aligner; `RepeatContext<'a>` for the repeat-aware ones (§2.2).
+    /// Generic over the lifetime, because the repeat context *is* two borrowed references —
+    /// a plain associated type could only name it as `RepeatContext<'static>`, which would
+    /// force every caller to own its locus data forever. `Copy`, and passed by value: it is
+    /// two pointers, so taking a reference to it would only add indirection.
+    type Context<'a>: Copy;
 
-    fn align(&self, read: &[u8], quality: &[u8], reference: &[u8],
-             context: &Self::Context, scratch: &mut Self::Scratch) -> Self::Output;
+    fn align(&self, read: ReadBases<'_>, reference: &[u8],
+             context: Self::Context<'_>, scratch: &mut Self::Scratch) -> Self::Output;
 }
 
 /// The total probability the reference produced this read, summed over every line-up.
@@ -250,7 +261,9 @@ implied. Two conditions are the **caller's** to uphold, because nothing here can
 - the repeat geometry must fit the reference it is used with (`left_flank_len + right_flank_len` no
   greater than the reference length) — production computes a boundary by subtraction and would
   underflow if this were violated, and is safe only because its locus type enforces it upstream;
-- the read and its quality slice must be the same length.
+- ~~the read and its quality slice must be the same length~~ — **no longer the caller's**:
+  `ReadBases::try_new` checks it once per read, which costs nothing on the per-cell hot path
+  the no-`Result` rule defends, and makes the invariant true by construction thereafter.
 
 State them as **debug assertions plus documented preconditions**, not as error variants — and note
 that a debug assertion compiles out of the release build this project actually runs, so a violated
@@ -321,7 +334,7 @@ function rather than duplicating it.
 | ng name | existing code | action |
 |---|---|---|
 | `LogProb` | declared in [`ng_step_interfaces.md`](ng_step_interfaces.md) §1; assigned to `types.rs` by [`module_layout.md`](module_layout.md) | **specified, not yet written** — `grep` over `src/` finds none. This module is its **first user**, not its author (§1); land it where the vocabulary already put it, beside `Bp` ([types.rs:151](../../../../src/ng/types.rs#L151)) |
-| `Alignment.ops`, `AlignmentNormalizer::normalize` | `left_align_indels(cigar: &mut Vec<CigarOp>, seq, ref_seq)` ([indel_norm.rs:408](../../../../src/pileup/walker/indel_norm.rs#L408)) | reuse `CigarOp`. The trait takes the whole `Alignment` rather than this function's `Vec<CigarOp>` **deliberately** — `left_align_cigar` ([:254](../../../../src/pileup/walker/indel_norm.rs#L254)) can drop a leading deletion and move the alignment's start, which an ops-only signature could not express (§3) |
+| `Alignment.cigar`, `AlignmentNormalizer::normalize` | `left_align_indels(cigar: &mut Vec<CigarOp>, seq, ref_seq)` ([indel_norm.rs:408](../../../../src/pileup/walker/indel_norm.rs#L408)) | reuse `CigarOp`. The trait takes the whole `Alignment` rather than this function's `Vec<CigarOp>` **deliberately** — `left_align_cigar` ([:254](../../../../src/pileup/walker/indel_norm.rs#L254)) can drop a leading deletion and move the alignment's start, which an ops-only signature could not express (§3) |
 | algorithm 1a (structured pass) | `left_align_indels` ([indel_norm.rs:408](../../../../src/pileup/walker/indel_norm.rs#L408)), `left_align_cigar` ([:254](../../../../src/pileup/walker/indel_norm.rs#L254)), `normalize_alleles` ([norm_seqs.rs:108](../../../../src/norm_seqs.rs#L108)) | port. **Not a naive single pass** — it merges consecutive indels and propagates one across alignment blocks; port those, they are the point |
 | algorithm 1b (repeated passes) | freebayes `stablyLeftAlign` (vendored, `freebayes/src/LeftAlign.cpp:385`, cap 20 at `LeftAlign.h:118`) | port the bounded loop. Note freebayes **returns false on exhaustion and its caller ignores it** — do not copy that; 1c exists precisely to fail loudly instead |
 | algorithm 1c (fixpoint) | — | **new**; a loop around 1a, not a third shift implementation |
@@ -332,7 +345,7 @@ function rather than duplicating it.
 | `Emission` (flat impl) | the flat `eps` arm of `align_subst` ([pair_hmm.rs:52](../../../../src/ssr/cohort/pair_hmm.rs#L52)) | port |
 | algorithm 5 (repeat marginal) | `align_subst` ([pair_hmm.rs:52](../../../../src/ssr/cohort/pair_hmm.rs#L52)) and its `banded_forward` ([:83](../../../../src/ssr/cohort/pair_hmm.rs#L83)) | port **this function only** — not `HipstrModel`, which is the genotyping model that calls it (row below). **Returns a linear probability; this interface returns its logarithm** — convert at the boundary. Its banding differs from algorithm 3's source: the *computation* is band-limited but the full matrix is still allocated — the two ports do not share a banding stance. **Interior gaps are forbidden** (`FLANK_SLOP` = 2, [:28](../../../../src/ssr/cohort/pair_hmm.rs#L28)) and that restriction is load-bearing, not an optimisation (spec §5.1) |
 | **NOT this module:** the stutter half | `HipstrModel::q_r` ([hipstr.rs:85](../../../../src/ssr/cohort/read_model/hipstr.rs#L85)) | the genotyping likelihood (step 7). It resizes the candidate to the observed length, so `align_subst` **always** takes its equal-length early return and `banded_forward` is unreachable from here — a parity test built around this model never exercises the forward pass (spec §5.1) |
-| `StutterModel` | `HipstrParams` + `stutter_pmf` ([hipstr.rs:168](../../../../src/ssr/cohort/read_model/hipstr.rs#L168)) | port; hoist from private struct to this module's shared type |
+| `StutterModel` / `StutterRates` | `HipstrParams` + `stutter_pmf` ([hipstr.rs:168](../../../../src/ssr/cohort/read_model/hipstr.rs#L168)) | port; hoist from private struct to this module's shared type |
 | `StutterModel` construction | `hipstr_params` ([hipstr.rs:131](../../../../src/ssr/cohort/read_model/hipstr.rs#L131)) from `StutterShape` ([param_estimation.rs:46](../../../../src/ssr/cohort/param_estimation.rs#L46)) | **adapt, do not port straight.** `hipstr_params` reads a *per-candidate* slip level, because stutter rises with allele length — that dimension belongs to the genotyping, which scores against candidates. This module measures, so its model is built from the locus and the **reference** allele length. `OUT_FRAME_REL` = 0.05 ([hipstr.rs:44](../../../../src/ssr/cohort/read_model/hipstr.rs#L44)) is a **placeholder, not an estimate** (spec §5.2) |
 | the per-call context | `ReadScoringContext` ([read_model/mod.rs:45](../../../../src/ssr/cohort/read_model/mod.rs#L45)) | the precedent for `RepeatContext` (§2.2) — production already passes the varying facts per call and keeps the model itself a stateless value |
 | slip cutoff | `MAX_SLIP` = 10 ([param_estimation.rs:21](../../../../src/ssr/cohort/param_estimation.rs#L21)) | import as a named const |
@@ -343,6 +356,17 @@ function rather than duplicating it.
 | algorithms 2, 4, 6 | — | **new**; no production counterpart |
 
 Production is a **read-only oracle**: ng ports from it and never edits it.
+
+**Reconciled with the implementation, 2026-07-23** (Milestones A–B of
+[`../impl_plan/alignment_best_path.md`](../impl_plan/alignment_best_path.md)). The signatures above
+were updated to what shipped, and one factual error was removed: §2.2 previously justified the
+per-call geometry partly on "`Motif` is an allocation", which is not true of ng's `Motif` — it is
+`Copy` over an inline `[u8; 6]` and allocates nothing. The decision stands on its other ground, that
+the geometry changes at every locus. Two independent reviewers caught the claim.
+
+`Motif` itself has since moved to `src/ng/types.rs` (`module_layout.md` principle 3), because
+importing it from `region_typing` — ng step 3 — contradicted this module's own statement that it
+knows no steps, on ng's public surface.
 
 ## 6. Open items
 
@@ -357,8 +381,11 @@ Production is a **read-only oracle**: ng ports from it and never edits it.
   literal — a too-small value loses long alleles silently. **Do not reach for
   [`MAX_SLIP`](../../../../src/ssr/cohort/param_estimation.rs#L21)**: it is a scoring cutoff, and an
   earlier draft's band derived from it was both too narrow and a layering violation (spec §3).
-- *Impl-time confirmation, not a decision:* the exact `Emission` signature (whether quality arrives
-  per call or as a pre-resolved row) resolves when the first two implementations exist.
+- *Impl-time confirmation, now **resolved** (A1):* the `Emission` signature resolves quality **per
+  row**, not per call — `scores_for(quality) -> BaseScores` is the primary method, with `emit_ln` a
+  provided convenience over it. A quality belongs to a read base, so it is constant along a matrix
+  row while the reference base varies along it, and production's own loop hoists it per row.
+  Structural, not measured; nothing existed to measure.
 
 *(An earlier draft filed "is `StutterModel` per locus or per read?" here as an impl-time
 confirmation. It was neither — it decides the trait signature, and it is now decided: the locus
