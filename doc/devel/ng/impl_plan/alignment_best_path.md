@@ -170,7 +170,7 @@ band loses long alleles without any error. Two tests, both required: the parity 
 
 ### Milestone D — algorithm 4, the comparison entry
 
-**☐ D1. The two-penalty aligner.**
+**✅ D1. The two-penalty aligner.**
 Algorithm 3's matrix, with whole-unit slips priced from the `StutterModel` (A3) instead of as a gap
 of that many bases. Three things must be right or it fails for its implementation rather than its
 premise: gaining and losing are **priced separately**; out-of-frame changes **keep a route**; and the

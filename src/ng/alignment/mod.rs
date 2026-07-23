@@ -26,6 +26,7 @@
 mod delimit_parity;
 pub mod emission;
 pub mod ssr_best_path_flat_gap;
+pub mod ssr_best_path_unit_slip;
 pub mod stutter;
 
 pub use emission::{BaseScores, Emission, FlatEmission, PerQualityEmission};

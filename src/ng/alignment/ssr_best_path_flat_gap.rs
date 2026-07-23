@@ -200,6 +200,26 @@ impl TransitionCosts {
     pub fn new() -> Self {
         Self::default()
     }
+
+    // Accessors for the sibling algorithm 4 (`ssr_best_path_unit_slip`), which shares this
+    // exact per-base gap model for its *out-of-frame* route and adds whole-unit slip states
+    // on top. `pub(super)` because they are an internal seam between the two aligners, not
+    // part of the module's public surface; reading them changes nothing about algorithm 3.
+    pub(super) fn ln_match_to_match(&self) -> f64 {
+        self.ln_match_to_match
+    }
+    pub(super) fn ln_gap_open(&self) -> f64 {
+        self.ln_gap_open
+    }
+    pub(super) fn ln_gap_open_tract(&self) -> f64 {
+        self.ln_gap_open_tract
+    }
+    pub(super) fn ln_gap_close(&self) -> f64 {
+        self.ln_gap_close
+    }
+    pub(super) fn ln_gap_extend(&self) -> f64 {
+        self.ln_gap_extend
+    }
 }
 
 /// Per-worker Viterbi scratch: two rolling score rows plus a **full** backpointer matrix
