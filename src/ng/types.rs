@@ -195,6 +195,10 @@ pub enum DomainError {
     /// A [`MismatchFraction`] was constructed from a value outside `[0, 1]`.
     #[error("mismatch fraction {0} is outside [0, 1]")]
     MismatchFraction(f32),
+    /// A flat emission model was built from a per-base error rate that is not a finite
+    /// probability in `[0, 1]`.
+    #[error("per-base error rate {0} is not a finite probability in [0, 1]")]
+    ErrorRate(f64),
 }
 
 // ---------------------------------------------------------------------

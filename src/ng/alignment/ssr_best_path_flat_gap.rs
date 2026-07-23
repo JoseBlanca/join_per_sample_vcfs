@@ -857,7 +857,7 @@ mod tests {
         // ε = 0.75 is the crossover established in step A1: a match and a mismatch score
         // identically there, so no cell can be decided by sequence either.
         let aligner = SsrFlatGapAligner {
-            emission: FlatEmission::new(0.75),
+            emission: FlatEmission::try_new(0.75).expect("a valid test error rate"),
             costs: flat_costs,
         };
         let stutter = StutterModel::hipstr_shipped();

@@ -23,7 +23,7 @@
 //! moves every downstream score. `per_quality_table_is_bit_exact` exists to make such a
 //! change fail loudly instead of silently.
 
-use crate::ng::types::BaseQual;
+use crate::ng::types::{BaseQual, DomainError};
 use std::sync::LazyLock;
 
 /// What a base is worth at one quality: the score if it agrees with the reference, and
@@ -244,49 +244,37 @@ impl FlatEmission {
     /// [src/ssr/cohort/pair_hmm.rs](../../../ssr/cohort/pair_hmm.rs)): a match scores
     /// `1 − ε` and a mismatch `ε / 3`, converted to log space here.
     ///
-    /// # Preconditions, and why they are not a `Result`
+    /// # Errors
     ///
-    /// `error_rate` must be a finite probability in `[0, 1]`. Nothing in this module
-    /// returns a `Result` — a fallible emission would push error handling onto the
-    /// caller's hottest path for a value that is the run's fixed configuration, not
-    /// per-read data (arch §3). The precondition is therefore a documented one plus a
-    /// debug assertion, and it is worth being blunt about what that means: **a debug
-    /// assertion compiles out of the release build this project actually runs.**
+    /// [`DomainError::ErrorRate`] if `error_rate` is not a finite probability in `[0, 1]`.
     ///
-    /// **This rate is not user-typeable today** — the only callers are tests. Arch §3
-    /// says that if such a condition turns out to be reachable from untrusted input it
-    /// becomes a *checked constructor on the context type*, and this type is that context
-    /// type. So the moment a CLI flag or config field feeds this, `new` should become a
-    /// `try_new` returning a `DomainError` — the shape [`MismatchFraction`] already uses.
+    /// # Why this one *is* checked, when nothing else in the module is
     ///
-    /// # Panics
+    /// Arch §3 bans `Result` across this module, and the reason is hot-path cost: a
+    /// fallible alignment would push error handling onto the caller's hottest loop for
+    /// cases that are answers, not failures. **That argument does not reach this
+    /// constructor.** The rate is the run's fixed configuration, consumed *once* into two
+    /// `f64` fields — checking it costs nothing per matrix cell, which is the only place
+    /// the ban was defending. Arch §3's own escape clause names the remedy as "a checked
+    /// constructor on the context type", and this type is that context type.
     ///
-    /// Panics in debug builds if `error_rate` is not a finite value in `[0, 1]`. In
-    /// release builds the assertion is compiled out and the value is clamped instead
-    /// (below), so the call never panics there.
+    /// The previous shape — a `debug_assert!` plus a release clamp — was defensible while
+    /// the only callers were tests, but it left the guarantee compiled out of the build the
+    /// project actually runs. Now the check is real in every profile. The clamping
+    /// behaviour survives in [`Self::from_unchecked_rate`], which the totality test uses to
+    /// exercise what a violated precondition would once have produced.
     ///
-    /// # Why a release clamp as well
-    ///
-    /// The debug assertion is the real check; the clamp is what keeps the **totality
-    /// contract** true once it is gone. Without it the floor is a lower bound only, so
-    /// `ε = ∞` yields `ln(∞) = +∞` for every mismatch — a positive log-probability that
-    /// makes mismatching infinitely attractive, and a negative rate yields a match score
-    /// above zero. Those are not slightly-wrong answers that surface downstream; they
-    /// silently invert the model. A non-finite rate is treated as `1`, the
-    /// no-information end of the scale, so garbage in cannot produce confident output.
-    ///
-    /// The `PROBABILITY_FLOOR` at each endpoint is separate and binds only at `ε = 0`
-    /// (which would make every mismatch impossible) and `ε = 1` (every match impossible).
-    /// Within the documented range it changes nothing.
+    /// The `PROBABILITY_FLOOR` at each endpoint is a separate thing and is **not** a check:
+    /// it is ported model behaviour, binding only at `ε = 0` (which would make every
+    /// mismatch impossible) and `ε = 1` (every match impossible). Within the accepted range
+    /// it changes nothing.
     ///
     /// [`MismatchFraction`]: crate::ng::types::MismatchFraction
-    #[must_use]
-    pub fn new(error_rate: f64) -> Self {
-        debug_assert!(
-            error_rate.is_finite() && (0.0..=1.0).contains(&error_rate),
-            "flat emission error rate {error_rate} is not a finite probability in [0, 1]"
-        );
-        Self::from_unchecked_rate(error_rate)
+    pub fn try_new(error_rate: f64) -> Result<Self, DomainError> {
+        if !error_rate.is_finite() || !(0.0..=1.0).contains(&error_rate) {
+            return Err(DomainError::ErrorRate(error_rate));
+        }
+        Ok(Self::from_unchecked_rate(error_rate))
     }
 
     /// Everything [`Self::new`] does **except** the debug assertion — that is, exactly
@@ -436,7 +424,7 @@ mod tests {
     #[test]
     fn emission_is_finite_at_every_quality() {
         let per_quality = PerQualityEmission::new();
-        let flat = FlatEmission::new(0.01);
+        let flat = FlatEmission::try_new(0.01).expect("a valid test error rate");
         for quality in 0..=u8::MAX {
             for score in [
                 per_quality.emit_ln(b'A', b'A', BaseQual(quality)),
@@ -450,6 +438,23 @@ mod tests {
         }
         assert!(per_quality.insert_ln().is_finite());
         assert!(flat.insert_ln().is_finite());
+    }
+
+    /// **The check is now real in every build profile**, which is the point of `try_new`:
+    /// the previous `debug_assert!` was compiled out of the release build this project
+    /// actually runs, so the guarantee existed only in tests.
+    #[test]
+    fn try_new_rejects_a_rate_that_is_not_a_probability() {
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.5, 1.5, 1e300] {
+            assert!(
+                matches!(FlatEmission::try_new(bad), Err(DomainError::ErrorRate(_))),
+                "rate {bad} was not rejected"
+            );
+        }
+        // Both endpoints are legal — degenerate, not invalid, and the floors make them safe.
+        assert!(FlatEmission::try_new(0.0).is_ok());
+        assert!(FlatEmission::try_new(1.0).is_ok());
+        assert!(FlatEmission::try_new(0.01).is_ok());
     }
 
     /// **Totality must survive a violated precondition**, because the debug assertion
@@ -522,7 +527,7 @@ mod tests {
     #[test]
     fn flat_emission_orders_match_above_mismatch_below_the_crossover() {
         for error_rate in [0.0, 0.001, 0.01, 0.1, 0.5, 0.74] {
-            let flat = FlatEmission::new(error_rate);
+            let flat = FlatEmission::try_new(error_rate).expect("a valid test error rate");
             assert!(
                 flat.emit_ln(b'A', b'A', BaseQual(30)) > flat.emit_ln(b'A', b'C', BaseQual(30)),
                 "match did not outscore mismatch at ε = {error_rate}"
@@ -530,7 +535,7 @@ mod tests {
         }
         // Above the crossover the order reverses, for the same reason it does at Q0/Q1.
         for error_rate in [0.76, 0.9, 1.0] {
-            let flat = FlatEmission::new(error_rate);
+            let flat = FlatEmission::try_new(error_rate).expect("a valid test error rate");
             assert!(
                 flat.emit_ln(b'A', b'A', BaseQual(30)) < flat.emit_ln(b'A', b'C', BaseQual(30)),
                 "expected the mismatch to win at ε = {error_rate}"
@@ -540,7 +545,7 @@ mod tests {
 
     #[test]
     fn flat_emission_scores_every_quality_alike() {
-        let flat = FlatEmission::new(0.02);
+        let flat = FlatEmission::try_new(0.02).expect("a valid test error rate");
         let at_low = flat.emit_ln(b'A', b'A', BaseQual(2));
         let at_high = flat.emit_ln(b'A', b'A', BaseQual(60));
         assert_eq!(at_low, at_high);
@@ -552,14 +557,14 @@ mod tests {
     /// same discipline the quality table applies at Q0.
     #[test]
     fn flat_emission_floors_both_degenerate_error_rates() {
-        let perfect = FlatEmission::new(0.0);
+        let perfect = FlatEmission::try_new(0.0).expect("a valid test error rate");
         assert_eq!(perfect.emit_ln(b'A', b'A', BaseQual(30)), 0.0); // ln(1)
         assert_eq!(
             perfect.emit_ln(b'A', b'C', BaseQual(30)),
             PROBABILITY_FLOOR.ln()
         );
 
-        let hopeless = FlatEmission::new(1.0);
+        let hopeless = FlatEmission::try_new(1.0).expect("a valid test error rate");
         assert_eq!(
             hopeless.emit_ln(b'A', b'A', BaseQual(30)),
             PROBABILITY_FLOOR.ln()
@@ -573,7 +578,12 @@ mod tests {
     #[test]
     fn both_implementations_score_an_inserted_base_against_a_uniform_composition() {
         assert_eq!(PerQualityEmission::new().insert_ln(), UNIFORM_BASE_LN);
-        assert_eq!(FlatEmission::new(0.01).insert_ln(), UNIFORM_BASE_LN);
+        assert_eq!(
+            FlatEmission::try_new(0.01)
+                .expect("a valid test error rate")
+                .insert_ln(),
+            UNIFORM_BASE_LN
+        );
     }
 
     /// The literal is written out so it costs nothing on the hot path; this is what keeps
@@ -632,7 +642,7 @@ mod tests {
     #[test]
     fn row_resolved_scores_agree_with_the_per_call_form() {
         let per_quality = PerQualityEmission::new();
-        let flat = FlatEmission::new(0.01);
+        let flat = FlatEmission::try_new(0.01).expect("a valid test error rate");
         for quality in 0..=u8::MAX {
             let quality = BaseQual(quality);
             let row = per_quality.scores_for(quality);
