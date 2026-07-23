@@ -91,7 +91,7 @@ priced apart); **algorithm 2** (the general-purpose affine aligner), gated.
 
 ### Milestone A — module skeleton and the aligner types (no logic)
 
-**☐ A0. Scaffold `src/ng/alignment/` and define `Alignment`.**
+**✅ A0. Scaffold `src/ng/alignment/` and define `Alignment`.**
 `mod.rs` declaring the module's files, wired into `ng/mod.rs`. A **folder**, not a file: it holds
 competing implementations (arch §Module home). Plus `Alignment { reference_offset, ops: Vec<CigarOp> }`
 reusing production's `CigarOp` rather than minting a parallel operation type — its users are
