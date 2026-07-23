@@ -266,8 +266,11 @@ pub trait ReadPreparer {
     fn prepare_read(&self, read: &MappedRead, locus: &Self::Locus) -> Option<Self::Prepared>;
 }
 ```
-*Impls to bench:* trust-mapper+left-align (freebayes-style), local reassembly
-(GATK-style), per-read pair-HMM to the tract (ours-STR / HipSTR-style).
+*Impls to bench:* trust-mapper+left-align (freebayes-style), per-read re-align against the
+reference, per-read pair-HMM to the tract (ours-STR / HipSTR-style). **Local reassembly
+(GATK-style) was listed here until 2026-07-23 and is struck: out of scope, not deferred** —
+production already calls generic loci better than GATK without it
+([`../spec/read_preparation.md`](../spec/read_preparation.md) §1).
 
 Design settled across three specs: the shared contract
 [`../spec/read_preparation.md`](../spec/read_preparation.md) plus the generic

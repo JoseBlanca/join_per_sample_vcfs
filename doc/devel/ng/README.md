@@ -15,6 +15,10 @@ by document kind:
     BAQ → `PreparedRead`) and
     [`read_preparation_ssr.md`](spec/read_preparation_ssr.md) (STR: tract extraction →
     `SsrTractObs`).
+  - [`alignment.md`](spec/alignment.md) — the **alignment algorithms** both step 2 and step 7 call:
+    best-path (one line-up) vs marginal (summed over all line-ups), affine vs repeat-aware, plus
+    alignment normalization. Not a pipeline step — it knows no caller. Lists the seven algorithms
+    to build and compare.
   - [`typed_regions.md`](spec/typed_regions.md) — step 3 (the typed-region generator): walks
     the reference and cuts it into `TypedRegion`s (SsrSegment / SsrBundle / Generic / Satellite).
     First integrating spec — stands on `RefSeq`, the tandem-repeat scanner, and the STR catalog.
@@ -49,6 +53,9 @@ by document kind:
     folder per step (trait + impls + tests together), shared vocabulary, `bench/`.
   - [`read_filtering.md`](arch/read_filtering.md) — step 1's types & interfaces,
     distilled (the code-facing companion to the spec).
+  - [`alignment.md`](arch/alignment.md) — the alignment module's types & interfaces
+    (`BestPathAligner`, `MarginalAligner`, `AlignmentNormalizer`, `RepeatSpan`, `StutterModel`;
+    seeds `LogProb`); companion to `spec/alignment.md`. Called by two steps, not a step itself.
   - [`typed_regions.md`](arch/typed_regions.md) — step 3's types & interfaces (the
     typed-region generator); companion to `spec/typed_regions.md`.
   - [`typed_regions_cli.md`](arch/typed_regions_cli.md) — the `pop_var_caller_exp` /
@@ -86,6 +93,14 @@ by document kind:
   - [`locus_generation.md`](impl_plan/locus_generation.md) — the shared locus-generation shape:
     the `locus_generation/` module, the locus types, `LocusGenerator<S>` + `NoLoci`, the
     dispatcher, and the iterator (proven with the count-only generator). Ships no real generator.
+  - **The alignment module, in three plans, in this order:**
+    [`alignment_best_path.md`](impl_plan/alignment_best_path.md) (the module skeleton, the aligner
+    types, the repeat delimiter that **unblocks the STR generator**, its banding, the two-penalty
+    comparison, and a gated affine aligner);
+    [`alignment_marginal.md`](impl_plan/alignment_marginal.md) (`LogProb`, the marginal interface,
+    the sequence marginal and the whole-read forward); and
+    [`alignment_normalization.md`](impl_plan/alignment_normalization.md) (the normalizer interface,
+    three left-aligners, and the property test that grades them against a definition).
   - [`locus_generation_ssr.md`](impl_plan/locus_generation_ssr.md) — the STR generator: the
     prerequisite `flank_bp`→`bundle_threshold` rename, `SsrLocus` + margin fetch, the ported
     reservoir cap, the fetch→align→tally transform, and byte parity vs production. Gated on the

@@ -4,8 +4,10 @@
 discipline from the preamble [`read_preparation.md`](read_preparation.md) — read that first;
 this spec covers only what is specific to the STR path. Grounded in the production `ssr/pileup`
 Stage-1 pipeline ([src/ssr/pileup/](../../../../src/ssr/pileup/)). **No code yet.** Naming:
-**STR** in prose, `ssr` in code — the module is `src/ng/read/` (the impl file `pair_hmm.rs`) and
-the STR types carry the `Ssr` prefix.*
+**STR** in prose, `ssr` in code — the preparer lives in `src/ng/read/`, and the pair-HMM it calls
+lives in the alignment module `src/ng/alignment/` ([`alignment.md`](alignment.md)); the STR types
+carry the `Ssr` prefix. Updated 2026-07-23: the aligner moved out of this spec into its own module,
+and this preparer now **composes** it rather than owning it.*
 
 ---
 
@@ -81,10 +83,12 @@ Per candidate read, in order:
 1. **Footprint + extract.** Map the reference tract window onto the read's coordinates across any
    internal indels, centering a window on the tract; widen it when a long allele reaches past the
    window (long-allele recovery).
-2. **Delimit** — a per-read **Viterbi (max-path) pair-HMM**. Align the extracted read slice
-   against `left_flank + reference_tract + right_flank` with a **tract-aware affine gap** (gaps
-   are cheap inside the tract, where length variation is expected, and dear in the flanks), and
-   read the repeat region off the flank-junction columns.
+2. **Delimit** — call the **repeat-aware best-path aligner** ([`alignment.md`](alignment.md) §4.2)
+   on the extracted read slice against `left_flank + reference_tract + right_flank`, then read the
+   repeat region off the flank-junction columns. That aligner prices gaps one way in the flanks and
+   another inside the tract. **How it should price a whole-unit slip is an open comparison owned by
+   that spec** — one flat per-base penalty, as production charges today, or a separate cheaper price
+   per repeat unit, as HipSTR does — so do not assume either here.
 3. **Classify by how many borders were anchored → observation.** This is where the extension
    lives, and note that the delimiter *already computes it* — the same alignment, read differently:
    - **both borders anchored** → the tract length is pinned: an **exact** observation (the
@@ -155,19 +159,23 @@ stays.
 The STR implementation:
 
 ```rust
-pub struct SsrDelimitPreparer<Canon: RefSeq> {
-    canon_ref: Canon,             // canonical bases for the flank+tract+flank alignment
-    scratch: ViterbiScratch,      // reused per-worker DP matrices, not per-read allocation
+pub struct SsrDelimitPreparer<Canon: RefSeq, A: BestPathAligner> {
+    canon_ref: Canon,   // canonical bases for the flank+tract+flank alignment
+    aligner: A,         // the repeat-aware best-path aligner (alignment.md §4.2), fixed at
+                        // compile time — a type parameter, never a trait object (preamble §6)
     /* config: quality gate, widen policy */
 }
 
-impl<Canon: RefSeq> ReadPreparer for SsrDelimitPreparer<Canon> {
+impl<Canon: RefSeq, A: BestPathAligner> ReadPreparer for SsrDelimitPreparer<Canon, A> {
     /// Unlike the generic path, the STR delimiter **does** need the locus: its motif, borders
-    /// and flanks are what make the gap penalties tract-aware.
+    /// and flanks are what tell the aligner where the tract is.
     type Locus = SsrLocus;
     type Prepared = SsrTractObs;
-    fn prepare_read(&self, read: &MappedRead, locus: &SsrLocus) -> Option<SsrTractObs> {
-        /* footprint → delimit → gate */
+    /// The aligner's own matrices — per worker, never per read (preamble §6).
+    type Scratch = A::Scratch;
+    fn prepare_read(&self, read: &MappedRead, locus: &SsrLocus,
+                    scratch: &mut Self::Scratch) -> Option<SsrTractObs> {
+        /* footprint → align → read off the junctions → gate */
     }
 }
 ```
@@ -210,9 +218,11 @@ new observation class is worthless if selection still drops its inputs upstream.
 ## 5. Cross-cutting concerns
 
 - **Performance / parallelism.** Pairwise-independence (preamble §3) makes STR prep parallel per
-  read. The Viterbi delimiter is the cost; reuse a per-worker `ViterbiScratch` for its matrices
-  rather than allocating per read (the project's scratch-buffer discipline — the production
-  delimiter already threads a reusable scratch).
+  read. The alignment is the cost, and **every** spanning read is aligned — this path has no
+  trust-the-CIGAR fast tier, and no pass-through or canonicalize mode, because measuring the repeat
+  *is* the preparation (preamble §3, which also records that a direct unit-counting fast path stays
+  parked as something to measure). Reuse the aligner's scratch per worker rather than allocating per
+  read (the project's scratch-buffer discipline — the production delimiter already threads one).
 - **Determinism.** Extraction depends only on the read and the locus, so a read delimits to the
   same `SsrTractObs` regardless of thread interleaving.
 
@@ -264,10 +274,12 @@ new observation class is worthless if selection still drops its inputs upstream.
   for exactly that reason (§4).
 
 **Alternatives to bench (recorded, not built now):** GangSTR-style **realign every read with
-Striped Smith-Waterman** against a synthetic repeat reference — an alternative *delimiter*
-producing an `SsrTractObs`-shaped output, so the tally consumes it unchanged. (HipSTR's
-read↔haplotype HMM is a *scoring* model — it belongs to step 7's likelihood bake-off, not to this
-delimitation step; noting it here only to place it correctly.)
+Striped Smith-Waterman** against a synthetic repeat reference. This is now expressed as a **swap of
+the aligner this preparer holds**, not as a second preparer: it is the quality-blind, flat-cost
+configuration of the best-path aligner ([`alignment.md`](alignment.md) §3, §4), and the tally
+consumes the same `SsrTractObs` unchanged. (HipSTR's read↔haplotype HMM is a *scoring* model — it
+belongs to step 7's likelihood bake-off, not to this delimitation step; noting it here only to place
+it correctly.)
 
 ---
 

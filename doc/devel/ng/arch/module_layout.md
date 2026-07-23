@@ -33,8 +33,13 @@ src/ng/
 ├── read/             – steps 1+2, one read-handling module (see principle 1, note):
 │                        · filtering.rs – step 1: the fixed filtering prelude (a single
 │                          file — no bake-off; wraps the bam/alignment_input filters)
-│                        · mod.rs + left_align_baq.rs / reassembly.rs / pair_hmm.rs –
-│                          step 2: ReadPreparer trait + its swappable impls, side by side
+│                        · mod.rs + left_align_baq.rs / ssr_delimit.rs –
+│                          step 2: ReadPreparer trait + its swappable impls, side by side.
+│                          The alignment algorithms they call live in alignment/, below —
+│                          a preparer composes one, it does not contain one.
+├── alignment/        – NOT a pipeline step: the shared alignment algorithms both step 2 and
+│                       step 7 call. Knows nothing about caller steps. mod.rs (the traits) +
+│                       one file per algorithm. Spec ../spec/alignment.md
 ├── region_typing/    – step 3  the typed-region generator: walks the reference and cuts it into
 │                       TypedRegion { region, kind } (SsrSegment/SsrBundle/Generic/Satellite). A
 │                       concrete iterator, no trait (no bake-off). Spec ../spec/typed_regions.md;
@@ -196,11 +201,13 @@ serialization when memory forces it or when the evidence types stop churning.
 ## Naming to confirm
 
 - `read/` (steps 1+2) — the merged read-handling module (see principle 1). Step 2's
-  files are named for the **transform they perform** (`left_align_baq.rs`, `reassembly.rs`,
-  `pair_hmm.rs`, …), not for the taxonomy pole they sit on — "trust the mapper" is an *axis*
+  files are named for the **transform they perform** (`left_align_baq.rs`, `ssr_delimit.rs`, …),
+  not for the taxonomy pole they sit on — "trust the mapper" is an *axis*
   (`ng_proposal.md` §2) and names a family, not one implementation. The `ReadPreparer` trait
-  lives in `read/mod.rs`; its impls are `LeftAlignBaqPreparer`, `ReassemblyPreparer`,
-  `SsrDelimitPreparer`. The "prep" abbreviation is gone: a `ReadPreparer` does `prepare_read`
+  lives in `read/mod.rs`; its impls are `LeftAlignBaqPreparer` and `SsrDelimitPreparer`.
+  (`reassembly.rs` / `ReassemblyPreparer` were listed here until 2026-07-23; local reassembly is
+  now out of scope, not deferred — `../spec/read_preparation.md` §1. `pair_hmm.rs` was listed here
+  too; the pair-HMM moved to `alignment/`, and a preparer now composes it.) The "prep" abbreviation is gone: a `ReadPreparer` does `prepare_read`
   and yields a `Prepared` observation (verb, agent noun, product).
 - `types.rs` (the one shared-types file) — a common Rust convention, honest for a mixed
   starting file; naming.md leans against a *permanent* generic module, so the plan is to

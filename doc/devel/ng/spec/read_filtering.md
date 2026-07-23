@@ -78,7 +78,8 @@ filtering's output (`MappedRead`) is read preparation's input.
 src/ng/read/
 ├── mod.rs         – module declarations + the ReadPreparer trait (step 2, added later)
 ├── filtering.rs   – step 1: the fixed filtering prelude  (this spec)  (+ #[cfg(test)])
-└── …              – step 2 impls land here as siblings: left_align_baq.rs, pair_hmm.rs, …
+└── …              – step 2 impls land here as siblings: left_align_baq.rs, ssr_delimit.rs, …
+                      (the alignment algorithms they call live in src/ng/alignment/)
 ```
 
 This is a deliberate, documented deviation from the "one folder per step" rule in

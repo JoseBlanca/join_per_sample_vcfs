@@ -1,206 +1,240 @@
-# ng step 2 — read preparation (the shared discipline)
+# ng — read preparation
 
-*Status: design spec, 2026-07-14. The **shared preamble** for step 2, read preparation. Read
-preparation has two implementations that share a contract but produce different evidence to
-different consumers, so each path has its own spec and this doc holds only what they have in
-common. The two path specs:*
-
-- *generic (SNP/indel): [`read_preparation_generic.md`](read_preparation_generic.md) —
-  left-align + BAQ.*
-- *STR: [`read_preparation_ssr.md`](read_preparation_ssr.md) — tract extraction.*
-
-*Under [`ng_proposal.md`](ng_proposal.md) (§2) and the arch docs
-[`../arch/ng_step_interfaces.md`](../arch/ng_step_interfaces.md) (the `ReadPreparer` trait sketch)
-and [`../arch/module_layout.md`](../arch/module_layout.md) (the `read/` module). Follows
-[`read_filtering.md`](read_filtering.md) (step 1). **No code yet.** Naming: **STR** in prose,
-`ssr` in code.*
+*Status: design spec, rewritten 2026-07-23, replacing the 2026-07-14 draft of this file. Defines
+what read preparation does, how much work it gives each read, and how it composes with the
+alignment module ([`alignment.md`](alignment.md)). The two path specs —
+[`read_preparation_generic.md`](read_preparation_generic.md) and
+[`read_preparation_ssr.md`](read_preparation_ssr.md) — still hold for their path-specific detail,
+except where §8 records a change. **No code yet.** Naming: **STR** in prose, `ssr` in code.*
 
 ---
 
-## 1. What read preparation *is* — goals, non-goals, and what it is not
+## 1. What read preparation is
 
-Read preparation is the **per-read transform** that turns a filtered `MappedRead` into a
-locus-ready observation. Read filtering (step 1) decided *which* reads survive; read
-preparation decides *what each surviving read looks like as evidence at its locus* — realigning
-or delimiting it against the reference and reconciling its per-base qualities, so the downstream
-evidence-gatherer sees a canonical, comparable read.
+Read filtering decided *which* reads survive. Read preparation decides **what each surviving read
+looks like as evidence at its locus**, and produces it: a per-read transform from a filtered read
+into a locus-ready observation the evidence-gatherer downstream can use.
 
-It is **marker-aware**, and that is the one structural difference from step 1: the router (step
-3) classifies each locus as generic (SNP/indel) or STR, and read preparation runs the matching
-implementation. The two implementations share the discipline below but almost nothing else —
-different algorithms, different output types, different consumers — which is why they are two
-specs. This doc is the contract they both obey.
+Its distinctive job is **deciding how much work a read needs**. Most reads need almost none — the
+mapper placed them well and there is nothing to fix. Some need their indels rewritten into a
+canonical form. A few need their alignment redone from scratch because the mapper's answer is not
+trustworthy. Preparation makes that choice per read and carries it out.
 
-### Goals
+**It does not compute alignments itself.** Lining a read up against the reference belongs to the
+alignment module, which knows nothing about caller steps. Preparation *composes* that module: it
+picks an algorithm, supplies the inputs, and interprets the result. Keeping the boundary there is
+what lets an alignment algorithm be swapped and measured without touching preparation, and vice
+versa.
 
-- Turn each filtered read into a **per-read, pairwise-independent** prepared observation that the
-  downstream gatherer can turn into locus evidence.
-- **Reuse the production preparations** behind a shared trait (§3), one implementation per path.
-- Keep read preparation **separate from the gatherer it feeds**, so the per-step bake-off
-  (`ng_proposal.md` §2) can swap a preparation implementation and hold the rest.
+Preparation is **marker-aware**, and that is its one structural split: a locus is either generic
+(SNP/indel) or a microsatellite, and the two paths share this contract but almost nothing else —
+different work, different outputs, different consumers.
 
-### Non-goals (deliberately excluded — could be goals, are not)
-
-- **The per-base, pairwise evidence-gathering** — applying the adaptor mask, reconciling
-  overlapping mate qualities, decomposing the CIGAR into per-position events. These need the
-  locus-column context and are **not per-read**; they live downstream in the gatherer (§5).
-- **Read likelihood (step 7).** Preparation produces observations, never `Lr = P(read | allele)`.
-  On the STR path in particular, prep emits the tract *bytes* and scoring is a separate step and
-  a separate pair-HMM; fusing them would foreclose the read-likelihood bake-off.
-- **Candidate generation (step 6) and the router (step 3).** Preparation is handed an
-  already-routed locus; it does not decide STR-ness or enumerate alleles.
-- **Local reassembly in v1.** GATK-style haplotype reassembly is a *future* generic-path
-  alternative to bench, not the first implementation.
-- **Base-quality recalibration (BQSR).** Production does not do it here; neither does ng.
-
-**Read preparation is not filtering.** It never *drops* a read for a whole-read property — that
-was step 1. It *may* return "no usable observation" for a read the transform itself defeats, and
-those are tallied, not silent (§5).
+**Non-goals.** Preparation never *drops* a read for a whole-read property — that was filtering. It
+does not decompose a read into per-position events (the pileup walker's job, and it needs
+locus-column context that preparation deliberately does not have). It does not generate candidate
+alleles or compute read likelihoods. And it does not reassemble: **local haplotype reassembly is out
+of scope for ng, not deferred** — the production caller already calls generic loci better than GATK
+without it, so it buys nothing here, and it would break the per-read independence every mode below
+relies on (§6).
 
 ---
 
-## 2. Where read preparation sits — compose, not subsume
+## 2. How much work a read needs — the generic path's three modes
 
-The most important shared architectural fact is one the production code already settled on
-**both** paths: **read preparation is a distinct step, composed with the gatherer, not fused
-into it.** In production the generic per-read fold (`process_read`) produces a `PreparedRead`
-that the **pileup walker consumes**; the STR Stage-1 pipeline produces an extracted-tract
-observation (`ReadObs::Sequence`) that the **tract tally + cohort likelihood consume**. Neither
-gatherer *is* the preparation — each takes a prepared read as input.
+On the generic path, preparation picks one of three modes per read. All three produce the **same
+output type**, which is what makes them interchangeable.
 
-This resolves the standing open question in `module_layout.md` (*"does `pileup/` subsume the
-generic path's step 2, or is it built from it?"*): **built from it.** `ReadPreparer` is a real step;
-the pileup (generic) and the tract tally (STR) are its consumers, one step upstream of where the
-two paths converge at `SampleLocusObservations` (`locus_generation.md` §3).
+| mode | what it does | when | cost |
+|---|---|---|---|
+| **pass through** | nothing to the placement | the read shows no insertions or deletions | none |
+| **canonicalize** | rewrite the read's indels into their leftmost equivalent spelling; optionally cap base qualities by alignment confidence | the read has indels and its placement is trusted | cheap |
+| **re-align** | discard the mapper's line-up and compute a fresh one from the read's bases | the read's placement is not trusted (§4) | a full alignment per read |
 
-```
-generic:  MappedRead ─prepare▶ PreparedRead ─▶ pileup generator ─▶ SampleLocusObservations
-STR:      MappedRead ─prepare▶ SsrTractObs  ─▶ STR generator    ─▶ SampleLocusObservations ─▶ Lr (step 7)
-                                                                   └── the paths converge here ──┘
-```
+**Pass-through is a fast path, not a different answer.** Left-alignment shifts indels; a read with
+no indels has nothing to shift, so canonicalizing it is provably a no-op. Recognizing that from the
+read's own alignment record and skipping the work changes nothing about the result. (Whether it also
+skips the base-quality capping is a separate decision — that step reads alignment *confidence*, which
+is not identically neutral just because there are no indels. §9.)
 
-Because the paths only converge at `SampleLocusObservations`, the prepared read is **inherently
-pre-convergence and path-specific** — which is exactly why forcing a single output type here
-(an earlier draft's `LocusRead` enum) was wrong, and why the trait keeps the output path-owned
-(§3). (Contrast step 6, candidate generation, where generic and STR legitimately share one
-output type, `AlleleCandidates`, because that step sits *after* convergence.)
+**Canonicalize is about spelling, not quality.** The same insertion or deletion can be written at
+several equivalent reference positions when it sits in or near a repeat — the gap slides without
+changing a single base of the result. Left-alignment picks the leftmost of those spellings so that
+equivalent variants get an identical one. This matters because differently-spelled equivalents look
+like different variants, and the reads supporting them scatter across several weak candidates
+instead of pooling into one strong one. The operation itself lives in the alignment module
+([`alignment.md`](alignment.md) §6); preparation decides when to apply it.
+
+**Re-align is the only mode that questions the mapper.** The other two accept the read's placement
+and work within it; this one throws it away and computes a new line-up with a best-path alignment
+algorithm ([`alignment.md`](alignment.md) §4.1). It is the expensive mode and the rare one — and it
+is the only route by which a mis-placed read can be rescued, so its trigger (§4) determines how much
+of that class the caller ever recovers.
 
 ---
 
-## 3. The shared contract — the `ReadPreparer` trait
+## 3. The STR path always aligns
 
-One trait states the shared shape; **each path owns its output type** via an associated type. The
-generic and STR outputs go to different consumers and are never held interchangeably (the router
-picks the path before prep runs), so the output is never unified — only the contract is.
+The microsatellite path has no equivalent of pass-through or canonicalize: **measuring the read's
+repeat is the preparation**, and measuring it requires an alignment. Every read that reaches the STR
+preparer is aligned against its locus with the repeat-aware best-path aligner
+([`alignment.md`](alignment.md) §4.2), and the repeat is read off the two flank boundaries.
 
-The names read as one idea: a **`ReadPreparer`** does **`prepare_read`** and yields a
-**`Prepared`** observation. Note what that does *not* promise: `PreparedRead` is the **generic
-path's** output specifically, not the universal step-2 output. The trait yields `Self::Prepared`
-— `PreparedRead` on the generic path, `SsrTractObs` on the STR path — so the tidy
-`ReadPreparer → PreparedRead` pairing holds for the generic path only. That asymmetry is
-deliberate (§2): do not read it as an invitation to re-unify the two outputs.
+Canonicalizing instead would not help. In a repeat, shifting the mapper's indel to its leftmost
+spelling does not recover how many units the read carries — which is the only quantity the STR path
+wants.
 
-```rust
-pub trait ReadPreparer {
-    /// What this implementation needs to know about the locus — path-owned:
-    /// `()` on the generic path (it needs no locus at all — it prepares the read against the
-    /// reference around the read's *own* span) or `SsrLocus` on the STR path (motif, borders,
-    /// flanks — so the delimiter's gaps can be tract-aware).
-    type Locus;
+**This was decided against the alternative, not by default.** Production considered a two-tier
+scheme that trusted the mapper's alignment for clean-looking reads and aligned only the doubtful
+ones, and dropped it in favour of aligning every spanning read. A fast path that counts units
+directly from a clean read remains parked as something to measure, not as a decision already taken —
+so if the cost of aligning everything ever justifies a fast tier, the comparison is a measurement
+away, and §9 keeps it open.
 
-    /// The per-read prepared observation this implementation emits — path-owned:
-    /// `PreparedRead` (generic) or `SsrTractObs` (STR). The two converge only downstream, at
-    /// `SampleLocusObservations`, never here.
-    type Prepared;
+---
 
-    /// Prepare one filtered read. The implementation **holds its own reference accessors**
-    /// (`RefSeq` / `RawRefSeq`) as fields and fetches what it needs — there is no window
-    /// argument (see below). `None` = the read produced no usable observation here (§5) — a
-    /// tallied per-read outcome, not a run error.
-    fn prepare_read(&self, read: &MappedRead, locus: &Self::Locus) -> Option<Self::Prepared>;
-}
-```
+## 4. Choosing the mode — the part that is not settled
 
-### No window argument — the preparer holds its accessors (a decision, and the alternative)
+Pass-through and canonicalize are chosen from the read's own alignment record: does it carry indels
+or not. That decision needs nothing but the read.
 
-An earlier sketch passed a pre-materialised reference window (`window: &RefWindow`, then a
-bundled `LocusWindow`). Production shows that is wrong on **both** paths:
+**Re-align is different: it needs a judgement the read cannot make about itself.** "The mapper's
+answer here is not trustworthy" is a property of the *place*, not of one read — a region where reads
+disagree with each other, pile up mismatches in the same column, or clip at the same offset. Nothing
+in the current ng step map produces that judgement:
 
-- **Generic:** `process_read(read, baq, raw_ref, cfg)` takes **no window**. It holds the
-  reference fetchers and reads around the read's own span. It also needs *two* views of the
-  reference — raw, case-preserving bytes for left-alignment and canonical bytes for the BAQ HMM
-  — which a single materialised span cannot carry.
-- **STR:** `delimit_read(region_seq, region_qual, locus, model, scratch)` takes the **locus**,
-  not a window — the tract structure is the whole point.
+- **Region typing** classifies the reference (microsatellite, repeat cluster, satellite, generic).
+  It says what the reference *is*, not how well reads mapped to it — it never looks at reads.
+- **The evidence-gatherer** does see the reads and could discover it, but it runs *after*
+  preparation, so a verdict it produces arrives too late for the read it should have changed.
 
-So the reference is a **field on the preparer**, fetched per read — exactly as step 1's
-`ReadFilter` holds `reference: R` plus a reused `ref_buf` scratch — and the only per-call context
-is the routed locus, which the generic path does not need at all (`type Locus = ()`).
+So the trigger needs either a new producer or a deliberate two-pass arrangement, and picking one is
+open (§9). Recording it here rather than assuming a default matters because **the trigger, not the
+algorithm, sets how much this mode is worth**: an aligner that never fires rescues nothing.
 
-*Alternative considered:* keep a window type carrying bases plus tract structure. **Rejected** —
-it needs a name for a concept that isn't one ("a window of *what*?"); it duplicates production's
-existing `RefSpan` (the sequence-carrying span); it would hand the generic path STR fields it
-ignores — the same papering-over we rejected for the output (§2); and it still could not carry
-the raw+canonical duality the generic transform requires.
+---
+
+## 5. What preparation produces
+
+Each path owns its output type; the two are never held interchangeably, because the router picks the
+path before preparation runs and the two go to different consumers. Both are specified in their path
+specs and only summarized here:
+
+- **Generic** — a still-decomposable read: the placement (canonical or re-aligned), the bases, the
+  qualities, and the per-read values the pileup walker needs. The walker turns it into per-position
+  evidence. Reused from production unchanged.
+- **STR** — the repeat the read shows: either the measured repeat between both flanks, or, when the
+  read ran off its own end mid-repeat, the part it did prove plus which flank it was anchored to (a
+  lower bound on the length, kept rather than discarded).
+
+A read that the transform itself defeats yields **no observation** — a normal, tallied per-read
+result, never a silent drop and never a masked run failure (§7).
+
+---
+
+## 6. The interface — per read, statically dispatched, with reused buffers
 
 Three properties every implementation upholds:
 
-- **Per-read and pairwise-independent.** Every read is prepared in isolation — no mate, no other
-  read, no locus-column context. Production relies on this to prepare reads in parallel with
-  deterministic output, and it is why the genuinely pairwise work (mate-overlap reconciliation)
-  is downstream, not here (§5).
-- **Content-canonicalising, not content-inventing.** Preparation re-*places* what the read
-  already says (left-aligning an indel that is already there, capping a quality already measured,
-  extracting a tract already sequenced). It does not assemble new sequence. (Local reassembly,
-  which *does* invent haplotypes, is the one deliberately deferred alternative — §5.)
-- **`None` means "this read, unusable here"** — a normal, tallied per-read result, never a hidden
-  drop and never a masked run error (§5).
+- **Per read, and independent of every other read.** A read is prepared in isolation: no mate, no
+  neighbouring read, no locus-column context. This is what makes preparation parallel with
+  deterministic output, and it is why the genuinely pairwise work (reconciling overlapping mates'
+  qualities) sits downstream in the gatherer instead. It is also why reassembly cannot be a mode
+  here: assembling haplotypes needs every read in a region at once.
+- **It re-places what the read already says; it does not invent sequence.** Canonicalizing an indel
+  that is already there, redoing a line-up, measuring a repeat that was already sequenced — all
+  re-express the read's own content.
+- **No usable observation is a result, not an error** (§7).
 
-The `read/` module holds every step-2 implementation side by side (`module_layout.md` principle
-1): the generic impls (`left_align_baq.rs`, later `reassembly.rs`) and the STR impl
-(`pair_hmm.rs`) are siblings, each an `impl ReadPreparer`. STR-ness is a property of the
-*implementation*, not a separate subtree (principle 2).
+**Dispatch is resolved at compile time.** Preparation runs on every read of every sample — billions
+of calls — so which implementation runs is fixed by a generic type parameter the compiler
+specializes, never by a trait object (`Box<dyn …>`): a virtual call and its indirection per read is
+a cost this path cannot carry. The per-read *mode* (§2), which genuinely varies read to read, is a
+matched enum rather than a second dispatch mechanism.
+
+**Buffers are caller-owned and reused.** The alignment algorithms preparation calls need matrices,
+and allocating them per read is the other cost this path cannot carry. So preparation threads a
+reusable scratch value, exactly as the existing read-likelihood models do.
+
+```rust
+pub trait ReadPreparer {
+    /// What this implementation needs to know about the locus — path-owned: nothing on the
+    /// generic path, the microsatellite locus (motif, boundaries, flanks) on the STR path.
+    type Locus;
+    /// The per-read observation this implementation emits — path-owned (§5).
+    type Prepared;
+    /// Reused buffers, including those the alignment algorithms need — allocated once per
+    /// worker, never per read.
+    type Scratch: Default;
+
+    /// Prepare one filtered read. `None` means this read yields no usable observation here —
+    /// a tallied per-read outcome, not a run error (§7).
+    fn prepare_read(&self, read: &MappedRead, locus: &Self::Locus,
+                    scratch: &mut Self::Scratch) -> Option<Self::Prepared>;
+}
+```
+
+The implementation **holds its own reference accessors** as fields and fetches what it needs around
+each read's span; there is no reference-window argument. The generic transform needs two views of
+the reference at once (raw bytes for left-alignment, canonical bytes for the quality-capping model),
+which a single materialised window cannot carry.
 
 ---
 
-## 4. Shared vocabulary and reuse
+## 7. Error model
 
-Common to both paths (path-specific reuse lives in each path spec's reuse map):
+Two outcomes, and they must not be confused:
 
-| what | existing code | ng reuse |
-|---|---|---|
-| the read itself | `MappedRead` ([bam/alignment_input.rs](../../../../src/bam/alignment_input.rs)) | reuse as-is — the step-2 input |
-| reference access | `RefSeq` + `RawRefSeq` ([ref_seq.md](ref_seq.md)) | reuse as-is — held **as a field on the preparer** and fetched per read (§3), raw bytes where the aligner's view matters, canonical bytes for HMM alignment |
+- **A read produces no usable observation** — `prepare_read` returns `None` and the reason is
+  tallied. Normal. The reasons differ by path (the generic path's quality-capping step can decline a
+  read; on the STR path a read may anchor no flank at all, or fail the base-quality gate) and each
+  path spec enumerates its own.
+- **A reference fetch fails** — a contig mismatch, a window past a contig end. This is a broken run,
+  **fatal**, and surfaced as such. It is never folded into a per-read `None`, so that `None` always
+  means "this read, unusable here" and never hides a broken reference.
 
-There is **no window/span type** to define: the preparer fetches the reference itself (§3), so
-nothing needs to bundle bases with a locus. The only per-call context is the routed locus
-(`Self::Locus`), whose STR shape is co-owned with the router spec (`LocusKind`) and is `()` on the
-generic path. A per-sample running tally (the step-2 analogue of `ReadFilterCounts`) records every
-`None` by reason — the "no silent caps" discipline — with the reasons enumerated per path (§5).
+Every `None` is counted by reason. A run that silently prepares nothing must be indistinguishable
+from a run that prepared everything only by reading the counts.
 
 ---
 
-## 5. Shared error model, and deferred-with-a-home
+## 8. What changed from the 2026-07-14 draft
 
-**Error model (identical on both paths).** Two distinct outcomes:
+Recorded so the path specs are not silently contradicted:
 
-- **A read produces no usable observation** — `prepare_read` returns `None`, the reason is
-  tallied. Normal per-read result, not a run error. (The reasons differ by path and are listed
-  in each path spec.)
-- **A reference fetch fails** — a contig mismatch, a window past the contig end. A run-level
-  configuration error, **fatal**, surfaced up front by window validation, never swallowed into a
-  per-read `None` (as in `read_filtering.md` §5). So a `None` always means "this read, unusable"
-  and never hides a broken reference.
+- **Alignment moved out.** The earlier draft had each preparer owning its alignment machinery. The
+  alignment algorithms now live in their own module ([`alignment.md`](alignment.md)), which knows
+  nothing about caller steps; preparation composes them. The STR path spec's `ViterbiScratch`-holding
+  preparer sketch becomes "holds the repeat-aware best-path aligner and its scratch".
+- **Re-align is a new generic mode.** The generic path spec describes itself as the
+  *trust-the-mapper* implementation that "does not realign". It gains a third mode (§2) for reads
+  whose placement is not trusted. Its two existing modes are unaffected.
+- **Reassembly is out of scope, not deferred.** Both the shared draft and the generic path spec list
+  local reassembly as a future sibling to bench. It is not: production already beats GATK on generic
+  loci without it (§1). Those entries should be struck.
+- **The trait gained a reused-scratch parameter** (§6). The earlier sketch was
+  `prepare_read(&self, read, locus)`; the alignment algorithms it now calls need matrices that
+  cannot be allocated per read.
+- **Dispatch is explicitly static.** The earlier draft did not say; at this call volume a trait
+  object is not an option (§6).
 
-**Deferred, with a home (shared):**
+---
 
-- **Adaptor-mask *application* and overlapping-mate quality reconciliation → the gatherer** (the
-  pileup walker on the generic path; subsumed by tract extraction on the STR path). Per-base and,
-  for mate overlap, pairwise — needing the locus-column context. Consistent with
-  `read_filtering.md` §6, which deferred the same two operations. (The generic prepared read
-  *carries* the adaptor boundary as an annotation but does not apply it — the walker does.)
-- **Read likelihood `P(read | allele)` → step 7.** Preparation emits observations, not scores.
-- **Local haplotype reassembly → a future generic `ReadPreparer` alternative** (see the generic spec).
+## 9. Open questions
 
-Everything else — the transforms, the output types, the consumers, the path-specific reuse and
-open questions — is in the two path specs.
+- **What flags a region as "not to be trusted", and when?** (§4) Region typing never looks at reads;
+  the gatherer looks at reads but runs too late. Either a new producer or a two-pass arrangement.
+  This decides whether the re-align mode is worth its cost, so it should be settled before that mode
+  is built rather than after.
+- **Does pass-through skip the base-quality capping too, or only the left-alignment?** (§2)
+  Left-alignment is provably neutral on an indel-free read; the capping step is not obviously so,
+  since it measures alignment confidence rather than indel placement. Cheap to settle by comparing
+  output on indel-free reads with the step on and off.
+- **Is a fast path for clean microsatellite reads worth it?** (§3) Aligning every spanning read is
+  the decision in force, with a direct unit-counting fast path parked. Whether the saved time is
+  worth a second code path — and whether the two agree on clean reads — is a measurement nobody has
+  run.
+- **Which reads reach the STR preparer at all.** The lower-bound observation class only exists if
+  the read selection upstream admits partially-covering reads; production's spanning gate excludes
+  exactly those. Owned by the STR path spec, repeated here because a change to selection is easy to
+  miss and makes the class unreachable.

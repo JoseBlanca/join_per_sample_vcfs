@@ -5,7 +5,9 @@ shared contract and discipline from the preamble
 [`read_preparation.md`](read_preparation.md) — read that first; this spec covers only what is
 specific to the generic path. Grounded in the production `process_read` fold
 ([pileup/per_sample/read_processor.rs](../../../../src/pileup/per_sample/read_processor.rs)).
-**No code yet.***
+**No code yet.** Updated 2026-07-23 to match the rewritten preamble: a third mode (**re-align**), the
+alignment algorithms moved out into their own module ([`alignment.md`](alignment.md)), and local
+reassembly struck as out of scope.*
 
 ---
 
@@ -23,9 +25,30 @@ confidence — into a still-decomposable read the pileup walker can turn into pe
 
 BAQ is a **config toggle on the one preparer**, not a second implementation (§2).
 
-**Non-goals** (beyond the shared preamble's): this is the *trust-the-mapper* implementation. It
-does **not** realign or reassemble; local reassembly is a separate, deferred `ReadPreparer` sibling
-(§6). It does not decompose the CIGAR into events — that is the pileup walker's job (§6).
+**Where these sit among the three modes.** The preamble (§2) names three: pass through,
+canonicalize, re-align. Both modes above are **canonicalize** — with and without the quality cap.
+The other two are additions to this path:
+
+- **pass through** — skip the left-alignment for a read carrying no indels. Left-alignment shifts
+  indels, so a read with none is provably unchanged by it: this is a fast path, not a different
+  answer. (Whether it should also skip BAQ is open — preamble §9.)
+- **re-align** — discard the mapper's placement entirely and compute a fresh one with a best-path
+  alignment algorithm from the alignment module ([`alignment.md`](alignment.md) §4.1). The only mode
+  that can rescue a mis-placed read. **What triggers it is unsettled** and owned by the preamble
+  (§4 there); until that is decided the mode cannot fire.
+
+All three produce the same `PreparedRead` (§3), which is what makes them interchangeable and
+comparable.
+
+**Non-goals** (beyond the shared preamble's): it does **not** reassemble — local haplotype
+reassembly is **out of scope for ng, not deferred** (the production caller already calls generic
+loci better than GATK without it, and assembling haplotypes would break the per-read independence
+this path rests on; preamble §1). It does not decompose the CIGAR into events — that is the pileup
+walker's job (§6).
+
+*An earlier draft of this spec called this the trust-the-mapper implementation that never realigns.
+That is no longer the whole path:* re-aligning a read whose placement is **not** trusted is now a
+third mode (§2).
 
 The output type is **`PreparedRead`** and the consumer is the **pileup walker** (preamble §2).
 
@@ -137,8 +160,11 @@ impl<Raw: RawRefSeq, Canon: RefSeq> ReadPreparer for LeftAlignBaqPreparer<Raw, C
     /// read's own span (production's `process_read` takes no window or locus either).
     type Locus = ();
     type Prepared = PreparedRead;
-    fn prepare_read(&self, read: &MappedRead, _locus: &()) -> Option<PreparedRead> {
-        /* fetch around read span → left-align → BAQ if configured */
+    /// Reused BAQ and alignment matrices — allocated per worker, never per read (preamble §6).
+    type Scratch = GenericPrepScratch;
+    fn prepare_read(&self, read: &MappedRead, _locus: &(),
+                    scratch: &mut Self::Scratch) -> Option<PreparedRead> {
+        /* pass through | fetch around read span → left-align → BAQ if configured | re-align */
     }
 }
 ```
@@ -180,10 +206,11 @@ the transform is left-align only and never returns `None`.
 - **Adaptor-mask application, mate-overlap reconciliation, CIGAR decomposition → the pileup
   walker.** `PreparedRead` is *decomposable*, not decomposed; it *carries* the adaptor boundary
   but does not apply it (preamble §5).
-- **Local haplotype reassembly → a future generic `ReadPreparer` sibling.** GATK-style de-novo
-  assembly + realign-to-haplotype is the "reassemble" pole of step 2's axis (`ng_proposal.md`
-  §2) — a genuine bench competitor to `LeftAlignBaqPreparer`, added as a sibling `impl ReadPreparer` when
-  we test it, not part of v1.
+- **Local haplotype reassembly — struck 2026-07-23: out of scope, not deferred.** This entry
+  previously listed GATK-style de-novo assembly + realign-to-haplotype as a future sibling to bench.
+  It is not going to be built: the production caller already calls generic loci better than GATK
+  without reassembling, so it buys nothing, and assembling haplotypes needs every read in a region
+  at once — which breaks the per-read independence this step rests on (preamble §1, §6).
 
 - **freebayes' extra alignment passes around indels → a future refinement.** freebayes does more
   than a single left-align pass to keep indel placement stable. The mechanism we know of is
@@ -195,10 +222,12 @@ the transform is left-align only and never returns `None`.
   passes actually move indel placement on our data. (freebayes is MIT-licensed, so reading and
   porting it is fine — unlike the AGPL TRF-mod case.)
 
-**Alternatives to bench (recorded, not built now):** GATK-style **local reassembly** (above) — a
-`ReadPreparer` sibling producing a `PreparedRead`-shaped output, so the pileup walker consumes it
-unchanged. *(The freebayes-style trust + left-align-only preparation is no longer listed here: it
-is a v1 config mode, §2 — not a deferred alternative.)*
+**Alternatives to bench (recorded, not built now):** a **faster best-path core** — wavefront
+alignment, or the difference-recurrence SIMD cores — as the re-align mode's algorithm. That is a
+swap *inside* the alignment module ([`alignment.md`](alignment.md) §4), invisible from here, because
+every mode yields the same `PreparedRead`. *(Local reassembly is no longer listed: out of scope,
+above. The freebayes-style trust + left-align-only preparation is not listed either: it is a v1
+config mode, §2.)*
 
 ---
 
@@ -224,8 +253,11 @@ qualities.
 
 ## 8. Resolved decisions
 
-*Nothing on the generic path is open. Each entry records the choice, its evidence, and the
-alternative it beat — kept here (rather than deleted) so the reasoning survives the decision.*
+*Each entry records the choice, its evidence, and the alternative it beat — kept here (rather than
+deleted) so the reasoning survives the decision. This section once opened "nothing on the generic
+path is open"; two questions **are** now open, both introduced by the re-align mode and both owned by
+the preamble (§9 there): **what marks a region as not-to-be-trusted**, and **whether pass-through
+skips the quality cap** as well as the left-alignment.*
 
 - **The prepared read — resolved: reuse production's `PreparedRead`, don't mint a parallel type.**
   The survey shows production's `PreparedRead` *is* precisely the F3+BAQ output the walker
@@ -234,8 +266,9 @@ alternative it beat — kept here (rather than deleted) so the reasoning survive
   name clash with a type that turned out to be the same thing; the `Ng` suffix named *where the
   type lived*, not what it is, and would have become a lie on port-back. Rust namespaces by
   module anyway — `ng::read::PreparedRead` and `pileup::walker::PreparedRead` could coexist, so
-  the clash never justified a suffix.) **Fork trigger:** if a later generic impl (reassembly)
-  needs a richer payload, define an ng-owned `ng::read::PreparedRead` *then* — widening a
+  the clash never justified a suffix.) **Fork trigger:** if the re-align mode (§2) turns out to
+  need a richer payload — carrying its own fresh alignment rather than a rewritten one — define an
+  ng-owned `ng::read::PreparedRead` *then* — widening a
   production type to serve the lab is the thing to avoid. Until that bites, reuse. Reuse may
   want `PreparedRead` hoisted out of `pileup/walker/` to a shared home (§7).
 - **The reference argument — resolved: there isn't one.** The preparer **holds** its `RawRefSeq`
@@ -253,5 +286,6 @@ alternative it beat — kept here (rather than deleted) so the reasoning survive
   absorb the preparation. The `pileup/` spec inherits this as a given, not a question to reopen.
   *Alternative considered:* the pileup subsumes the preparation into its walk (the
   `module_layout.md` "subsume or compose?" pole). Rejected — production already draws the seam at
-  `PreparedRead`, and subsuming would dissolve step 2's bake-off surface (a reassembly preparer
-  could no longer be swapped in behind the same contract).
+  `PreparedRead`, and subsuming would dissolve step 2's bake-off surface (a re-aligning
+  preparer, or a different alignment algorithm behind one, could no longer be swapped in behind the
+  same contract).

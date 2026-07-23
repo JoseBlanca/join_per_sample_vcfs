@@ -476,7 +476,11 @@ genotypes to estimate parameters).
 ### Cross-cutting reading (the levers ng should probe)
 - **Trust vs reassemble (step 2)** is the deepest axis and the leading hypothesis for
   freebayes' detection edge; GATK's assembly and per-read STR realignment are the two
-  ends we should A/B on synthetic data.
+  ends we should A/B on synthetic data. **Partly settled, 2026-07-23:** the reassembly end is
+  **not** being built — the production caller already calls generic loci better than GATK without
+  reassembling, so that side of the A/B has no open question left. What remains live on this axis is
+  trust-the-mapper vs **per-read re-align**, now a real mode
+  ([`read_preparation.md`](read_preparation.md) §2).
 - **The router (step 3) with a DRAGstr-style graft** is the cheapest way to add
   STR-awareness to a general core — a concrete design for ng.
 - **Priors (step 8)** span a clean ladder — flat → fixed-het → SFS → marginalised-LOO
