@@ -21,6 +21,7 @@
 //! `doc/devel/ng/impl_plan/alignment_best_path.md`.
 
 pub mod emission;
+pub mod ssr_best_path_flat_gap;
 pub mod stutter;
 
 pub use emission::{BaseScores, Emission, FlatEmission, PerQualityEmission};

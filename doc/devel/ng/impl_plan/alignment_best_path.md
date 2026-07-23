@@ -126,7 +126,7 @@ masses sum to one" is *not* asserted (arch §2.4). *Depends:* A2. *Source:* spec
 
 ### Milestone B — algorithm 3, the parity anchor *(this unblocks the STR generator)*
 
-**☐ B1. The two-regime matrix and traceback, unbanded. Own commit; do not bundle.**
+**✅ B1. The two-regime matrix and traceback, unbanded. Own commit; do not bundle.**
 Port `delimit_read`: match/insertion/deletion states, affine gaps, and the **tract-aware gap-open**
 (stiff in the flanks, soft inside the repeat) keyed by which reference column a gap touches. Fill the
 whole matrix, as production does — **unbanded is deliberate** and is what makes parity provable
