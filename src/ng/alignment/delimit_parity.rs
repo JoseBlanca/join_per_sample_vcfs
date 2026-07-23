@@ -258,6 +258,13 @@ const CASES_PER_SEED: usize = 3_000;
 /// cheaply. But the port was originally justified by a far larger sweep, and the ability to
 /// repeat that should not need editing the source — `PVC_PARITY_CASES=50000 cargo test
 /// ng_measures_the_same_bytes` reproduces it.
+///
+/// **The default's detection floor is coarser for *banding* than for the recurrence.** A
+/// gross band deficiency (dropping the run-off flank terms) still fails on the first seed
+/// inside 3,000 cases, but a *one-cell*-too-narrow band (a `BAND_HEADROOM` short by one) first
+/// diverges only around case 28,307 — past the default. So the delimiter's band headroom
+/// carries a deliberate multiple-cell margin (see `BAND_HEADROOM`), and any change that
+/// narrows the band toward its true minimum must be validated at soak size, not the default.
 fn cases_per_seed() -> usize {
     std::env::var("PVC_PARITY_CASES")
         .ok()

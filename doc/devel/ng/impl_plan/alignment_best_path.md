@@ -155,7 +155,7 @@ B2. *Source:* spec §10.3, arch §Test & bench shape.
 
 ### Milestone C — banding, as its own change
 
-**☐ C1. Band the delimiter. Own commit; do not bundle.**
+**✅ C1. Band the delimiter. Own commit; do not bundle.**
 Restrict the matrix to a per-read band: a **floor of |read length − reference length|** — forced,
 because these are global alignments — plus headroom for a path that strays past the minimum and
 returns. The headroom is a named constant carrying its reasoning, **never a literal**, and **never

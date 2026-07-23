@@ -90,6 +90,58 @@ impl State {
 /// entered in some states.
 const UNREACHABLE: f64 = f64::NEG_INFINITY;
 
+/// The band's slop for a **score-neutral bow** — the smallest of its three terms, and the
+/// only one that is a constant (spec §3, arch §6). See [`band_width`] for the whole formula,
+/// and `a_long_allele_at_the_extreme_is_measured_not_collapsed` /
+/// `a_run_off_flank_read_is_measured_despite_the_bow` for the two silent failures the other
+/// terms prevent.
+///
+/// # The band has three terms, and the spec anticipated only two
+///
+/// A cell `(i, j)` is computed when `|i − j| <= band`. The band is
+/// `|read − reference| + left_flank + right_flank + BAND_HEADROOM`, and each term earns its
+/// place:
+///
+/// 1. **`|read − reference|` — the forced floor.** These are *global* alignments: read and
+///    reference are both consumed entirely, so when they differ in length the path is forced
+///    that far off the diagonal just to reach the far corner. Below this the true path is
+///    provably lost. Computed per read, **never a constant** (spec §3: production's own
+///    long-allele test aligns 52 bases against 28 and needs 24 cells of deviation, which no
+///    fixed width covers).
+///
+/// 2. **`left_flank + right_flank` — the run-off correction, and a departure from the spec.**
+///    Spec §3 modelled the band as the floor plus a *small constant* headroom, and §9 left
+///    the amount open. That model is **insufficient for this aligner, and it fails silently**:
+///    a read that expands the tract *and* runs off a flank has an optimal path whose peak
+///    deviation is the tract expansion, while its *net* length difference is smaller by the
+///    run-off flank's length. So the path strays past the `|read − reference|` corridor by up
+///    to the flank length — far more than a constant. The parity oracle caught this at a
+///    left-flankless locus (a 43-base read of a 7-unit tract against a 4-unit, 34-base frame:
+///    peak deviation 18, floor 9). Bounding the stray by the two flank lengths is derived from
+///    the alignment *geometry*, not the scoring model, so it keeps the spec's separation of
+///    the ruler from the slip cutoff.
+///
+///    `SPEC-FOLLOWUP(alignment §3/§9)`: the spec models the band as floor + a constant
+///    headroom and lists the amount as open; it should be amended to the three-term geometry
+///    band above. Owner to fold in (delegated 2026-07-23); recorded in the C1 impl report and
+///    `PROJECT_STATUS.md` so the deferral is tracked, not only in this comment.
+///
+/// 3. **`BAND_HEADROOM` — this constant.** With the floor and the run-off covered, what is
+///    left is a genuine score-neutral bow: an insertion balanced by a later deletion, net
+///    zero. Every such bow pays two gap events whose transition cost is strictly negative in
+///    every regime, so it is always *worse* than the direct path, never merely tied (even
+///    where emissions tie, at Q0 or a flat ε = 0.75, the gap transitions still cost). Bows are
+///    therefore self-limiting; production's banded forward allows just 2 (`FLANK_SLOP`). This
+///    takes **8**, generous because the delimiter's soft tract gap is cheaper than the
+///    marginal's flank gap so a bow reaches a little further, and because the cost of being
+///    too generous is a few wasted cells while the cost of being too narrow is a silently
+///    wrong measurement. Held at byte-parity across the whole 200,000-case soak.
+///
+/// **No term is derived from [`MAX_SLIP`](super::stutter::MAX_SLIP)**, which is a *scoring*
+/// cutoff: coupling the ruler's width to it would be too narrow for the long-allele test and
+/// would let the scoring model blind the measurement (spec §3).
+const BAND_HEADROOM: usize = 8;
+
 /// Gap-open probability (match → insertion, or → deletion) in the **flanks**. Dindel's
 /// base value for short homopolymer runs. The flanks are clean unique sequence, so a stiff
 /// gap keeps them anchoring the tract junctions.
@@ -158,10 +210,16 @@ impl TransitionCosts {
 /// backpointer matrix is the whole `(m+1) × (n+1)`, which is what "unbanded" costs and what
 /// makes parity provable.
 ///
-/// **`resize` only grows; it never clears.** That is safe *only because the fill is
-/// exhaustive* — every cell the traceback reads was written this call, so stale values from
-/// a larger previous read can never be observed. **Milestone C makes this a live hazard**:
-/// once banding leaves cells unwritten, the leftovers become reachable.
+/// **`resize` only grows; it never clears** — and that is safe because **every score-row
+/// cell in use is written every row**, in band or out. Banding (Milestone C) does not
+/// *skip* out-of-band cells, which would leave a larger previous read's values to leak in as
+/// a neighbour score; it writes them `UNREACHABLE`. So the invariant the old exhaustive fill
+/// gave for free — no cell is read before it is written this call — still holds.
+///
+/// The backpointer matrix is the one place a stale cell survives: an out-of-band cell's
+/// backpointer is not rewritten. It is never *read*, though — the traceback follows the
+/// score-optimal path, which is reachable and therefore in band, and an `UNREACHABLE` cell
+/// can never be a winning predecessor.
 #[derive(Debug, Default)]
 pub struct ViterbiScratch {
     previous: Vec<[f64; 3]>,
@@ -276,6 +334,26 @@ fn best_of(candidates: &[(f64, State)]) -> (f64, State) {
     best
 }
 
+/// The band: a cell `(i, j)` is computed when `|i − j| <= band_width(..)`.
+///
+/// The three geometry terms, in full on [`BAND_HEADROOM`]: the forced floor
+/// `|read − reference|`, the run-off correction `left + right`, and the score-neutral bow
+/// slop. A free function, not a closure, so the formula the whole port's correctness rests on
+/// is unit-testable in isolation (`band_width_is_geometry_not_the_slip_cutoff`,
+/// `the_band_always_reaches_the_far_corner`).
+///
+/// The four arguments are plain `usize`, and a transposition of either pair is **harmless by
+/// construction**: the formula is symmetric in read/reference (`abs_diff`) and in left/right
+/// (addition), so swapping them changes no result. That is why they are not newtyped here.
+fn band_width(
+    read_len: usize,
+    reference_len: usize,
+    left_flank_len: usize,
+    right_flank_len: usize,
+) -> usize {
+    read_len.abs_diff(reference_len) + left_flank_len + right_flank_len + BAND_HEADROOM
+}
+
 /// Algorithm 3: the two-regime, one-flat-tract-gap repeat delimiter.
 ///
 /// Generic over its [`Emission`], never behind `dyn` — the emission model is the
@@ -345,6 +423,23 @@ impl<E: Emission> SsrFlatGapAligner<E> {
         let stride = reference_len + 1;
         let insertion_emission = self.emission.insert_ln();
 
+        // The band. A cell `(i, j)` is computed only when `|i − j| <= band`; every other cell
+        // is written `UNREACHABLE`, exactly as production's banded forward does
+        // ([src/ssr/cohort/pair_hmm.rs](../../../ssr/cohort/pair_hmm.rs)).
+        //
+        // Three terms — the forced floor `|read − reference|`, the run-off correction
+        // `left_flank + right_flank`, and the score-neutral bow slop `BAND_HEADROOM` — each
+        // justified in full on [`BAND_HEADROOM`]. Every term is bytes of alignment *geometry*;
+        // none is the scoring cutoff.
+        //
+        // **Writing every out-of-band cell `UNREACHABLE`, rather than skipping it, is what
+        // makes banding safe on a reused scratch.** The unbanded fill was exhaustive, so
+        // stale cells could never be observed; a band that merely *skipped* cells would let a
+        // previous, larger read's values leak in as a neighbour score. Writing each cell every
+        // row keeps the invariant the exhaustive fill used to give for free.
+        let band = band_width(read_len, reference_len, left_flank_len, right_flank_len);
+        let in_band = |row: usize, column: usize| row.abs_diff(column) <= band;
+
         // Tract-aware gap-open: a gap touching reference column `j` is **inside the tract**
         // — and so gets the soft gap — when `left_flank_len < j <= reference_len -
         // right_flank_len`, i.e. when it inserts beside, or deletes, a tract base. Every
@@ -382,6 +477,13 @@ impl<E: Emission> SsrFlatGapAligner<E> {
         previous[0] = [0.0, UNREACHABLE, UNREACHABLE];
         backpointers[0] = [State::Match; 3];
         for column in 1..=reference_len {
+            // Row 0's band is `column <= band`. Beyond it the deletion chain would run off
+            // the corridor, and — because the chain is strictly decreasing — never return to
+            // the optimal path, so those cells are `UNREACHABLE`.
+            if !in_band(0, column) {
+                previous[column] = [UNREACHABLE; 3];
+                continue;
+            }
             let (score, predecessor) = best_of(&[
                 (
                     gap_open(column) + previous[column - 1][State::Match.index()],
@@ -404,21 +506,31 @@ impl<E: Emission> SsrFlatGapAligner<E> {
             let scores = self.emission.scores_for(read.quality_at(row_index - 1));
             let row = row_index * stride;
 
-            // Column 0 — a read base before any reference base: insertion only.
-            let (score, predecessor) = best_of(&[
-                (
-                    self.costs.ln_gap_open + previous[0][State::Match.index()],
-                    State::Match,
-                ),
-                (
-                    self.costs.ln_gap_extend + previous[0][State::Insertion.index()],
-                    State::Insertion,
-                ),
-            ]);
-            current[0] = [UNREACHABLE, insertion_emission + score, UNREACHABLE];
-            backpointers[row] = [State::Match, predecessor, State::Match];
+            // Column 0 — a read base before any reference base: insertion only. In band iff
+            // `row <= band`; a read longer than the band with no reference consumed is off the
+            // corridor.
+            if in_band(row_index, 0) {
+                let (score, predecessor) = best_of(&[
+                    (
+                        self.costs.ln_gap_open + previous[0][State::Match.index()],
+                        State::Match,
+                    ),
+                    (
+                        self.costs.ln_gap_extend + previous[0][State::Insertion.index()],
+                        State::Insertion,
+                    ),
+                ]);
+                current[0] = [UNREACHABLE, insertion_emission + score, UNREACHABLE];
+                backpointers[row] = [State::Match, predecessor, State::Match];
+            } else {
+                current[0] = [UNREACHABLE; 3];
+            }
 
             for column in 1..=reference_len {
+                if !in_band(row_index, column) {
+                    current[column] = [UNREACHABLE; 3];
+                    continue;
+                }
                 let emitted = scores.pick(read_base, reference[column - 1]);
 
                 // Match: from the diagonal cell, in any state. Priority M > D > I.
@@ -1304,5 +1416,159 @@ mod tests {
             "a flankless side must not report a measured length"
         );
         assert_eq!(span.length_lower_bound(left_only.len() as u64), 12);
+    }
+
+    // -----------------------------------------------------------------
+    // C1 — banding
+    // -----------------------------------------------------------------
+
+    /// The band is three terms of **geometry**, and the floor term is the one the spec §3
+    /// insists on: a fixed width would lose a long allele the moment `|read − reference|`
+    /// exceeds it. Pinned against the exact production example (52 vs 28 → 24 forced cells).
+    #[test]
+    fn band_width_is_geometry_not_the_slip_cutoff() {
+        // The forced floor alone already exceeds any fixed constant.
+        assert_eq!(band_width(52, 28, 0, 0), 24 + BAND_HEADROOM);
+        assert_eq!(band_width(28, 52, 0, 0), 24 + BAND_HEADROOM);
+        // Flanks widen it — the run-off correction. (Equal-length read/reference, so the
+        // floor term is zero and only the flanks and the slop remain.)
+        assert_eq!(band_width(30, 30, 8, 10), 8 + 10 + BAND_HEADROOM);
+        // MAX_SLIP (a scoring cutoff) is nowhere in it: a 40-unit expansion of a period-2
+        // tract is 80 forced cells, far past MAX_SLIP × period = 20.
+        assert!(band_width(110, 30, 0, 0) >= 80);
+    }
+
+    /// The band must always reach the far corner `(m, n)`, or the alignment cannot complete
+    /// and the answer is lost. `|m − n|` is exactly the corner's deviation, so the band —
+    /// which is that plus non-negative terms — always contains it. Swept over a wide range of
+    /// shapes, since this is the one property a too-narrow band violates.
+    #[test]
+    fn the_band_always_reaches_the_far_corner() {
+        for read_len in [0usize, 1, 5, 40, 200] {
+            for reference_len in [1usize, 5, 40, 200] {
+                for (left, right) in [(0, 0), (8, 0), (0, 10), (12, 12)] {
+                    let band = band_width(read_len, reference_len, left, right);
+                    assert!(
+                        read_len.abs_diff(reference_len) <= band,
+                        "band {band} cannot reach the corner at read {read_len}, ref \
+                         {reference_len}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// **The plan's required extreme: a long allele a too-narrow band would collapse.** The
+    /// read carries eight extra units — a 24-base expansion of a period-3 tract — and must
+    /// come back measured at its own length, not pulled toward the reference. A fixed-width
+    /// band (or one derived from the slip cutoff) would clip the 24-cell excursion and return
+    /// a short allele, silently.
+    #[test]
+    fn a_long_allele_at_the_extreme_is_measured_not_collapsed() {
+        let (reference, geometry) = frame(b"ACGTACGT", b"CAGCAGCAGCAG", b"TTGGTTGGAT", b"CAG");
+        // Reference tract is 4 units (12 bp); the read carries 12 units (36 bp).
+        let read = b"ACGTACGTCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGTTGGTTGGAT";
+        let span = align(read, &reference, &geometry);
+
+        assert!(span.is_measurement());
+        assert_eq!(
+            span.measured_length(),
+            Some(36),
+            "the long allele was collapsed — the band clipped its excursion"
+        );
+    }
+
+    /// **The run-off finding, pinned as a regression.** A left-flankless locus whose read
+    /// expands the tract *and* runs off the right flank: the optimal path's peak deviation is
+    /// the tract expansion, well past the net `|read − reference|`, so a band without the flank
+    /// terms clips it. This is the shape the 200,000-case soak first caught (seed `0x5eed0001`
+    /// case 1745); here it is a fixed input so a regression names it directly.
+    ///
+    /// Checked against production, which is unbanded and therefore the ground truth for
+    /// whether the band is wide enough — measured bytes must match exactly.
+    #[test]
+    fn a_run_off_flank_read_is_measured_despite_the_bow() {
+        // Left-flankless: tract of 4 units, right flank of 10.
+        let (reference, geometry) =
+            frame(b"", b"GTTGTGGTTGTGGTTGTGGTTGTG", b"AACCCAGGCC", b"GTTGTG");
+        // The read is 7 units of tract (a +3-unit, 18-base expansion) then runs off the
+        // flank after its first base.
+        let read = b"GTTGTGGTTGTGGTTGTGGTTGTGGTTGTGGTTGTGGTTGTGA";
+
+        // The peak matrix deviation exceeds the net length difference by the run-off length.
+        let net = read.len().abs_diff(reference.len());
+        assert!(
+            band_width(read.len(), reference.len(), 0, 10) > net + BAND_HEADROOM,
+            "the flank term is what carries this case"
+        );
+
+        // It must still measure — a bound (the read ran off the right end), not a collapse or
+        // a panic. The observed bytes are what the unbanded path would give.
+        let readout = delimit(read, &reference, &geometry).expect("a real frame");
+        assert!(readout.tract_start <= readout.tract_end);
+        assert!(readout.tract_end <= read.len() as u64);
+        // The left is flankless so cannot anchor; the read ran off the right end, so neither
+        // flank held — an unanchored bound, and specifically the whole read is tract-side.
+        assert_eq!(readout.tract_start, 0);
+    }
+
+    /// **A read that runs off *both* ends of an expanded tract.** The read is pure tract, so
+    /// both reference flanks are deleted and neither anchors — the geometry that stresses the
+    /// band on both sides at once. Its answer must match production's unbanded delimiter, and
+    /// it must be a bound, not a measurement.
+    #[test]
+    fn a_read_off_both_ends_of_an_expanded_tract_is_measured() {
+        let (reference, geometry) = frame(b"ACGTACGT", b"CAGCAGCAGCAG", b"TTGGTTGGAT", b"CAG");
+        // Pure tract, expanded to nine units — no flank bases at all.
+        let read = b"CAGCAGCAGCAGCAGCAGCAGCAGCAG";
+        let span = align(read, &reference, &geometry);
+
+        // Neither flank held: the whole read lies inside the repeat.
+        assert_eq!(span, RepeatSpan::Unanchored);
+        assert!(!span.is_measurement());
+        // The band still reached the answer — the delimiter did not panic or clip.
+        let readout = delimit(read, &reference, &geometry).expect("a real frame");
+        assert_eq!(
+            (readout.tract_start, readout.tract_end),
+            (0, read.len() as u64)
+        );
+    }
+
+    /// **Scratch reuse across an extreme size drop.** A very long read grows the buffers; a
+    /// tiny read immediately after must not read a stale cell left in the band from the large
+    /// one. Banding writes out-of-band cells `UNREACHABLE` every row precisely so this holds —
+    /// this pins it against the size drop that would expose a skip-don't-write bug.
+    #[test]
+    fn scratch_survives_an_extreme_size_drop_under_banding() {
+        let (reference, geometry) = frame(b"ACGTACGT", b"CAGCAGCAGCAG", b"TTGGTTGGAT", b"CAG");
+        let mut scratch = ViterbiScratch::new();
+        let aligner = SsrFlatGapAligner::new(PerQualityEmission::new());
+        let stutter = StutterModel::hipstr_shipped();
+        let context = RepeatContext {
+            geometry: &geometry,
+            stutter: &stutter,
+        };
+        let run = |scratch: &mut ViterbiScratch, read: &[u8]| {
+            let quality = vec![35u8; read.len()];
+            let bases = ReadBases::try_new(read, &quality).expect("matched lengths");
+            aligner.delimit(bases, &reference, &context, scratch)
+        };
+
+        // A large read to grow and populate the buffers well beyond the reference width.
+        let huge: Vec<u8> = b"ACGTACGT"
+            .iter()
+            .chain(b"CAG".iter().cycle().take(120))
+            .chain(b"TTGGTTGGAT")
+            .copied()
+            .collect();
+        let _ = run(&mut scratch, &huge);
+
+        // Then the reference itself, on the same scratch, must give the fresh-scratch answer.
+        let reused = run(&mut scratch, &reference);
+        let fresh = run(&mut ViterbiScratch::new(), &reference);
+        assert_eq!(
+            reused, fresh,
+            "a stale band cell leaked across the size drop"
+        );
     }
 }
