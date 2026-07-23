@@ -189,3 +189,72 @@ commands are unchanged (see A0 §5 and Standing items).
 - **`from_unchecked_rate` exists for testability** — `new` minus the debug assertion, because the
   assertion fires in the test profile and the release path would otherwise be untestable without
   compiling the test out of the build anyone runs.
+
+---
+
+## Step A2 — `RepeatSpan`, `RepeatGeometry`, and the `BestPathAligner` trait
+
+**Status:** shipped (reviewed, fixes applied).
+**Review:** [ng_alignment_a2_2026-07-23.md](../reviews/ng_alignment_a2_2026-07-23.md) — no Blockers, **8 Majors**, several Minors; six Majors applied, two carried to Checkpoint A.
+
+### 1. Plan and the one deviation
+
+The plan's A2 is "`RepeatSpan`, `RepeatGeometry`, `RepeatContext`, and the `BestPathAligner` trait".
+**`RepeatContext` moved to A3, recorded.** It bundles a `&StutterModel`, and that type does not exist
+until A3 — so A2 could only have landed it by inventing a placeholder type or by shipping a struct
+that gains its second field one commit later. Moving one type across the boundary between two
+adjacent types-only steps preserves both steps' intent and keeps each commit coherent. *Source:*
+arch §2.1, §2.2, §3.
+
+### 2. Assumptions and decisions
+
+- **`RepeatSpan`'s four variants are the widening**, and the reason is worth restating: production's
+  `Delimited` collapses every unanchored case into one **side-blind** `BorderOffEnd`, so it cannot
+  say which flank was missing. B2 is the step that produces these, and the plan flags it as
+  silently-failing precisely because a mis-assigned side is a wrong observation class on a read that
+  still looks fine.
+- **The accessors are split by what they can honestly claim** — see the review's M1. `measured_length`
+  answers only where a measurement exists; `length_lower_bound` answers everywhere; `observed_span`
+  hands back bases, not a length.
+- **`Range<u64>`, not ng's existing `RegionSpan`** — `RegionSpan` is the region seam's
+  *reference*-coordinate vocabulary and this module knows no coordinates. Costs `Copy`.
+- **`Bp` for lengths, bare `u64` for offsets.** The distinction is real: `Bp` is documented as ng's
+  length currency, while an offset into a caller-supplied slice is the `RepeatInterval` shape.
+- **A factual error in the architecture doc, not repeated in the code.** Arch §2.2 justifies the
+  per-call geometry partly on "`Motif` is an allocation". ng's `Motif` is `Copy` over an inline
+  `[u8; 6]` and allocates nothing. The decision stands on its other ground — the geometry changes at
+  every locus — and the code now says only that. **Arch §2.2 still carries the claim.**
+
+### 3. Changes made
+
+[src/ng/alignment/mod.rs](../../../../src/ng/alignment/mod.rs) — `RepeatSpan` (+4 accessors),
+`RepeatGeometry` (+2 methods), `BestPathAligner`, module-doc update.
+
+### 4. Tests added — 12
+
+The ones that carry weight: `only_a_two_flank_span_yields_a_measured_length` (which also asserts the
+trap directly — the two variants' raw spans are *equal*, so nothing reading the span alone can tell
+them apart); `fitting_is_exactly_having_a_repeat_length` (sweeps every flank pair against every
+reference length in a small window, and asserts the three parts reconstruct the whole);
+`repeat_len_reports_no_answer_rather_than_underflowing` (both subtractions, including the mirror case
+that is the only route to the second). `TODO(Milestone B)` records the four tests the trait contract
+owes once an implementation exists.
+
+### 5. Validation results
+
+Container: `cargo fmt --check` exit 0; `cargo clippy --all-targets --all-features -D warnings` exit
+0; `cargo test --lib` **2153 passed, 0 failed, 4 ignored**.
+
+### 6. Tradeoffs and follow-ups — three for the owner at Checkpoint A
+
+- **Lift `Motif` to `types.rs`?** The import is a genuine peer→stage back-reference: `region_typing`
+  is ng step 3, and `alignment` states two lines above the import that it knows no steps. The `pub
+  motif` field puts it on ng's public surface. Recorded as debt in code rather than fixed, because
+  the move reaches beyond this step and touches `types.rs`.
+- **A `ReadBases` newtype in `align`'s signature?** `read`, `quality` and `reference` are three
+  positionally interchangeable `&[u8]`, and the read/quality-length precondition exists exactly
+  because two of them must correspond. Bundling read and quality dissolves that precondition with no
+  `Result` — the check moves to a once-per-read constructor, off the hot path. Not applied: it
+  changes the trait the arch doc specifies and ripples into every later aligner. **Cheapest now,
+  while there are no implementors.**
+- **Arch §2.2's `Motif`-allocation claim** should be corrected in the doc.

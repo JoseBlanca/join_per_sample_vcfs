@@ -106,7 +106,7 @@ path uses `ln(1/4)`, its flat path has no emission for it at all, so the flat va
 recorded at implementation, not a port (arch §2.3). *Depends:* A0. *Source:* spec §4.2, arch
 §2.3, §5.
 
-**☐ A2. `RepeatSpan`, `RepeatGeometry`, `RepeatContext`, and the `BestPathAligner` trait.**
+**✅ A2. `RepeatSpan`, `RepeatGeometry`, `RepeatContext`, and the `BestPathAligner` trait.**
 `RepeatSpan`'s four cases (both flanks, left only, right only, neither); the geometry with
 **measured, never assumed-equal** flank lengths; the per-call context bundling geometry and stutter;
 the trait with its `Scratch`, `Output` and `Context` associated types. No algorithms. *Depends:* A1.
