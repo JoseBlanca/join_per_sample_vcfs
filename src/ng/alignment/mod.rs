@@ -31,17 +31,7 @@ pub mod stutter;
 pub use emission::{BaseScores, Emission, FlatEmission, PerQualityEmission};
 pub use stutter::{MAX_SLIP, StutterModel, StutterRates};
 
-// KNOWN DEBT — `Motif` is imported from a *pipeline-stage* module (`region_typing` calls
-// itself ng step 3) into a module that states two lines above that it knows no steps and
-// no callers, and the `pub motif` field below puts that back-reference on ng's public
-// surface. `Motif` is STR domain vocabulary with consumers in three modules across stage
-// boundaries, and `module_layout.md` principle 3 already assigns such types to the shared
-// vocabulary in `types.rs`. Lifting it there (re-exporting from `segment_criteria` so step
-// 3 is untouched) is the fix; it is not done here because this plan's preconditions state
-// it adds nothing to `types.rs`, and the move reaches beyond this step. Raised at
-// Checkpoint A.
-use crate::ng::region_typing::segment_criteria::Motif;
-use crate::ng::types::Bp;
+use crate::ng::types::{Bp, Motif};
 use crate::pileup::walker::CigarOp;
 use std::ops::Range;
 
@@ -71,7 +61,7 @@ use std::ops::Range;
 /// this is recorded as known debt rather than fixed here; porting this module back is the
 /// natural moment to do it.
 ///
-/// [`Motif`]: crate::ng::region_typing::segment_criteria::Motif
+/// [`Motif`]: crate::ng::types::Motif
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Alignment {
     /// Where the placement starts, measured in bases from the start of **the reference

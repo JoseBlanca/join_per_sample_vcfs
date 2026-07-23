@@ -571,8 +571,8 @@ mod tests {
     use super::*;
     use crate::ng::alignment::emission::{FlatEmission, PerQualityEmission};
     use crate::ng::alignment::{RepeatGeometry, StutterModel};
-    use crate::ng::region_typing::segment_criteria::Motif;
     use crate::ng::types::Bp;
+    use crate::ng::types::Motif;
 
     /// Build a reference stretch as `left flank + tract + right flank`, and the geometry
     /// that describes it.

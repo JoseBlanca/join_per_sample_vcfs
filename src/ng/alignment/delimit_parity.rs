@@ -34,8 +34,8 @@
 use super::ssr_best_path_flat_gap::{SsrFlatGapAligner, ViterbiScratch};
 use super::{BestPathAligner, PerQualityEmission, RepeatContext, RepeatGeometry, RepeatSpan};
 use super::{StutterModel, stutter};
-use crate::ng::region_typing::segment_criteria::Motif as NgMotif;
 use crate::ng::types::Bp;
+use crate::ng::types::Motif as NgMotif;
 use crate::ssr::pileup::alignment::{
     Delimited, HmmModel, ViterbiScratch as ProdScratch, delimit_read,
 };

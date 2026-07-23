@@ -3,6 +3,8 @@
 //! (`doc/devel/ng/arch/module_layout.md` principle 3). Seeded here with only what the
 //! `RefSeq` reference accessor needs.
 
+use std::fmt;
+
 /// Which reference sequence a coordinate refers to: an index into the reference contig
 /// table ([`crate::fasta::ContigList`]), in `@SQ` / `.fai` order. Unconstrained — any
 /// `u32` is a legal index at the type level, and an out-of-range id is caught at fetch
@@ -194,6 +196,118 @@ pub enum DomainError {
     #[error("mismatch fraction {0} is outside [0, 1]")]
     MismatchFraction(f32),
 }
+
+// ---------------------------------------------------------------------
+// The motif — STR domain vocabulary, shared across steps
+// ---------------------------------------------------------------------
+
+/// STR scope: a repeat unit (period) is between 1 and this many bases.
+pub const MAX_MOTIF_LEN: usize = 6;
+
+/// A motif's bytes were not a valid STR period.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum MotifError {
+    /// Length is `0` or above [`MAX_MOTIF_LEN`] — outside the STR period range.
+    #[error("motif length {len} is outside the STR period range 1..={MAX_MOTIF_LEN}")]
+    BadLength { len: usize },
+}
+
+/// A tandem-repeat unit — the repeat's period, 1..=[`MAX_MOTIF_LEN`] bases.
+///
+/// The bytes are stored **verbatim**: the reference-strand, phase-faithful unit
+/// exactly as it tiles the locus (e.g. `CAG`), *not* canonicalized. Rotating to
+/// a canonical form (`CAG` → `AGC`) would break tiling, and reconstruction reads
+/// phase-correct bytes off the reference anyway; the canonical *class* used for
+/// stutter pooling is derived on demand downstream, never stored here.
+///
+/// Inline and `Copy`: a fixed 6-byte buffer plus a length, never heap-allocated.
+/// Unused tail bytes are zero, so the derived `Eq`/`Hash` compare only the live
+/// prefix (`0` is not a valid base, so it cannot collide with one).
+///
+/// INVARIANT (relied on by the derived `Eq`/`Hash`): every constructor MUST
+/// zero-initialize the unused tail of `buf`. [`Motif::new`] is currently the
+/// only one; any future constructor must uphold this or the derived impls will
+/// treat equal motifs as distinct.
+///
+/// ## Why this is a port, when spec §4 said to reuse production's
+///
+/// Spec §4 kept `ssr::types::Motif` on the grounds that it *"carries no
+/// coordinates and no width, and so has nothing to rebase — the Revision's
+/// 'reuse where it costs production nothing' case exactly."* The first half is
+/// true; **the conclusion was wrong**, and the compiler said so.
+///
+/// `ssr::types::Motif` is `pub(crate)`. ng's [`SsrSegment`] is `pub` (the ng-sibling
+/// convention) and returns a motif, so reusing it trips rustc's
+/// `private_interfaces` lint — a `pub` item leaking a `pub(crate)` type. The
+/// three ways out: widen `Motif` in `src/ssr/types.rs` (**touching production —
+/// forbidden**); demote ng's whole classification surface to `pub(crate)` (bends ng's
+/// convention *and* buys `dead_code` warnings for every item until its Milestone
+/// D consumer exists); or port the 40 lines. So reuse did **not** cost
+/// production nothing — it cost a visibility compromise, which is precisely the
+/// coupling "a fresh ng caller from scratch" (owner, 2026-07-16) exists to
+/// avoid.
+///
+/// Ported, ng's `region_typing` names nothing from `src/ssr/` outside its
+/// `#[cfg(test)]` differential — which is exactly where the dependency belongs.
+/// The type is coordinate-free and trivially checkable, so the duplication is
+/// cheap and the drift risk is near zero; the differential compares motifs by
+/// bytes and would catch it anyway.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Motif {
+    buf: [u8; MAX_MOTIF_LEN],
+    len: u8,
+}
+
+impl Motif {
+    /// Build a motif from its bytes, validating the STR period range.
+    ///
+    /// The bytes are taken verbatim (no canonicalization); the caller is
+    /// responsible for supplying the phase-faithful, reference-strand unit.
+    pub fn new(bytes: &[u8]) -> Result<Self, MotifError> {
+        let len = bytes.len();
+        if len == 0 || len > MAX_MOTIF_LEN {
+            return Err(MotifError::BadLength { len });
+        }
+        let mut buf = [0u8; MAX_MOTIF_LEN];
+        buf[..len].copy_from_slice(bytes);
+        Ok(Self {
+            buf,
+            len: len as u8,
+        })
+    }
+
+    /// The motif bytes.
+    #[inline]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.buf[..self.len as usize]
+    }
+
+    /// The period (motif length, in bases).
+    #[inline]
+    pub fn period(&self) -> usize {
+        self.len as usize
+    }
+}
+
+impl fmt::Debug for Motif {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Bases are ASCII; render as text for readable test output / logs,
+        // falling back to bytes if a motif ever held non-UTF-8.
+        match std::str::from_utf8(self.as_bytes()) {
+            Ok(s) => write!(f, "Motif({s:?})"),
+            Err(_) => write!(f, "Motif({:?})", self.as_bytes()),
+        }
+    }
+}
+
+// Where `Motif` used to live, and why it moved. It was written in
+// `region_typing::segment_criteria`, because that is where the STR classifier needed it. It
+// then gained consumers in `locus_generation` and `alignment` — three modules across
+// pipeline-stage boundaries — and `alignment` states in its own module doc that it is **not
+// a pipeline step and knows no callers**, which an import from step 3 flatly contradicted,
+// on ng's *public* surface. `module_layout.md` principle 3 already assigns shared STR domain
+// vocabulary here. `segment_criteria` re-exports it, so step 3's own callers are untouched.
 
 #[cfg(test)]
 mod tests {

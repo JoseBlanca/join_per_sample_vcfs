@@ -294,7 +294,7 @@ impl StutterModel {
     /// path to get wrong, and no guard that compiles out. [`Motif`] already guarantees a
     /// period in `1..=6`, so the conversion at a real call site cannot fail.
     ///
-    /// [`Motif`]: crate::ng::region_typing::segment_criteria::Motif
+    /// [`Motif`]: crate::ng::types::Motif
     /// [`NonZeroU8`]: std::num::NonZeroU8
     #[must_use]
     pub fn probability(&self, bp_diff: i64, period: NonZeroU8) -> f64 {
