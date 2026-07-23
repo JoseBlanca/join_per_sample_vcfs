@@ -83,3 +83,58 @@ D2 is the 3-vs-4 comparison on synthetic reads — a research *report* measuring
 accuracy**, split by period, and at period 1 split by whether the indel is the repeat's own base (spec
 §10.3). It is a distinct deliverable (a simulator + a measurement harness + a written finding), and it
 is explicitly off the critical path. **Reassess with the owner before starting it.**
+
+---
+
+## Step D2 — the 3-vs-4 comparison (research report)
+
+**Status:** shipped (harness + report, reviewed).
+**Deliverables:** [`examples/ssr_delimiter_comparison.rs`](../../../../examples/ssr_delimiter_comparison.rs)
+and [ssr_delimiter_3v4_comparison_2026-07-23.md](../research/ssr_delimiter_3v4_comparison_2026-07-23.md).
+**Review:** [ng_alignment_d2_2026-07-23.md](../reviews/ng_alignment_d2_2026-07-23.md) — finding
+validated as real, not a harness artifact; 1 Major (report mechanism) + 1 Minor (flank collision),
+both applied.
+
+### The finding
+
+On synthetic reads with known truth, split by period and — at period 1 — by own-base vs
+different-base indel (§10.3), **algorithm 4 is uniformly the better delimiter**: more accurate, with
+bias at or near zero. The result **inverts the spec's stated hypothesis**:
+
+- The §4.2 fear that the two-penalty ruler rounds interruptions toward tidy lengths does **not**
+  materialise — algorithm 4's bias is ~0.
+- It is **algorithm 3** that carries a small reference-pull bias (worst −0.13 bp at period-1
+  foreign-base insertions), which is the ~1.02 tract inconsistency documented in B1 surfacing as
+  measurement bias — the same effect as the recorded production failure "stutter reads pulled to
+  reference."
+- The spec's predicted period-1 cancellation (own-base favours 4, different-base favours 3) does not
+  occur: algorithm 4 wins **both**, and different-base (92.6% → 99.5%) is its biggest win — because
+  mis-routing a foreign base is a *scoring* concern, but a delimiter measures the same *length* either
+  way. Averaging the two period-1 sub-cases would have hidden this, which is exactly why the spec
+  makes the split mandatory.
+
+### What the process caught
+
+- **The review's hand-read sweep corrected a wrong mechanism in the first draft of the report** — the
+  loss is a left-boundary collapse, not a uniform substitution reinterpretation. The finding was
+  right; the explanation was not.
+- Investigating a flank-comment inaccuracy surfaced that a **tiling collision** at a junction (a flank
+  starting with the motif's own first base) can slide the boundary a whole unit and collapse accuracy
+  to 83% — a flank artifact, now excluded by construction and recorded as a cautionary note.
+
+### The adoption decision is not this module's
+
+Whether to *adopt* algorithm 4 as the STR delimiter turns on the genotype comparison, which spans this
+module and the genotyping that composes it (§5.1, §10.3) — its harness lives with the genotyping. This
+module's job was to establish that each algorithm computes what it claims and to measure them
+head-to-head; both are done. The measurement evidence points to algorithm 4.
+
+---
+
+## Milestone E — gated, out of this plan
+
+Algorithm 2 (the general-purpose affine aligner) is **gated** (plan §Milestone E, spec §10.3): it is
+built only once the generic path decides "what marks a region as not-to-be-trusted"
+(`read_preparation.md §4`), and "if the gate is still open at Checkpoint D, stop there; this milestone
+moves to read preparation's plan." That gate is a separate, unbuilt spec, so **E is out of scope for
+this plan.** With D2 done, the buildable scope of `alignment_best_path.md` is complete.

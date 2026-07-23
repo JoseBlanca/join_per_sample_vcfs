@@ -177,7 +177,7 @@ premise: gaining and losing are **priced separately**; out-of-frame changes **ke
 model reads the shared stutter parameters rather than a second copy. *Depends:* C1. *Source:* spec
 §4.2, arch §5.
 
-**☐ D2. The 3-versus-4 comparison on synthetic reads.**
+**✅ D2. The 3-versus-4 comparison on synthetic reads.**
 Score both on simulated reads with known repeat lengths, measuring **calibration as well as
 accuracy**. Run **period 1 as well as period 2 and above** — the two regimes exercise different parts
 of the model and neither is skippable. At period 1, score indels **of the repeat's own base**
