@@ -45,10 +45,13 @@ the two determinism rules. *Source:* spec §4.2, arch §5.
   Two reviewers independently established it is unreachable — one structurally, one by exhaustive
   sweep. Documented as a lemma with a `debug_assert!` and a sweeping test rather than reinstated as a
   redundant guard.
-- **The state-index-to-enum refactor was declined for now.** A genuine improvement (it would remove
-  15 casts and close the traceback's silent `_ =>` arm), but it is a refactor of a port whose
-  byte-identity was just established over 800,000 cases, and this plan's rule is transcribe first,
-  change separately. A `debug_assert_eq!` closes the immediate hazard.
+- **The state-index-to-enum refactor was declined *at the time*, then done as a post-checkpoint
+  follow-up** (owner-delegated). Declining first was the point: it refactors a port whose
+  byte-identity is the module's only oracle, so "transcribe first, change separately" applied, and
+  the parity harness B3 built is what made the change provably safe. `const MATCH/INSERTION/DELETION:
+  usize` → a `#[repr(u8)] enum State` with the same discriminants; the traceback's silent `_ =>` arm
+  is gone (a fourth state is now a compile error, not an insertion), `best_of`'s tag is type-safe
+  instead of a bare `u8`, and the casts are removed. Parity green, 200,000-case soak green.
 
 ### 3. Changes made
 

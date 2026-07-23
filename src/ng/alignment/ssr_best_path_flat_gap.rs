@@ -47,12 +47,44 @@ use super::emission::Emission;
 use super::{BestPathAligner, ReadBases, RepeatContext, RepeatSpan};
 use std::sync::LazyLock;
 
-/// Index of the match state in a cell's three-state score array.
-const MATCH: usize = 0;
-/// Index of the insertion state (a read base consumed against no reference base).
-const INSERTION: usize = 1;
-/// Index of the deletion state (a reference base consumed against no read base).
-const DELETION: usize = 2;
+/// Which of the pair-HMM's three states a cell was entered in.
+///
+/// An enum rather than three `const usize` indices, which is what this was ported as. The
+/// port kept production's shape deliberately — transcribe first, change separately — and this
+/// is the separate change, made once the byte-parity oracle existed to prove it changed
+/// nothing.
+///
+/// Two things it buys, both real defects rather than tidiness:
+///
+/// - **The traceback's catch-all arm is gone.** Matching a `usize` needs a `_ =>`, and that
+///   arm silently read *any* value other than match or deletion as an insertion. Nothing
+///   could reach it, but nothing said so either; now the compiler enumerates the three cases,
+///   and a fourth would be a compile error rather than an insertion.
+/// - **`best_of`'s second element is type-safe.** It carried a `u8` — indistinguishable from
+///   a [`BaseQual`](crate::ng::types::BaseQual), which is in scope in the same loop — and
+///   every construction site needed an `as u8` cast.
+///
+/// `#[repr(u8)]` with explicit discriminants, so the layout and index values are exactly
+/// production's: match 0, insertion 1, deletion 2. `index()` compiles to the same constant
+/// the `const` did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum State {
+    /// A read base and a reference base consumed together.
+    Match = 0,
+    /// A read base consumed against no reference base.
+    Insertion = 1,
+    /// A reference base consumed against no read base.
+    Deletion = 2,
+}
+
+impl State {
+    /// Index into a cell's three-state score array.
+    #[inline]
+    const fn index(self) -> usize {
+        self as usize
+    }
+}
 
 /// An unreachable score. A real value, not an error: some cells genuinely cannot be
 /// entered in some states.
@@ -136,7 +168,7 @@ pub struct ViterbiScratch {
     current: Vec<[f64; 3]>,
     /// Per cell `(i, j)` and per state, the predecessor state that won the maximum — a
     /// flat `(m+1) × (n+1)` matrix, row-major with stride `n + 1`.
-    backpointers: Vec<[u8; 3]>,
+    backpointers: Vec<[State; 3]>,
 }
 
 impl ViterbiScratch {
@@ -153,7 +185,7 @@ impl ViterbiScratch {
         }
         let cells = (read_len + 1) * row;
         if self.backpointers.len() < cells {
-            self.backpointers.resize(cells, [0u8; 3]);
+            self.backpointers.resize(cells, [State::Match; 3]);
         }
     }
 }
@@ -233,7 +265,7 @@ impl TractReadout {
 /// of transition candidates, so this cannot fire today — the assertion records that, so a
 /// future dynamic call site is caught in development rather than indexing off the end.
 #[inline]
-fn best_of(candidates: &[(f64, u8)]) -> (f64, u8) {
+fn best_of(candidates: &[(f64, State)]) -> (f64, State) {
     debug_assert!(!candidates.is_empty(), "best_of requires a candidate");
     let mut best = candidates[0];
     for &candidate in &candidates[1..] {
@@ -338,7 +370,7 @@ impl<E: Emission> SsrFlatGapAligner<E> {
         // cells are deletions of leading reference bases.
         //
         // **`gap_open` is consulted at column 1 only, here.** From column 2 on, the match
-        // predecessor `previous[column - 1][MATCH]` is `UNREACHABLE`, so that candidate is
+        // predecessor `previous[column - 1][State::Match.index()]` is `UNREACHABLE`, so that candidate is
         // `-inf` and the deletion-extend candidate always wins — the open cost never enters.
         // And column 1 is inside the tract only when the left flank is empty. So the whole
         // of row 0's tract-awareness reduces to a single case: **a locus with no left flank**.
@@ -348,17 +380,20 @@ impl<E: Emission> SsrFlatGapAligner<E> {
         // randomized cases. It survived only because the fixture generated no zero-length
         // flanks. Once it did, the same mutation failed within ~100 cases.
         previous[0] = [0.0, UNREACHABLE, UNREACHABLE];
-        backpointers[0] = [MATCH as u8, MATCH as u8, MATCH as u8];
+        backpointers[0] = [State::Match; 3];
         for column in 1..=reference_len {
             let (score, predecessor) = best_of(&[
-                (gap_open(column) + previous[column - 1][MATCH], MATCH as u8),
                 (
-                    self.costs.ln_gap_extend + previous[column - 1][DELETION],
-                    DELETION as u8,
+                    gap_open(column) + previous[column - 1][State::Match.index()],
+                    State::Match,
+                ),
+                (
+                    self.costs.ln_gap_extend + previous[column - 1][State::Deletion.index()],
+                    State::Deletion,
                 ),
             ]);
             previous[column] = [UNREACHABLE, UNREACHABLE, score];
-            backpointers[column] = [MATCH as u8, MATCH as u8, predecessor];
+            backpointers[column] = [State::Match, State::Match, predecessor];
         }
 
         // Rows 1..=read_len — one read base per row.
@@ -371,14 +406,17 @@ impl<E: Emission> SsrFlatGapAligner<E> {
 
             // Column 0 — a read base before any reference base: insertion only.
             let (score, predecessor) = best_of(&[
-                (self.costs.ln_gap_open + previous[0][MATCH], MATCH as u8),
                 (
-                    self.costs.ln_gap_extend + previous[0][INSERTION],
-                    INSERTION as u8,
+                    self.costs.ln_gap_open + previous[0][State::Match.index()],
+                    State::Match,
+                ),
+                (
+                    self.costs.ln_gap_extend + previous[0][State::Insertion.index()],
+                    State::Insertion,
                 ),
             ]);
             current[0] = [UNREACHABLE, insertion_emission + score, UNREACHABLE];
-            backpointers[row] = [MATCH as u8, predecessor, MATCH as u8];
+            backpointers[row] = [State::Match, predecessor, State::Match];
 
             for column in 1..=reference_len {
                 let emitted = scores.pick(read_base, reference[column - 1]);
@@ -386,16 +424,16 @@ impl<E: Emission> SsrFlatGapAligner<E> {
                 // Match: from the diagonal cell, in any state. Priority M > D > I.
                 let (match_score, match_predecessor) = best_of(&[
                     (
-                        self.costs.ln_match_to_match + previous[column - 1][MATCH],
-                        MATCH as u8,
+                        self.costs.ln_match_to_match + previous[column - 1][State::Match.index()],
+                        State::Match,
                     ),
                     (
-                        self.costs.ln_gap_close + previous[column - 1][DELETION],
-                        DELETION as u8,
+                        self.costs.ln_gap_close + previous[column - 1][State::Deletion.index()],
+                        State::Deletion,
                     ),
                     (
-                        self.costs.ln_gap_close + previous[column - 1][INSERTION],
-                        INSERTION as u8,
+                        self.costs.ln_gap_close + previous[column - 1][State::Insertion.index()],
+                        State::Insertion,
                     ),
                 ]);
 
@@ -403,20 +441,23 @@ impl<E: Emission> SsrFlatGapAligner<E> {
 
                 // Insertion: from the cell above — a read base consumed, no reference base.
                 let (insertion_score, insertion_predecessor) = best_of(&[
-                    (open + previous[column][MATCH], MATCH as u8),
+                    (open + previous[column][State::Match.index()], State::Match),
                     (
-                        self.costs.ln_gap_extend + previous[column][INSERTION],
-                        INSERTION as u8,
+                        self.costs.ln_gap_extend + previous[column][State::Insertion.index()],
+                        State::Insertion,
                     ),
                 ]);
 
                 // Deletion: from the cell to the left — a reference base consumed, no read
                 // base.
                 let (deletion_score, deletion_predecessor) = best_of(&[
-                    (open + current[column - 1][MATCH], MATCH as u8),
                     (
-                        self.costs.ln_gap_extend + current[column - 1][DELETION],
-                        DELETION as u8,
+                        open + current[column - 1][State::Match.index()],
+                        State::Match,
+                    ),
+                    (
+                        self.costs.ln_gap_extend + current[column - 1][State::Deletion.index()],
+                        State::Deletion,
                     ),
                 ]);
 
@@ -437,9 +478,9 @@ impl<E: Emission> SsrFlatGapAligner<E> {
         // The final cell: best terminal state, tie-broken M > D > I.
         let last = previous[reference_len];
         let (_, final_state) = best_of(&[
-            (last[MATCH], MATCH as u8),
-            (last[DELETION], DELETION as u8),
-            (last[INSERTION], INSERTION as u8),
+            (last[State::Match.index()], State::Match),
+            (last[State::Deletion.index()], State::Deletion),
+            (last[State::Insertion.index()], State::Insertion),
         ]);
 
         // Walk the traceback, recording for each reference base consumed how many read
@@ -454,11 +495,11 @@ impl<E: Emission> SsrFlatGapAligner<E> {
 
         let mut row_index = read_len;
         let mut column = reference_len;
-        let mut state = final_state as usize;
+        let mut state = final_state;
         while row_index != 0 || column != 0 {
-            let predecessor = backpointers[row_index * stride + column][state];
+            let predecessor = backpointers[row_index * stride + column][state.index()];
             match state {
-                MATCH => {
+                State::Match => {
                     let consumed = column - 1; // reference base this match consumes
                     if consumed == left_junction {
                         tract_start = row_index - 1;
@@ -469,7 +510,7 @@ impl<E: Emission> SsrFlatGapAligner<E> {
                     row_index -= 1;
                     column -= 1;
                 }
-                DELETION => {
+                State::Deletion => {
                     let consumed = column - 1;
                     if consumed == left_junction {
                         tract_start = row_index;
@@ -479,18 +520,17 @@ impl<E: Emission> SsrFlatGapAligner<E> {
                     }
                     column -= 1;
                 }
-                _ => {
-                    // Insertion: consumes a read base, no reference base.
+                State::Insertion => {
+                    // Consumes a read base, no reference base.
                     //
-                    // A catch-all rather than `INSERTION =>` because a `usize` match needs
-                    // one; the assertion is what keeps it honest, since every other value
-                    // would be silently read as an insertion. Backpointers only ever hold
-                    // the three state indices, so this cannot fire today.
-                    debug_assert_eq!(state, INSERTION, "unknown traceback state");
+                    // Named rather than a catch-all: this used to be `_ =>` with a debug
+                    // assertion, because matching a `usize` requires one — and that arm would
+                    // have read any unexpected value as an insertion. The enum makes the
+                    // three cases exhaustive, so the assertion has nothing left to guard.
                     row_index -= 1;
                 }
             }
-            state = predecessor as usize;
+            state = predecessor;
         }
 
         // A flank "ran off the read end" when no read base sits on its side of the tract.
@@ -817,20 +857,45 @@ mod tests {
     /// silently invert every tie in the matrix.
     #[test]
     fn best_of_keeps_the_first_candidate_on_a_tie() {
-        // All equal: the first wins.
-        assert_eq!(best_of(&[(1.0, 7), (1.0, 8), (1.0, 9)]), (1.0, 7));
+        use State::{Deletion, Insertion, Match};
+
+        // All equal: the first wins. This is the whole mechanism behind M > D > I — each
+        // call site encodes the preference by *ordering* its candidates.
+        assert_eq!(
+            best_of(&[(1.0, Match), (1.0, Deletion), (1.0, Insertion)]),
+            (1.0, Match)
+        );
         // A strictly better later candidate still wins.
-        assert_eq!(best_of(&[(1.0, 7), (2.0, 8), (2.0, 9)]), (2.0, 8));
+        assert_eq!(
+            best_of(&[(1.0, Match), (2.0, Deletion), (2.0, Insertion)]),
+            (2.0, Deletion)
+        );
         // A single candidate is returned unchanged.
-        assert_eq!(best_of(&[(-3.5, 2)]), (-3.5, 2));
+        assert_eq!(best_of(&[(-3.5, Deletion)]), (-3.5, Deletion));
         // Unreachable candidates do not displace a reachable one, in either position.
-        assert_eq!(best_of(&[(UNREACHABLE, 1), (0.0, 2)]), (0.0, 2));
-        assert_eq!(best_of(&[(0.0, 1), (UNREACHABLE, 2)]), (0.0, 1));
+        assert_eq!(
+            best_of(&[(UNREACHABLE, Insertion), (0.0, Match)]),
+            (0.0, Match)
+        );
+        assert_eq!(
+            best_of(&[(0.0, Match), (UNREACHABLE, Insertion)]),
+            (0.0, Match)
+        );
         // All unreachable: still answers, with the first — the traceback needs *a* state.
         assert_eq!(
-            best_of(&[(UNREACHABLE, 5), (UNREACHABLE, 6)]),
-            (UNREACHABLE, 5)
+            best_of(&[(UNREACHABLE, Match), (UNREACHABLE, Deletion)]),
+            (UNREACHABLE, Match)
         );
+    }
+
+    /// The discriminants are load-bearing: they are the array indices, and they must stay
+    /// exactly production's `M = 0`, `I = 1`, `D = 2`. A reordering of the variants would
+    /// silently permute every score array.
+    #[test]
+    fn the_state_discriminants_are_the_array_indices() {
+        assert_eq!(State::Match.index(), 0);
+        assert_eq!(State::Insertion.index(), 1);
+        assert_eq!(State::Deletion.index(), 2);
     }
 
     /// **The tie-break is a correctness rule, not a nicety** (spec §4.2): two reads of the
