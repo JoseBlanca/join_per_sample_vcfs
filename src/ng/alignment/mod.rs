@@ -178,6 +178,12 @@ impl RepeatSpan {
     /// Defined for every case, because even an unanchored read says something: the repeat
     /// is at least as long as the stretch of it the read shows. For [`Self::Between`] the
     /// bound is the measurement itself.
+    ///
+    /// **The [`Self::Unanchored`] answer presumes the read was aligned against a real
+    /// locus.** That variant is also what an *empty* reference produces — there was no
+    /// locus to delimit — and there the `read_len` fallback would assert a repeat at least
+    /// as long as the read at a locus with no bases at all. The caller knows which case it
+    /// is in; this accessor cannot.
     #[must_use]
     pub fn length_lower_bound(&self, read_len: u64) -> u64 {
         match self {
@@ -312,7 +318,15 @@ pub struct RepeatContext<'a> {
 /// [`Alignment`] for the affine aligner and [`RepeatSpan`] for the repeat-aware ones —
 /// they answer different questions, so a single output type would force one of them to
 /// lie. `Context` is `()` for the affine aligner, which needs nothing locus-specific, and
-/// the repeat context for the others. `Scratch` is per-algorithm, never one shared buffer.
+/// [`RepeatContext`] for the others. `Scratch` is per-algorithm, never one shared buffer.
+///
+/// **`Context` carries a lifetime, and is passed by value.** The architecture sketch has a
+/// plain `type Context` taken by reference, but the repeat context *is* two references —
+/// the geometry and the stutter model both travel per call and are borrowed, so that they
+/// need not be rebuilt per locus across millions of loci. A plain associated type could
+/// only name that as `RepeatContext<'static>`, which would force every caller to own its
+/// locus data forever. So `Context<'a>` is generic over the lifetime, and since the value
+/// is two pointers and `Copy`, taking a reference *to* it would only add indirection.
 ///
 /// # Contract
 ///
@@ -365,8 +379,13 @@ pub trait BestPathAligner: Sized {
     type Scratch: Default;
     /// [`Alignment`] for the affine aligner; [`RepeatSpan`] for the repeat-aware ones.
     type Output;
-    /// `()` for the affine aligner; the repeat context for the repeat-aware ones.
-    type Context;
+    /// `()` for the affine aligner; [`RepeatContext`] for the repeat-aware ones.
+    ///
+    /// `Copy` because the by-value signature rests on it: a caller aligning many reads
+    /// against one locus has to hand the same context to each, and without the bound a
+    /// generic helper doing that would not compile. Both implementations are two pointers
+    /// or nothing at all; an implementation with a large owned context passes `&'a Big`.
+    type Context<'a>: Copy;
 
     /// Align `read` (with its per-base `quality`) against `reference`.
     ///
@@ -377,7 +396,7 @@ pub trait BestPathAligner: Sized {
         read: &[u8],
         quality: &[u8],
         reference: &[u8],
-        context: &Self::Context,
+        context: Self::Context<'_>,
         scratch: &mut Self::Scratch,
     ) -> Self::Output;
 }

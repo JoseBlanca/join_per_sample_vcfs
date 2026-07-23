@@ -86,3 +86,60 @@ Container: `cargo fmt --check` exit 0; `cargo clippy --all-targets --all-feature
   **Milestone C's banding makes it a live hazard** — once cells go unwritten, the leftovers become
   reachable.
 - The state enum refactor, deferred above.
+
+---
+
+## Step B2 — the `RepeatSpan` readout, the widening
+
+**Status:** shipped (reviewed, fixes applied).
+**Review:** [ng_alignment_b2_2026-07-23.md](../reviews/ng_alignment_b2_2026-07-23.md) — 3 Majors, no
+Blockers; all applied.
+
+### 1. Plan
+
+Walk the traceback and read the repeat off the two flank-junction columns, **reporting which flanks
+anchored** — the part production's side-blind `Delimited::BorderOffEnd` cannot express, and the part
+the STR preparer needs to tell a measurement from a lower bound. *Source:* spec §4.2, arch §2.1, §5.
+
+### 2. Decisions
+
+- **`TractReadout::classify` maps the 2×2 of anchoring onto the four `RepeatSpan` cases**, and the
+  trait impl wires it. Verified by mutation, not argument: swapping `FromLeft`/`FromRight` is caught
+  by 2 tests, swapping the anchor initialisers by 3, transposing the endpoints by 6.
+- **The trait's `Context` became a generic associated type passed by value** (`type Context<'a>: Copy`).
+  The arch sketch's plain `type Context` taken by reference cannot name `RepeatContext<'a>` without
+  forcing `RepeatContext<'static>`, which would make every caller own its locus data forever — the
+  opposite of arch §2.2's reason for borrowing it. Both reviewers assessed the alternatives and upheld
+  the GAT; one verified by compilation that `type Context<'a> = ()` still works for the gated affine
+  aligner.
+- **A flank that does not exist cannot anchor** — the review's main finding, and a correction to B1.
+
+### 3. Tests — 8 added
+
+Four `RepeatSpan` cases all reachable from real alignments; a clean repeat measures exactly; a long
+allele is measured at its own length; a truncated read **bounds** rather than measures; an interrupted
+repeat verbatim; the flankless cases.
+
+### 4. Validation
+
+Container: fmt clean, clippy clean, `cargo test --lib` **2194 passed, 0 failed**.
+
+### 5. The finding worth carrying forward
+
+**A flankless geometry turned an unmeasured read into a measurement**, and the cause was a convention
+I wrote in B1: "a flank that does not exist cannot fail to hold". Harmless while it was two raw bits;
+**B2 is the step that promotes those bits to a claim about length**, and `Between` is the one variant
+that says the length is pinned. Demonstrated live — frame `("", "CAGCAGCAGCAG", "")`, read `CAGCAG` →
+`measured_length() == Some(6)`, a short allele nothing observed, at contig-edge loci where the
+evidence is already thinnest.
+
+Inverted: **a flank that does not exist cannot anchor.** At a flankless edge, a read that ended
+because the tract ended and one that ran out mid-tract produce an *identical* readout, so the
+measurement claim over-claims for one of them. A flankless locus can therefore never yield a
+measurement — honest, since there is no flank to pin the edge against. **Parity is undisturbed:**
+production's `Region` makes no measurement claim, and B3 compares the measured bytes.
+
+The general lesson, now three steps running: **the code was right and the test was not.** One of this
+step's own tests (`the_classified_span_agrees_with_the_raw_readout`) was a tautology — `align` *is*
+`classify ∘ delimit`, so comparing against `readout.classify()` compares `classify(x)` with
+`classify(x)`, and it passed under the very mutation it was written to catch.

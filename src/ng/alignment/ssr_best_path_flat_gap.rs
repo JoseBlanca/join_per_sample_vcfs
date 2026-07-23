@@ -43,8 +43,8 @@
 //! It is reproduced here rather than fixed because **reproducing it silently and fixing it
 //! silently both end with a parity test failing for a reason nobody can find** (spec §4.2).
 
-use super::RepeatContext;
 use super::emission::Emission;
+use super::{BestPathAligner, RepeatContext, RepeatSpan};
 use crate::ng::types::BaseQual;
 use std::sync::LazyLock;
 
@@ -179,6 +179,45 @@ pub struct TractReadout {
     pub left_anchored: bool,
     /// Whether the right flank held — false when the read ran off its end inside it.
     pub right_anchored: bool,
+}
+
+impl TractReadout {
+    /// Classify the readout into the four cases a caller can act on.
+    ///
+    /// **This is the widening, and it is where ng goes past production.** Production's
+    /// `Delimited` collapses every unanchored outcome into one `BorderOffEnd`, so it is
+    /// *side-blind*: it cannot say which flank was missing, and the STR read preparer cannot
+    /// otherwise tell a measurement from a lower bound (arch §2.1, §5; spec §8).
+    ///
+    /// **The mapping is the whole risk of this step, and its failure is silent.** Getting a
+    /// side backwards does not crash and does not produce an implausible number — it
+    /// produces a read that looks perfectly good and is filed under the wrong observation
+    /// class. So read the two middle arms carefully: [`RepeatSpan::FromLeft`] means the
+    /// **left** flank is the one that *held*, and therefore that the read ran off its own
+    /// 3′ end somewhere inside the repeat.
+    #[must_use]
+    pub fn classify(&self) -> RepeatSpan {
+        // `delimit` guarantees this, but the type is public with public fields — B3's parity
+        // harness needs the raw offsets — so a hand-built readout can reach here. An
+        // inverted pair would become a `Between` whose measured length saturates to zero: a
+        // *confident zero-unit allele*, which is far worse than a rejection.
+        debug_assert!(
+            self.tract_start <= self.tract_end,
+            "inverted tract offsets: {} > {}",
+            self.tract_start,
+            self.tract_end
+        );
+        let span = self.tract_start..self.tract_end;
+        match (self.left_anchored, self.right_anchored) {
+            (true, true) => RepeatSpan::Between(span),
+            (true, false) => RepeatSpan::FromLeft(span),
+            (false, true) => RepeatSpan::FromRight(span),
+            // Neither flank held: the read lies wholly inside the repeat and carries no
+            // per-read fact about its length, so the span is dropped rather than reported
+            // as if it measured something.
+            (false, false) => RepeatSpan::Unanchored,
+        }
+    }
 }
 
 /// Pick the best of the candidates, keeping the **first on ties** — so the caller encodes
@@ -472,9 +511,53 @@ impl<E: Emission> SsrFlatGapAligner<E> {
         Some(TractReadout {
             tract_start: tract_start as u64,
             tract_end: tract_end as u64,
-            left_anchored: left_flank_len == 0 || tract_start != 0,
-            right_anchored: right_flank_len == 0 || tract_end != read_len,
+            // **A flank that does not exist cannot anchor.** B1 had this the other way round
+            // — "a flank that does not exist cannot fail to hold" — which was harmless while
+            // these were two raw bits, but B2 promotes them to a `RepeatSpan`, and
+            // `Between` is the one variant that claims to *pin* the repeat's length.
+            //
+            // At a contig-edge locus with no right flank, the two cases that matter produce
+            // an **identical** readout: a read that ended because the tract ended, and a
+            // read that ended because the read ran out mid-tract. Both give
+            // `tract_end == read_len`, and nothing here can tell them apart. Calling that a
+            // measurement over-claims for one of the two — a short allele that was never
+            // observed, exactly what the widening exists to prevent, at the geometry where
+            // the evidence is already thinnest.
+            //
+            // So the conservative reading wins: without a flank holding that side, the span
+            // is a lower bound. The cost is that a flankless locus can never yield a
+            // measurement, which is honest — with no flank in the frame there is nothing to
+            // pin the tract's edge against.
+            //
+            // This is ng-only and does **not** disturb the parity oracle: production's
+            // `Delimited::Region` makes no measurement claim, and B3 compares the measured
+            // *bytes*, which are unchanged.
+            left_anchored: left_flank_len > 0 && tract_start != 0,
+            right_anchored: right_flank_len > 0 && tract_end != read_len,
         })
+    }
+}
+
+impl<E: Emission> BestPathAligner for SsrFlatGapAligner<E> {
+    type Scratch = ViterbiScratch;
+    type Output = RepeatSpan;
+    type Context<'a> = RepeatContext<'a>;
+
+    /// Measure the read's repeat, and report **which flanks held it**.
+    ///
+    /// An empty reference gives [`RepeatSpan::Unanchored`] — a *defined answer*, not an
+    /// error. There is no locus to delimit, so the read carries no fact about one, which is
+    /// exactly what `Unanchored` means (arch §3).
+    fn align(
+        &self,
+        read: &[u8],
+        quality: &[u8],
+        reference: &[u8],
+        context: Self::Context<'_>,
+        scratch: &mut Self::Scratch,
+    ) -> Self::Output {
+        self.delimit(read, quality, reference, &context, scratch)
+            .map_or(RepeatSpan::Unanchored, |readout| readout.classify())
     }
 }
 
@@ -913,12 +996,234 @@ mod tests {
         let stub = delimit(b"AC", &reference, &geometry).expect("a real frame");
         assert!(stub.tract_start <= stub.tract_end);
 
-        // A frame with no flanks at all — a repeat at both contig edges. Nothing can anchor,
-        // so both flags report anchored by the "a flank that does not exist cannot fail to
-        // hold" convention, and the whole read is tract.
+        // A frame with no flanks at all — a repeat at both contig edges. **Neither side can
+        // anchor**, because there is no flank to hold it: a flank that does not exist cannot
+        // anchor. The span is still the whole read, but it is a bound, not a measurement.
         let (bare, bare_geometry) = frame(b"", b"CAGCAGCAG", b"", b"CAG");
         let all_repeat = delimit(b"CAGCAGCAG", &bare, &bare_geometry).expect("a real frame");
         assert_eq!((all_repeat.tract_start, all_repeat.tract_end), (0, 9));
-        assert!(all_repeat.left_anchored && all_repeat.right_anchored);
+        assert!(!all_repeat.left_anchored && !all_repeat.right_anchored);
+    }
+
+    // -----------------------------------------------------------------
+    // B2 — the RepeatSpan readout, the widening
+    // -----------------------------------------------------------------
+
+    /// Align through the public [`BestPathAligner`] surface.
+    fn align(read: &[u8], reference: &[u8], geometry: &RepeatGeometry) -> RepeatSpan {
+        let aligner = SsrFlatGapAligner::new(PerQualityEmission::new());
+        let stutter = StutterModel::hipstr_shipped();
+        let context = RepeatContext {
+            geometry,
+            stutter: &stutter,
+        };
+        let quality = vec![35u8; read.len()];
+        let mut scratch = ViterbiScratch::new();
+        aligner.align(read, &quality, reference, context, &mut scratch)
+    }
+
+    /// **`classify` is a pure mapping, and this pins every arm of it — including which side
+    /// is which.** A mis-assigned side is the silent failure this step exists to avoid: the
+    /// read still looks perfectly good and is simply filed under the wrong observation
+    /// class. `FromLeft` means the **left** flank is the one that held.
+    #[test]
+    fn classify_maps_each_anchoring_to_its_own_case() {
+        let readout = |left_anchored, right_anchored| TractReadout {
+            tract_start: 4,
+            tract_end: 10,
+            left_anchored,
+            right_anchored,
+        };
+
+        assert_eq!(readout(true, true).classify(), RepeatSpan::Between(4..10));
+        assert_eq!(readout(true, false).classify(), RepeatSpan::FromLeft(4..10));
+        assert_eq!(
+            readout(false, true).classify(),
+            RepeatSpan::FromRight(4..10)
+        );
+        assert_eq!(readout(false, false).classify(), RepeatSpan::Unanchored);
+
+        // The two one-flank cases must not be interchangeable — swapping the inputs must
+        // swap the outputs, not leave them alone.
+        assert_ne!(
+            readout(true, false).classify(),
+            readout(false, true).classify()
+        );
+    }
+
+    /// **All four cases are reachable from real alignments**, which is what the plan asks
+    /// this step to prove. Anchoring is what distinguishes them, so each read is chosen to
+    /// present a different pair of flanks to the same frame.
+    #[test]
+    fn every_repeat_span_case_is_reachable() {
+        let (reference, geometry) = frame(b"ACGTACGT", b"CAGCAGCAGCAG", b"TTGGTTGGAT", b"CAG");
+
+        // Both flanks present.
+        assert!(matches!(
+            align(&reference, &reference, &geometry),
+            RepeatSpan::Between(_)
+        ));
+        // Runs off its 3′ end inside the repeat: only the left flank held.
+        assert!(matches!(
+            align(b"ACGTACGTCAGCAGCAG", &reference, &geometry),
+            RepeatSpan::FromLeft(_)
+        ));
+        // Starts inside the repeat: only the right flank held.
+        assert!(matches!(
+            align(b"CAGCAGTTGGTTGGAT", &reference, &geometry),
+            RepeatSpan::FromRight(_)
+        ));
+        // Wholly inside the repeat: neither flank held, and no span is reported.
+        assert_eq!(
+            align(b"CAGCAGCAG", &reference, &geometry),
+            RepeatSpan::Unanchored
+        );
+    }
+
+    /// A clean repeat is a **measurement**, and it measures exactly. This is the case the
+    /// whole distinction exists to separate from the other three.
+    #[test]
+    fn a_clean_repeat_is_a_measurement_of_the_right_length() {
+        let (reference, geometry) = frame(b"ACGTACGT", b"CAGCAGCAGCAG", b"TTGGTTGGAT", b"CAG");
+        let span = align(&reference, &reference, &geometry);
+
+        assert!(span.is_measurement());
+        assert_eq!(span.measured_length(), Some(12));
+        assert_eq!(span.observed_span(), Some(&(8..20)));
+    }
+
+    /// A longer allele must be **measured**, not collapsed — and it must still come back as
+    /// a measurement rather than a bound, because both flanks held.
+    #[test]
+    fn a_longer_allele_is_measured_at_its_own_length() {
+        let (reference, geometry) = frame(b"ACGTACGT", b"CAGCAGCAGCAG", b"TTGGTTGGAT", b"CAG");
+        let span = align(
+            b"ACGTACGTCAGCAGCAGCAGCAGCAGCAGTTGGTTGGAT",
+            &reference,
+            &geometry,
+        );
+
+        assert!(span.is_measurement());
+        assert_eq!(span.measured_length(), Some(21));
+    }
+
+    /// **A truncated read is a lower bound, not a short allele.** This is the distinction the
+    /// widening buys, and the one a caller most easily loses: the span looks like any other,
+    /// so only the *case* says it is not a measurement.
+    #[test]
+    fn a_truncated_read_bounds_the_length_instead_of_measuring_it() {
+        let (reference, geometry) = frame(b"ACGTACGT", b"CAGCAGCAGCAG", b"TTGGTTGGAT", b"CAG");
+        let read = b"ACGTACGTCAGCAGCAG";
+        let span = align(read, &reference, &geometry);
+
+        assert!(!span.is_measurement());
+        assert_eq!(
+            span.measured_length(),
+            None,
+            "a bound must not report a length"
+        );
+        // It still bounds the repeat below, and the bound is the part of it the read shows.
+        assert_eq!(span.length_lower_bound(read.len() as u64), 9);
+        // ...and the raw span is available for extracting the bases it did see.
+        assert_eq!(span.observed_span(), Some(&(8..17)));
+    }
+
+    /// An interrupted repeat comes out **verbatim** through the public surface too — the
+    /// flat tract gap is content-agnostic, so a substitution inside the tract is measured,
+    /// not tidied away.
+    #[test]
+    fn an_interrupted_repeat_is_measured_verbatim() {
+        let (reference, geometry) = frame(b"ACGTACGT", b"CAGCAGCAGCAG", b"TTGGTTGGAT", b"CAG");
+        let read = b"ACGTACGTCAGCAGCTGCAGTTGGTTGGAT";
+        let span = align(read, &reference, &geometry);
+
+        assert_eq!(span.measured_length(), Some(12));
+        let observed = span.observed_span().expect("a measured span");
+        assert_eq!(
+            &read[observed.start as usize..observed.end as usize],
+            b"CAGCAGCTGCAG"
+        );
+    }
+
+    /// An empty reference is not a locus, so the read carries no fact about one — a defined
+    /// answer rather than an error (arch §3).
+    #[test]
+    fn an_empty_reference_aligns_to_unanchored() {
+        let geometry = RepeatGeometry {
+            left_flank_len: Bp(0),
+            right_flank_len: Bp(0),
+            motif: Motif::new(b"CAG").expect("a valid test motif"),
+        };
+        assert_eq!(align(b"ACGT", b"", &geometry), RepeatSpan::Unanchored);
+    }
+
+    /// The public surface must report the offsets the algorithm actually found.
+    ///
+    /// **Deliberately not written as `span == readout.classify()`** — that was the first
+    /// version, and it is a tautology: `align` *is* `delimit(..).map_or(Unanchored,
+    /// classify)`, so it compares `classify(x)` with `classify(x)` and passes under every
+    /// mutation of `classify`, including swapping `FromLeft` with `FromRight`. What is
+    /// checked instead is the part that is not definitionally true: that the wiring carries
+    /// B1's offsets through unchanged, and that the *case* follows from the anchoring flags
+    /// spelled out independently here.
+    #[test]
+    fn the_public_surface_reports_the_offsets_the_traceback_found() {
+        let (reference, geometry) = frame(b"ACGTACGT", b"CAGCAGCAGCAG", b"TTGGTTGGAT", b"CAG");
+        for read in [
+            reference.clone(),
+            b"ACGTACGTCAGCAGCAGCAGCAGCAGCAGTTGGTTGGAT".to_vec(),
+            b"ACGTACGTCAGCAGCAG".to_vec(),
+            b"CAGCAGTTGGTTGGAT".to_vec(),
+            b"CAGCAGCAG".to_vec(),
+        ] {
+            let readout = delimit(&read, &reference, &geometry).expect("a real frame");
+            let span = align(&read, &reference, &geometry);
+
+            // The case, derived here from the flags rather than by calling `classify`.
+            let expected = match (readout.left_anchored, readout.right_anchored) {
+                (true, true) => RepeatSpan::Between(readout.tract_start..readout.tract_end),
+                (true, false) => RepeatSpan::FromLeft(readout.tract_start..readout.tract_end),
+                (false, true) => RepeatSpan::FromRight(readout.tract_start..readout.tract_end),
+                (false, false) => RepeatSpan::Unanchored,
+            };
+            assert_eq!(span, expected, "read {read:?}");
+
+            if let Some(observed) = span.observed_span() {
+                assert_eq!(observed.start, readout.tract_start);
+                assert_eq!(observed.end, readout.tract_end);
+            }
+        }
+    }
+
+    /// **A locus with no flank on a side can never measure that side.** This is the case the
+    /// review caught: before the fix, a flankless frame reported `Between` — a *measurement*
+    /// — for a read that had measured nothing, because "a flank that does not exist cannot
+    /// fail to hold" turned into "the length is pinned".
+    ///
+    /// The two readings are indistinguishable there (a read that ended because the tract
+    /// ended, and one that ran out mid-tract, produce identical offsets), so the honest
+    /// answer is the conservative one: a bound, not a measurement.
+    #[test]
+    fn a_locus_without_flanks_yields_bounds_rather_than_measurements() {
+        // No flanks at all: nothing can anchor, whatever the read shows.
+        let (bare, bare_geometry) = frame(b"", b"CAGCAGCAGCAG", b"", b"CAG");
+        for read in [b"CAGCAG".as_slice(), b"CAGCAGCAGCAG".as_slice()] {
+            let span = align(read, &bare, &bare_geometry);
+            assert_eq!(span, RepeatSpan::Unanchored, "read {read:?}");
+            assert!(!span.is_measurement());
+            assert_eq!(span.measured_length(), None);
+        }
+
+        // A left flank only — a repeat running to a contig end. The left side can anchor;
+        // the right never can, so the best available answer is a lower bound.
+        let (left_only, left_geometry) = frame(b"ACGTACGT", b"CAGCAGCAGCAG", b"", b"CAG");
+        let span = align(&left_only, &left_only, &left_geometry);
+        assert!(matches!(span, RepeatSpan::FromLeft(_)));
+        assert_eq!(
+            span.measured_length(),
+            None,
+            "a flankless side must not report a measured length"
+        );
+        assert_eq!(span.length_lower_bound(left_only.len() as u64), 12);
     }
 }

@@ -134,7 +134,7 @@ whole matrix, as production does — **unbanded is deliberate** and is what make
 junction gap belongs to the block on its **5′ side**. **Isolated because its failure is silent:** a
 wrong recurrence is a wrong repeat length, not a panic. *Depends:* A3. *Source:* spec §4.2, arch §5.
 
-**☐ B2. The `RepeatSpan` readout — the widening. Own commit; do not bundle.**
+**✅ B2. The `RepeatSpan` readout — the widening. Own commit; do not bundle.**
 Walk the traceback and read the repeat off the two flank-junction columns, reporting **which flanks
 anchored**. This is where ng goes beyond production: `Delimited::BorderOffEnd` is side-blind, and the
 STR preparer cannot otherwise tell a measurement from a lower bound (arch §5). **Isolated because its
