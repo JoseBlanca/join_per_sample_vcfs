@@ -1,8 +1,9 @@
 //! ng alignment — lining a read up against a reference stretch.
 //!
 //! This is a **folder, not a file**, because it holds competing implementations that get
-//! compared: the traits will live here in `mod.rs` and each algorithm sits in its own file
-//! beside its siblings (`doc/devel/ng/arch/alignment.md` §Module home). File names say
+//! compared: the three aligner and normalizer traits will live here in `mod.rs` and each
+//! algorithm sits in its own file beside its siblings — as does the shared [`emission`]
+//! component (`doc/devel/ng/arch/alignment.md` §Module home). File names say
 //! which trait an algorithm implements and whether it is repeat-aware, because both are
 //! load-bearing — the best-path and marginal families implement *different* traits, and
 //! every repeat-aware algorithm has an affine counterpart it must not be confused with.
@@ -12,9 +13,14 @@
 //! alignments or probabilities, which is why it sits outside the step-per-module rule
 //! rather than breaking it (`doc/devel/ng/spec/alignment.md` §1).
 //!
-//! Landed so far: [`Alignment`], the output shape of the general-purpose affine aligner.
-//! No trait and no algorithm yet — those arrive with the later steps of the plan
+//! Landed so far: [`Alignment`], the output shape of the general-purpose affine aligner,
+//! and the [`emission`] component every aligner scores its bases with. No aligner trait
+//! and no algorithm yet — those arrive with the later steps of the plan
 //! `doc/devel/ng/impl_plan/alignment_best_path.md`.
+
+pub mod emission;
+
+pub use emission::{BaseScores, Emission, FlatEmission, PerQualityEmission};
 
 use crate::pileup::walker::CigarOp;
 

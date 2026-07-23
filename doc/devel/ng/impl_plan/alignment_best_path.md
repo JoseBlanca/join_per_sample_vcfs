@@ -98,7 +98,7 @@ reusing production's `CigarOp` rather than minting a parallel operation type —
 algorithm 2 (Milestone E, gated) and the normalizers in plan 3. No algorithms. *Source:* arch §Module
 home, §2.1.
 
-**☐ A1. `Emission` + its two implementations.**
+**✅ A1. `Emission` + its two implementations.**
 The trait, plus the per-base-quality implementation (port `EMISSION_LN` **including its
 quality-zero floor**, without which a Q0 base annihilates every path through it) and the flat-rate
 one. Note the two have **no common source** for the inserted-base score: production's per-quality

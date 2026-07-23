@@ -101,3 +101,91 @@ of this plan. Flagged at Checkpoint A.
   this module is the natural moment.
 - **`Hash` is not derivable** on `Alignment` because `CigarOp` does not derive it. Recorded in code
   so the next person finds the blocker rather than the symptom.
+
+---
+
+## Step A1 — `Emission` and its two implementations
+
+**Status:** shipped (reviewed, fixes applied).
+**Review:** [ng_alignment_a1_2026-07-23.md](../reviews/ng_alignment_a1_2026-07-23.md) — no Blockers, **5 Majors**, ~12 Minors, all applied.
+
+### 1. Plan
+
+The `Emission` trait plus the per-base-quality implementation (porting `EMISSION_LN` **including
+its quality-zero floor**) and the flat-rate one. *Source:* spec §4.2, arch §2.3, §5.
+
+### 2. Assumptions and decisions
+
+- **The flat model's `insert_ln` is `ln(1/4)` — a decision, not a port**, as arch §2.3 warned it
+  would have to be. Production's per-quality path uses `ln(1/4)`; its flat path has no emission for
+  an inserted base at all, only a *transition* cost (`gap = eps`,
+  [pair_hmm.rs](../../../../src/ssr/cohort/pair_hmm.rs)). Reasoning for choosing `ln(1/4)`: `ε` is
+  the chance of misreading a base whose true identity the reference supplies, and an inserted base
+  has no such base — so there is nothing for `ε` to describe, and both models make the same uniform
+  assumption. Taking production's `gap = eps` instead would put a transition cost in an emission
+  slot and **price the same event twice** once the aligner's gap model lands on top.
+- **Arch §6's deferred signature question is now settled: quality resolves per *row*.** Arch listed
+  "whether quality arrives per call or as a pre-resolved row" as an impl-time confirmation that
+  "resolves when the first two implementations exist" — they now do. `scores_for(quality) ->
+  BaseScores` is the trait's primary method, with `emit_ln` a provided convenience over it. The
+  reason is structural, not measured (**nothing is built yet to measure**): a quality belongs to a
+  *read base*, so it is constant along a matrix row while the reference base varies along it, and
+  production's own loop hoists it per row. Matching that loop shape matters here beyond speed —
+  Milestone B has to reproduce production byte for byte.
+- **The bases are compared by raw byte equality, and canonicalizing them is the caller's job.**
+  This is the arch §3 precondition shape, and it did not need a design decision: ng already offers
+  both forms deliberately — `RefSeq::fetch` canonicalizes, `RawRefSeq` is verbatim with soft-mask
+  intact. Upper-casing inside `emit_ln` was rejected as a scoring-model change smuggled into a
+  component, and it would cost per cell.
+- **`ε = 1` is the treatment for a non-finite rate** — the no-information end of the scale, so
+  garbage input cannot yield confident output.
+- **A `try_new` was recommended and deliberately not applied** — see Tradeoffs.
+
+### 3. Changes made
+
+| file | change |
+|---|---|
+| [src/ng/alignment/emission.rs](../../../../src/ng/alignment/emission.rs) | **new** — `Emission` (with `Sized`), `BaseScores`, `PerQualityEmission`, `FlatEmission` |
+| [src/ng/alignment/mod.rs](../../../../src/ng/alignment/mod.rs) | `pub mod emission;` + re-exports + doc correction |
+
+### 4. Tests added — 15
+
+Highlights: `per_quality_table_is_bit_exact` (exact `f64` equality across all 256 qualities, guarding
+the parity contract against a *reformulation* that a tolerance test would wave through);
+`emission_is_finite_at_every_quality` and `flat_emission_stays_total_for_rates_outside_the_contract`
+(the totality contract, the latter on the release path specifically);
+`a_match_outscores_a_mismatch_above_the_quality_one_crossover` and its flat counterpart;
+`mismatch_floor_never_binds_over_the_quality_domain`; `emission_compares_bases_by_raw_byte_equality`.
+
+**One test wrote itself into a correction.** The first version asserted "a match always outscores a
+mismatch" and **failed at Q1**. The test was wrong, not the code: a match beats a mismatch exactly
+when `1 − ε > ε/3`, i.e. `ε < 0.75`, i.e. `Q > 1.249`, so at Q0 and Q1 the ported model genuinely
+prefers the mismatch — at `ε ≈ 0.79` the base is nearly noise, and there are three ways to disagree
+against one to agree. Inherited from production, not introduced here. The test now pins both sides
+of the crossover instead of the tidy claim.
+
+### 5. Validation results
+
+Container, after fixes: `cargo fmt --check` exit 0; `cargo clippy --all-targets --all-features -D
+warnings` exit 0; `cargo test --lib` **2141 passed, 0 failed, 4 ignored**. The two pre-existing red
+commands are unchanged (see A0 §5 and Standing items).
+
+### 6. Tradeoffs and follow-ups
+
+- **The review's strongest argument was not applied, deliberately.** `FlatEmission::new` should
+  arguably be a checked `try_new`: arch §3 bans `Result` on *hot-path* cost grounds, but this rate
+  is per-run configuration consumed once into two `f64` fields, so checking it costs nothing per
+  cell — and arch §3's own escape clause names the checked constructor on the *context type* as the
+  remedy. Two things held it back: it needs a new `DomainError` variant in `src/ng/types.rs`, which
+  this plan's preconditions say it "adds nothing to"; and arch's clause is conditioned on the value
+  being reachable from **untrusted input**, which it is not today (the only callers are tests).
+  Instead the totality hole is closed by clamping, and **the question goes to the owner at
+  Checkpoint A.** It becomes mandatory the moment a CLI flag or config field feeds this rate.
+- **Two further recorded-not-applied items**, both for the same reason (they touch `types.rs` or
+  arch §2.3): a `Base` newtype for the two `u8` base parameters, which are positionally adjacent and
+  transposable; and renaming `insert_ln`.
+- **The hot-path claim is structural and unmeasured.** No bench exists for this module; the first
+  one belongs with the first algorithm, not with a component nothing calls yet.
+- **`from_unchecked_rate` exists for testability** — `new` minus the debug assertion, because the
+  assertion fires in the test profile and the release path would otherwise be untestable without
+  compiling the test out of the build anyone runs.
