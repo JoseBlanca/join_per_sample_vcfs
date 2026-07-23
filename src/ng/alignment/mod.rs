@@ -31,7 +31,7 @@ pub mod stutter;
 pub use emission::{BaseScores, Emission, FlatEmission, PerQualityEmission};
 pub use stutter::{MAX_SLIP, StutterModel, StutterRates};
 
-use crate::ng::types::{Bp, Motif};
+use crate::ng::types::{BaseQual, Bp, DomainError, Motif};
 use crate::pileup::walker::CigarOp;
 use std::ops::Range;
 
@@ -304,6 +304,74 @@ pub struct RepeatContext<'a> {
     pub stutter: &'a StutterModel,
 }
 
+/// A read's bases and their per-base qualities, held together because they are only
+/// meaningful together.
+///
+/// **This type exists to dissolve a precondition rather than document one.** The two slices
+/// have to be the same length — quality *i* belongs to base *i* — and the aligner trait used
+/// to take them as two separate `&[u8]` arguments with that stated as a caller obligation
+/// plus a `debug_assert!`. Two problems with that. The arguments were positionally
+/// interchangeable with each other *and* with the reference, so a transposition was a silent
+/// wrong answer; and the assertion compiled out of the release build the project runs, so
+/// the obligation was unenforced exactly where it mattered.
+///
+/// Checking once at construction costs nothing on the hot path — this is built per read,
+/// while the thing arch §3's no-`Result` rule defends is per *matrix cell* — and it makes the
+/// invariant true by construction everywhere downstream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadBases<'a> {
+    bases: &'a [u8],
+    qualities: &'a [u8],
+}
+
+impl<'a> ReadBases<'a> {
+    /// Pair a read's bases with its qualities.
+    ///
+    /// # Errors
+    ///
+    /// [`DomainError::ReadQualityLengthMismatch`] if the two slices differ in length.
+    pub fn try_new(bases: &'a [u8], qualities: &'a [u8]) -> Result<Self, DomainError> {
+        if bases.len() != qualities.len() {
+            return Err(DomainError::ReadQualityLengthMismatch {
+                bases: bases.len(),
+                qualities: qualities.len(),
+            });
+        }
+        Ok(Self { bases, qualities })
+    }
+
+    /// The read's bases.
+    #[must_use]
+    pub fn bases(&self) -> &'a [u8] {
+        self.bases
+    }
+
+    /// The per-base qualities, the same length as [`Self::bases`].
+    #[must_use]
+    pub fn qualities(&self) -> &'a [u8] {
+        self.qualities
+    }
+
+    /// How many bases the read has.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.bases.len()
+    }
+
+    /// Whether the read has no bases. A legal, if useless, read.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.bases.is_empty()
+    }
+
+    /// The quality of base `index`, as the domain newtype.
+    #[inline]
+    #[must_use]
+    pub fn quality_at(&self, index: usize) -> BaseQual {
+        BaseQual(self.qualities[index])
+    }
+}
+
 /// Line a read up against a reference sequence the single most probable way.
 ///
 /// # What varies between implementations
@@ -346,14 +414,17 @@ pub struct RepeatContext<'a> {
 /// [`RepeatSpan::Unanchored`], not an error. Two conditions are instead the **caller's** to
 /// uphold, because nothing here can check them cheaply:
 ///
-/// - the geometry must fit the reference it is used with — [`RepeatGeometry::fits_reference`];
-/// - `read` and `quality` must be the same length.
+/// - the geometry must fit the reference it is used with — [`RepeatGeometry::fits_reference`].
 ///
-/// They are documented preconditions plus debug assertions, and it is worth being blunt
-/// about what that means: **a debug assertion compiles out of the release build this
-/// project runs**, so a violated precondition is a wrong answer rather than a crash. If
-/// either turns out to be reachable from untrusted input, it becomes a checked constructor
-/// on the context type — not a `Result` on this call (arch §3).
+/// It is a documented precondition plus a debug assertion, and it is worth being blunt about
+/// what that means: **a debug assertion compiles out of the release build this project
+/// runs**, so a violated precondition is a wrong answer rather than a crash. If it turns out
+/// to be reachable from untrusted input, it becomes a checked constructor on the context
+/// type — not a `Result` on this call (arch §3).
+///
+/// Arch §3 named a *second* such condition — that the read and its qualities be the same
+/// length. That one is no longer the caller's to remember: [`ReadBases`] makes it true by
+/// construction, which is the same remedy arch §3 prescribes, applied one step earlier.
 ///
 /// The `Sized` supertrait is deliberate: implementations are selected by generic type
 /// parameter, never behind `dyn`, because this runs per read across a whole cohort (arch
@@ -381,14 +452,14 @@ pub trait BestPathAligner: Sized {
     /// or nothing at all; an implementation with a large owned context passes `&'a Big`.
     type Context<'a>: Copy;
 
-    /// Align `read` (with its per-base `quality`) against `reference`.
+    /// Align `read` against `reference`.
     ///
     /// `reference` is a bare stretch of bases, not a genome region — this module knows no
-    /// coordinates and no callers.
+    /// coordinates and no callers. The read carries its qualities with it ([`ReadBases`]),
+    /// so the two cannot be mismatched or transposed here.
     fn align(
         &self,
-        read: &[u8],
-        quality: &[u8],
+        read: ReadBases<'_>,
         reference: &[u8],
         context: Self::Context<'_>,
         scratch: &mut Self::Scratch,
@@ -451,6 +522,40 @@ mod tests {
             right_flank_len: Bp(right_flank_len),
             motif: Motif::new(b"CAG").expect("CAG is a valid period-3 motif"),
         }
+    }
+
+    /// **The mismatch that used to be a documented precondition.** It was the caller's to
+    /// remember, backed by a `debug_assert!` that compiled out of the release build — so the
+    /// one build that matters did not check it. Now it cannot be built wrong.
+    #[test]
+    fn read_bases_rejects_qualities_that_do_not_match_the_bases() {
+        assert!(ReadBases::try_new(b"ACGT", &[30, 30, 30, 30]).is_ok());
+        assert!(ReadBases::try_new(b"", &[]).is_ok());
+
+        assert!(matches!(
+            ReadBases::try_new(b"ACGT", &[30, 30, 30]),
+            Err(DomainError::ReadQualityLengthMismatch {
+                bases: 4,
+                qualities: 3
+            })
+        ));
+        assert!(ReadBases::try_new(b"ACGT", &[]).is_err());
+        assert!(ReadBases::try_new(b"", &[30]).is_err());
+    }
+
+    #[test]
+    fn read_bases_hands_back_what_it_was_given() {
+        let read = ReadBases::try_new(b"ACGT", &[10, 20, 30, 40]).expect("matched lengths");
+        assert_eq!(read.bases(), b"ACGT");
+        assert_eq!(read.qualities(), &[10, 20, 30, 40]);
+        assert_eq!(read.len(), 4);
+        assert!(!read.is_empty());
+        assert_eq!(read.quality_at(2), BaseQual(30));
+        assert!(
+            ReadBases::try_new(b"", &[])
+                .expect("empty is legal")
+                .is_empty()
+        );
     }
 
     /// **The distinction the type exists to carry.** Only `Between` measures a repeat;

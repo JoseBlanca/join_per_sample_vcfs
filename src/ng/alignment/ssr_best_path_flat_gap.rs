@@ -44,8 +44,7 @@
 //! silently both end with a parity test failing for a reason nobody can find** (spec §4.2).
 
 use super::emission::Emission;
-use super::{BestPathAligner, RepeatContext, RepeatSpan};
-use crate::ng::types::BaseQual;
+use super::{BestPathAligner, ReadBases, RepeatContext, RepeatSpan};
 use std::sync::LazyLock;
 
 /// Index of the match state in a cell's three-state score array.
@@ -272,17 +271,11 @@ impl<E: Emission> SsrFlatGapAligner<E> {
     #[must_use]
     pub fn delimit(
         &self,
-        read: &[u8],
-        quality: &[u8],
+        read: ReadBases<'_>,
         reference: &[u8],
         context: &RepeatContext<'_>,
         scratch: &mut ViterbiScratch,
     ) -> Option<TractReadout> {
-        debug_assert_eq!(
-            read.len(),
-            quality.len(),
-            "read and quality slices must be the same length"
-        );
         debug_assert!(
             context
                 .geometry
@@ -291,6 +284,7 @@ impl<E: Emission> SsrFlatGapAligner<E> {
         );
 
         let read_len = read.len();
+        let bases = read.bases();
         let reference_len = reference.len();
         if reference_len == 0 {
             return None;
@@ -358,10 +352,10 @@ impl<E: Emission> SsrFlatGapAligner<E> {
 
         // Rows 1..=read_len — one read base per row.
         for row_index in 1..=read_len {
-            let read_base = read[row_index - 1];
+            let read_base = bases[row_index - 1];
             // Quality is resolved once per row, not once per cell: it belongs to the read
             // base, so it is constant along the row while the reference base varies.
-            let scores = self.emission.scores_for(BaseQual(quality[row_index - 1]));
+            let scores = self.emission.scores_for(read.quality_at(row_index - 1));
             let row = row_index * stride;
 
             // Column 0 — a read base before any reference base: insertion only.
@@ -555,13 +549,12 @@ impl<E: Emission> BestPathAligner for SsrFlatGapAligner<E> {
     /// exactly what `Unanchored` means (arch §3).
     fn align(
         &self,
-        read: &[u8],
-        quality: &[u8],
+        read: ReadBases<'_>,
         reference: &[u8],
         context: Self::Context<'_>,
         scratch: &mut Self::Scratch,
     ) -> Self::Output {
-        self.delimit(read, quality, reference, &context, scratch)
+        self.delimit(read, reference, &context, scratch)
             .map_or(RepeatSpan::Unanchored, |readout| readout.classify())
     }
 }
@@ -598,8 +591,9 @@ mod tests {
             stutter: &stutter,
         };
         let quality = vec![35u8; read.len()];
+        let bases = ReadBases::try_new(read, &quality).expect("matched lengths");
         let mut scratch = ViterbiScratch::new();
-        aligner.delimit(read, &quality, reference, &context, &mut scratch)
+        aligner.delimit(bases, reference, &context, &mut scratch)
     }
 
     /// **A clean repeat measures exactly.** The read is the reference, so the tract must
@@ -731,9 +725,10 @@ mod tests {
             stutter: &stutter,
         };
         let quality = vec![35u8; read.len()];
+        let bases = ReadBases::try_new(read, &quality).expect("matched lengths");
         let mut scratch = ViterbiScratch::new();
         let stiff = aligner
-            .delimit(read, &quality, &reference, &context, &mut scratch)
+            .delimit(bases, &reference, &context, &mut scratch)
             .expect("a real frame");
 
         assert!(
@@ -778,7 +773,8 @@ mod tests {
 
         let run = |scratch: &mut ViterbiScratch, read: &[u8]| {
             let quality = vec![35u8; read.len()];
-            aligner.delimit(read, &quality, &reference, &context, scratch)
+            let bases = ReadBases::try_new(read, &quality).expect("matched lengths");
+            aligner.delimit(bases, &reference, &context, scratch)
         };
 
         let first = run(&mut scratch, &reference);
@@ -866,9 +862,10 @@ mod tests {
             stutter: &stutter,
         };
         let quality = vec![35u8; reference.len()];
+        let bases = ReadBases::try_new(&reference, &quality).expect("matched lengths");
         let mut scratch = ViterbiScratch::new();
         let readout = aligner
-            .delimit(&reference, &quality, &reference, &context, &mut scratch)
+            .delimit(bases, &reference, &context, &mut scratch)
             .expect("a real frame");
 
         // Every path scores the same, so preferring match keeps the line-up on the diagonal
@@ -1023,8 +1020,9 @@ mod tests {
             stutter: &stutter,
         };
         let quality = vec![35u8; read.len()];
+        let bases = ReadBases::try_new(read, &quality).expect("matched lengths");
         let mut scratch = ViterbiScratch::new();
-        aligner.align(read, &quality, reference, context, &mut scratch)
+        aligner.align(bases, reference, context, &mut scratch)
     }
 
     /// **`classify` is a pure mapping, and this pins every arm of it — including which side

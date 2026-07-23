@@ -32,7 +32,9 @@
 //! still depends on nothing in production**.
 
 use super::ssr_best_path_flat_gap::{SsrFlatGapAligner, ViterbiScratch};
-use super::{BestPathAligner, PerQualityEmission, RepeatContext, RepeatGeometry, RepeatSpan};
+use super::{
+    BestPathAligner, PerQualityEmission, ReadBases, RepeatContext, RepeatGeometry, RepeatSpan,
+};
 use super::{StutterModel, stutter};
 use crate::ng::types::Bp;
 use crate::ng::types::Motif as NgMotif;
@@ -207,7 +209,8 @@ fn ng_answer(case: &Case, scratch: &mut ViterbiScratch) -> RepeatSpan {
         stutter: &stutter_model,
     };
     let aligner = SsrFlatGapAligner::new(PerQualityEmission::new());
-    aligner.align(&case.read, &case.quality, &reference, context, scratch)
+    let bases = ReadBases::try_new(&case.read, &case.quality).expect("generated in step");
+    aligner.align(bases, &reference, context, scratch)
 }
 
 /// Check ng's answer against **itself** — that the case it reports is the one its own offsets

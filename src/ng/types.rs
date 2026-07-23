@@ -199,6 +199,9 @@ pub enum DomainError {
     /// probability in `[0, 1]`.
     #[error("per-base error rate {0} is not a finite probability in [0, 1]")]
     ErrorRate(f64),
+    /// A read's bases and its qualities were paired but differ in length.
+    #[error("read has {bases} bases but {qualities} qualities")]
+    ReadQualityLengthMismatch { bases: usize, qualities: usize },
 }
 
 // ---------------------------------------------------------------------
