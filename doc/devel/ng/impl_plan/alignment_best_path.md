@@ -112,7 +112,7 @@ recorded at implementation, not a port (arch §2.3). *Depends:* A0. *Source:* sp
 the trait with its `Scratch`, `Output` and `Context` associated types. No algorithms. *Depends:* A1.
 *Source:* arch §2.1, §2.2, §3.
 
-**☐ A3. `StutterModel` — the parameters and the distribution.**
+**✅ A3. `StutterModel` — the parameters and the distribution.**
 The seven parameters and `probability(bp_diff, period)`, following spec §5.2 term by term. Built
 **per locus**, from the locus's stutter shape and its *reference* allele length — never from a
 candidate's length, which is the genotyping's dimension (arch §5). Unit tests: the distribution

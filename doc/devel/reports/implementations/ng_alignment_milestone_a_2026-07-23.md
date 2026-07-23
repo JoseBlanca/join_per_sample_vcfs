@@ -258,3 +258,65 @@ Container: `cargo fmt --check` exit 0; `cargo clippy --all-targets --all-feature
   changes the trait the arch doc specifies and ripples into every later aligner. **Cheapest now,
   while there are no implementors.**
 - **Arch §2.2's `Motif`-allocation claim** should be corrected in the doc.
+
+---
+
+## Step A3 — `StutterModel` (and `RepeatContext`)
+
+**Status:** shipped (reviewed, fixes applied).
+**Review:** [ng_alignment_a3_2026-07-23.md](../reviews/ng_alignment_a3_2026-07-23.md) — **1 Blocker, 5 Majors**, all applied.
+
+### 1. Plan
+
+The seven parameters and `probability(bp_diff, period)`, following spec §5.2 term by term, plus
+`RepeatContext` carried over from A2. *Source:* spec §5.2, arch §2.4.
+
+### 2. Assumptions and decisions
+
+- **`period` is a `NonZeroU8`.** I first wrote a `debug_assert!` plus a release fallback, and a test
+  named `a_zero_period_has_no_probability_rather_than_dividing_by_zero` — which **could not reach the
+  path it claimed to test**, because the assertion fires first in the test profile. Rather than write
+  an honest test for a guard, the illegal state is now unrepresentable: no release path to get wrong,
+  no guard that compiles out. `Motif` already guarantees a period of 1–6.
+- **Private fields with accessors**, diverging from arch §2.4's public-field sketch, because the
+  clamps *are* the contract — public fields would let a caller build a model whose geometrics sit at
+  0 or 1, and every guarantee in the doc would be a comment rather than a fact.
+- **`MAX_SLIP`'s one-constant-two-scales behaviour is reproduced, not fixed.** Spec §5.2 says to
+  decide about it deliberately rather than inherit it. The decision is to reproduce production, and
+  to write down the cost: out-of-frame changes are cut off about `period − 1` times sooner in real
+  terms (about 13 bp against 40 at period 4; the effect **vanishes** at period 2). Changing it is a
+  behaviour change to a model the genotyping shares, and this plan's rule is transcribe first.
+- **`MAX_SLIP` is copied from production, not imported** — ng does not depend on production — and a
+  **test-only** cross-reference now enforces that the two stay equal.
+- **Named constructors `hipstr_shipped()` / `hipstr_em_start()`.** Spec §5.2 warns that HipSTR has
+  two parameter sets and that mixing them yields a pairing existing nowhere — a trap the spec records
+  *itself* having fallen into. The constructors make the rows mechanically uncrossable.
+
+### 3. Changes made
+
+New [src/ng/alignment/stutter.rs](../../../../src/ng/alignment/stutter.rs) (`StutterModel`,
+`StutterRates`, `MAX_SLIP`); [mod.rs](../../../../src/ng/alignment/mod.rs) gains `RepeatContext`,
+the module declaration and re-exports.
+
+### 4. Tests added — 15
+
+**The arithmetic was independently re-derived by a reviewer and came back correct** — every branch,
+the re-indexing, the negative-number behaviour, and the constants. Every finding was about what the
+tests could not *see*, which is the useful lesson of this step: two separate transpositions
+(`in_up`↔`in_down`, `in_geom`↔`out_geom`) and one whole untested direction (out-of-frame) were
+invisible because the fixtures gave paired parameters equal values. `all_distinct()` — six different
+rates — is the fix, and `StutterRates` makes the transposition hard to write in the first place.
+
+### 5. Validation results
+
+Container: `cargo fmt --check` exit 0; `cargo clippy --all-targets --all-features -D warnings` exit
+0; `cargo test --lib` **2168 passed, 0 failed, 4 ignored**.
+
+### 6. Tradeoffs and follow-ups
+
+- **The adapting constructor is owed**, not missing by accident: building a model per locus from a
+  stutter shape needs an ng stutter-shape type, and fitting one is the genotyping's job (spec §5.2).
+- **The one-constant-two-scales asymmetry** is a recorded follow-up for the owner — reproduced
+  deliberately, with its cost quantified, rather than silently inherited or silently fixed.
+- **A `try_new` for `StutterModel::new` was assessed and found *not* to be step A1's question** — see
+  the review's open question 1. The clamp here is ported behaviour; A1's is not.

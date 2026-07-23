@@ -13,15 +13,18 @@
 //! alignments or probabilities, which is why it sits outside the step-per-module rule
 //! rather than breaking it (`doc/devel/ng/spec/alignment.md` §1).
 //!
-//! Landed so far: [`Alignment`] and [`RepeatSpan`], the two output shapes; [`RepeatGeometry`],
-//! which tells a repeat-aware algorithm where the repeat sits; the [`BestPathAligner`] trait
-//! they meet at; and the [`emission`] component every aligner scores its bases with. **No
-//! algorithm yet** — those arrive with Milestone B of the plan
+//! Landed so far: [`Alignment`] and [`RepeatSpan`], the two output shapes; [`RepeatGeometry`]
+//! and [`RepeatContext`], which tell a repeat-aware algorithm where the repeat sits and how it
+//! slips; the [`BestPathAligner`] trait they meet at; and the two shared components, the
+//! [`emission`] scoring every aligner uses and the [`stutter`] model. **No algorithm yet** —
+//! those arrive with Milestone B of the plan
 //! `doc/devel/ng/impl_plan/alignment_best_path.md`.
 
 pub mod emission;
+pub mod stutter;
 
 pub use emission::{BaseScores, Emission, FlatEmission, PerQualityEmission};
+pub use stutter::{MAX_SLIP, StutterModel, StutterRates};
 
 // KNOWN DEBT — `Motif` is imported from a *pipeline-stage* module (`region_typing` calls
 // itself ng step 3) into a module that states two lines above that it knows no steps and
@@ -275,6 +278,29 @@ impl RepeatGeometry {
             .checked_sub(self.right_flank_len.get())
             .map(Bp)
     }
+}
+
+/// What varies from one repeat to the next — the per-call argument every repeat-aware
+/// algorithm is handed.
+///
+/// Both parts change at every locus, which is why they travel **per call rather than as
+/// constructor state**: holding them would mean building a new aligner per locus across
+/// millions of loci. This mirrors production, whose read-likelihood model is a stateless
+/// value taking a per-call scoring context (arch §2.2, §4).
+///
+/// Borrowed rather than owned, so a caller that already holds a geometry and a model for a
+/// locus pays nothing to pass them to each of that locus's reads.
+///
+/// *(The plan lists this in step A2 with [`RepeatGeometry`]; it landed in A3, because it
+/// names a [`StutterModel`] and that type arrives there.)*
+#[derive(Debug, Clone, Copy)]
+pub struct RepeatContext<'a> {
+    /// Where the repeat sits in the reference stretch.
+    pub geometry: &'a RepeatGeometry,
+    /// How the repeat slips. **Only the algorithms that price whole-unit slips read this**
+    /// — algorithm 4. The flat-gap delimiter (algorithm 3) ignores it, which is the point:
+    /// its measurement is content-agnostic and must not be pulled toward tidy lengths.
+    pub stutter: &'a StutterModel,
 }
 
 /// Line a read up against a reference sequence the single most probable way.
