@@ -95,7 +95,7 @@ arch §Test & bench shape.
 
 ### Milestone B — 1a, the port
 
-**☐ B1. `left_align_structured.rs`. Own commit; do not bundle.**
+**✅ B1. `left_align_structured.rs`. Own commit; do not bundle.**
 An `AlignmentNormalizer` calling the existing `left_align_indels`. **Port its two load-bearing
 behaviours, they are the point:** it merges consecutive indels, and it propagates an indel across
 alignment blocks rather than stopping at the first — this is *not* a naive single pass, and the

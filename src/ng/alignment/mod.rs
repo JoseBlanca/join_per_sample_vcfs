@@ -29,6 +29,7 @@
 #[cfg(test)]
 mod delimit_parity;
 pub mod emission;
+pub mod left_align_structured;
 #[cfg(test)]
 mod leftmost_property;
 pub mod ssr_best_path_flat_gap;
