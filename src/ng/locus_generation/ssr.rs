@@ -7,14 +7,17 @@
 //! and a widened admission gate). See `doc/devel/ng/spec/locus_generation_ssr.md` (design)
 //! and `doc/devel/ng/arch/locus_generation_ssr.md` (types & interfaces).
 //!
-//! This module lands across the STR generator plan. So far: the config, counts, cap
-//! constant, the working input ([`SsrLocus`] + its margin fetch), the reservoir cap, the
-//! per-locus read fetch, and the read-region CIGAR mapping. The delimiter is the alignment
-//! module's [`SsrFlatGapAligner`](crate::ng::alignment::ssr_best_path_flat_gap); the classify
-//! pipeline, tally, and the `LocusGenerator` impl land next.
+//! This module lands across the STR generator plan: the config, counts, cap constant, the
+//! working input ([`SsrLocus`] + its margin fetch), the reservoir cap, the per-locus read
+//! fetch, the read-region CIGAR mapping, the per-read classify pipeline (delimited by the
+//! alignment module's [`SsrFlatGapAligner`](crate::ng::alignment::ssr_best_path_flat_gap)), the
+//! tally, and — the public surface — [`SsrGenerator`], the [`LocusGenerator`](super::LocusGenerator)
+//! that turns one `SsrSegment` into one locus.
 
-use super::LocusGenerationError;
+use super::{LocusGenerationError, LocusGenerator, LocusKind, SampleLocusObservations, SsrDetail};
 use crate::bam::alignment_input::MappedRead;
+use crate::ng::alignment::ssr_best_path_flat_gap::{SsrFlatGapAligner, ViterbiScratch};
+use crate::ng::alignment::{PerQualityEmission, StutterModel};
 use crate::ng::read::input::SampleReads;
 use crate::ng::ref_seq::{ContigTable, RawRefSeq, RefSeq, RefSeqError};
 use crate::ng::region_typing::segment_criteria::SsrSegment;
@@ -347,8 +350,6 @@ pub fn fetch_capped_reads<R: RawRefSeq>(
 // directly and a plain scratch buffer. Consumed by the classify pipeline (D2b).
 // ---------------------------------------------------------------------
 mod read_region {
-    #![allow(dead_code)] // consumed by D2b (the classify pipeline)
-
     use crate::pileup::walker::CigarOp;
     use std::ops::Range;
 
@@ -595,8 +596,6 @@ mod read_region {
 // production's `classify_read`, over the new delimiter. Consumed by the tally + generator.
 // ---------------------------------------------------------------------
 mod classify {
-    #![allow(dead_code)] // consumed by the tally + generator (D2c, D3)
-
     use super::SsrLocus;
     use super::read_region::{
         MIN_REGION_Q1, extract_region, flank_truncated, passes_quality_gate, read_footprint,
@@ -947,8 +946,6 @@ mod classify {
 // (spec §3, §6). Consumed by the generator (D3).
 // ---------------------------------------------------------------------
 mod tally {
-    #![allow(dead_code)] // consumed by the generator (D3)
-
     use super::SsrGeneratorCounts;
     use super::classify::{Classified, NoObservationReason};
     use crate::bam::alignment_input::{FLAG_REVERSE_STRAND, MappedRead};
@@ -1280,6 +1277,209 @@ mod tally {
     }
 }
 
+// ---------------------------------------------------------------------
+// D3 — the generator: one `SsrSegment` → one `SampleLocusObservations`. The four steps
+// (build the locus, fetch+cap the reads, classify each, tally) run inside the first
+// `next_locus`; the second returns `None`. One locus per segment, including zero coverage
+// (spec §2, arch §1, §2).
+// ---------------------------------------------------------------------
+
+/// The STR locus generator: turns one microsatellite tract into one locus.
+///
+/// Holds its own accessors and reusable scratch, the "a generator holds its own accessors"
+/// convention ([`LocusGenerator`](super::LocusGenerator); spec §2). The aligner is fixed to
+/// [`PerQualityEmission`] — production's emission table — so the delimitation matches production
+/// for the parity oracle (spec §6).
+///
+/// **The reference seam (the Arc gap).** Two reference handles, because they serve two needs the
+/// current [`RawRefSeq`] design keeps apart:
+/// - `reference` — the margin fetch ([`SsrLocus::fetch`], [`RefSeq`] + [`ContigTable`]), a
+///   persistent accessor the generator holds.
+/// - `make_reference` — a **factory** the per-file read query needs
+///   ([`SampleReads::reads_in_region`]): each file's stream owns its own reader, and a
+///   `RawRefSeq` is a stateful reader that is neither `Clone` nor shareable by `&`, so the query
+///   takes `FnMut() -> R` rather than a borrow.
+///
+/// These are the same reference logically; a future `Arc`-shared reference would collapse them to
+/// one field with a cheap per-file view. Holding both — the factory rebuilding `R` per query — is
+/// the working stopgap the spec flags (spec §8): correct, and cheap on the in-memory fixtures the
+/// tests and the dump tool run, though a file-backed `R` whose factory reloads is the real
+/// integration this defers.
+pub struct SsrGenerator<R, MF> {
+    /// The reference the margin fetch reads the flanks from.
+    reference: R,
+    /// Builds a fresh read-query reference for [`SampleReads::reads_in_region`]'s
+    /// mismatch-fraction filter — one per file, per query (see the type doc).
+    make_reference: MF,
+    /// The tract delimiter — production's emission table, for parity (spec §6).
+    aligner: SsrFlatGapAligner<PerQualityEmission>,
+    /// Reused alignment matrices, so the pair-HMM does not reallocate per read.
+    align_scratch: ViterbiScratch,
+    /// The stutter model feeding the aligner's context. The flat-gap aligner ignores it, but
+    /// the context carries it (spec §2, arch §5).
+    stutter: StutterModel,
+    /// Reused scratch for the margin fetch.
+    margin_buffer: Vec<u8>,
+    /// Reused scratch for the quality gate.
+    qual_buffer: Vec<u8>,
+    config: SsrGeneratorConfig,
+    counts: SsrGeneratorCounts,
+    /// The region of the segment begun, from [`begin_segment`](LocusGenerator::begin_segment) —
+    /// its `ContigId` is what the margin fetch and the read query key on (`SsrSegment` carries a
+    /// contig *name*, not an id).
+    current_region: Option<GenomeRegion>,
+    /// Latched once the segment's single locus has been produced, so the second `next_locus`
+    /// returns `None` (spec §2).
+    produced: bool,
+}
+
+impl<R, MF> SsrGenerator<R, MF>
+where
+    R: RefSeq + ContigTable + RawRefSeq,
+    MF: FnMut() -> R,
+{
+    /// Build a generator over `reference` (the margin fetch) and `make_reference` (the read-query
+    /// factory), with `config` checked against `bundle_threshold` — the region-typing radius the
+    /// flank must stay within (spec §4). Fails if `flank_bp > bundle_threshold`.
+    pub fn new(
+        reference: R,
+        make_reference: MF,
+        config: SsrGeneratorConfig,
+        bundle_threshold: Bp,
+    ) -> Result<Self, SsrGeneratorConfigError> {
+        config.check_flank_within(bundle_threshold)?;
+        Ok(Self {
+            reference,
+            make_reference,
+            aligner: SsrFlatGapAligner::new(PerQualityEmission::new()),
+            align_scratch: ViterbiScratch::new(),
+            stutter: StutterModel::hipstr_shipped(),
+            margin_buffer: Vec::new(),
+            qual_buffer: Vec::new(),
+            config,
+            counts: SsrGeneratorCounts::default(),
+            current_region: None,
+            produced: false,
+        })
+    }
+
+    /// The running STR counts — accumulated across every segment, readable at any point.
+    pub fn counts(&self) -> &SsrGeneratorCounts {
+        &self.counts
+    }
+}
+
+impl<R, MF> LocusGenerator<SsrSegment> for SsrGenerator<R, MF>
+where
+    R: RefSeq + ContigTable + RawRefSeq,
+    MF: FnMut() -> R,
+{
+    fn begin_segment(&mut self, region: GenomeRegion) {
+        self.current_region = Some(region);
+        self.produced = false;
+    }
+
+    fn next_locus(
+        &mut self,
+        segment: &SsrSegment,
+        reads: &SampleReads,
+    ) -> Result<Option<SampleLocusObservations>, LocusGenerationError> {
+        if self.produced {
+            return Ok(None);
+        }
+        self.produced = true;
+        let region = self
+            .current_region
+            .expect("begin_segment is called before next_locus (the LocusGenerator contract)");
+        let contig = region.contig;
+
+        // The margin fetch and the read query key on `region.contig` (an id), the reservoir seed
+        // on `segment.chrom()` (a name); the `LocusGenerator` contract leaves the region/segment
+        // pairing unenforced, so a mis-pairing would silently fetch the wrong contig. Guard it in
+        // debug/test builds against the reference's own name for that id.
+        debug_assert_eq!(
+            self.reference
+                .contigs()
+                .entries
+                .get(contig.get() as usize)
+                .map(|entry| entry.name.as_str()),
+            Some(segment.chrom()),
+            "the region's contig and the segment must name the same contig"
+        );
+
+        // (1) Build the locus — fetch the tract ± flank, clamped at contig ends.
+        let locus = SsrLocus::fetch(
+            &self.reference,
+            contig,
+            segment.clone(),
+            self.config.flank_bp,
+            &mut self.margin_buffer,
+        )?;
+
+        // (2) Fetch the reads over the tract-plus-margin query span, admitting on relevance
+        // (overlap, which `SampleReads` applies) — not spanning — and depth-cap them.
+        let margin_start = locus.margin_start.get();
+        // `margin_len >= 1` on a successful `fetch` (the tract is non-empty), so the `- 1` for
+        // the inclusive end cannot underflow.
+        let margin_len = locus.tract_with_margin_bases.len() as u64;
+        let query_span = GenomeRegion {
+            contig,
+            start: Position(margin_start),
+            end: Position(margin_start + margin_len - 1),
+        };
+        let capped = fetch_capped_reads(
+            reads,
+            query_span,
+            seed_for_segment(segment),
+            self.config.max_reads_per_locus,
+            &mut self.make_reference,
+        )?;
+        // Per-locus discards cannot approach 2^32 (the cap and any real depth are far below), so
+        // the `as u32` on the locus field below is exact; the run-level counter keeps the u64.
+        let reads_discarded_by_cap = capped.fetched - capped.kept.len() as u64;
+        self.counts.reads_fetched += capped.fetched;
+        self.counts.reads_discarded_by_cap += reads_discarded_by_cap;
+
+        // (3) Classify each kept read against the locus (delimit, recover, gate).
+        let mut outcomes = Vec::with_capacity(capped.kept.len());
+        for read in &capped.kept {
+            outcomes.push(classify::classify_read(
+                read,
+                &locus,
+                &self.aligner,
+                &self.stutter,
+                &mut self.align_scratch,
+                &mut self.qual_buffer,
+            ));
+        }
+
+        // (4) Tally the outcomes into the locus's observed sequences + the run-level counts.
+        let tallied = tally::tally(capped.kept.iter().zip(outcomes), &mut self.counts);
+
+        // Assemble the output: the tract coordinates, the tract bases only (flanks go in the
+        // kind), and the flanks split out of the fetched margin (spec §3).
+        let left = locus.left_flank_len();
+        let tract_len = segment.tract_len() as usize;
+        let bases = &locus.tract_with_margin_bases;
+        Ok(Some(SampleLocusObservations {
+            region: GenomeRegion {
+                contig,
+                start: Position(segment.start()),
+                end: Position(segment.end()),
+            },
+            reference_bases: bases[left..left + tract_len].into(),
+            observed_sequences: tallied.observed_sequences,
+            reads_without_observation: tallied.reads_without_observation,
+            reads_discarded_by_cap: reads_discarded_by_cap as u32,
+            kind: LocusKind::Ssr(SsrDetail {
+                motif: segment.motif(),
+                left_flank: bases[..left].into(),
+                right_flank: bases[left + tract_len..].into(),
+            }),
+        }))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1577,12 +1777,15 @@ mod tests {
 
     /// A `RawRefSeq` over the fixture contigs (all `A`s), for `reads_in_region`'s
     /// mismatch-fraction filter — matches the fixture reference the reads are opened against.
+    /// Named (`chr1` / `chr2`) so a generator's contig-name invariant holds against the
+    /// `SsrSegment`'s `chrom()`; the fetch itself keys on `ContigId`, so the names are only for
+    /// that check.
     fn fixture_ref_bases() -> InMemoryRefSeq {
         use crate::ng::read::input::test_fixtures::matching_contigs;
-        InMemoryRefSeq::from_contigs(
+        InMemoryRefSeq::from_named_contigs(
             matching_contigs()
                 .iter()
-                .map(|(_, len, _)| vec![b'A'; *len])
+                .map(|(name, len, _)| ((*name).to_string(), vec![b'A'; *len]))
                 .collect(),
         )
     }
@@ -1655,5 +1858,210 @@ mod tests {
             kept_positions(7),
             "same seed → same kept set"
         );
+    }
+
+    // --- D3: the generator ---------------------------------------------------
+
+    /// A generator over the all-`A` fixture reference (`chr1` = 100 bp, `chr2` = 200 bp), with
+    /// `flank_bp = 10` (within a bundle threshold of 10) and no cap. The reference and the
+    /// read-query factory are the same all-`A` bases, so fixture reads (also all-`A`) clear the
+    /// mismatch filter — the tract content is not real STR sequence, which is fine for the
+    /// structural checks D3 owns (real tract parity is E's).
+    fn ssr_generator() -> SsrGenerator<InMemoryRefSeq, fn() -> InMemoryRefSeq> {
+        SsrGenerator::new(
+            fixture_ref_bases(),
+            fixture_ref_bases as fn() -> InMemoryRefSeq,
+            SsrGeneratorConfig {
+                flank_bp: Bp(10),
+                max_reads_per_locus: None,
+            },
+            Bp(10),
+        )
+        .expect("flank within the bundle threshold")
+    }
+
+    /// `new` refuses a flank wider than the bundle threshold — the cross-config check at
+    /// construction (spec §4).
+    #[test]
+    fn new_rejects_a_flank_wider_than_the_bundle_threshold() {
+        // `SsrGenerator` is not `Debug` (it holds a closure and the aligner), so match on the
+        // `Result` directly rather than `expect_err`.
+        let result = SsrGenerator::new(
+            fixture_ref_bases(),
+            fixture_ref_bases as fn() -> InMemoryRefSeq,
+            SsrGeneratorConfig {
+                flank_bp: Bp(50),
+                max_reads_per_locus: None,
+            },
+            Bp(10),
+        );
+        assert!(matches!(
+            result,
+            Err(SsrGeneratorConfigError::FlankExceedsBundleThreshold { .. })
+        ));
+    }
+
+    /// A tract no read covers still yields **one** locus — present, with an empty observation
+    /// table and zeroed drop counts — and the second `next_locus` returns `None`. "We looked and
+    /// saw nothing" ≠ "we never looked" (spec §2). The locus carries the tract coordinates, the
+    /// tract bases only, and the flanks split out of the fetched margin.
+    #[test]
+    fn a_zero_coverage_tract_yields_one_empty_but_present_locus() {
+        // One read on chr1 at 65..94 — clear of the tract's query span (30..59), and long
+        // enough (30 bp) to clear the min-read-length filter, so it is a genuine miss rather
+        // than a filtered read.
+        use crate::ng::read::input::test_fixtures::read_named_with_length;
+        let (_reference_dir, _bam_dir, reads) =
+            sample_reads_with(&[read_named_with_length("r0", 0, 65, 30)]);
+        let mut generator = ssr_generator();
+        let segment = tract(40, 49); // chr1, motif AC, 10 bp
+
+        generator.begin_segment(span(40, 49));
+        let locus = generator
+            .next_locus(&segment, &reads)
+            .expect("no fetch error")
+            .expect("one locus per segment, even at zero coverage");
+
+        assert_eq!(locus.region, span(40, 49));
+        assert_eq!(locus.region.len(), 10);
+        assert_eq!(
+            &*locus.reference_bases,
+            &b"AAAAAAAAAA"[..],
+            "the tract only"
+        );
+        assert!(locus.observed_sequences.is_empty(), "no read covered it");
+        assert_eq!(locus.reads_without_observation, 0);
+        assert_eq!(locus.reads_discarded_by_cap, 0);
+        match locus.kind {
+            LocusKind::Ssr(SsrDetail {
+                motif,
+                left_flank,
+                right_flank,
+            }) => {
+                assert_eq!(motif, Motif::new(b"AC").unwrap());
+                assert_eq!(&*left_flank, &b"AAAAAAAAAA"[..], "10 bp left flank");
+                assert_eq!(&*right_flank, &b"AAAAAAAAAA"[..], "10 bp right flank");
+            }
+            other => panic!("expected an Ssr locus, got {other:?}"),
+        }
+
+        assert!(
+            generator
+                .next_locus(&segment, &reads)
+                .expect("no error")
+                .is_none(),
+            "the second poll ends the segment"
+        );
+        assert_eq!(
+            generator.counts().reads_fetched,
+            0,
+            "no read reached the tract"
+        );
+    }
+
+    /// A covered tract wires fetch → classify → tally: every fetched read is accounted for,
+    /// either as an observation's support or in `reads_without_observation` (no cap, so nothing
+    /// is discarded). The tract content here is not real STR sequence, so *which* bucket a read
+    /// lands in is E's concern; this pins the conservation the four steps must uphold.
+    #[test]
+    fn a_covered_tract_accounts_every_fetched_read() {
+        use crate::ng::read::input::test_fixtures::read_named_with_length;
+        // Four 30 bp reads (clearing the min-read-length filter) overlapping the query span
+        // (30..59) on chr1.
+        let records: Vec<_> = (0..4)
+            .map(|i| read_named_with_length(&format!("r{i}"), 0, 30 + i * 3, 30))
+            .collect();
+        let (_reference_dir, _bam_dir, reads) = sample_reads_with(&records);
+        let mut generator = ssr_generator();
+        let segment = tract(40, 49);
+
+        generator.begin_segment(span(40, 49));
+        let locus = generator
+            .next_locus(&segment, &reads)
+            .expect("no fetch error")
+            .expect("one locus");
+
+        let fetched = generator.counts().reads_fetched;
+        assert_eq!(fetched, 4, "all four overlapping reads reached the tract");
+        let supported: u32 = locus.observed_sequences.iter().map(|obs| obs.num_obs).sum();
+        assert_eq!(
+            supported as u64 + locus.reads_without_observation as u64,
+            fetched,
+            "every fetched read is either an observation or a no-observation"
+        );
+        assert_eq!(locus.reads_discarded_by_cap, 0, "no cap");
+    }
+
+    /// The cap wires through `next_locus`: with `max_reads_per_locus = 2` over four overlapping
+    /// reads, the locus reports two discarded, and the run-level counter agrees (the `as u32`
+    /// path and `counts.reads_discarded_by_cap`).
+    #[test]
+    fn a_capped_locus_reports_the_discarded_reads() {
+        use crate::ng::read::input::test_fixtures::read_named_with_length;
+        let records: Vec<_> = (0..4)
+            .map(|i| read_named_with_length(&format!("r{i}"), 0, 30 + i * 3, 30))
+            .collect();
+        let (_reference_dir, _bam_dir, reads) = sample_reads_with(&records);
+        let mut generator = SsrGenerator::new(
+            fixture_ref_bases(),
+            fixture_ref_bases as fn() -> InMemoryRefSeq,
+            SsrGeneratorConfig {
+                flank_bp: Bp(10),
+                max_reads_per_locus: Some(2),
+            },
+            Bp(10),
+        )
+        .expect("flank within the bundle threshold");
+        let segment = tract(40, 49);
+
+        generator.begin_segment(span(40, 49));
+        let locus = generator
+            .next_locus(&segment, &reads)
+            .expect("no error")
+            .expect("one locus");
+
+        assert_eq!(generator.counts().reads_fetched, 4);
+        assert_eq!(locus.reads_discarded_by_cap, 2, "4 fetched, 2 kept");
+        assert_eq!(generator.counts().reads_discarded_by_cap, 2);
+    }
+
+    /// A tract near the contig **end** splits a short right flank end-to-end: the fetched margin
+    /// is clamped, so `SsrDetail.right_flank` is shorter than the left, and `reference_bases` is
+    /// still the tract only. This is the contig-end-clamp path through the generator's
+    /// flank-split (proven not to misalign; pinned here as a regression anchor).
+    #[test]
+    fn a_near_end_tract_splits_a_short_right_flank() {
+        use crate::ng::read::input::test_fixtures::read_named_with_length;
+        // A read clear of the tract's query span (82..100) — zero coverage, so the locus is
+        // present-but-empty and only the flank split is under test.
+        let (_reference_dir, _bam_dir, reads) =
+            sample_reads_with(&[read_named_with_length("r0", 0, 1, 30)]);
+        let mut generator = ssr_generator(); // flank_bp = 10
+        // chr1 is 100 bp; tract [92, 96] → margin [82, 100], right flank clamped to 100 - 96 = 4.
+        let segment = tract(92, 96);
+
+        generator.begin_segment(span(92, 96));
+        let locus = generator
+            .next_locus(&segment, &reads)
+            .expect("no error")
+            .expect("one locus");
+
+        assert_eq!(locus.region, span(92, 96));
+        assert_eq!(
+            &*locus.reference_bases,
+            &b"AAAAA"[..],
+            "the 5 bp tract only"
+        );
+        match locus.kind {
+            LocusKind::Ssr(SsrDetail {
+                left_flank,
+                right_flank,
+                ..
+            }) => {
+                assert_eq!(left_flank.len(), 10, "full left flank");
+                assert_eq!(right_flank.len(), 4, "clamped right flank (100 - 96)");
+            }
+            other => panic!("expected an Ssr locus, got {other:?}"),
+        }
     }
 }
