@@ -588,6 +588,329 @@ mod read_region {
     }
 }
 
+// ---------------------------------------------------------------------
+// D2b — classify one read against a locus: delimit (the alignment module's flat-gap
+// aligner), recover a long allele by widening, gate the tract quality, and map the result
+// to an observation or a no-observation reason. The per-read pipeline ported from
+// production's `classify_read`, over the new delimiter. Consumed by the tally + generator.
+// ---------------------------------------------------------------------
+mod classify {
+    #![allow(dead_code)] // consumed by the tally + generator (D2c, D3)
+
+    use super::SsrLocus;
+    use super::read_region::{
+        MIN_REGION_Q1, extract_region, flank_truncated, passes_quality_gate, read_footprint,
+        widen_region,
+    };
+    use crate::bam::alignment_input::MappedRead;
+    use crate::ng::alignment::ssr_best_path_flat_gap::{SsrFlatGapAligner, ViterbiScratch};
+    use crate::ng::alignment::{
+        BestPathAligner, Emission, ReadBases, RepeatContext, RepeatGeometry, RepeatSpan,
+        StutterModel,
+    };
+    use crate::ng::locus_generation::ReadCoverage;
+    use crate::ng::types::Bp;
+    use std::ops::Range;
+
+    /// Why a read yielded no usable observation — the tally increments the matching
+    /// `SsrGeneratorCounts` reason (and `reads_without_observation`).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum NoObservationReason {
+        /// Neither flank anchored (the read lies wholly inside the repeat), or a malformed read.
+        NoBorderAnchored,
+        /// The delimited tract failed the base-quality gate.
+        LowQuality,
+        /// The allele stayed flank-truncated even after widening.
+        WindowTruncated,
+    }
+
+    /// What one read contributes to a locus: an observed tract (complete or partial), or a
+    /// reason it observed nothing.
+    #[derive(Debug, Clone, PartialEq)]
+    pub(super) enum Classified {
+        Observed {
+            bases: Box<[u8]>,
+            coverage: ReadCoverage,
+        },
+        NoObservation(NoObservationReason),
+    }
+
+    /// Classify one read against `locus` using `aligner`. `stutter` feeds the context (the
+    /// flat-gap aligner ignores it); `align_scratch` and `qual_buffer` are reused across reads.
+    ///
+    /// The pipeline mirrors production: extract the read's slice over the locus window, delimit
+    /// it, and — if a *complete* tract looks truncated by the window (a mapper-collapsed long
+    /// allele) — widen the slice and re-delimit, giving up as `WindowTruncated` if it stays
+    /// truncated. A complete tract is quality-gated; **partials are kept as lower bounds**
+    /// without the gate (spec §3, the new behaviour production discards).
+    pub(super) fn classify_read<E: Emission>(
+        read: &MappedRead,
+        locus: &SsrLocus,
+        aligner: &SsrFlatGapAligner<E>,
+        stutter: &StutterModel,
+        align_scratch: &mut ViterbiScratch,
+        qual_buffer: &mut Vec<u8>,
+    ) -> Classified {
+        // A malformed record (qual length ≠ seq length) cannot be sliced safely.
+        if read.qual.len() != read.seq.len() {
+            return Classified::NoObservation(NoObservationReason::NoBorderAnchored);
+        }
+        let read_len = read.seq.len();
+        let reference = &*locus.tract_with_margin_bases;
+        let left = locus.left_flank_len();
+        let right = locus.right_flank_len();
+        let geometry = RepeatGeometry {
+            left_flank_len: Bp(left as u64),
+            right_flank_len: Bp(right as u64),
+            motif: locus.segment.motif(),
+        };
+        let context = RepeatContext {
+            geometry: &geometry,
+            stutter,
+        };
+
+        let fp = read_footprint(&read.cigar, read.pos);
+        let window_start = (locus.margin_start.get() - 1) as u32; // 0-based
+        let window_len = reference.len() as u32;
+        let region = extract_region(&read.cigar, fp, read_len, window_start, window_len);
+
+        let span = delimit(aligner, read, &region, reference, context, align_scratch);
+        match span {
+            RepeatSpan::Between(tract)
+                if flank_truncated(&region, &to_usize(&tract), read_len, left, right) =>
+            {
+                // A complete tract whose flanks look eaten by the window: widen and retry.
+                let wide = widen_region(region, read_len, left, right);
+                let wspan = delimit(aligner, read, &wide, reference, context, align_scratch);
+                match wspan {
+                    RepeatSpan::Between(wtract)
+                        if !flank_truncated(&wide, &to_usize(&wtract), read_len, left, right) =>
+                    {
+                        complete_or_low_quality(read, &wide, &wtract, qual_buffer)
+                    }
+                    _ => Classified::NoObservation(NoObservationReason::WindowTruncated),
+                }
+            }
+            RepeatSpan::Between(tract) => {
+                complete_or_low_quality(read, &region, &tract, qual_buffer)
+            }
+            RepeatSpan::FromLeft(tract) => {
+                partial(read, &region, &tract, ReadCoverage::PartialLeft)
+            }
+            RepeatSpan::FromRight(tract) => {
+                partial(read, &region, &tract, ReadCoverage::PartialRight)
+            }
+            RepeatSpan::Unanchored => {
+                Classified::NoObservation(NoObservationReason::NoBorderAnchored)
+            }
+        }
+    }
+
+    /// Align the read's `region` slice against the reference frame.
+    fn delimit<E: Emission>(
+        aligner: &SsrFlatGapAligner<E>,
+        read: &MappedRead,
+        region: &Range<usize>,
+        reference: &[u8],
+        context: RepeatContext<'_>,
+        scratch: &mut ViterbiScratch,
+    ) -> RepeatSpan {
+        let bases = ReadBases::try_new(&read.seq[region.clone()], &read.qual[region.clone()])
+            .expect("seq and qual are the same slice, hence equal length");
+        aligner.align(bases, reference, context, scratch)
+    }
+
+    fn to_usize(range: &Range<u64>) -> Range<usize> {
+        range.start as usize..range.end as usize
+    }
+
+    /// A complete tract, if it clears the base-quality gate; else `LowQuality`. `tract` is
+    /// relative to the `region` slice.
+    fn complete_or_low_quality(
+        read: &MappedRead,
+        region: &Range<usize>,
+        tract: &Range<u64>,
+        qual_buffer: &mut Vec<u8>,
+    ) -> Classified {
+        let region_seq = &read.seq[region.clone()];
+        let region_qual = &read.qual[region.clone()];
+        let tract = to_usize(tract);
+        if passes_quality_gate(&region_qual[tract.clone()], MIN_REGION_Q1, qual_buffer) {
+            Classified::Observed {
+                bases: region_seq[tract].into(),
+                coverage: ReadCoverage::Complete,
+            }
+        } else {
+            Classified::NoObservation(NoObservationReason::LowQuality)
+        }
+    }
+
+    /// A partial (lower-bound) observation: the tract bases the read showed, tagged with which
+    /// border held and how far it reached (in read coordinates, clamped to `u16`).
+    fn partial(
+        read: &MappedRead,
+        region: &Range<usize>,
+        tract: &Range<u64>,
+        coverage: fn(u16) -> ReadCoverage,
+    ) -> Classified {
+        let region_seq = &read.seq[region.clone()];
+        let tract = to_usize(tract);
+        // `reach` is the observed tract length in **read** coordinates. `ReadCoverage`'s reach
+        // is nominally in locus positions, which diverge from read bases under stutter; the
+        // approximation is bounded because `num_obs_along_locus` clamps the reach to the locus
+        // length (a long partial correctly saturates to full coverage).
+        let reach = (tract.end - tract.start).min(u16::MAX as usize) as u16;
+        Classified::Observed {
+            bases: region_seq[tract].into(),
+            coverage: coverage(reach),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::ng::alignment::PerQualityEmission;
+        use crate::ng::region_typing::segment_criteria::{Motif, SsrSegment};
+        use crate::ng::types::Position;
+        use crate::pileup::walker::CigarOp;
+
+        // Reference frame: 6-base flanks around a CACACA tract → "GGGGGGCACACATTTTTT".
+        const FRAME: &[u8] = b"GGGGGGCACACATTTTTT";
+
+        fn locus() -> SsrLocus {
+            SsrLocus {
+                segment: SsrSegment::new("chr1".into(), 7, 12, Motif::new(b"CA").unwrap(), 1.0)
+                    .unwrap(),
+                tract_with_margin_bases: FRAME.into(),
+                margin_start: Position(1),
+            }
+        }
+
+        fn read(seq: &[u8], qual_value: u8) -> MappedRead {
+            MappedRead {
+                qname: b"r".to_vec(),
+                flag: 0,
+                ref_id: 0,
+                pos: 1,
+                mapq: 60,
+                cigar: vec![CigarOp::Match(seq.len() as u32)],
+                seq: seq.to_vec(),
+                qual: vec![qual_value; seq.len()],
+                mate_ref_id: None,
+                mate_pos: None,
+                adaptor_boundary: None,
+                source_file_index: 0,
+            }
+        }
+
+        fn classify(read: &MappedRead) -> Classified {
+            let aligner = SsrFlatGapAligner::new(PerQualityEmission::new());
+            let stutter = StutterModel::hipstr_shipped();
+            let mut scratch = ViterbiScratch::new();
+            let mut qual_buffer = Vec::new();
+            classify_read(
+                read,
+                &locus(),
+                &aligner,
+                &stutter,
+                &mut scratch,
+                &mut qual_buffer,
+            )
+        }
+
+        /// A read spanning the whole frame measures the tract exactly — a complete observation
+        /// of the reference allele.
+        #[test]
+        fn a_spanning_read_yields_a_complete_observation() {
+            let classified = classify(&read(FRAME, 40));
+            assert_eq!(
+                classified,
+                Classified::Observed {
+                    bases: (*b"CACACA").into(),
+                    coverage: ReadCoverage::Complete,
+                }
+            );
+        }
+
+        /// A read whose tract quality is below the gate is `LowQuality`, not an observation.
+        #[test]
+        fn a_low_quality_tract_is_rejected() {
+            // Whole read at quality 5 (< MIN_REGION_Q1 = 15).
+            let classified = classify(&read(FRAME, 5));
+            assert_eq!(
+                classified,
+                Classified::NoObservation(NoObservationReason::LowQuality)
+            );
+        }
+
+        /// A read that anchors the left flank but ends inside the tract is a partial (left)
+        /// observation — a lower bound production would have discarded.
+        #[test]
+        fn a_read_running_off_the_right_is_a_left_partial() {
+            // left flank + 4 tract bases, then the read ends (no right flank).
+            let classified = classify(&read(b"GGGGGGCACA", 40));
+            match classified {
+                Classified::Observed {
+                    bases,
+                    coverage: ReadCoverage::PartialLeft(reach),
+                } => {
+                    assert_eq!(&*bases, b"CACA");
+                    assert_eq!(reach, 4);
+                }
+                other => panic!("expected a left partial, got {other:?}"),
+            }
+        }
+
+        /// A read that anchors the right flank but begins inside the tract is a partial
+        /// (right) — the mirror of the left case, which a `PartialLeft`/`PartialRight` swap
+        /// would fail.
+        #[test]
+        fn a_read_running_off_the_left_is_a_right_partial() {
+            // 4 tract bases + full right flank, mapped at the tract's 3rd base (0-based 8).
+            let mut read = read(b"CACATTTTTT", 40);
+            read.pos = 9;
+            match classify(&read) {
+                Classified::Observed {
+                    bases,
+                    coverage: ReadCoverage::PartialRight(reach),
+                } => {
+                    assert_eq!(&*bases, b"CACA");
+                    assert_eq!(reach, 4);
+                }
+                other => panic!("expected a right partial, got {other:?}"),
+            }
+        }
+
+        /// A read wholly inside the tract anchors neither flank — no per-read fact, so no
+        /// observation.
+        #[test]
+        fn a_read_wholly_inside_the_tract_is_unanchored() {
+            let mut read = read(b"CACACA", 40); // exactly the tract, no flanks
+            read.pos = 7;
+            assert_eq!(
+                classify(&read),
+                Classified::NoObservation(NoObservationReason::NoBorderAnchored)
+            );
+        }
+
+        /// A long-allele read the mapper laid down all-Match pushes its far flank out of the
+        /// ref-sized window; the first delimit sees a truncated flank, and widening the read
+        /// slice recovers the full long allele (spec §2, the long-allele window recovery).
+        #[test]
+        fn a_window_truncated_long_allele_is_recovered_by_widening() {
+            // 5 CA units (10 bp tract) instead of the reference's 3, mapped 22M.
+            let classified = classify(&read(b"GGGGGGCACACACACATTTTTT", 40));
+            assert_eq!(
+                classified,
+                Classified::Observed {
+                    bases: (*b"CACACACACA").into(),
+                    coverage: ReadCoverage::Complete,
+                }
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
