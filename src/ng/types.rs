@@ -159,6 +159,34 @@ impl Bp {
     }
 }
 
+/// A probability held as its natural logarithm — the number stored is `ln(p)`, not
+/// `p` itself.
+///
+/// `f64::NEG_INFINITY` is a legal value, not an error: it is `ln(0)`, the score of
+/// something impossible — a read line-up that cannot happen. That is the whole reason
+/// probabilities are carried this way here: an impossible line-up reaches a finite
+/// sentinel a caller can see (`-∞`), where in ordinary probabilities it reaches `0`,
+/// indistinguishable from a value that merely got too small to represent. Every finite
+/// `f64` and `-∞` is a valid log-probability, so — like [`Bp`], and unlike
+/// [`MismatchFraction`] — the value is unconstrained, the field is public, and there is
+/// no checked constructor.
+///
+/// Its point as a *distinct type* is that the compiler refuses to mix it with an
+/// ordinary (linear) probability. That is the mistake the alignment module is most
+/// exposed to: the production code it ports returns linear probabilities, the
+/// conversion to a logarithm happens at one boundary, and a `LogProb` accidentally
+/// handed a raw probability would be a plausible wrong number rather than a compile
+/// error without this wrapper.
+#[derive(Copy, Clone, PartialEq, PartialOrd, Debug)]
+pub struct LogProb(pub f64);
+
+impl LogProb {
+    #[inline]
+    pub fn get(self) -> f64 {
+        self.0
+    }
+}
+
 /// A fraction of mismatched bases, constrained to `[0, 1]`. Unlike the
 /// unconstrained newtypes above, an out-of-range value is *unrepresentable*:
 /// the field is private and construction goes through the checked
@@ -354,6 +382,52 @@ mod tests {
         assert_eq!(BaseQual(93).get(), 93);
         assert_eq!(Bp(150).get(), 150);
         assert_eq!(Position(1).get(), 1);
+    }
+
+    /// `LogProb` is unconstrained: any finite logarithm round-trips, and `-∞` — the
+    /// score of an impossible line-up — is a value it must carry, not reject. That
+    /// `-∞` is preserved rather than coerced is the property callers rely on to tell
+    /// "cannot happen" from "too small to represent".
+    #[test]
+    fn log_prob_carries_any_logarithm_including_negative_infinity() {
+        assert_eq!(LogProb(0.0).get(), 0.0); // ln(1): certainty
+        assert_eq!(LogProb(-2.5).get(), -2.5);
+        assert_eq!(LogProb(f64::NEG_INFINITY).get(), f64::NEG_INFINITY);
+        // Ordering places the impossible line-up below every finite score, which is
+        // what lets a caller compare log-probabilities directly.
+        assert!(LogProb(f64::NEG_INFINITY) < LogProb(-1000.0));
+        assert!(LogProb(-2.5) < LogProb(0.0));
+    }
+
+    /// **Why the type derives `PartialOrd`, not `Ord`.** A `NaN` is outside the
+    /// documented domain (finite ∪ {−∞}), but the unconstrained public field makes it
+    /// *representable*, and a `NaN` compares unordered to everything — including itself.
+    /// A total order would be a lie here, and this pins that: a stray `NaN` reaching a
+    /// caller that maxes log-scores silently loses every comparison rather than
+    /// panicking, so this documents the hazard at the type rather than leaving it to be
+    /// rediscovered.
+    #[test]
+    fn log_prob_partialord_is_not_a_total_order_for_nan() {
+        let nan = LogProb(f64::NAN);
+        let also_nan = LogProb(f64::NAN);
+        let finite = LogProb(0.0);
+        // `None` for two NaNs means unordered *and* unequal — reflexivity fails, so
+        // `Eq`/`Ord` would be unsound and are correctly not derived.
+        assert_eq!(nan.partial_cmp(&also_nan), None);
+        // A NaN is unordered against every finite score, in either direction — the
+        // silent-comparison hazard a caller that maxes log-scores must know about.
+        assert_eq!(nan.partial_cmp(&finite), None);
+        assert_eq!(finite.partial_cmp(&nan), None);
+        assert!(nan != finite);
+    }
+
+    /// The field is unconstrained, so `+∞` — an out-of-domain value the doc does not
+    /// name as valid — is carried verbatim rather than coerced or rejected, exactly as
+    /// `-∞` is. The type is a transparent wrapper: what goes in comes back out.
+    #[test]
+    fn log_prob_carries_positive_infinity_out_of_domain() {
+        assert_eq!(LogProb(f64::INFINITY).get(), f64::INFINITY);
+        assert!(LogProb(f64::INFINITY) > LogProb(1e300));
     }
 
     fn genome_position(contig: u32, position: u64) -> GenomePosition {
