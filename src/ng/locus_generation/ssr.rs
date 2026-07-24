@@ -631,6 +631,14 @@ mod classify {
         Observed {
             bases: Box<[u8]>,
             coverage: ReadCoverage,
+            /// The read's base-quality error mass over the tract, `Σ ln(P_err)`, in log-error
+            /// space (freebayes' `q_sum` convention). The **BQ** support moment the spec names
+            /// (spec §3, "strand/BQ/MAPQ moments") — computed here because the tract base
+            /// qualities are already sliced, a free by-product; the tally folds it into
+            /// [`ObservedSequence::q_sum`](crate::ng::locus_generation::ObservedSequence). MAPQ
+            /// is carried separately, off the [`MappedRead`], in the tally. **Soft** — filled,
+            /// unconsumed today.
+            q_sum: f64,
         },
         NoObservation(NoObservationReason),
     }
@@ -735,14 +743,25 @@ mod classify {
         let region_seq = &read.seq[region.clone()];
         let region_qual = &read.qual[region.clone()];
         let tract = to_usize(tract);
-        if passes_quality_gate(&region_qual[tract.clone()], MIN_REGION_Q1, qual_buffer) {
+        let tract_qual = &region_qual[tract.clone()];
+        if passes_quality_gate(tract_qual, MIN_REGION_Q1, qual_buffer) {
             Classified::Observed {
                 bases: region_seq[tract].into(),
                 coverage: ReadCoverage::Complete,
+                q_sum: ln_p_err_sum(tract_qual),
             }
         } else {
             Classified::NoObservation(NoObservationReason::LowQuality)
         }
+    }
+
+    /// `Σ ln(P_err)` over base qualities — the per-read base-quality error mass on the tract, in
+    /// log-error space (freebayes' `q_sum` convention). Negative and monotone: higher quality →
+    /// less error mass. The BQ support moment (spec §3); there is no BAQ on this path and MAPQ is
+    /// carried separately, so this is the base-quality term alone.
+    fn ln_p_err_sum(quals: &[u8]) -> f64 {
+        const LN10_OVER_10: f64 = std::f64::consts::LN_10 / 10.0;
+        quals.iter().map(|&q| -(q as f64) * LN10_OVER_10).sum()
     }
 
     /// A partial (lower-bound) observation: the tract bases the read showed, tagged with which
@@ -754,6 +773,7 @@ mod classify {
         coverage: fn(u16) -> ReadCoverage,
     ) -> Classified {
         let region_seq = &read.seq[region.clone()];
+        let region_qual = &read.qual[region.clone()];
         let tract = to_usize(tract);
         // `reach` is the observed tract length in **read** coordinates. `ReadCoverage`'s reach
         // is nominally in locus positions, which diverge from read bases under stutter; the
@@ -761,8 +781,10 @@ mod classify {
         // length (a long partial correctly saturates to full coverage).
         let reach = (tract.end - tract.start).min(u16::MAX as usize) as u16;
         Classified::Observed {
-            bases: region_seq[tract].into(),
+            bases: region_seq[tract.clone()].into(),
             coverage: coverage(reach),
+            // Partials are kept without the quality gate (spec §3), but still carry the BQ moment.
+            q_sum: ln_p_err_sum(&region_qual[tract]),
         }
     }
 
@@ -822,14 +844,18 @@ mod classify {
         /// of the reference allele.
         #[test]
         fn a_spanning_read_yields_a_complete_observation() {
-            let classified = classify(&read(FRAME, 40));
-            assert_eq!(
-                classified,
+            match classify(&read(FRAME, 40)) {
                 Classified::Observed {
-                    bases: (*b"CACACA").into(),
+                    bases,
                     coverage: ReadCoverage::Complete,
+                    q_sum,
+                } => {
+                    assert_eq!(&*bases, b"CACACA");
+                    // Six Q40 bases: Σ ln(P_err) = 6 · 40 · (−ln10/10), all negative.
+                    assert!(q_sum < 0.0, "the BQ error mass is negative, got {q_sum}");
                 }
-            );
+                other => panic!("expected a complete observation, got {other:?}"),
+            }
         }
 
         /// A read whose tract quality is below the gate is `LowQuality`, not an observation.
@@ -853,6 +879,7 @@ mod classify {
                 Classified::Observed {
                     bases,
                     coverage: ReadCoverage::PartialLeft(reach),
+                    ..
                 } => {
                     assert_eq!(&*bases, b"CACA");
                     assert_eq!(reach, 4);
@@ -873,6 +900,7 @@ mod classify {
                 Classified::Observed {
                     bases,
                     coverage: ReadCoverage::PartialRight(reach),
+                    ..
                 } => {
                     assert_eq!(&*bases, b"CACA");
                     assert_eq!(reach, 4);
@@ -899,14 +927,355 @@ mod classify {
         #[test]
         fn a_window_truncated_long_allele_is_recovered_by_widening() {
             // 5 CA units (10 bp tract) instead of the reference's 3, mapped 22M.
-            let classified = classify(&read(b"GGGGGGCACACACACATTTTTT", 40));
-            assert_eq!(
-                classified,
+            match classify(&read(b"GGGGGGCACACACACATTTTTT", 40)) {
                 Classified::Observed {
-                    bases: (*b"CACACACACA").into(),
+                    bases,
                     coverage: ReadCoverage::Complete,
+                    ..
+                } => assert_eq!(&*bases, b"CACACACACA"),
+                other => panic!("expected the recovered long allele, got {other:?}"),
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// D2c — the tally: fold each kept read's `Classified` into the locus's observed sequences,
+// deduping by `(bases, read_coverage)`, accumulating the support moments, and counting the
+// no-observation reasons. A port of production's `tally` (`src/ssr/pileup/locus_tally.rs`),
+// extended with partial observations and the strand/BQ/MAPQ moments the shared type carries
+// (spec §3, §6). Consumed by the generator (D3).
+// ---------------------------------------------------------------------
+mod tally {
+    #![allow(dead_code)] // consumed by the generator (D3)
+
+    use super::SsrGeneratorCounts;
+    use super::classify::{Classified, NoObservationReason};
+    use crate::bam::alignment_input::{FLAG_REVERSE_STRAND, MappedRead};
+    use crate::ng::locus_generation::{ObservedSequence, ReadCoverage};
+    use std::collections::HashMap;
+
+    /// The per-locus tally the generator folds onto the `SampleLocusObservations`: the deduped
+    /// observed sequences and how many reads reached the aligner but yielded nothing.
+    /// (`reads_fetched` / `reads_discarded_by_cap` are the caller's to set — they come from the
+    /// cap, not the outcomes.)
+    pub(super) struct SsrTally {
+        pub(super) observed_sequences: Vec<ObservedSequence>,
+        pub(super) reads_without_observation: u32,
+    }
+
+    /// Accumulated support for one distinct `(bases, read_coverage)` bucket — the moments summed
+    /// as reads fold in, materialised into an [`ObservedSequence`] at the end.
+    #[derive(Default)]
+    struct Support {
+        num_obs: u32,
+        num_fwd: u32,
+        q_sum: f64,
+        mapq_sum: u32,
+        mapq_sum_sq: u64,
+    }
+
+    /// Fold each kept read's classification into the locus tally.
+    ///
+    /// Observations dedup by **`(bases, read_coverage)`** — a `Complete` and a partial of the
+    /// same bases are different evidence and stay separate rows, two identical partials merge
+    /// (spec §3). Each bucket accumulates the strand (`num_fwd` off the reverse-strand flag),
+    /// BQ (`q_sum`, off the read's tract error mass) and MAPQ moments; `chain_ids` stays empty
+    /// because the STR path does not phase. `observed_sequences` is sorted by `(bases,
+    /// coverage)`, so — like production's `tally` — the bases, the counts and the integer moments
+    /// are independent of the order reads were folded. `q_sum` is the one exception: it sums in
+    /// `f64`, which is commutative but not associative, so a bucket's `q_sum` can differ in its
+    /// low bits under a different fold order. That is immaterial while `q_sum` is soft and
+    /// unconsumed, and the parity oracle checks only bytes and counts (spec §6).
+    ///
+    /// `counts` carries the **run-level** totals (complete/partial observations and the three
+    /// no-observation reasons); the returned `reads_without_observation` is this locus's own
+    /// total.
+    pub(super) fn tally<'a>(
+        reads_and_outcomes: impl IntoIterator<Item = (&'a MappedRead, Classified)>,
+        counts: &mut SsrGeneratorCounts,
+    ) -> SsrTally {
+        let mut buckets: HashMap<(Box<[u8]>, ReadCoverage), Support> = HashMap::new();
+        let mut reads_without_observation = 0u32;
+        for (read, outcome) in reads_and_outcomes {
+            match outcome {
+                Classified::Observed {
+                    bases,
+                    coverage,
+                    q_sum,
+                } => {
+                    match coverage {
+                        ReadCoverage::Complete => counts.observations_complete += 1,
+                        ReadCoverage::PartialLeft(_) | ReadCoverage::PartialRight(_) => {
+                            counts.observations_partial += 1
+                        }
+                    }
+                    let support = buckets.entry((bases, coverage)).or_default();
+                    support.num_obs += 1;
+                    if read.flag & FLAG_REVERSE_STRAND == 0 {
+                        support.num_fwd += 1;
+                    }
+                    support.q_sum += q_sum;
+                    let mapq = u32::from(read.mapq);
+                    support.mapq_sum += mapq;
+                    support.mapq_sum_sq += u64::from(mapq) * u64::from(mapq);
                 }
+                Classified::NoObservation(reason) => {
+                    reads_without_observation += 1;
+                    match reason {
+                        NoObservationReason::NoBorderAnchored => counts.no_border_anchored += 1,
+                        NoObservationReason::LowQuality => counts.low_quality += 1,
+                        NoObservationReason::WindowTruncated => counts.window_truncated += 1,
+                    }
+                }
+            }
+        }
+
+        let mut observed_sequences: Vec<ObservedSequence> = buckets
+            .into_iter()
+            .map(|((bases, read_coverage), support)| ObservedSequence {
+                bases,
+                read_coverage,
+                num_obs: support.num_obs,
+                num_fwd: support.num_fwd,
+                q_sum: support.q_sum,
+                mapq_sum: support.mapq_sum,
+                mapq_sum_sq: support.mapq_sum_sq,
+                // The STR path does not phase — there is no chain id to fold (spec §3).
+                chain_ids: Vec::new(),
+            })
+            .collect();
+        observed_sequences.sort_unstable_by(|a, b| {
+            a.bases
+                .cmp(&b.bases)
+                .then_with(|| coverage_order(a.read_coverage).cmp(&coverage_order(b.read_coverage)))
+        });
+
+        SsrTally {
+            observed_sequences,
+            reads_without_observation,
+        }
+    }
+
+    /// A total order over `ReadCoverage` (which is not `Ord`) for a deterministic tie-break when
+    /// two observations share bases: complete first, then left partials, then right partials,
+    /// each ordered by reach.
+    fn coverage_order(coverage: ReadCoverage) -> (u8, u16) {
+        match coverage {
+            ReadCoverage::Complete => (0, 0),
+            ReadCoverage::PartialLeft(n) => (1, n),
+            ReadCoverage::PartialRight(n) => (2, n),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::pileup::walker::CigarOp;
+
+        /// A `MappedRead` with a given strand flag and MAPQ — the only fields the tally reads
+        /// off the read; the sequence and qualities live in the `Classified` handed alongside.
+        fn read(flag: u16, mapq: u8) -> MappedRead {
+            MappedRead {
+                qname: b"r".to_vec(),
+                flag,
+                ref_id: 0,
+                pos: 1,
+                mapq,
+                cigar: vec![CigarOp::Match(6)],
+                seq: b"CACACA".to_vec(),
+                qual: vec![40; 6],
+                mate_ref_id: None,
+                mate_pos: None,
+                adaptor_boundary: None,
+                source_file_index: 0,
+            }
+        }
+
+        fn observed(bases: &[u8], coverage: ReadCoverage, q_sum: f64) -> Classified {
+            Classified::Observed {
+                bases: bases.into(),
+                coverage,
+                q_sum,
+            }
+        }
+
+        /// A `Complete` and a `PartialLeft` of the **same** bases are different evidence, so they
+        /// stay as two separate rows (spec §3) — the property the `(bases, read_coverage)` dedup
+        /// key rests on.
+        #[test]
+        fn a_complete_and_a_partial_of_the_same_bases_stay_separate() {
+            let fwd = read(0, 60);
+            let outcomes = vec![
+                (&fwd, observed(b"CACACA", ReadCoverage::Complete, -1.0)),
+                (
+                    &fwd,
+                    observed(b"CACACA", ReadCoverage::PartialLeft(6), -1.0),
+                ),
+            ];
+            let mut counts = SsrGeneratorCounts::default();
+            let result = tally(outcomes, &mut counts);
+            assert_eq!(result.observed_sequences.len(), 2);
+            assert_eq!(counts.observations_complete, 1);
+            assert_eq!(counts.observations_partial, 1);
+        }
+
+        /// Two identical partials (same bases, same coverage) are the identical constraint, so
+        /// they merge into one row with `num_obs == 2` (spec §3).
+        #[test]
+        fn two_identical_partials_merge_into_one_count() {
+            let fwd = read(0, 60);
+            let outcomes = vec![
+                (&fwd, observed(b"CACA", ReadCoverage::PartialLeft(4), -1.0)),
+                (&fwd, observed(b"CACA", ReadCoverage::PartialLeft(4), -1.0)),
+            ];
+            let mut counts = SsrGeneratorCounts::default();
+            let result = tally(outcomes, &mut counts);
+            assert_eq!(result.observed_sequences.len(), 1);
+            assert_eq!(result.observed_sequences[0].num_obs, 2);
+        }
+
+        /// The strand, BQ and MAPQ moments accumulate across the reads folded into a bucket:
+        /// `num_fwd` counts the forward-strand reads, `q_sum` sums the per-read BQ mass,
+        /// `mapq_sum` / `mapq_sum_sq` sum MAPQ and MAPQ². `chain_ids` stays empty.
+        #[test]
+        fn the_support_moments_accumulate() {
+            let fwd = read(0, 60);
+            let rev = read(FLAG_REVERSE_STRAND, 30);
+            let outcomes = vec![
+                (&fwd, observed(b"CACACA", ReadCoverage::Complete, -2.0)),
+                (&rev, observed(b"CACACA", ReadCoverage::Complete, -3.0)),
+            ];
+            let mut counts = SsrGeneratorCounts::default();
+            let result = tally(outcomes, &mut counts);
+            let obs = &result.observed_sequences[0];
+            assert_eq!(obs.num_obs, 2);
+            assert_eq!(obs.num_fwd, 1, "one forward, one reverse");
+            assert_eq!(obs.q_sum, -5.0, "the BQ masses sum");
+            assert_eq!(obs.mapq_sum, 90, "60 + 30");
+            assert_eq!(obs.mapq_sum_sq, 60 * 60 + 30 * 30);
+            assert!(obs.chain_ids.is_empty(), "the STR path does not phase");
+        }
+
+        /// Each no-observation reason lands in its own run-level counter, and every such read is
+        /// counted in the locus's `reads_without_observation` total.
+        #[test]
+        fn no_observation_reasons_are_counted_by_reason_and_in_total() {
+            let r = read(0, 60);
+            let outcomes = vec![
+                (
+                    &r,
+                    Classified::NoObservation(NoObservationReason::NoBorderAnchored),
+                ),
+                (
+                    &r,
+                    Classified::NoObservation(NoObservationReason::LowQuality),
+                ),
+                (
+                    &r,
+                    Classified::NoObservation(NoObservationReason::WindowTruncated),
+                ),
+                (
+                    &r,
+                    Classified::NoObservation(NoObservationReason::LowQuality),
+                ),
+            ];
+            let mut counts = SsrGeneratorCounts::default();
+            let result = tally(outcomes, &mut counts);
+            assert!(result.observed_sequences.is_empty());
+            assert_eq!(result.reads_without_observation, 4);
+            assert_eq!(counts.no_border_anchored, 1);
+            assert_eq!(counts.low_quality, 2);
+            assert_eq!(counts.window_truncated, 1);
+        }
+
+        /// `observed_sequences` is sorted by bytes, then by coverage — so the record is identical
+        /// regardless of the order reads folded in (production's order-independence, extended to
+        /// the coverage tie-break).
+        #[test]
+        fn observed_is_sorted_by_bases_then_coverage() {
+            let r = read(0, 60);
+            let outcomes = vec![
+                (&r, observed(b"GG", ReadCoverage::Complete, -1.0)),
+                (&r, observed(b"AA", ReadCoverage::PartialRight(2), -1.0)),
+                (&r, observed(b"AA", ReadCoverage::Complete, -1.0)),
+                (&r, observed(b"AA", ReadCoverage::PartialLeft(2), -1.0)),
+            ];
+            let mut counts = SsrGeneratorCounts::default();
+            let result = tally(outcomes, &mut counts);
+            let order: Vec<(&[u8], ReadCoverage)> = result
+                .observed_sequences
+                .iter()
+                .map(|o| (o.bases.as_ref(), o.read_coverage))
+                .collect();
+            assert_eq!(
+                order,
+                vec![
+                    (b"AA".as_ref(), ReadCoverage::Complete),
+                    (b"AA".as_ref(), ReadCoverage::PartialLeft(2)),
+                    (b"AA".as_ref(), ReadCoverage::PartialRight(2)),
+                    (b"GG".as_ref(), ReadCoverage::Complete),
+                ]
             );
+        }
+
+        /// The integer moments of a **multi-read bucket** are order-independent: the same reads
+        /// (differing strand and MAPQ) folded into one `(bases, coverage)` bucket in two orders
+        /// give the same `num_obs` / `num_fwd` / `mapq_sum` / `mapq_sum_sq`. This is the case the
+        /// singleton buckets of `tally_is_order_independent` never exercise, and it isolates
+        /// `q_sum` as the sole order-sensitive field (its f64 sum is not asserted here).
+        #[test]
+        fn a_multi_read_bucket_accumulates_integer_moments_order_independently() {
+            let fwd = read(0, 60);
+            let rev = read(FLAG_REVERSE_STRAND, 30);
+            let moments = |outcomes: Vec<(&MappedRead, Classified)>| {
+                let mut counts = SsrGeneratorCounts::default();
+                let obs = tally(outcomes, &mut counts).observed_sequences;
+                assert_eq!(obs.len(), 1, "all reads share one bucket");
+                let o = &obs[0];
+                (o.num_obs, o.num_fwd, o.mapq_sum, o.mapq_sum_sq)
+            };
+            let forward_first = moments(vec![
+                (&fwd, observed(b"CACACA", ReadCoverage::Complete, -2.0)),
+                (&rev, observed(b"CACACA", ReadCoverage::Complete, -3.0)),
+            ]);
+            let reverse_first = moments(vec![
+                (&rev, observed(b"CACACA", ReadCoverage::Complete, -3.0)),
+                (&fwd, observed(b"CACACA", ReadCoverage::Complete, -2.0)),
+            ]);
+            assert_eq!(forward_first, reverse_first);
+            assert_eq!(forward_first, (2, 1, 90, 60 * 60 + 30 * 30));
+        }
+
+        /// The tally is order-independent: the same multiset of outcomes folded in two different
+        /// orders yields the same observed sequences and the same counts. (Its buckets are
+        /// singletons, so no `q_sum` f64 reordering occurs — the multi-read integer case is
+        /// `a_multi_read_bucket_accumulates_integer_moments_order_independently`.)
+        #[test]
+        fn tally_is_order_independent() {
+            let r = read(0, 60);
+            let run = |outcomes: Vec<(&MappedRead, Classified)>| {
+                let mut counts = SsrGeneratorCounts::default();
+                let result = tally(outcomes, &mut counts);
+                (result.observed_sequences, counts)
+            };
+            let a = run(vec![
+                (&r, observed(b"CACACA", ReadCoverage::Complete, -1.0)),
+                (&r, observed(b"CACA", ReadCoverage::Complete, -1.0)),
+                (
+                    &r,
+                    Classified::NoObservation(NoObservationReason::LowQuality),
+                ),
+            ]);
+            let b = run(vec![
+                (
+                    &r,
+                    Classified::NoObservation(NoObservationReason::LowQuality),
+                ),
+                (&r, observed(b"CACA", ReadCoverage::Complete, -1.0)),
+                (&r, observed(b"CACACA", ReadCoverage::Complete, -1.0)),
+            ]);
+            assert_eq!(a, b);
         }
     }
 }
