@@ -11,9 +11,12 @@
 //! and the working input ([`SsrLocus`] + its margin fetch). The align → tally rest of the
 //! transform is gated on the ng STR aligner (`read_preparation_ssr.md`), unbuilt.
 
-use crate::ng::ref_seq::{ContigTable, RefSeq, RefSeqError};
+use super::LocusGenerationError;
+use crate::bam::alignment_input::MappedRead;
+use crate::ng::read::input::SampleReads;
+use crate::ng::ref_seq::{ContigTable, RawRefSeq, RefSeq, RefSeqError};
 use crate::ng::region_typing::segment_criteria::SsrSegment;
-use crate::ng::types::{Bp, ContigId, Position};
+use crate::ng::types::{Bp, ContigId, GenomeRegion, Position};
 
 /// An STR locus ready to align against: the segment plus the reference bases the aligner
 /// aligns the reads to.
@@ -284,6 +287,55 @@ impl<T> Reservoir<T> {
     pub fn into_held(self) -> Vec<T> {
         self.held
     }
+}
+
+// ---------------------------------------------------------------------
+// The per-locus read fetch (D1): fetch over the tract+margin span, depth-cap.
+// ---------------------------------------------------------------------
+
+/// The reads kept for one locus after depth-capping, and how many were fetched — the caller
+/// records `reads_discarded_by_cap = fetched - kept.len()`.
+pub struct CappedReads {
+    pub kept: Vec<MappedRead>,
+    pub fetched: u64,
+}
+
+/// Fetch the reads over a locus's query span (tract + margin) and depth-cap them with the
+/// reservoir, seeded per locus (spec §2, §4).
+///
+/// Admission is **relevance** — overlap with `query_span`, which `SampleReads` already applies
+/// — **not** spanning: production's `reaches_locus` gate is deliberately not ported, because a
+/// read that runs off mid-tract is exactly what a partial observation is made of (spec §2). The
+/// cap sits between fetch and align; `None` keeps every read. `make_reference` is the per-query
+/// reference factory `reads_in_region` needs for the mismatch-fraction filter.
+pub fn fetch_capped_reads<R: RawRefSeq>(
+    reads: &SampleReads,
+    query_span: GenomeRegion,
+    seed: u64,
+    max_reads_per_locus: Option<u32>,
+    make_reference: impl FnMut() -> R,
+) -> Result<CappedReads, LocusGenerationError> {
+    let stream = reads.reads_in_region(query_span, make_reference)?;
+    let mut fetched = 0u64;
+    let kept = match max_reads_per_locus {
+        Some(cap) => {
+            let mut reservoir = Reservoir::new(cap as usize, seed);
+            for read in stream {
+                reservoir.offer(read?);
+                fetched += 1;
+            }
+            reservoir.into_held()
+        }
+        None => {
+            let mut all = Vec::new();
+            for read in stream {
+                all.push(read?);
+                fetched += 1;
+            }
+            all
+        }
+    };
+    Ok(CappedReads { kept, fetched })
 }
 
 #[cfg(test)]
@@ -568,6 +620,98 @@ mod tests {
             kept(seed),
             prod_kept(seed),
             "the kept set must be identical"
+        );
+    }
+
+    // --- D1: the per-locus read fetch + cap ---------------------------------
+
+    fn span(start: u64, end: u64) -> GenomeRegion {
+        GenomeRegion {
+            contig: ContigId(0),
+            start: Position(start),
+            end: Position(end),
+        }
+    }
+
+    /// A `RawRefSeq` over the fixture contigs (all `A`s), for `reads_in_region`'s
+    /// mismatch-fraction filter — matches the fixture reference the reads are opened against.
+    fn fixture_ref_bases() -> InMemoryRefSeq {
+        use crate::ng::read::input::test_fixtures::matching_contigs;
+        InMemoryRefSeq::from_contigs(
+            matching_contigs()
+                .iter()
+                .map(|(_, len, _)| vec![b'A'; *len])
+                .collect(),
+        )
+    }
+
+    /// Open a `SampleReads` over one indexed BAM of `records`, against the fixture reference.
+    fn sample_reads_with(
+        records: &[noodles_sam::alignment::RecordBuf],
+    ) -> (tempfile::TempDir, tempfile::TempDir, SampleReads) {
+        use crate::ng::read::filtering::ReadFilterConfig;
+        use crate::ng::read::input::test_fixtures::{
+            fixture_reference, header, indexed_bam, matching_contigs,
+        };
+        let (reference_dir, reference) = fixture_reference(false);
+        let (bam_dir, bam) = indexed_bam(
+            &header(
+                Some("coordinate"),
+                &matching_contigs(),
+                &[("rg1", Some("NA12878"))],
+            ),
+            records,
+        );
+        let reads = SampleReads::open(&[bam], &reference, ReadFilterConfig::default(), false)
+            .expect("the fixture sample opens");
+        (reference_dir, bam_dir, reads)
+    }
+
+    /// The cap keeps `max_reads_per_locus` of the fetched reads and counts them all; `None`
+    /// keeps everything (spec §4).
+    #[test]
+    fn fetch_caps_reads_and_counts_the_fetched() {
+        use crate::ng::read::input::test_fixtures::read_named_with_length;
+        let records: Vec<_> = (0..5)
+            .map(|i| read_named_with_length(&format!("r{i}"), 0, 1 + i * 10, 30))
+            .collect();
+        let (_reference_dir, _bam_dir, reads) = sample_reads_with(&records);
+
+        let capped = fetch_capped_reads(&reads, span(1, 100), 42, Some(3), fixture_ref_bases)
+            .expect("fetch succeeds");
+        assert_eq!(capped.fetched, 5);
+        assert_eq!(capped.kept.len(), 3, "capped to 3 of the 5 fetched");
+
+        let uncapped = fetch_capped_reads(&reads, span(1, 100), 42, None, fixture_ref_bases)
+            .expect("fetch succeeds");
+        assert_eq!(uncapped.fetched, 5);
+        assert_eq!(uncapped.kept.len(), 5, "no cap keeps every read");
+    }
+
+    /// The kept subset is a deterministic function of the seed (the thread-invariance the seed
+    /// buys, spec §4).
+    #[test]
+    fn the_capped_kept_set_is_deterministic_for_a_seed() {
+        use crate::ng::read::input::test_fixtures::read_named_with_length;
+        let records: Vec<_> = (0..20)
+            .map(|i| read_named_with_length(&format!("r{i}"), 0, 1 + i * 4, 20))
+            .collect();
+        let (_reference_dir, _bam_dir, reads) = sample_reads_with(&records);
+        let kept_positions = |seed| {
+            let mut positions: Vec<u64> =
+                fetch_capped_reads(&reads, span(1, 100), seed, Some(5), fixture_ref_bases)
+                    .expect("fetch succeeds")
+                    .kept
+                    .iter()
+                    .map(|read| read.pos)
+                    .collect();
+            positions.sort_unstable();
+            positions
+        };
+        assert_eq!(
+            kept_positions(7),
+            kept_positions(7),
+            "same seed → same kept set"
         );
     }
 }
