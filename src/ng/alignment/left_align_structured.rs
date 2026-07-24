@@ -72,6 +72,11 @@ impl AlignmentNormalizer for StructuredLeftAligner {
     /// function needs (its `ref_seq[0]` at the read's first aligned base) is `reference` from the
     /// offset onward.
     ///
+    /// **Fast path for the common case.** A read with no indel — the overwhelming majority — costs a
+    /// single cigar scan and returns: `left_align_indels` early-returns before touching the
+    /// reference, allocating nothing. So the caller does **not** need to pre-filter no-indel reads;
+    /// this is already essentially free on them.
+    ///
     /// **Two preconditions, handled differently.** The cigar's consistency with `read` (its
     /// read-consuming ops summing to `read.len()`) is upheld *gracefully* — production's own guard
     /// leaves a malformed cigar untouched rather than corrupting it. But `reference_offset <=

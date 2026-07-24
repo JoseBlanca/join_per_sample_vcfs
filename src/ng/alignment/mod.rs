@@ -626,6 +626,34 @@ pub trait AlignmentNormalizer: Sized {
     fn normalize(&self, alignment: &mut Alignment, read: &[u8], reference: &[u8]);
 }
 
+/// **The recommended normalizer: algorithm 1a, the GATK/production left-aligner.**
+///
+/// The module ships three `AlignmentNormalizer`s so they can be *compared*, not because a caller
+/// should choose between them by taste (spec §1, §6). The comparison is settled, and this alias
+/// records the answer so a caller reaches for one obvious thing:
+///
+/// - **1a** [`StructuredLeftAligner`](left_align_structured::StructuredLeftAligner) — a port of
+///   production's `left_align_indels` (GATK `leftAlignIndels`). One structured pass: always
+///   leftmost, merges/trims/propagates across blocks, no loop, and — for a read with no indel —
+///   returns after a single cigar scan with no allocation. **This is the default.**
+/// - **1b** [`RepeatedLeftAligner`](left_align_repeated::RepeatedLeftAligner) — freebayes' repeated
+///   capped passes. It can ship a *non-leftmost* result (its 20-pass cap), so it is the comparator
+///   that shows freebayes' shape is worse here, not a production candidate.
+/// - **1c** [`FixpointLeftAligner`](left_align_structured::FixpointLeftAligner) — 1a to a fixpoint; built only to *test* whether 1a is a true
+///   fixpoint. It is, empirically (the differ-at-all screen saw 0 panics and 0 disagreements with 1a
+///   across 63,821 real and adversarial reads), so 1c is retained as a regression guard, not a
+///   default.
+///
+/// **The evidence** (`ng_normalizer_screen` over GIAB HG002 10x, 2026-07-24): across 63,757 real
+/// indel-bearing reads the three produce **identical** output — so the *choice* of normalizer does
+/// not change calling, and normalization placement is not the lever behind the indel deficit
+/// (spec §6). On synthetic reads that place an indel past 1b's cap, only 1b diverges. **Owner
+/// decision, 2026-07-24:** 1a is the default; 1b and 1c are kept as comparators / regression guards.
+///
+/// A named alias rather than a hidden default inside a caller: which normalizer runs stays visible
+/// at the use site, and a caller with a reason to pick another still names it explicitly.
+pub type DefaultAlignmentNormalizer = left_align_structured::StructuredLeftAligner;
+
 #[cfg(test)]
 mod tests {
     use super::*;
