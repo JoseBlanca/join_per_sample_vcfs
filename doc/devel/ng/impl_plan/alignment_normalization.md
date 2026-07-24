@@ -82,7 +82,7 @@ an operations-only signature could not express. The read is required too: how fa
 bounded by matching on **both** sequences. No implementations. *Depends:* plan 1. *Source:* arch §3,
 §5.
 
-**☐ A2. The leftmost property checker.**
+**✅ A2. The leftmost property checker.**
 A test-support function: given an `Alignment`, its read and its reference, assert that **no indel can
 shift one base left and still represent the same pair of sequences**. Not an implementation of
 left-alignment — a checker for one. Unit-tested against hand-built alignments that are

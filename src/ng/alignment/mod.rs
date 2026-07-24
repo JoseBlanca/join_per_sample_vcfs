@@ -29,6 +29,8 @@
 #[cfg(test)]
 mod delimit_parity;
 pub mod emission;
+#[cfg(test)]
+mod leftmost_property;
 pub mod ssr_best_path_flat_gap;
 pub mod ssr_best_path_unit_slip;
 pub mod ssr_marginal_sequence;
