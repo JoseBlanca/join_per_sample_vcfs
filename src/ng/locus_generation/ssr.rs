@@ -2064,4 +2064,214 @@ mod tests {
             other => panic!("expected an Ssr locus, got {other:?}"),
         }
     }
+
+    // --- E2: the parity oracle — the port anchor -----------------------------
+
+    /// **The north-star parity oracle** (spec §6, §9.3): every COMPLETE observation ng produces
+    /// must match production's `SsrLocusObs.observed` byte for byte, in bases and count, **with the
+    /// cap disabled** on a fixture shallower than any cap.
+    ///
+    /// Both sides run over the **same** reads and the **same** reference frame. ng runs its real
+    /// per-read pipeline (`classify::classify_read`, the `SsrFlatGapAligner` over production's
+    /// `PerQualityEmission` table) and its real `tally`; production runs its real delimiter
+    /// (`delimit_read` over `HmmModel`) and its real `tally`. The two aligners are *different
+    /// algorithms* — this is exactly the claim under test: that on the complete class of clean reads
+    /// they delimit the identical tract. The generator's fetch/cap are not exercised here because,
+    /// with the cap disabled, they only select reads and never change an observation's bases; that
+    /// wiring is covered by D3 and the dump-tool fixture (E1). The production side reproduces
+    /// production's *clean-read* classify path (extract → delimit → the Region tract), which for
+    /// these Q40, fully-spanned reads is exactly what production's `classify_read` does — asserted,
+    /// not assumed, via `flank_truncated` and the quality floor.
+    ///
+    /// Partial observations are ng's new behaviour with **no oracle**: this checks only that they
+    /// *exist* (ng's classify keeps as a partial the read production's delimiter drops as
+    /// border-off-end), not their bytes (spec §6).
+    ///
+    /// **Scope.** The fixture is all-Match reads of the reference allele and a one-unit *contraction*
+    /// (`CACA`), so it pins parity on the complete class over the delimiters' contraction and
+    /// exact-match behaviour. An *expansion* allele or a soft-clipped read cannot be added without
+    /// leaving this regime: both drive the tract past the reference-sized window, tripping the
+    /// long-allele **widening** recovery — a branch this production-side reproduction deliberately
+    /// does not model (it asserts `!flank_truncated`). Widening-path and soft-clip parity are not
+    /// covered here.
+    #[test]
+    fn ng_complete_observations_match_frozen_production_byte_for_byte() {
+        use crate::bam::alignment_input::MappedRead;
+        use crate::ng::alignment::ssr_best_path_flat_gap::{
+            SsrFlatGapAligner, ViterbiScratch as NgViterbiScratch,
+        };
+        use crate::ng::alignment::{PerQualityEmission, StutterModel};
+        use crate::ng::locus_generation::ReadCoverage;
+        use crate::pileup::walker::CigarOp;
+        // Frozen production oracle (called test-only, as the reservoir parity test does; ng does not
+        // depend on production at run time).
+        use crate::ssr::pileup::alignment::{
+            Delimited, HmmModel, ViterbiScratch as ProdViterbiScratch, delimit_read,
+        };
+        use crate::ssr::pileup::footprint::{extract_region, flank_truncated, read_footprint};
+        use crate::ssr::pileup::locus_tally::{QcCounts, ReadObs, tally as production_tally};
+        use crate::ssr::types::{Locus, Motif as ProductionMotif};
+
+        // A 6 bp G-flank + CACACA + 6 bp T-flank — production's own delimiter fixture frame.
+        const FRAME: &[u8] = b"GGGGGGCACACATTTTTT";
+
+        /// A reference-frame read: `seq` mapped all-Match at 1-based `pos`, Q40.
+        fn mapped(seq: &[u8], pos: u64) -> MappedRead {
+            MappedRead {
+                qname: b"r".to_vec(),
+                flag: 0,
+                ref_id: 0,
+                pos,
+                mapq: 60,
+                cigar: vec![CigarOp::Match(seq.len() as u32)],
+                seq: seq.to_vec(),
+                qual: vec![40u8; seq.len()],
+                mate_ref_id: None,
+                mate_pos: None,
+                adaptor_boundary: None,
+                source_file_index: 0,
+            }
+        }
+
+        // Three complete reads of the reference allele (CACACA) and two of a clean shorter allele
+        // (CACA, one CA unit deleted) — two distinct observed sequences, so the parity is not a
+        // single-allele triviality. Plus one partially-covering read (left flank + two CA units, no
+        // right flank) — the read ng keeps as a partial and production drops as border-off-end.
+        let reads = [
+            mapped(FRAME, 1),
+            mapped(FRAME, 1),
+            mapped(FRAME, 1),
+            mapped(b"GGGGGGCACATTTTTT", 1),
+            mapped(b"GGGGGGCACATTTTTT", 1),
+            mapped(b"GGGGGGCACA", 1),
+        ];
+
+        // --- ng: real classify + real tally ---------------------------------
+        let ng_locus = SsrLocus {
+            segment: SsrSegment::new("chr1".into(), 7, 12, Motif::new(b"CA").unwrap(), 1.0)
+                .unwrap(),
+            tract_with_margin_bases: FRAME.into(),
+            margin_start: Position(1),
+        };
+        let aligner = SsrFlatGapAligner::new(PerQualityEmission::new());
+        let stutter = StutterModel::hipstr_shipped();
+        let mut ng_scratch = NgViterbiScratch::new();
+        let mut qual_buffer = Vec::new();
+        let mut counts = SsrGeneratorCounts::default();
+        let ng_outcomes: Vec<_> = reads
+            .iter()
+            .map(|read| {
+                classify::classify_read(
+                    read,
+                    &ng_locus,
+                    &aligner,
+                    &stutter,
+                    &mut ng_scratch,
+                    &mut qual_buffer,
+                )
+            })
+            .collect();
+        let ng = tally::tally(reads.iter().zip(ng_outcomes), &mut counts);
+        let ng_complete: Vec<(Vec<u8>, u32)> = ng
+            .observed_sequences
+            .iter()
+            .filter(|obs| obs.read_coverage == ReadCoverage::Complete)
+            .map(|obs| (obs.bases.to_vec(), obs.num_obs))
+            .collect();
+
+        // --- production: real delimit_read + real tally ---------------------
+        let production_locus = Locus::new(
+            "chr1".into(),
+            6, // 0-based tract start
+            12,
+            ProductionMotif::new(b"CA").unwrap(),
+            1.0,
+            FRAME.into(),
+            0, // ref_bytes_start (0-based)
+        )
+        .unwrap();
+        // The clean-read glue below reproduces production's `classify_read`
+        // (src/ssr/pileup/driver.rs:195) — private, so it cannot be called directly. Only its
+        // control flow is copied; the delimiter (`delimit_read`) and the `tally` are the real frozen
+        // production code. Both simplifications the reproduction makes are **self-checking**, so it
+        // cannot silently drift from production: the widening branch is asserted away
+        // (`!flank_truncated`) and the quality gate is asserted to pass. If production's
+        // `classify_read` grows a step before its Region→Sequence path, update here too.
+        let model = HmmModel::new();
+        let mut production_scratch = ProdViterbiScratch::new();
+        let outcomes: Vec<ReadObs> = reads
+            .iter()
+            .map(|read| {
+                let footprint = read_footprint(&read.cigar, read.pos);
+                let region =
+                    extract_region(&read.cigar, footprint, read.seq.len(), &production_locus);
+                match delimit_read(
+                    &read.seq[region.clone()],
+                    &read.qual[region.clone()],
+                    &production_locus,
+                    &model,
+                    &mut production_scratch,
+                ) {
+                    Delimited::Region(tract) => {
+                        // The fixture reads span cleanly: a complete tract with full flanks, so
+                        // production's classify_read takes its Region→Sequence path, not widening.
+                        assert!(
+                            !flank_truncated(
+                                &region,
+                                &tract,
+                                read.seq.len(),
+                                production_locus.left_flank().len(),
+                                production_locus.right_flank().len(),
+                            ),
+                            "the fixture read is not window-truncated"
+                        );
+                        // Production gates on the tract's lower-quartile base quality
+                        // (MIN_REGION_Q1 = 15); every tract base here is Q40, so its
+                        // `sequence_or_low_quality` returns `Sequence`. Asserted so that skipping
+                        // the gate cannot mask a divergence.
+                        assert!(
+                            read.qual[region.clone()][tract.clone()]
+                                .iter()
+                                .all(|&q| q >= 15),
+                            "the fixture tract clears production's quality floor"
+                        );
+                        ReadObs::Sequence(read.seq[region][tract].into())
+                    }
+                    Delimited::BorderOffEnd => ReadObs::BorderOffEnd,
+                }
+            })
+            .collect();
+        let qc = QcCounts {
+            depth: reads.len() as u32,
+            n_filtered: 0,
+            mapped_reads: reads.len() as u32,
+        };
+        let production = production_tally(&production_locus, &outcomes, qc);
+        let production_observed: Vec<(Vec<u8>, u32)> = production
+            .observed
+            .iter()
+            .map(|(bases, count)| (bases.to_vec(), *count))
+            .collect();
+
+        // --- the parity assertion -------------------------------------------
+        assert_eq!(
+            ng_complete,
+            vec![(b"CACA".to_vec(), 2), (b"CACACA".to_vec(), 3)],
+            "ng's two complete alleles, sorted by bytes with their counts"
+        );
+        assert_eq!(
+            ng_complete, production_observed,
+            "ng's complete observations match production's SsrLocusObs.observed byte for byte"
+        );
+
+        // ng's classify keeps a partial where production's delimiter drops the same read.
+        assert_eq!(
+            counts.observations_partial, 1,
+            "ng's classify keeps the partially-covering read as a partial"
+        );
+        assert_eq!(
+            production.n_border_off_end, 1,
+            "production's delimiter drops that same read as border-off-end — no oracle for its bytes"
+        );
+    }
 }
