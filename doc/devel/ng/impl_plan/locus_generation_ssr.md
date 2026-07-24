@@ -173,7 +173,7 @@ one locus per segment; a zero-coverage tract yields an empty-but-present locus.
 
 ### Milestone E — the port anchor: dump tool + parity *(gated on D)*
 
-**☐ E1. `examples/ng_ssr_loci_dump.rs` + a committed fixture.**
+**✅ E1. `examples/ng_ssr_loci_dump.rs` + a committed fixture.** *(committed)*
 Following `examples/ssr_psp_seqdump.rs`: positional args, a `#`-prefixed `key=value` counts header,
 a TSV column line, tab-separated rows (partial reads on their own rows). Asserted on a small
 committed fixture: **one locus per `SsrSegment`** (incl uncovered), **every fetched read accounted
@@ -181,12 +181,16 @@ for** (complete / partial / capped / no-observation), **byte-identical across re
 **unchanged when the cap is raised above the fixture's deepest locus** (a cap below must change the
 output). *Depends:* D. *Source:* spec §9.
 
-**☐ E2. The parity oracle — the port anchor.**
+**✅ E2. The parity oracle — the port anchor.** *(committed; an in-crate test comparing ng's
+real classify+tally against production's real `delimit_read`+`tally`, rather than the dump-tool
+fixture, so it can call the frozen production oracle directly — the reservoir-parity precedent.)*
 Against production's `SsrLocusObs.observed` on the shared fixture: every **complete** observation
 matches **byte for byte** (bases and count), **with the cap disabled**, on a fixture **shallower
 than the cap** — the one precondition, without which parity cannot pass by construction (spec §4,
 §6). And **partial observations exist**, which proves the relevance gate (D1) actually admitted the
-partially-covering reads. *Depends:* E1, the production oracle. *Source:* spec §6, §9.
+partially-covering reads. *Depends:* E1, the production oracle. *Source:* spec §6, §9. **Result:**
+byte-identical on two distinct clean alleles; expansion/soft-clip/widening parity noted as out of
+scope (they leave the non-widening regime the production-side reproduction models).
 
 > **Checkpoint E:** complete-observation parity with production is green; partials are present and
 > measured. **The STR generator is complete.** Pause for review.
