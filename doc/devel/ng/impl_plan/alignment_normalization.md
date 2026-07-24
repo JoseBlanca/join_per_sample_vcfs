@@ -109,7 +109,7 @@ Verified by A2 on a fixture, plus byte-parity of the resulting operations agains
 
 ### Milestone C — 1b and 1c
 
-**☐ C1. `left_align_repeated.rs` — repeated simple passes.**
+**✅ C1. `left_align_repeated.rs` — repeated simple passes.**
 Re-run a simple shift pass until nothing moves, bounded (freebayes uses 20). **Do not copy
 freebayes' handling of exhaustion:** it returns a failure flag its own caller ignores, so
 non-convergent results ship silently (arch §5). Here, exhaustion is reported. Verified by A2.
