@@ -105,7 +105,7 @@ single term and the result is a base-by-base comparison under a **single flat er
 per-base qualities. Tests: an exact match scores `(1−ε)^len`; one substitution costs exactly a factor
 `(ε/3)/(1−ε)`. *Depends:* A2. *Source:* spec §5.1, arch §5.
 
-**☐ B2. The unequal-length forward, with interior gaps forbidden. Own commit; do not bundle.**
+**✅ B2. The unequal-length forward, with interior gaps forbidden. Own commit; do not bundle.**
 The banded forward summing the few ways a length difference can be absorbed by gaps **within a couple
 of bases of either end**. **The interior-gap restriction is load-bearing and must be ported, not
 tidied away:** an indel in the middle of the repeat is what the *stutter* model explains, and letting

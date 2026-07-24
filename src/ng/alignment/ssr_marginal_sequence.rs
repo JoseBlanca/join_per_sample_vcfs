@@ -45,6 +45,39 @@
 
 use crate::ng::types::DomainError;
 
+/// Bases of slop tolerated at each end of a sequence: a gap is admitted only within this
+/// many positions of either end, the interior being diagonal-only. **Ported verbatim from
+/// production's `FLANK_SLOP`** ([src/ssr/cohort/pair_hmm.rs](../../../ssr/cohort/pair_hmm.rs)),
+/// and the restriction it enforces is **load-bearing, not an optimisation**: an indel in the
+/// middle of the repeat is what the *stutter* model explains, so letting this algorithm
+/// explain it too would make base error and slippage indistinguishable (spec §5.1). Confining
+/// gaps to the ends is what keeps the base-error rate and the stutter rate separately
+/// estimable.
+const FLANK_SLOP: usize = 2;
+
+/// The reused forward-matrix buffer for the unequal-length case (B2), so scoring a locus's
+/// reads allocates once rather than per read — the caller owns it and hands it back each
+/// call, exactly as production's `HmmScratch` does. Empty until first used and grown on
+/// demand; it decides nothing about a result, so its `Default` is safe as the trait's
+/// `Scratch` bound requires.
+///
+/// The equal-length case needs no matrix and ignores this.
+#[derive(Debug, Default)]
+pub struct SequenceMarginalScratch {
+    /// The flattened `(m+1) × (n+1)` forward matrix, `m`/`n` the two sequence lengths.
+    /// Compute is band-limited but the buffer is the full matrix — memory is not banded,
+    /// which is fine at repeat sizes (production makes the same tradeoff).
+    cells: Vec<f64>,
+}
+
+impl SequenceMarginalScratch {
+    /// A fresh, empty buffer.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
 /// The sequence-versus-sequence marginal aligner (algorithm 5).
 ///
 /// A stateless value carrying only its flat per-base error rate ε, so it can be held by
@@ -101,10 +134,6 @@ impl SsrSequenceMarginal {
     /// the false-confidence trap this project has recorded more than once.
     ///
     /// [`MarginalAligner`]: super::MarginalAligner
-    // `dead_code` in the plain lib build only: this is exercised by the B1 tests and wired
-    // to the `MarginalAligner` impl in B3, which removes this allow. B2 extends it with the
-    // unequal-length forward in between.
-    #[allow(dead_code)]
     fn equal_length_probability(&self, read: &[u8], reference: &[u8]) -> f64 {
         debug_assert_eq!(
             read.len(),
@@ -116,20 +145,126 @@ impl SsrSequenceMarginal {
         }
         substitution_product(read, reference, self.eps)
     }
+
+    /// The full ported function's probability — **linear**, to become a
+    /// [`LogProb`](crate::ng::types::LogProb) only at the trait boundary (B3). This is the
+    /// dispatch `align_subst` itself performs
+    /// ([src/ssr/cohort/pair_hmm.rs](../../../ssr/cohort/pair_hmm.rs)):
+    ///
+    /// - **equal lengths** → [`Self::equal_length_probability`], the single-term sum (which
+    ///   itself splits the exact-match fast path from the substitution product);
+    /// - **different lengths** → [`banded_forward`], summing the few ways the length
+    ///   difference is absorbed by **end** gaps.
+    ///
+    /// **This routing is the real guarantee** that `equal_length_probability` only ever sees
+    /// equal-length input — the thing its `debug_assert!` merely documents, since that
+    /// assertion compiles out of release. Which is why the length test lives here, not on the
+    /// assertion.
+    //
+    // This is the single entry point of the dead-until-B3 chain: nothing calls it in the plain
+    // lib build until B3 wires the `MarginalAligner` impl, but everything it calls
+    // (`equal_length_probability`, `banded_forward`, and their callees) counts as *used*
+    // through it, so the attribute belongs here alone. `expect`, not `allow`, and deliberately:
+    // once B3 makes this reachable the expectation is unfulfilled, so
+    // `unfulfilled_lint_expectations` fails the build under `-D warnings` until the attribute is
+    // removed — a compiler backstop for the removal rather than a manual B3-checklist item. It
+    // is gated `cfg(not(test))` because in the *test* build this IS used (by the tests below),
+    // where an unconditional `expect(dead_code)` would itself be unfulfilled and fail `--tests`.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "single entry point of the chain wired in B3")
+    )]
+    fn linear_probability(
+        &self,
+        read: &[u8],
+        reference: &[u8],
+        scratch: &mut SequenceMarginalScratch,
+    ) -> f64 {
+        if read.len() == reference.len() {
+            self.equal_length_probability(read, reference)
+        } else {
+            banded_forward(read, reference, self.eps, scratch)
+        }
+    }
 }
 
 /// The closed-form substitution score for two equal-length sequences: a match scores
 /// `1 − ε`, a mismatch `ε / 3`, multiplied across the columns. A free function taking ε,
 /// mirroring the source's `substitution_product` so the port reads against it.
-// `dead_code` in the plain lib build only until B3 wires the trait — see
-// `equal_length_probability`.
-#[allow(dead_code)]
 fn substitution_product(read: &[u8], reference: &[u8], eps: f64) -> f64 {
     let mismatch = eps / 3.0;
     read.iter()
         .zip(reference)
         .map(|(a, b)| if a == b { 1.0 - eps } else { mismatch })
         .product()
+}
+
+/// Whether position `pos` (0-based) lies in either flank of a sequence of length `len` —
+/// within [`FLANK_SLOP`] of either end. Ported verbatim from production's `in_flank`.
+fn in_flank(pos: usize, len: usize) -> bool {
+    pos < FLANK_SLOP || pos + FLANK_SLOP >= len
+}
+
+/// The banded forward sum for **unequal-length** sequences, gaps confined to the flanks.
+///
+/// A faithful port of production's `banded_forward`
+/// ([src/ssr/cohort/pair_hmm.rs](../../../ssr/cohort/pair_hmm.rs)). `read` has length `m`,
+/// `reference` length `n`; the length difference is absorbed by gaps, but **only within
+/// [`FLANK_SLOP`] of either end** — a gap touching an interior position is not admitted, so
+/// an interior indel is *not competed* against an end gap and scores far below one. That
+/// restriction is the whole point (spec §5.1): it is what keeps a sequencing error and a
+/// stutter slip separately identifiable, and porting it — rather than writing a general
+/// forward that would run fine and silently destroy that separation — is why this is its own
+/// step.
+///
+/// The forward runs in **linear** probabilities: each cell sums its reachable predecessors
+/// times the transition (a diagonal emission `1 − ε` / `ε/3`, or an end gap `ε`), and the
+/// answer is the bottom-right cell. Cells outside the band `|i − j| ≤ |m − n| + FLANK_SLOP`
+/// stay zero. The band floor is arithmetic — a global alignment must consume both sequences,
+/// so the path is forced `|m − n|` off the diagonal — plus the flank slop as headroom.
+fn banded_forward(
+    read: &[u8],
+    reference: &[u8],
+    eps: f64,
+    scratch: &mut SequenceMarginalScratch,
+) -> f64 {
+    let m = read.len();
+    let n = reference.len();
+    let band = m.abs_diff(n) + FLANK_SLOP;
+    let gap = eps; // a flank-slop base is error-like under the flat emission, as in the source.
+    let mismatch = eps / 3.0;
+    let emit = |a: u8, b: u8| if a == b { 1.0 - eps } else { mismatch };
+
+    let width = n + 1;
+    scratch.cells.clear();
+    scratch.cells.resize((m + 1) * width, 0.0);
+    let at = |i: usize, j: usize| i * width + j;
+    scratch.cells[at(0, 0)] = 1.0;
+
+    for i in 0..=m {
+        for j in 0..=n {
+            if i == 0 && j == 0 {
+                continue;
+            }
+            if i.abs_diff(j) > band {
+                continue;
+            }
+            let mut acc = 0.0;
+            if i > 0 && j > 0 {
+                acc += scratch.cells[at(i - 1, j - 1)] * emit(read[i - 1], reference[j - 1]);
+            }
+            // Insertion: consume read[i-1] against a gap in the reference — flank only.
+            if i > 0 && in_flank(i - 1, m) {
+                acc += scratch.cells[at(i - 1, j)] * gap;
+            }
+            // Deletion: consume reference[j-1] against a gap in the read — flank only.
+            if j > 0 && in_flank(j - 1, n) {
+                acc += scratch.cells[at(i, j - 1)] * gap;
+            }
+            scratch.cells[at(i, j)] = acc;
+        }
+    }
+    scratch.cells[at(m, n)]
 }
 
 #[cfg(test)]
@@ -246,5 +381,175 @@ mod tests {
         ));
         assert!(SsrSequenceMarginal::try_new(f64::NAN).is_err());
         assert!(SsrSequenceMarginal::try_new(f64::INFINITY).is_err());
+    }
+
+    // ---- B2: the unequal-length banded forward -----------------------------------------
+    //
+    // Driven **deliberately** through `linear_probability` (the dispatcher), because the
+    // caller algorithm 5 was written for — production's read-likelihood model — always makes
+    // the two sequences equal-length first, so it NEVER reaches this branch (spec §5.1). A
+    // test built by imitating that caller would leave the forward pass untouched.
+
+    /// **The assertion that pins the interior-gap restriction — the point of the whole step.**
+    /// An indel in the *middle* of the tract must score far below an end gap of the same
+    /// size. It is not that the interior indel loses a close contest: an interior gap is not
+    /// admitted at all, so it is never competed against an end gap — it can only be reached
+    /// as a run of substitutions, which costs orders of magnitude more. A general forward
+    /// that allowed interior gaps would score the two comparably and silently destroy the
+    /// base-error-vs-stutter separability this restriction exists to keep.
+    #[test]
+    fn an_interior_indel_scores_far_below_an_end_gap() {
+        let a = aligner(EPS);
+        let mut scratch = SequenceMarginalScratch::new();
+        let reference = b"CACACACACACA"; // 12 bp
+        let end_indel = b"CACACACACACAC"; // one extra base at the trailing flank
+        let mut interior_indel = reference.to_vec();
+        interior_indel.insert(6, b'G'); // one extra base in the middle of the tract
+        assert_eq!(end_indel.len(), reference.len() + 1);
+        assert_eq!(interior_indel.len(), reference.len() + 1);
+
+        let end = a.linear_probability(end_indel, reference, &mut scratch);
+        let interior = a.linear_probability(&interior_indel, reference, &mut scratch);
+        assert!(
+            interior < end * 1e-3,
+            "interior indel ({interior}) must score far below an end gap ({end})"
+        );
+    }
+
+    /// A single end (flank) indel *is* scored, and tracks the clean end-gap path: the
+    /// diagonal over all of the reference, then one gap at the flank, `(1 − ε)^len · ε`.
+    #[test]
+    fn a_single_end_indel_is_scored() {
+        let a = aligner(EPS);
+        let mut scratch = SequenceMarginalScratch::new();
+        let reference = b"CACACACA";
+        let read = b"CACACACAC"; // one extra base at the trailing flank
+        let got = a.linear_probability(read, reference, &mut scratch);
+        let clean_end_gap_path = (1.0 - EPS).powi(8) * EPS;
+        assert!(got > 0.0);
+        assert!(
+            (got / clean_end_gap_path - 1.0).abs() < 0.05,
+            "end-indel score {got} should track the clean end-gap path {clean_end_gap_path}"
+        );
+    }
+
+    /// **The dispatcher routes by length — the structural guarantee behind B1's debug-only
+    /// assertion.** An equal-length pair goes to the single-term sum (identical to calling
+    /// `equal_length_probability` directly); an unequal-length pair goes to the forward and
+    /// comes back a valid probability — crucially *without* reaching (and tripping) the
+    /// equal-length arm's precondition. This is what actually keeps that arm off unequal
+    /// input, which is why the length guarantee is tested here rather than on the assertion.
+    #[test]
+    fn linear_probability_routes_equal_and_unequal_lengths_to_the_right_arm() {
+        let a = aligner(EPS);
+        let mut scratch = SequenceMarginalScratch::new();
+
+        // Equal length → exactly the single-term sum.
+        let via_dispatch = a.linear_probability(b"CACACACA", b"CACAGACA", &mut scratch);
+        assert_eq!(
+            via_dispatch,
+            a.equal_length_probability(b"CACACACA", b"CACAGACA")
+        );
+
+        // Unequal length → the forward, a valid probability, no panic.
+        let unequal = a.linear_probability(b"CACACACAC", b"CACACACA", &mut scratch);
+        assert!(unequal > 0.0 && unequal <= 1.0, "unequal score {unequal}");
+    }
+
+    /// The unequal-length forward returns a probability in `[0, 1]` — the boundary-slop
+    /// normalisation defect lets the total mass over *differing-length* outputs slightly
+    /// exceed one, but any single score is still a probability.
+    #[test]
+    fn a_longer_read_returns_a_probability_in_the_unit_interval() {
+        let a = aligner(EPS);
+        let mut scratch = SequenceMarginalScratch::new();
+        let p = a.linear_probability(b"CACACAC", b"CACACA", &mut scratch);
+        assert!((0.0..=1.0).contains(&p), "p = {p}");
+    }
+
+    /// A reused scratch buffer gives a bit-identical result to a fresh one, even after being
+    /// primed by an unrelated, larger alignment — the buffer decides nothing, which is what
+    /// the trait's `Scratch: Default` contract requires and what keeps the cohort's
+    /// byte-identity guarantee intact.
+    #[test]
+    fn a_reused_scratch_gives_a_bit_identical_result() {
+        let a = aligner(EPS);
+        let mut primed = SequenceMarginalScratch::new();
+        let mut fresh = SequenceMarginalScratch::new();
+        let reference = b"CACACACA";
+        let read = b"CACACACAC";
+        // Prime with an unrelated, larger alignment, then reuse.
+        let _ = a.linear_probability(b"CACACACACACA", b"CACA", &mut primed);
+        let reused = a.linear_probability(read, reference, &mut primed);
+        let clean = a.linear_probability(read, reference, &mut fresh);
+        assert_eq!(reused.to_bits(), clean.to_bits());
+    }
+
+    /// `in_flank` marks exactly the [`FLANK_SLOP`] positions at each end and nothing in
+    /// between — the boundary that admits an end gap but forbids an interior one.
+    #[test]
+    fn in_flank_marks_only_the_ends() {
+        // len 8, FLANK_SLOP 2: positions 0,1 and 6,7 are flank; 2..=5 are interior.
+        let flags: Vec<bool> = (0..8).map(|pos| in_flank(pos, 8)).collect();
+        assert_eq!(
+            flags,
+            vec![true, true, false, false, false, false, true, true]
+        );
+    }
+
+    /// **The forward is symmetric in its two sequences, which drives the deletion side.** The
+    /// insertion transition (`in_flank(i-1, m)`) and the deletion transition
+    /// (`in_flank(j-1, n)`) are mirror images: scoring the longer sequence as the read
+    /// exercises the first, scoring it as the reference exercises the second, and the two must
+    /// agree. Without this, a regression that mishandled the *deletion* branch — read shorter
+    /// than reference — would slip past every other test, which only ever makes the read the
+    /// longer or equal sequence. Approximate, not bit-exact: the two fills add the insertion
+    /// and deletion terms in opposite order, so they round differently by a ULP.
+    #[test]
+    fn the_forward_is_symmetric_so_the_deletion_side_is_scored() {
+        let a = aligner(EPS);
+        let mut scratch = SequenceMarginalScratch::new();
+        let longer = b"GGACGTACGT"; // 10 bp: the 8-bp sequence with two leading-flank bases
+        let shorter = b"ACGTACGT"; // 8 bp
+        let read_longer = a.linear_probability(longer, shorter, &mut scratch); // insertion side
+        let read_shorter = a.linear_probability(shorter, longer, &mut scratch); // deletion side
+        assert!(read_longer > 0.0 && read_shorter > 0.0);
+        assert!(
+            (read_longer - read_shorter).abs() < 1e-15,
+            "symmetric: read-longer {read_longer} vs read-shorter {read_shorter}"
+        );
+    }
+
+    /// **The band floor is `|m − n|`, not `FLANK_SLOP` — and that is load-bearing.** A length
+    /// difference of 3 (beyond `FLANK_SLOP` = 2) is reachable only because the band widens by
+    /// the length difference: two end gaps at the leading flank and one at the trailing flank
+    /// give a valid line-up, and the final cell sits `|m − n| = 3` off the diagonal. Drop the
+    /// `|m − n|` term from the band — a plausible "simplification" — and the answer cell falls
+    /// outside a `FLANK_SLOP`-only band and the score collapses to `0.0`, silently losing every
+    /// stutter event larger than the slop. All the other unequal-length tests use a difference
+    /// of 1, so only this one would catch that.
+    #[test]
+    fn the_band_floor_admits_a_length_difference_beyond_the_flank_slop() {
+        let a = aligner(EPS);
+        let mut scratch = SequenceMarginalScratch::new();
+        let reference = b"ACGTACGT"; // 8 bp
+        let read = b"GGACGTACGTA"; // 11 bp: "GG" prepended, "A" appended — three end gaps
+        assert_eq!(read.len(), reference.len() + 3);
+        let got = a.linear_probability(read, reference, &mut scratch);
+        assert!(
+            got > 0.0 && got <= 1.0,
+            "a length-3 difference must score above zero (band floor); got {got}"
+        );
+    }
+
+    /// An empty read against a reference longer than `2 · FLANK_SLOP` scores exactly `0`: it
+    /// could only be produced by deleting the whole reference, but interior deletions are
+    /// forbidden, so no line-up reaches the end — the interior-gap restriction at its extreme.
+    #[test]
+    fn an_empty_read_cannot_delete_a_long_references_interior() {
+        let a = aligner(EPS);
+        let mut scratch = SequenceMarginalScratch::new();
+        let p = a.linear_probability(b"", b"ACGTACGT", &mut scratch); // 0 vs 8 bp
+        assert_eq!(p, 0.0);
     }
 }
