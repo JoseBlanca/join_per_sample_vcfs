@@ -38,6 +38,14 @@
 //! A misplaced indel is a **wrong variant, not a crash**. So 1a lands as its own commit with the
 //! property test green and byte-parity established, so that if indel placement ever moves, `git
 //! bisect` lands here rather than in a bundle (plan step B1).
+//!
+//! # Algorithm 1c also lives here
+//!
+//! [`FixpointLeftAligner`] (1c) is a thin wrapper that applies 1a to a fixpoint, with an iteration
+//! cap as a safety net that **fails loudly** (panics) rather than returning a half-normalised
+//! alignment. It shares this file with 1a because it *is* 1a in a loop — no shifting of its own
+//! (arch §Module home). It is the deliberate contrast with algorithm 1b, which *reports* cap
+//! exhaustion instead of panicking on it.
 
 use super::{Alignment, AlignmentNormalizer};
 // A behavioural back-reference into the pipeline-stage module `pileup::walker`, deliberate under
@@ -82,6 +90,84 @@ impl AlignmentNormalizer for StructuredLeftAligner {
         let reference_from_placement = &reference[offset..];
         left_align_indels(&mut alignment.cigar, read, reference_from_placement);
     }
+}
+
+/// The most times [`FixpointLeftAligner`] applies its inner normalizer before giving up.
+///
+/// A correct [`StructuredLeftAligner`] reaches its fixpoint in **at most two** applications — one to
+/// left-align, one to confirm nothing moved (`left_align_indels` is idempotent on already-leftmost
+/// input). The cap sits well above that as a safety net: reaching it means the inner normalizer is
+/// **not converging**, which is a defect, and 1c panics rather than return a half-normalised
+/// alignment.
+pub const FIXPOINT_MAX_ITERATIONS: u32 = 8;
+
+// Compile-time guard: the cap must leave room for the two applications a correct 1a needs (one to
+// left-align, one to confirm). Lowering it below that would panic on every real shifting read — a
+// regression the runtime tests, which use explicit small caps, would not all catch.
+const _: () = assert!(
+    FIXPOINT_MAX_ITERATIONS >= 2,
+    "FIXPOINT_MAX_ITERATIONS must allow the two applications a one-pass fixpoint needs"
+);
+
+/// Algorithm 1c: apply algorithm 1a repeatedly until the alignment stops changing, with the
+/// iteration cap as a safety net that **fails loudly**.
+///
+/// It is a **thin wrapper over 1a**, not a third implementation of the shifting: [`drive_to_fixpoint`]
+/// does no left-alignment of its own — it only re-applies [`StructuredLeftAligner`] and watches for
+/// a fixpoint. Its whole reason to exist is what it does when the fixpoint is *not* reached within
+/// the cap: it **panics**, rather than returning a half-normalised alignment the way freebayes'
+/// capped loop silently does (spec §6). That is the deliberate contrast with algorithm 1b, which
+/// *reports* exhaustion as a return value; 1c *fails loudly* on it. Because 1a is a proper one-pass
+/// fixpoint, 1c converges in two iterations on every real input and never trips the cap — the panic
+/// is a guard against a broken inner normalizer, not an expected outcome.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FixpointLeftAligner;
+
+impl AlignmentNormalizer for FixpointLeftAligner {
+    /// Left-align to a fixpoint by re-applying 1a. **Panics** if the alignment has not stopped
+    /// changing after [`FIXPOINT_MAX_ITERATIONS`] applications — see the type docs.
+    fn normalize(&self, alignment: &mut Alignment, read: &[u8], reference: &[u8]) {
+        drive_to_fixpoint(
+            &StructuredLeftAligner,
+            alignment,
+            read,
+            reference,
+            FIXPOINT_MAX_ITERATIONS,
+        );
+    }
+}
+
+/// Apply `inner` to `alignment` until it stops changing, up to `max_iterations` times; **panic** if
+/// it has not converged by then.
+///
+/// This is the fixpoint machinery 1c is built from, factored out and generic so the cap-exhaustion
+/// path can be driven in tests with a normalizer that never stabilises — the real inner (1a) never
+/// reaches it. It performs **no** left-alignment itself: it clones the whole [`Alignment`] (so a
+/// change in `reference_offset`, not just the cigar, counts as movement), re-applies `inner`, and
+/// stops the instant an application changes nothing. Failing to converge is a **loud** panic, never
+/// a quietly half-normalised return.
+fn drive_to_fixpoint<N: AlignmentNormalizer>(
+    inner: &N,
+    alignment: &mut Alignment,
+    read: &[u8],
+    reference: &[u8],
+    max_iterations: u32,
+) {
+    for _ in 0..max_iterations {
+        let before = alignment.clone();
+        inner.normalize(alignment, read, reference);
+        if *alignment == before {
+            return;
+        }
+    }
+    panic!(
+        "left-alignment did not reach a fixpoint within {max_iterations} iterations — the inner \
+         normalizer is not converging; refusing to return a half-normalised alignment\n  \
+         alignment: {:?}\n  read: {:?}\n  reference: {:?}",
+        alignment,
+        std::str::from_utf8(read).unwrap_or("<non-utf8>"),
+        std::str::from_utf8(reference).unwrap_or("<non-utf8>"),
+    );
 }
 
 #[cfg(test)]
@@ -386,5 +472,120 @@ mod tests {
                 "case {index}: wrapper diverged from left_align_indels",
             );
         }
+    }
+
+    // ---- Algorithm 1c: the fixpoint wrapper (plan step C2) ----------------------------
+
+    /// A stand-in normalizer that **never** reaches a fixpoint — it changes the alignment on every
+    /// application (by advancing the offset). Used to drive [`drive_to_fixpoint`]'s cap-exhaustion panic
+    /// deliberately; the real inner (1a) converges and never reaches that path.
+    struct NonConvergingNormalizer;
+    impl AlignmentNormalizer for NonConvergingNormalizer {
+        fn normalize(&self, alignment: &mut Alignment, _read: &[u8], _reference: &[u8]) {
+            alignment.reference_offset += 1;
+        }
+    }
+
+    #[test]
+    fn the_fixpoint_wrapper_left_aligns_and_stays_leftmost() {
+        let mut alignment = align(0, vec![Match(4), Deletion(1), Match(1)]);
+        FixpointLeftAligner.normalize(&mut alignment, b"GAAAT", b"GAAAAT");
+        assert_eq!(alignment.cigar, vec![Match(1), Deletion(1), Match(4)]);
+        assert!(is_left_aligned(&alignment, b"GAAAT", b"GAAAAT"));
+        assert_left_aligned(&alignment, b"GAAAT", b"GAAAAT");
+    }
+
+    #[test]
+    fn an_already_leftmost_input_reaches_the_fixpoint_without_shifting() {
+        // The one-iteration path: an input already leftmost is a fixpoint on the first application,
+        // so 1c returns it unchanged and does not panic.
+        let mut alignment = align(0, vec![Match(1), Deletion(1), Match(4)]);
+        FixpointLeftAligner.normalize(&mut alignment, b"GAAAT", b"GAAAAT");
+        assert_eq!(alignment.cigar, vec![Match(1), Deletion(1), Match(4)]);
+    }
+
+    #[test]
+    fn the_fixpoint_wrapper_agrees_with_the_single_pass() {
+        // 1c is 1a in a loop, and 1a is already a fixpoint, so the two produce identical output.
+        let cases = [
+            Case {
+                offset: 0,
+                cigar: vec![Match(4), Deletion(1), Match(1)],
+                read: b"GAAAT",
+                reference: b"GAAAAT",
+            },
+            Case {
+                offset: 0,
+                cigar: vec![Match(4), Insertion(1), Match(1)],
+                read: b"GAAAAT",
+                reference: b"GAAAT",
+            },
+            Case {
+                offset: 0,
+                cigar: vec![Match(5), Deletion(2)],
+                read: b"CATAT",
+                reference: b"CATATAT",
+            },
+            Case {
+                offset: 2,
+                cigar: vec![Match(4), Deletion(1), Match(1)],
+                read: b"GAAAT",
+                reference: b"TTGAAAAT",
+            },
+        ];
+        for (index, case) in cases.iter().enumerate() {
+            let mut fixpoint = align(case.offset, case.cigar.clone());
+            FixpointLeftAligner.normalize(&mut fixpoint, case.read, case.reference);
+
+            let mut structured = align(case.offset, case.cigar.clone());
+            StructuredLeftAligner.normalize(&mut structured, case.read, case.reference);
+
+            assert_eq!(fixpoint, structured, "case {index}: 1c and 1a disagree");
+        }
+    }
+
+    #[test]
+    fn a_correct_inner_converges_within_two_iterations() {
+        // 1a needs exactly two iterations (one to left-align, one to confirm no change), so a cap of
+        // two is enough and must NOT panic.
+        let mut alignment = align(0, vec![Match(4), Deletion(1), Match(1)]);
+        drive_to_fixpoint(
+            &StructuredLeftAligner,
+            &mut alignment,
+            b"GAAAT",
+            b"GAAAAT",
+            2,
+        );
+        assert_eq!(alignment.cigar, vec![Match(1), Deletion(1), Match(4)]);
+    }
+
+    #[test]
+    #[should_panic(expected = "did not reach a fixpoint")]
+    fn a_deliberately_capped_run_surfaces_the_failure_rather_than_swallowing_it() {
+        // The whole point of 1c: a run that cannot converge within its cap **panics**, it does not
+        // return a half-normalised alignment. Driven with an inner that never stabilises.
+        let mut alignment = align(0, vec![Match(3)]);
+        drive_to_fixpoint(
+            &NonConvergingNormalizer,
+            &mut alignment,
+            b"ACG",
+            b"ACG",
+            FIXPOINT_MAX_ITERATIONS,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "did not reach a fixpoint")]
+    fn a_cap_of_one_cannot_confirm_convergence_and_panics() {
+        // A single iteration left-aligns but cannot confirm stability, so the safety net fires even
+        // with the real, correct 1a — the cap guards the confirmation, not just non-convergence.
+        let mut alignment = align(0, vec![Match(4), Deletion(1), Match(1)]);
+        drive_to_fixpoint(
+            &StructuredLeftAligner,
+            &mut alignment,
+            b"GAAAT",
+            b"GAAAAT",
+            1,
+        );
     }
 }

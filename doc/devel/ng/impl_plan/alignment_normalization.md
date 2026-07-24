@@ -115,7 +115,7 @@ freebayes' handling of exhaustion:** it returns a failure flag its own caller ig
 non-convergent results ship silently (arch §5). Here, exhaustion is reported. Verified by A2.
 *Depends:* B1. *Source:* spec §6, arch §5.
 
-**☐ C2. 1c — the fixpoint wrapper.**
+**✅ C2. 1c — the fixpoint wrapper.**
 1a applied repeatedly until nothing moves, with the iteration cap as a safety net that **fails
 loudly** rather than returning a half-normalised alignment. A thin wrapper over 1a, not a third
 implementation of the shifting. Verified by A2, plus a test that a deliberately-capped run surfaces
