@@ -99,7 +99,7 @@ for one that needs the geometry. No implementations. *Depends:* A1. *Source:* ar
 
 ### Milestone B — algorithm 5, the sequence marginal
 
-**☐ B1. The equal-length case.**
+**✅ B1. The equal-length case.**
 When the two sequences are the same length there is exactly one way to line them up, so the sum has a
 single term and the result is a base-by-base comparison under a **single flat error rate** — not
 per-base qualities. Tests: an exact match scores `(1−ε)^len`; one substitution costs exactly a factor
