@@ -2,6 +2,33 @@
 //! gap inside the repeat**. This is ng's tract delimiter, and the module's **only
 //! byte-parity oracle**.
 //!
+//! # Not the recommended delimiter — kept as the oracle and the baseline
+//!
+//! **[`super::ssr_best_path_unit_slip`] (algorithm 4) measured better and is the recommended
+//! STR delimiter.** On synthetic reads with known truth it was uniformly more accurate and
+//! free of the small reference-pull bias this flat-gap model carries (the D2 comparison,
+//! `doc/devel/reports/research/ssr_delimiter_3v4_comparison_2026-07-23.md`). So a new caller
+//! that just wants to measure a repeat should reach for algorithm 4, not this.
+//!
+//! Algorithm 3 is **retained deliberately, not deprecated**, for two reasons that outrank the
+//! measurement result:
+//!
+//! - **It is the module's only byte-parity oracle.** This is a port of production's
+//!   `delimit_read`, held byte-identical to it over a 200,000-case soak (`delimit_parity`).
+//!   Algorithm 4 has **no oracle of its own** — its correctness rests on the differential
+//!   cross-check *against this aligner* (`algorithm_4_agrees_with_algorithm_3_on_clean_reads`).
+//!   Removing or disabling algorithm 3 would delete the only thing that validates algorithm 4.
+//! - **Adoption is not settled here.** D2 measured which ruler is more accurate; whether to
+//!   *adopt* algorithm 4 turns on the genotype comparison, which spans this module and the
+//!   genotyping that composes it (spec §10.3) and has not run. The measurement points to 4;
+//!   the decision is downstream.
+//!
+//! So this is not disabled by a panic or removed: doing either would break the oracle and the
+//! validation of the algorithm it would be promoting. The steering belongs at the **selection
+//! site** — when the STR read preparer is wired up it should instantiate algorithm 4, and any
+//! future user-facing choice should omit algorithm 3 from its menu while keeping the type
+//! compilable for these tests.
+//!
 //! It is the same alignment as the affine aligner, but with two gap regimes along the
 //! reference: a **stiff** gap in the flanks and a **soft** one inside the tract. The
 //! reasoning is that flanks are clean unique sequence and should hold the tract's edges in

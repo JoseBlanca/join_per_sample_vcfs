@@ -13,7 +13,15 @@
 //! and can be shown byte-identical to it; algorithm 4 is new (arch §5: "no production
 //! counterpart"), so it is *measured*, not verified. Its tests establish that it computes
 //! what it claims — the three properties the spec makes mandatory, plus the degenerate cases
-//! — not that it matches an external truth.
+//! — not that it matches an external truth. What confidence it has comes from the differential
+//! against algorithm 3 (the byte-parity-validated sibling), which is exactly why algorithm 3
+//! is kept rather than deleted (see [`super::ssr_best_path_flat_gap`]).
+//!
+//! **This is the recommended STR delimiter.** It measured better than algorithm 3 in the D2
+//! comparison (`doc/devel/reports/research/ssr_delimiter_3v4_comparison_2026-07-23.md`) — more
+//! accurate, and without the small reference-pull bias the flat-gap model carries. Whether to
+//! formally *adopt* it turns on the genotype comparison, which lives with the genotyping
+//! (spec §10.3) and has not run; the measurement evidence points here.
 //!
 //! # The recurrence, and the three decisions behind it
 //!
