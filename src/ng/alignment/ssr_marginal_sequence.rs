@@ -702,4 +702,50 @@ mod tests {
             );
         }
     }
+
+    /// **C2 — the sequence marginal scores its own generating allele highest.** A read whose
+    /// *measured repeat* is a *k*-unit tract (with two substitution errors) scores higher
+    /// against the *k*-unit candidate than against a neighbour (k±1, k±2): a length mismatch is
+    /// absorbed only as end gaps and pays for it, and a mismatch of more than the flank slop is
+    /// unreachable altogether. The ordering is **stable across the flat error rate**. This is
+    /// what "computes what it claims" means for algorithm 5 *in isolation* — composing the
+    /// stutter model that would properly price the length change is the genotyping's, not this
+    /// module's (spec §5.1, §10.3).
+    #[test]
+    fn the_sequence_marginal_scores_its_generating_allele_highest() {
+        let unit = b"CAG";
+        for truth in [6usize, 10] {
+            // The read's measured repeat: a truth-unit tract with two *real* substitution
+            // errors — tract[1] is `A` (→ `T`) and tract[5] is `G` (→ `T`).
+            let mut read = unit.repeat(truth);
+            read[1] = b'T';
+            read[5] = b'T';
+
+            for eps in [0.001, 0.05] {
+                let a = SsrSequenceMarginal::try_new(eps).expect("eps in [0, 1]");
+                let mut scratch = SequenceMarginalScratch::new();
+                let mut truth_score = f64::NEG_INFINITY;
+                let mut best_neighbour = f64::NEG_INFINITY;
+                for units in (truth - 2)..=(truth + 2) {
+                    let candidate = unit.repeat(units);
+                    let s = a
+                        .marginal_probability(&read, &candidate, (), &mut scratch)
+                        .get();
+                    if units == truth {
+                        truth_score = s;
+                    } else {
+                        best_neighbour = best_neighbour.max(s);
+                    }
+                }
+                // The equal-length candidate needs no gaps; a neighbour pays end-gap penalties
+                // (k±1) or is unreachable beyond the flank slop (k±2 → −∞). Either way the
+                // truth wins by a clear margin, not a rounding-width one.
+                assert!(
+                    truth_score > best_neighbour + 1.0,
+                    "at eps {eps}, truth={truth}: {truth_score} must beat the best neighbour \
+                     {best_neighbour} by a clear margin"
+                );
+            }
+        }
+    }
 }

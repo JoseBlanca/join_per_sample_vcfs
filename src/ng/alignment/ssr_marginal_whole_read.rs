@@ -539,4 +539,54 @@ mod tests {
         // Three-way, with one impossible term ignored.
         assert!((ln_sum3(0.0, 0.0, ni) - 2.0f64.ln()).abs() < 1e-15);
     }
+
+    /// **C2 — the whole-read forward scores its own generating allele highest.** A read
+    /// generated from a *k*-unit allele (flanks + *k* copies, with two substitution errors in
+    /// the tract) must score higher against the *k*-unit reference than against any neighbour
+    /// (k±1, k±2), and that ordering must be **stable across the flat error rate**. This is
+    /// what "computes what it claims" means for algorithm 6 in isolation. It is deliberately
+    /// **not** a comparison against algorithm 5 — that head-to-head scores a measured repeat
+    /// against a whole read and spans the genotyping, not this module (spec §10.3).
+    #[test]
+    fn the_whole_read_forward_scores_its_generating_allele_highest() {
+        for truth in [6usize, 10] {
+            // A read from the truth allele, with two *real* substitution errors in the tract:
+            // `CAG` repeats, so tract[1] is `A` (→ `T`) and tract[5] is `G` (→ `T`).
+            let (mut read, _) = locus(LEFT, &tract(truth), RIGHT);
+            read[LEFT.len() + 1] = b'T';
+            read[LEFT.len() + 5] = b'T';
+
+            for eps in [0.001, 0.05] {
+                let a =
+                    SsrWholeReadMarginal::new(FlatEmission::try_new(eps).expect("eps in [0, 1]"));
+                let stutter = StutterModel::hipstr_shipped();
+                let mut scratch = WholeReadMarginalScratch::new();
+                let mut truth_score = f64::NEG_INFINITY;
+                let mut best_neighbour = f64::NEG_INFINITY;
+                for units in (truth - 2)..=(truth + 2) {
+                    let (reference, geometry) = locus(LEFT, &tract(units), RIGHT);
+                    let context = RepeatContext {
+                        geometry: &geometry,
+                        stutter: &stutter,
+                    };
+                    let s = a
+                        .marginal_probability(&read, &reference, context, &mut scratch)
+                        .get();
+                    if units == truth {
+                        truth_score = s;
+                    } else {
+                        best_neighbour = best_neighbour.max(s);
+                    }
+                }
+                // A strict margin, not merely argmax: one unit is a soft tract gap, several
+                // nats, so a bare "highest" that a rounding-width tie could satisfy is not
+                // enough to claim the algorithm discriminates alleles.
+                assert!(
+                    truth_score > best_neighbour + 1.0,
+                    "at eps {eps}, truth={truth}: {truth_score} must beat the best neighbour \
+                     {best_neighbour} by a clear margin"
+                );
+            }
+        }
+    }
 }

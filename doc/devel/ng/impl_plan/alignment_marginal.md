@@ -138,7 +138,7 @@ whether the design wins **before** anyone pays for the per-read storage it would
 and it keeps the per-locus observation table a tally rather than per-read records (spec §9).
 *Depends:* B3. *Source:* spec §9, §10.1.
 
-**☐ C2. Each algorithm computes what it claims.**
+**✅ C2. Each algorithm computes what it claims.**
 Not a bake-off — that spans this module and the genotyping (see Scope). Prove instead, on synthetic
 reads with known truth, that each returns the probability it says it returns: a read generated from
 an allele scores higher against that allele than against its neighbours, and the ordering is stable
