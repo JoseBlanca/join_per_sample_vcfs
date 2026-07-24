@@ -19,10 +19,11 @@
 //! shared components, the [`emission`] scoring every aligner uses and the [`stutter`] model;
 //! and the first algorithm, [`ssr_best_path_flat_gap`] — the repeat-aware delimiter, which is
 //! this module's **only byte-parity oracle** against production (`delimit_parity`, test-only).
-//! The [`MarginalAligner`] trait now has its first implementation, algorithm 5
+//! The [`MarginalAligner`] trait has two implementations: algorithm 5
 //! ([`ssr_marginal_sequence`] — the sequence-versus-sequence marginal, a linear-space port of
-//! production's `align_subst`, byte-parity-checked against it); algorithm 6 (the whole-read
-//! forward) arrives next in `doc/devel/ng/impl_plan/alignment_marginal.md`. Still to come in
+//! production's `align_subst`, byte-parity-checked against it) and algorithm 6
+//! ([`ssr_marginal_whole_read`] — the whole-read two-regime forward, new code with no port
+//! oracle, run with fixed synthetic qualities). Still to come in
 //! `doc/devel/ng/impl_plan/alignment_best_path.md`: the affine aligner (E, gated).
 
 #[cfg(test)]
@@ -31,6 +32,7 @@ pub mod emission;
 pub mod ssr_best_path_flat_gap;
 pub mod ssr_best_path_unit_slip;
 pub mod ssr_marginal_sequence;
+pub mod ssr_marginal_whole_read;
 pub mod stutter;
 
 pub use emission::{BaseScores, Emission, FlatEmission, PerQualityEmission};

@@ -130,7 +130,7 @@ so it is reproduced knowingly. *Depends:* B2. *Source:* spec §5.1, §7, arch §
 
 ### Milestone C — algorithm 6, the whole-read forward
 
-**☐ C1. The whole-read forward.**
+**✅ C1. The whole-read forward.**
 A forward over the whole read against a full flank-repeat-flank sequence, scoring with **one flat
 error rate** and **fixed synthetic qualities** — following production, which pairs a flat rate at
 scoring with a base-quality gate at read ingestion. Building it this way is deliberate: it settles
