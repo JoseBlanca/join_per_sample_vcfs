@@ -127,7 +127,7 @@ the failure instead of swallowing it. *Depends:* B1. *Source:* spec §6.
 
 ### Milestone D — the screen
 
-**☐ D1. The differ-at-all screen.**
+**✅ D1. The differ-at-all screen.**
 Run all three over the same real reads and count outputs that disagree, reported per algorithm pair.
 **This is the cheap discriminating measurement:** if the count is near zero, normalization cannot
 explain any difference in calling and that avenue closes for one run (spec §6). Land it as a small
