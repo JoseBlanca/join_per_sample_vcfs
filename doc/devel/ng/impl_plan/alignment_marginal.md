@@ -115,7 +115,7 @@ that an interior indel scores far below an end gap of the same size — the asse
 restriction. **Drive this path deliberately:** production's own caller never reaches it (see
 Principles). *Depends:* B1. *Source:* spec §5.1, arch §5.
 
-**☐ B3. The logarithm boundary. Own commit; do not bundle.**
+**✅ B3. The logarithm boundary. Own commit; do not bundle.**
 Convert at the interface: the ported function returns a plain probability, this trait returns its
 logarithm. **Isolated because its failure is silent:** a missed or doubled conversion returns a
 plausible number, not an error. Tests: parity against the ported function, compared in whichever

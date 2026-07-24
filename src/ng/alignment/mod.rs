@@ -19,10 +19,11 @@
 //! shared components, the [`emission`] scoring every aligner uses and the [`stutter`] model;
 //! and the first algorithm, [`ssr_best_path_flat_gap`] — the repeat-aware delimiter, which is
 //! this module's **only byte-parity oracle** against production (`delimit_parity`, test-only).
-//! The [`MarginalAligner`] trait is landed with no implementations yet; its algorithms 5 and 6
-//! arrive with the plan `doc/devel/ng/impl_plan/alignment_marginal.md`. Still to come in
-//! `doc/devel/ng/impl_plan/alignment_best_path.md`: the two-penalty aligner (D, landed) and the
-//! affine aligner (E, gated).
+//! The [`MarginalAligner`] trait now has its first implementation, algorithm 5
+//! ([`ssr_marginal_sequence`] — the sequence-versus-sequence marginal, a linear-space port of
+//! production's `align_subst`, byte-parity-checked against it); algorithm 6 (the whole-read
+//! forward) arrives next in `doc/devel/ng/impl_plan/alignment_marginal.md`. Still to come in
+//! `doc/devel/ng/impl_plan/alignment_best_path.md`: the affine aligner (E, gated).
 
 #[cfg(test)]
 mod delimit_parity;

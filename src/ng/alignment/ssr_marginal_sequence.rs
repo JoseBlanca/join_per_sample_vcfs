@@ -43,7 +43,8 @@
 //! requires the linear form, which the log-space component cannot provide without `exp()`
 //! round-trips that defeat parity.)
 
-use crate::ng::types::DomainError;
+use super::MarginalAligner;
+use crate::ng::types::{DomainError, LogProb};
 
 /// Bases of slop tolerated at each end of a sequence: a gap is admitted only within this
 /// many positions of either end, the interior being diagonal-only. **Ported verbatim from
@@ -160,20 +161,6 @@ impl SsrSequenceMarginal {
     /// equal-length input — the thing its `debug_assert!` merely documents, since that
     /// assertion compiles out of release. Which is why the length test lives here, not on the
     /// assertion.
-    //
-    // This is the single entry point of the dead-until-B3 chain: nothing calls it in the plain
-    // lib build until B3 wires the `MarginalAligner` impl, but everything it calls
-    // (`equal_length_probability`, `banded_forward`, and their callees) counts as *used*
-    // through it, so the attribute belongs here alone. `expect`, not `allow`, and deliberately:
-    // once B3 makes this reachable the expectation is unfulfilled, so
-    // `unfulfilled_lint_expectations` fails the build under `-D warnings` until the attribute is
-    // removed — a compiler backstop for the removal rather than a manual B3-checklist item. It
-    // is gated `cfg(not(test))` because in the *test* build this IS used (by the tests below),
-    // where an unconditional `expect(dead_code)` would itself be unfulfilled and fail `--tests`.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "single entry point of the chain wired in B3")
-    )]
     fn linear_probability(
         &self,
         read: &[u8],
@@ -267,9 +254,51 @@ fn banded_forward(
     scratch.cells[at(m, n)]
 }
 
+impl MarginalAligner for SsrSequenceMarginal {
+    type Scratch = SequenceMarginalScratch;
+    /// `()` — the sequence-versus-sequence marginal needs nothing locus-specific: it compares
+    /// two bare sequences under the fixed error rate, with no geometry (contrast algorithm 6,
+    /// whose context is the repeat geometry).
+    type Context<'a> = ();
+
+    /// **The logarithm boundary — the one place the linear result becomes a [`LogProb`].**
+    ///
+    /// `linear_probability` computes the answer in ordinary probabilities, faithfully
+    /// to production's `align_subst`; this returns its **natural logarithm**, and that single
+    /// `.ln()` is the whole of the conversion. It is isolated in its own step because the
+    /// failure mode is silent: a missing `.ln()` would return a linear probability typed as a
+    /// `LogProb`, and a doubled one `ln(ln(x))` — both plausible numbers, neither an error.
+    ///
+    /// **An unreachable line-up returns `LogProb(f64::NEG_INFINITY)`, not zero.** The linear
+    /// probability of an impossible line-up is `0.0`, and `0f64.ln()` is `-∞` — exactly the
+    /// distinction the [`LogProb`] contract exists to preserve: `-∞` is a value a caller can
+    /// see and act on, where a linear `0` is indistinguishable from underflow (arch §1, spec
+    /// §7). No special-casing is needed; `.ln()` already maps `0` to `-∞`.
+    ///
+    /// # A known normalisation defect, reproduced knowingly
+    ///
+    /// Over **equal-length** inputs this is a proper distribution (the substitution products
+    /// sum to one). The unequal-length case adds end-gap paths *on top* of that, so summed
+    /// over all differing-length outputs the total mass **slightly exceeds one** (spec §5.1).
+    /// It is inherited from `align_subst` deliberately, not fixed here: it is harmless where
+    /// this is used — the genotyping normalises per read — and the equal-length case dominates
+    /// overwhelmingly. Recorded so it is reproduced knowingly rather than discovered as a
+    /// surprise.
+    fn marginal_probability(
+        &self,
+        read: &[u8],
+        reference: &[u8],
+        _context: (),
+        scratch: &mut Self::Scratch,
+    ) -> LogProb {
+        LogProb(self.linear_probability(read, reference, scratch).ln())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     const EPS: f64 = 0.01;
 
@@ -551,5 +580,126 @@ mod tests {
         let mut scratch = SequenceMarginalScratch::new();
         let p = a.linear_probability(b"", b"ACGTACGT", &mut scratch); // 0 vs 8 bp
         assert_eq!(p, 0.0);
+    }
+
+    // ---- B3: the logarithm boundary + parity against the ported function ----------------
+
+    /// **Parity against the ported function — the byte-level oracle for this port.** ng's
+    /// linear scorer must reproduce production's `align_subst`
+    /// ([src/ssr/cohort/pair_hmm.rs](../../../ssr/cohort/pair_hmm.rs)) **bit for bit**, across
+    /// all three of its arms and both gap directions. This is the fidelity the logarithm
+    /// boundary rests on: match the linear values and the logged ones match too. Production is
+    /// a read-only oracle here, exactly as `delimit_parity` uses `delimit_read`.
+    #[test]
+    fn linear_probability_matches_production_align_subst_bit_for_bit() {
+        use crate::ssr::cohort::pair_hmm::{HmmScratch, align_subst};
+        let cases: &[(&[u8], &[u8])] = &[
+            (b"CACACACA", b"CACACACA"),    // exact match — the fast path
+            (b"CACAGACA", b"CACACACA"),    // equal-length substitution
+            (b"CACACACAC", b"CACACACA"),   // read longer — insertion side
+            (b"CACACACA", b"CACACACAC"),   // read shorter — deletion side
+            (b"GGACGTACGTA", b"ACGTACGT"), // a length-3 difference through the band floor
+        ];
+        // Sweep ε, endpoints included, so the degenerate 0.0 / 1.0 cases are checked against
+        // production and not only against B1's hand-computed values.
+        for &eps in &[0.0, 0.001, EPS, 0.2, 1.0] {
+            let a = aligner(eps);
+            for &(read, reference) in cases {
+                let mut ours_scratch = SequenceMarginalScratch::new();
+                let mut prod_scratch = HmmScratch::new();
+                let ours = a.linear_probability(read, reference, &mut ours_scratch);
+                let prod = align_subst(read, reference, eps, &mut prod_scratch);
+                assert_eq!(
+                    ours.to_bits(),
+                    prod.to_bits(),
+                    "linear parity failed at eps {eps} for {read:?} vs {reference:?}: \
+                     ours {ours}, prod {prod}"
+                );
+            }
+        }
+    }
+
+    /// **The whole boundary, end to end, as one contract:** the marginal equals production's
+    /// `align_subst` *logarithm*. The two bit-exact tests above (linear parity, and the
+    /// marginal is one `.ln()` of the linear) already imply this transitively, but stating it
+    /// as a single assertion documents the contract the module actually offers a caller.
+    #[test]
+    fn the_marginal_is_the_logarithm_of_production_align_subst() {
+        use crate::ssr::cohort::pair_hmm::{HmmScratch, align_subst};
+        let a = aligner(EPS);
+        for &(read, reference) in &[
+            (b"CACACACA".as_slice(), b"CACACACA".as_slice()), // exact
+            (b"CACAGACA".as_slice(), b"CACACACA".as_slice()), // substitution
+            (b"CACACACAC".as_slice(), b"CACACACA".as_slice()), // insertion
+            (b"CACACACA".as_slice(), b"CACACACAC".as_slice()), // deletion
+        ] {
+            let mut ours = SequenceMarginalScratch::new();
+            let mut prod = HmmScratch::new();
+            let marginal = a.marginal_probability(read, reference, (), &mut ours);
+            let prod_log = align_subst(read, reference, EPS, &mut prod).ln();
+            assert_eq!(marginal.get().to_bits(), prod_log.to_bits());
+        }
+    }
+
+    /// **The boundary is exactly one logarithm — not zero, not two.** The marginal is the
+    /// natural log of the linear probability. A missing `.ln()` would return a linear
+    /// probability typed as a `LogProb`; a doubled one would return `ln(ln(x))` — both
+    /// plausible wrong numbers, neither an error, which is why this pins the conversion
+    /// directly against the linear value.
+    #[test]
+    fn marginal_probability_is_the_single_logarithm_of_the_linear_probability() {
+        let a = aligner(EPS);
+        let cases: &[(&[u8], &[u8])] = &[
+            (b"CACACACA", b"CACACACA"),
+            (b"CACAGACA", b"CACACACA"),
+            (b"CACACACAC", b"CACACACA"),
+        ];
+        for &(read, reference) in cases {
+            let mut s1 = SequenceMarginalScratch::new();
+            let mut s2 = SequenceMarginalScratch::new();
+            let marginal = a.marginal_probability(read, reference, (), &mut s1);
+            let linear = a.linear_probability(read, reference, &mut s2);
+            assert_eq!(marginal.get().to_bits(), linear.ln().to_bits());
+        }
+    }
+
+    /// **An unreachable line-up is `-∞`, not `0` — the distinction the `LogProb` contract
+    /// exists for.** An empty read against a reference too long to reach by end gaps has linear
+    /// probability exactly `0`; the marginal is `ln(0) = -∞`, a value a caller can see and act
+    /// on, rather than a linear `0` indistinguishable from underflow.
+    #[test]
+    fn an_unreachable_line_up_is_negative_infinity_not_zero() {
+        let a = aligner(EPS);
+        let mut scratch = SequenceMarginalScratch::new();
+        let marginal = a.marginal_probability(b"", b"ACGTACGT", (), &mut scratch);
+        // `== NEG_INFINITY` already excludes 0, NaN, and +∞ and pins the sign.
+        assert_eq!(marginal.get(), f64::NEG_INFINITY);
+    }
+
+    proptest! {
+        /// **The port matches production over the whole sequence domain, not just five hand-
+        /// picked pairs.** For any two short byte strings and any ε in `[0, 1]`, ng's linear
+        /// scorer must be bit-for-bit identical to production's `align_subst`. This is what
+        /// guards the band and flank edges the example cases might all happen to agree on — a
+        /// divergence here would be a real port defect, surfaced as a shrunk counterexample.
+        #[test]
+        fn linear_probability_matches_align_subst_on_random_sequences(
+            read in prop::collection::vec(any::<u8>(), 0..12),
+            reference in prop::collection::vec(any::<u8>(), 0..12),
+            eps in 0.0f64..=1.0,
+        ) {
+            use crate::ssr::cohort::pair_hmm::{HmmScratch, align_subst};
+            let a = SsrSequenceMarginal::try_new(eps).expect("eps in [0, 1]");
+            let mut ours_scratch = SequenceMarginalScratch::new();
+            let mut prod_scratch = HmmScratch::new();
+            let ours = a.linear_probability(&read, &reference, &mut ours_scratch);
+            let prod = align_subst(&read, &reference, eps, &mut prod_scratch);
+            prop_assert_eq!(
+                ours.to_bits(),
+                prod.to_bits(),
+                "eps {}, read {:?}, reference {:?}: ours {}, prod {}",
+                eps, read, reference, ours, prod
+            );
+        }
     }
 }
