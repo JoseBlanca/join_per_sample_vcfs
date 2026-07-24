@@ -9,15 +9,18 @@
 //!
 //! This module lands across the STR generator plan: the config, counts, cap constant, the
 //! working input ([`SsrLocus`] + its margin fetch), the reservoir cap, the per-locus read
-//! fetch, the read-region CIGAR mapping, the per-read classify pipeline (delimited by the
-//! alignment module's [`SsrFlatGapAligner`](crate::ng::alignment::ssr_best_path_flat_gap)), the
-//! tally, and — the public surface — [`SsrGenerator`], the [`LocusGenerator`](super::LocusGenerator)
-//! that turns one `SsrSegment` into one locus.
+//! fetch, the read-region CIGAR mapping, the per-read classify pipeline (delimited by a chosen
+//! [`RepeatDelimiter`] — algorithm 4, the unit-slip aligner, by default; algorithm 3, the
+//! flat-gap production-parity port, for the bake-off and the parity oracle), the tally, and — the
+//! public surface — [`SsrGenerator`], the [`LocusGenerator`](super::LocusGenerator) that turns one
+//! `SsrSegment` into one locus.
 
 use super::{LocusGenerationError, LocusGenerator, LocusKind, SampleLocusObservations, SsrDetail};
 use crate::bam::alignment_input::MappedRead;
-use crate::ng::alignment::ssr_best_path_flat_gap::{SsrFlatGapAligner, ViterbiScratch};
-use crate::ng::alignment::{PerQualityEmission, StutterModel};
+use crate::ng::alignment::ssr_best_path_unit_slip::SsrUnitSlipAligner;
+use crate::ng::alignment::{
+    BestPathAligner, PerQualityEmission, RepeatContext, RepeatSpan, StutterModel,
+};
 use crate::ng::read::input::SampleReads;
 use crate::ng::ref_seq::{ContigTable, RawRefSeq, RefSeq, RefSeqError};
 use crate::ng::region_typing::segment_criteria::SsrSegment;
@@ -590,22 +593,20 @@ mod read_region {
 }
 
 // ---------------------------------------------------------------------
-// D2b — classify one read against a locus: delimit (the alignment module's flat-gap
-// aligner), recover a long allele by widening, gate the tract quality, and map the result
+// D2b — classify one read against a locus: delimit (the chosen `RepeatDelimiter` — algorithm 3 or
+// 4), recover a long allele by widening, gate the tract quality, and map the result
 // to an observation or a no-observation reason. The per-read pipeline ported from
 // production's `classify_read`, over the new delimiter. Consumed by the tally + generator.
 // ---------------------------------------------------------------------
 mod classify {
-    use super::SsrLocus;
     use super::read_region::{
         MIN_REGION_Q1, extract_region, flank_truncated, passes_quality_gate, read_footprint,
         widen_region,
     };
+    use super::{RepeatDelimiter, SsrLocus};
     use crate::bam::alignment_input::MappedRead;
-    use crate::ng::alignment::ssr_best_path_flat_gap::{SsrFlatGapAligner, ViterbiScratch};
     use crate::ng::alignment::{
-        BestPathAligner, Emission, ReadBases, RepeatContext, RepeatGeometry, RepeatSpan,
-        StutterModel,
+        ReadBases, RepeatContext, RepeatGeometry, RepeatSpan, StutterModel,
     };
     use crate::ng::locus_generation::ReadCoverage;
     use crate::ng::types::Bp;
@@ -642,20 +643,22 @@ mod classify {
         NoObservation(NoObservationReason),
     }
 
-    /// Classify one read against `locus` using `aligner`. `stutter` feeds the context (the
-    /// flat-gap aligner ignores it); `align_scratch` and `qual_buffer` are reused across reads.
+    /// Classify one read against `locus` using `aligner` (the chosen [`RepeatDelimiter`]). `stutter`
+    /// feeds the context — algorithm 3 (flat-gap) ignores it, algorithm 4 (unit-slip) prices its
+    /// slips from it; `align_scratch` (the aligner's own scratch) and `qual_buffer` are reused
+    /// across reads.
     ///
     /// The pipeline mirrors production: extract the read's slice over the locus window, delimit
     /// it, and — if a *complete* tract looks truncated by the window (a mapper-collapsed long
     /// allele) — widen the slice and re-delimit, giving up as `WindowTruncated` if it stays
     /// truncated. A complete tract is quality-gated; **partials are kept as lower bounds**
     /// without the gate (spec §3, the new behaviour production discards).
-    pub(super) fn classify_read<E: Emission>(
+    pub(super) fn classify_read<A: RepeatDelimiter>(
         read: &MappedRead,
         locus: &SsrLocus,
-        aligner: &SsrFlatGapAligner<E>,
+        aligner: &A,
         stutter: &StutterModel,
-        align_scratch: &mut ViterbiScratch,
+        align_scratch: &mut A::Scratch,
         qual_buffer: &mut Vec<u8>,
     ) -> Classified {
         // A malformed record (qual length ≠ seq length) cannot be sliced safely.
@@ -714,13 +717,13 @@ mod classify {
     }
 
     /// Align the read's `region` slice against the reference frame.
-    fn delimit<E: Emission>(
-        aligner: &SsrFlatGapAligner<E>,
+    fn delimit<A: RepeatDelimiter>(
+        aligner: &A,
         read: &MappedRead,
         region: &Range<usize>,
         reference: &[u8],
         context: RepeatContext<'_>,
-        scratch: &mut ViterbiScratch,
+        scratch: &mut A::Scratch,
     ) -> RepeatSpan {
         let bases = ReadBases::try_new(&read.seq[region.clone()], &read.qual[region.clone()])
             .expect("seq and qual are the same slice, hence equal length");
@@ -791,6 +794,7 @@ mod classify {
     mod tests {
         use super::*;
         use crate::ng::alignment::PerQualityEmission;
+        use crate::ng::alignment::ssr_best_path_flat_gap::{SsrFlatGapAligner, ViterbiScratch};
         use crate::ng::region_typing::segment_criteria::{Motif, SsrSegment};
         use crate::ng::types::Position;
         use crate::pileup::walker::CigarOp;
@@ -1284,12 +1288,37 @@ mod tally {
 // (spec §2, arch §1, §2).
 // ---------------------------------------------------------------------
 
+/// A tract delimiter the generator can drive — either alignment-module aligner that measures a
+/// read's repeat: [algorithm 3](crate::ng::alignment::ssr_best_path_flat_gap::SsrFlatGapAligner)
+/// (the flat-gap port of production's `delimit_read`, kept as the byte-parity oracle and baseline)
+/// or [algorithm 4](SsrUnitSlipAligner) (the unit-slip model, the recommended default). Any
+/// [`BestPathAligner`] whose `Output` is a [`RepeatSpan`] over a [`RepeatContext`] qualifies.
+///
+/// It is a **trait alias** (a supertrait bundle with a blanket impl), the one bound the generator
+/// and [`classify::classify_read`] repeat — so the aligner is a **type parameter**, chosen per
+/// generator and monomorphised. The choice is thus **static dispatch**: `align` is a direct call in
+/// the per-read loop, never a `dyn` indirection (a bake-off runs millions of reads). The only
+/// dynamic dispatch is the one-per-run `Box<dyn LocusGenerator>` the dispatcher already uses to hold
+/// a generator — outside the hot loop.
+pub trait RepeatDelimiter:
+    BestPathAligner<Output = RepeatSpan> + for<'a> BestPathAligner<Context<'a> = RepeatContext<'a>>
+{
+}
+
+impl<A> RepeatDelimiter for A where
+    A: BestPathAligner<Output = RepeatSpan>
+        + for<'a> BestPathAligner<Context<'a> = RepeatContext<'a>>
+{
+}
+
 /// The STR locus generator: turns one microsatellite tract into one locus.
 ///
 /// Holds its own accessors and reusable scratch, the "a generator holds its own accessors"
-/// convention ([`LocusGenerator`](super::LocusGenerator); spec §2). The aligner is fixed to
-/// [`PerQualityEmission`] — production's emission table — so the delimitation matches production
-/// for the parity oracle (spec §6).
+/// convention ([`LocusGenerator`](super::LocusGenerator); spec §2). The delimiter `A` is a **type
+/// parameter** ([`RepeatDelimiter`]) so the algorithm is chosen per generator and dispatched
+/// statically — [`with_default_aligner`](Self::with_default_aligner) builds the recommended
+/// algorithm 4 (the unit-slip aligner), while [`new`](Self::new) takes any aligner, which is how a
+/// bake-off swaps in algorithm 3 (the flat-gap port) and how the parity oracle pins it (spec §6).
 ///
 /// **The reference seam (the Arc gap).** Two reference handles, because they serve two needs the
 /// current [`RawRefSeq`] design keeps apart:
@@ -1305,18 +1334,20 @@ mod tally {
 /// the working stopgap the spec flags (spec §8): correct, and cheap on the in-memory fixtures the
 /// tests and the dump tool run, though a file-backed `R` whose factory reloads is the real
 /// integration this defers.
-pub struct SsrGenerator<R, MF> {
+pub struct SsrGenerator<R, MF, A: RepeatDelimiter> {
     /// The reference the margin fetch reads the flanks from.
     reference: R,
     /// Builds a fresh read-query reference for [`SampleReads::reads_in_region`]'s
     /// mismatch-fraction filter — one per file, per query (see the type doc).
     make_reference: MF,
-    /// The tract delimiter — production's emission table, for parity (spec §6).
-    aligner: SsrFlatGapAligner<PerQualityEmission>,
-    /// Reused alignment matrices, so the pair-HMM does not reallocate per read.
-    align_scratch: ViterbiScratch,
-    /// The stutter model feeding the aligner's context. The flat-gap aligner ignores it, but
-    /// the context carries it (spec §2, arch §5).
+    /// The tract delimiter — the chosen [`RepeatDelimiter`] (algorithm 3 or 4).
+    aligner: A,
+    /// Reused alignment matrices (the aligner's own scratch type), so it does not reallocate per
+    /// read.
+    align_scratch: A::Scratch,
+    /// The stutter model feeding the aligner's context. Algorithm 3 (flat-gap) ignores it;
+    /// algorithm 4 (unit-slip) prices its slips from it. The context carries it either way (spec
+    /// §2, arch §5).
     stutter: StutterModel,
     /// Reused scratch for the margin fetch.
     margin_buffer: Vec<u8>,
@@ -1333,17 +1364,46 @@ pub struct SsrGenerator<R, MF> {
     produced: bool,
 }
 
-impl<R, MF> SsrGenerator<R, MF>
+impl<R, MF> SsrGenerator<R, MF, SsrUnitSlipAligner<PerQualityEmission>>
 where
     R: RefSeq + ContigTable + RawRefSeq,
     MF: FnMut() -> R,
 {
-    /// Build a generator over `reference` (the margin fetch) and `make_reference` (the read-query
-    /// factory), with `config` checked against `bundle_threshold` — the region-typing radius the
-    /// flank must stay within (spec §4). Fails if `flank_bp > bundle_threshold`.
+    /// A generator with the **recommended** delimiter — algorithm 4, the unit-slip aligner over
+    /// production's [`PerQualityEmission`] table (arch §5: the more faithful, better-measured
+    /// model). The default for real use; a bake-off or the parity oracle passes a different aligner
+    /// to [`new`](Self::new).
+    pub fn with_default_aligner(
+        reference: R,
+        make_reference: MF,
+        config: SsrGeneratorConfig,
+        bundle_threshold: Bp,
+    ) -> Result<Self, SsrGeneratorConfigError> {
+        Self::new(
+            reference,
+            make_reference,
+            SsrUnitSlipAligner::new(PerQualityEmission::new()),
+            config,
+            bundle_threshold,
+        )
+    }
+}
+
+impl<R, MF, A> SsrGenerator<R, MF, A>
+where
+    R: RefSeq + ContigTable + RawRefSeq,
+    MF: FnMut() -> R,
+    A: RepeatDelimiter,
+{
+    /// Build a generator over `reference` (the margin fetch), `make_reference` (the read-query
+    /// factory) and `aligner` (the chosen delimiter — algorithm 3 or 4), with `config` checked
+    /// against `bundle_threshold`, the region-typing radius the flank must stay within (spec §4).
+    /// Fails if `flank_bp > bundle_threshold`. For the recommended default, use
+    /// [`with_default_aligner`](Self::with_default_aligner).
     pub fn new(
         reference: R,
         make_reference: MF,
+        aligner: A,
         config: SsrGeneratorConfig,
         bundle_threshold: Bp,
     ) -> Result<Self, SsrGeneratorConfigError> {
@@ -1351,8 +1411,8 @@ where
         Ok(Self {
             reference,
             make_reference,
-            aligner: SsrFlatGapAligner::new(PerQualityEmission::new()),
-            align_scratch: ViterbiScratch::new(),
+            aligner,
+            align_scratch: A::Scratch::default(),
             stutter: StutterModel::hipstr_shipped(),
             margin_buffer: Vec::new(),
             qual_buffer: Vec::new(),
@@ -1369,10 +1429,11 @@ where
     }
 }
 
-impl<R, MF> LocusGenerator<SsrSegment> for SsrGenerator<R, MF>
+impl<R, MF, A> LocusGenerator<SsrSegment> for SsrGenerator<R, MF, A>
 where
     R: RefSeq + ContigTable + RawRefSeq,
     MF: FnMut() -> R,
+    A: RepeatDelimiter,
 {
     fn begin_segment(&mut self, region: GenomeRegion) {
         self.current_region = Some(region);
@@ -1867,8 +1928,10 @@ mod tests {
     /// read-query factory are the same all-`A` bases, so fixture reads (also all-`A`) clear the
     /// mismatch filter — the tract content is not real STR sequence, which is fine for the
     /// structural checks D3 owns (real tract parity is E's).
-    fn ssr_generator() -> SsrGenerator<InMemoryRefSeq, fn() -> InMemoryRefSeq> {
-        SsrGenerator::new(
+    fn ssr_generator()
+    -> SsrGenerator<InMemoryRefSeq, fn() -> InMemoryRefSeq, SsrUnitSlipAligner<PerQualityEmission>>
+    {
+        SsrGenerator::with_default_aligner(
             fixture_ref_bases(),
             fixture_ref_bases as fn() -> InMemoryRefSeq,
             SsrGeneratorConfig {
@@ -1886,7 +1949,7 @@ mod tests {
     fn new_rejects_a_flank_wider_than_the_bundle_threshold() {
         // `SsrGenerator` is not `Debug` (it holds a closure and the aligner), so match on the
         // `Result` directly rather than `expect_err`.
-        let result = SsrGenerator::new(
+        let result = SsrGenerator::with_default_aligner(
             fixture_ref_bases(),
             fixture_ref_bases as fn() -> InMemoryRefSeq,
             SsrGeneratorConfig {
@@ -2002,7 +2065,7 @@ mod tests {
             .map(|i| read_named_with_length(&format!("r{i}"), 0, 30 + i * 3, 30))
             .collect();
         let (_reference_dir, _bam_dir, reads) = sample_reads_with(&records);
-        let mut generator = SsrGenerator::new(
+        let mut generator = SsrGenerator::with_default_aligner(
             fixture_ref_bases(),
             fixture_ref_bases as fn() -> InMemoryRefSeq,
             SsrGeneratorConfig {

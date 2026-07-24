@@ -24,7 +24,12 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use pop_var_caller::ng::locus_generation::ssr::{SsrGenerator, SsrGeneratorConfig};
+use pop_var_caller::ng::alignment::PerQualityEmission;
+use pop_var_caller::ng::alignment::ssr_best_path_flat_gap::SsrFlatGapAligner;
+use pop_var_caller::ng::alignment::ssr_best_path_unit_slip::SsrUnitSlipAligner;
+use pop_var_caller::ng::locus_generation::ssr::{
+    RepeatDelimiter, SsrGenerator, SsrGeneratorConfig,
+};
 use pop_var_caller::ng::locus_generation::{
     LocusGenerator, LocusKind, ReadCoverage, SampleLocusObservations,
 };
@@ -160,12 +165,15 @@ fn coverage_label(coverage: ReadCoverage) -> &'static str {
 }
 
 /// Run the whole pipeline over `fasta` + `bams`, optionally restricted to `contig_filter` (a contig
-/// name), building the [`DumpReport`]. `gen_config` is the STR generator's config (the tests vary
-/// its cap). The reference's `.fai` is created if absent; the BAM index likewise (`SampleReads`).
-fn run_dump(
+/// name), delimiting reads with `aligner` (algorithm 3 or 4 — [`RepeatDelimiter`], monomorphised so
+/// the per-read `align` is a direct call), building the [`DumpReport`]. `gen_config` is the STR
+/// generator's config (the tests vary its cap). The reference's `.fai` is created if absent; the BAM
+/// index likewise (`SampleReads`).
+fn run_dump<A: RepeatDelimiter>(
     fasta: &Path,
     bams: &[PathBuf],
     contig_filter: Option<&str>,
+    aligner: A,
     gen_config: SsrGeneratorConfig,
 ) -> Result<DumpReport, Box<dyn std::error::Error>> {
     let cache = Arc::new(ReferenceInfoCache::new());
@@ -185,6 +193,7 @@ fn run_dump(
             let contigs = contigs.clone();
             move || WindowedRefSeq::new(fasta.clone(), contigs.clone())
         },
+        aligner,
         gen_config,
         Bp(walk_config.criteria.bundle_threshold),
     )?;
@@ -234,15 +243,41 @@ fn main() -> ExitCode {
     if args.len() < 3 {
         eprintln!(
             "usage: ng_ssr_loci_dump <reference.fa> <sample.bam|cram> [contig]\n\
-             dumps, per microsatellite tract, the observed tract sequences one sample's reads showed."
+             dumps, per microsatellite tract, the observed tract sequences one sample's reads showed.\n\
+             delimiter: PVC_SSR_DELIMITER=unit-slip (default, algorithm 4) | flat-gap (algorithm 3, \
+             the production-parity port) — set it to compare the two."
         );
         return ExitCode::from(2);
     }
     let fasta = PathBuf::from(&args[1]);
     let bam = PathBuf::from(&args[2]);
     let contig_filter = args.get(3).map(String::as_str);
+    let config = SsrGeneratorConfig::default();
 
-    match run_dump(&fasta, &[bam], contig_filter, SsrGeneratorConfig::default()) {
+    // The delimiter is chosen once here and monomorphised into `run_dump` — the per-read `align` in
+    // the walk is a static call, never a `dyn` one. Default: algorithm 4 (the recommended unit-slip
+    // aligner); `PVC_SSR_DELIMITER=flat-gap` selects algorithm 3, the byte-parity port, for a
+    // side-by-side comparison.
+    let delimiter = std::env::var("PVC_SSR_DELIMITER").unwrap_or_default();
+    let emission = PerQualityEmission::new();
+    let report = match delimiter.as_str() {
+        "flat-gap" => run_dump(
+            &fasta,
+            &[bam],
+            contig_filter,
+            SsrFlatGapAligner::new(emission),
+            config,
+        ),
+        _ => run_dump(
+            &fasta,
+            &[bam],
+            contig_filter,
+            SsrUnitSlipAligner::new(emission),
+            config,
+        ),
+    };
+
+    match report {
         Ok(report) => {
             print!("{}", report.render());
             ExitCode::SUCCESS
@@ -375,14 +410,57 @@ mod tests {
         (dir, fasta, bam)
     }
 
+    /// Dump with the default (recommended) delimiter, algorithm 4.
     fn dump(fasta: &Path, bam: &Path, config: SsrGeneratorConfig) -> DumpReport {
+        dump_with(
+            fasta,
+            bam,
+            SsrUnitSlipAligner::new(PerQualityEmission::new()),
+            config,
+        )
+    }
+
+    /// Dump with an explicit delimiter — the seam a bake-off drives.
+    fn dump_with<A: RepeatDelimiter>(
+        fasta: &Path,
+        bam: &Path,
+        aligner: A,
+        config: SsrGeneratorConfig,
+    ) -> DumpReport {
         run_dump(
             fasta,
             std::slice::from_ref(&bam.to_path_buf()),
             None,
+            aligner,
             config,
         )
         .expect("the fixture dumps")
+    }
+
+    /// The two delimiters are **selectable** and agree on the clean fixture: algorithm 4 (the
+    /// unit-slip default) and algorithm 3 (the flat-gap port) produce byte-identical output on
+    /// reference-allele reads, so the choice is a real, comparable knob — not a behaviour fork on
+    /// clean data (they diverge only on the harder alleles a bake-off exists to weigh).
+    #[test]
+    fn the_two_delimiters_are_selectable_and_agree_on_the_clean_fixture() {
+        let (_dir, fasta, bam) = fixture();
+        let unit_slip = dump_with(
+            &fasta,
+            &bam,
+            SsrUnitSlipAligner::new(PerQualityEmission::new()),
+            SsrGeneratorConfig::default(),
+        );
+        let flat_gap = dump_with(
+            &fasta,
+            &bam,
+            SsrFlatGapAligner::new(PerQualityEmission::new()),
+            SsrGeneratorConfig::default(),
+        );
+        assert_eq!(
+            unit_slip.render(),
+            flat_gap.render(),
+            "algorithms 3 and 4 agree on clean reference-allele reads"
+        );
     }
 
     /// Both AC tracts are emitted as loci (one per `SsrSegment`, including the uncovered tract2),
