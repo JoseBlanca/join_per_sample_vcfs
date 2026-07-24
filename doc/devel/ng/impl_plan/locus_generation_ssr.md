@@ -141,22 +141,25 @@ green, plus the seed derivation (name + `start - 1`) asserted directly.
 
 ### Milestone D — the transform: fetch → align → tally → output *(gated on `align_read`)*
 
-**☐ D1. Fetch + the relevance gate + the cap.**
+**✅ D1. Fetch + the relevance gate + the cap.** *(committed 3dd445a)*
 Fetch reads over **the tract plus the margin** via `SampleReads::reads_in_region`, admit on
 **relevance** (overlap with the query span, which `SampleReads` already applies) — **do not** port
 `reaches_locus` — and offer survivors to the reservoir (C). *Depends:* B, C. *Source:* spec §2, arch
 §5. Verified: the query span is tract+margin (not the tract); a margin-only read is admitted; no
 spanning gate is applied, so partially-covering reads reach the tally.
 
-**☐ D2. Align + tally.**
+**✅ D2. Align + tally.** *(landed as three sub-steps — D2a read-region CIGAR mapping cb55429,
+D2b per-read classify ec0c0da, D2c the tally d74061e)*
 Call `align_read(&read, &ssr_locus)` per kept read; classify each result **complete** vs **partial**;
 tally into `observed_sequences` with the dedup key **`(bases, read_coverage)`** (a complete and a
 partial of identical bases stay separate rows); record each observation's `read_coverage` **before
 the cap** (so the derived depth is the sample's, not the reservoir's); count the no-observation
 reasons into `SsrGeneratorCounts`. The port of `tally`, **extended** with partials and the support
-moments. *Depends:* D1, **the ng STR aligner**. *Source:* spec §2, §3, §4, arch §3, §5.
+moments. *Depends:* D1, **the ng STR aligner**. *Source:* spec §2, §3, §4, arch §3, §5. (The
+per-read `align_read` invocation loop itself is wired in D3's `next_locus`, the one place the kept
+reads and the locus meet.)
 
-**☐ D3. Output assembly + `SsrGenerator: LocusGenerator<SsrSegment>`.**
+**✅ D3. Output assembly + `SsrGenerator: LocusGenerator<SsrSegment>`.** *(committed 69e7411)*
 Assemble the `SampleLocusObservations`: `region` = the tract coords, `reference_bases` = the tract
 **only** (no flanks), `kind = Ssr(SsrDetail { motif, left_flank, right_flank })` split from the
 fetched margin, the two read-drop counters; both tables sorted so the result is order-independent.
