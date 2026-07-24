@@ -82,14 +82,14 @@ qualities).
 
 ### Milestone A — `LogProb` and the interface (no logic)
 
-**☐ A1. Land `LogProb` in `types.rs`.**
+**✅ A1. Land `LogProb` in `types.rs`.**
 `LogProb(pub f64)` — a probability held as its natural logarithm, where negative infinity means
 impossible and is a **value, not an error**. Land it where the shared vocabulary already put it,
 beside `Bp`. Its point is that the compiler refuses to mix it with an ordinary probability, which is
 the transposition this module is most exposed to, since the code being ported returns linear
 probabilities. *Depends:* plan 1. *Source:* arch §1, §5.
 
-**☐ A2. The `MarginalAligner` trait.**
+**✅ A2. The `MarginalAligner` trait.**
 `Scratch` and `Context` associated types; `marginal_probability(read, reference, context, scratch)`
 returning `LogProb`. `Context` is `()` for a sequence-versus-sequence marginal and the repeat context
 for one that needs the geometry. No implementations. *Depends:* A1. *Source:* arch §3.
