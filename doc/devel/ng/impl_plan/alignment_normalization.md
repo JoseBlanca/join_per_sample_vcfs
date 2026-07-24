@@ -75,7 +75,7 @@ fixpoint wrapper (1c); the leftmost **property checker**; the differ-at-all scre
 
 ### Milestone A — the interface and the oracle, before any implementation
 
-**☐ A1. The `AlignmentNormalizer` trait.**
+**✅ A1. The `AlignmentNormalizer` trait.**
 `normalize(&mut Alignment, read, reference)`. It takes the whole `Alignment` and not just its
 operations because left-alignment can drop a leading deletion and move the alignment's start, which
 an operations-only signature could not express. The read is required too: how far a gap may shift is

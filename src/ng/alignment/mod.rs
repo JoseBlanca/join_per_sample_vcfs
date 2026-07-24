@@ -564,6 +564,64 @@ pub trait MarginalAligner: Sized {
     ) -> LogProb;
 }
 
+/// Rewrite an existing alignment into its canonical **left-most** spelling, in place.
+///
+/// This is a different task from the two aligners above, and a different trait for it: the
+/// aligners *compute* an alignment from two sequences, while this *rewrites* one that already
+/// exists. The same insertion or deletion can be written at several equivalent positions when
+/// it sits in or near a repeat — the gap can slide without changing a single base of the
+/// result — and equivalent alignments spelled differently look like different variants, so
+/// their supporting reads scatter instead of pooling. Left-alignment shifts every gap as far
+/// left as it can go without introducing a mismatch, and merges adjacent gaps of the same
+/// kind. Nothing about the alignment's quality changes; only its spelling (spec §6).
+///
+/// It shares **no machinery** with [`BestPathAligner`] and [`MarginalAligner`]: no dynamic
+/// programming, no matrix, no scratch. It is in this module only because it operates on
+/// alignments, and it is a separate trait because it is a separate task (spec §1, §6).
+///
+/// # Why it takes the whole [`Alignment`], not just its operations
+///
+/// Left-alignment can shift a **leading deletion off the front** of the alignment, which drops
+/// the deletion and moves where the placement starts — its [`Alignment::reference_offset`].
+/// Production's structured pass does exactly that (`left_align_cigar` with end-deletion
+/// stripping; [indel_norm.rs](../../../pileup/walker/indel_norm.rs)). A signature over the
+/// operations alone (`&mut Vec<CigarOp>`) could not express that move, so it would silently
+/// foreclose a normalizer that needs it (arch §3, §5).
+///
+/// # Why the read is required, and why it carries no qualities
+///
+/// How far a gap may shift is bounded by matching on **both** sequences — a base can only move
+/// left across a reference base it equals *and* a read base it equals. So the read is not
+/// optional context; it is half of what defines "leftmost". But it arrives as a bare `&[u8]`,
+/// not a [`ReadBases`]: normalization shifts gaps by comparing **bases**, never quality
+/// scores, so it is quality-blind by construction and there are no qualities to pass (spec §6).
+///
+/// # Contract
+///
+/// **Pure per call**, like the two aligner traits: the output is a function of the arguments
+/// and the implementation's own constructor state, with no hidden state — so the result never
+/// depends on call order or thread count. There is no `Scratch` associated type, because these
+/// algorithms fill no matrix; a normalizer that wants a reusable buffer owns it as its own
+/// field. **No `Result`:** an alignment that is already leftmost is normalized to itself, an
+/// answer rather than a failure, so `normalize` returns nothing and mutates in place.
+///
+/// The `Sized` supertrait matches [`BestPathAligner`] and [`MarginalAligner`]: implementations
+/// are selected by generic type parameter, never behind `dyn`. Normalization runs per read as
+/// the caller walks a cohort, and the module's rule is static dispatch throughout (spec §7,
+/// arch §4). Stating it makes that a compile error rather than a convention.
+///
+/// [`ReadBases`]: crate::ng::alignment::ReadBases
+pub trait AlignmentNormalizer: Sized {
+    /// Rewrite `alignment` into its left-most spelling, given the `read` it places and the
+    /// `reference` stretch it was placed against.
+    ///
+    /// `reference` is the whole stretch the alignment was computed against;
+    /// [`Alignment::reference_offset`] says where within it the placement starts. `read` is the
+    /// full read sequence, bare bases with no qualities (see above). Both are borrowed and
+    /// neither is mutated — only `alignment` changes, in place.
+    fn normalize(&self, alignment: &mut Alignment, read: &[u8], reference: &[u8]);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -983,5 +1041,120 @@ mod tests {
             marginal_reusing_context(&RepeatContextMarginal, b"ACGTA", b"ACGTA", context);
         assert_eq!(first.get(), -3.0 - 5.0);
         assert_eq!(second.get(), -3.0 - 5.0);
+    }
+
+    // ---- A1: the `AlignmentNormalizer` trait -----------------------------------------
+    //
+    // A1 lands the trait with **no algorithm** — the three real normalizers (1a/1b/1c)
+    // arrive in Milestones B and C. The two impls below are `#[cfg(test)]` compile-time
+    // anchors, not implementations of any plan algorithm: their bodies are trivial and
+    // deterministic, and their only job is to prove the trait can be met — including the
+    // one shape the whole-`Alignment` signature exists for: moving `reference_offset`.
+
+    /// The degenerate normalizer: every alignment is already leftmost, so it does nothing.
+    /// It anchors that an implementation can leave an [`Alignment`] untouched — the
+    /// already-leftmost case is an answer, not a no-op to be special-cased away.
+    struct IdentityNormalizer;
+    impl AlignmentNormalizer for IdentityNormalizer {
+        fn normalize(&self, _alignment: &mut Alignment, _read: &[u8], _reference: &[u8]) {}
+    }
+
+    /// A stand-in that strips a **leading deletion** and advances
+    /// [`Alignment::reference_offset`] by the bases it dropped. This is the load-bearing
+    /// anchor: it is expressible **only** because the trait takes the whole `Alignment` and
+    /// not just its operations. Production's structured pass does exactly this move (a
+    /// deletion that left-aligns to the read start rolls off the front); a signature over
+    /// `&mut Vec<CigarOp>` could not, which is the point arch §5 records. It is not a real
+    /// left-aligner — it only demonstrates the offset can move.
+    struct LeadingDeletionStripper;
+    impl AlignmentNormalizer for LeadingDeletionStripper {
+        fn normalize(&self, alignment: &mut Alignment, _read: &[u8], _reference: &[u8]) {
+            if let Some(CigarOp::Deletion(dropped)) = alignment.cigar.first().copied() {
+                alignment.reference_offset += u64::from(dropped);
+                alignment.cigar.remove(0);
+            }
+        }
+    }
+
+    /// Drive a normalizer **through a generic bound**, which is the only place the trait's
+    /// `Sized` supertrait (static dispatch, never `dyn`) actually bites: a concrete call
+    /// compiles regardless, so a test using concrete types alone would not pin it. A generic
+    /// function whose type parameter has no `?Sized` relaxation can only be instantiated with
+    /// a `Sized` implementor, so this helper existing at all is the guard.
+    fn normalize_via<N: AlignmentNormalizer>(
+        normalizer: &N,
+        alignment: &mut Alignment,
+        read: &[u8],
+        reference: &[u8],
+    ) {
+        normalizer.normalize(alignment, read, reference);
+    }
+
+    /// The trait is implementable and the already-leftmost case is a genuine identity —
+    /// nothing about the alignment changes, driven through the generic (static-dispatch)
+    /// caller so the `Sized` supertrait is exercised, not merely declared.
+    #[test]
+    fn alignment_normalizer_leaves_an_already_leftmost_alignment_untouched() {
+        let mut alignment = Alignment {
+            reference_offset: 4,
+            cigar: vec![CigarOp::Match(3), CigarOp::Insertion(1), CigarOp::Match(2)],
+        };
+        let before = alignment.clone();
+        normalize_via(&IdentityNormalizer, &mut alignment, b"ACGTAC", b"ACGACAC");
+        assert_eq!(alignment, before);
+    }
+
+    /// **The whole-`Alignment` signature earns its shape here.** A normalizer that drops a
+    /// leading deletion must move `reference_offset` by the bases it removed — a change an
+    /// operations-only signature could not express. Both fields move together: the deletion
+    /// leaves the CIGAR *and* the placement start advances by its length.
+    #[test]
+    fn alignment_normalizer_can_move_the_reference_offset() {
+        let mut alignment = Alignment {
+            reference_offset: 10,
+            cigar: vec![CigarOp::Deletion(2), CigarOp::Match(5)],
+        };
+        normalize_via(
+            &LeadingDeletionStripper,
+            &mut alignment,
+            b"ACGTA",
+            b"GGACGTA",
+        );
+        assert_eq!(alignment.reference_offset, 12);
+        assert_eq!(alignment.cigar, vec![CigarOp::Match(5)]);
+    }
+
+    /// The stripper's **guard** is load-bearing: a first op that is not a deletion must be
+    /// left alone. Without this, a widened pattern (strip unconditionally) would remove a
+    /// leading `Match` and wrongly advance `reference_offset`, and the offset-moving test
+    /// above would still pass.
+    #[test]
+    fn leading_deletion_stripper_leaves_a_non_leading_deletion_alignment_untouched() {
+        let mut alignment = Alignment {
+            reference_offset: 7,
+            cigar: vec![CigarOp::Match(4), CigarOp::Deletion(2), CigarOp::Match(3)],
+        };
+        let before = alignment.clone();
+        normalize_via(
+            &LeadingDeletionStripper,
+            &mut alignment,
+            b"ACGTACG",
+            b"ACGTGGACG",
+        );
+        assert_eq!(alignment, before);
+    }
+
+    /// The empty-cigar boundary: `cigar.first()` is `None`, so nothing is dropped and no
+    /// `.remove(0)` runs. Pins the no-op path against a regression that indexed `cigar[0]`
+    /// or hoisted the removal out of the guard, which would panic on the smallest input.
+    #[test]
+    fn leading_deletion_stripper_leaves_an_empty_cigar_untouched() {
+        let mut alignment = Alignment {
+            reference_offset: 3,
+            cigar: vec![],
+        };
+        normalize_via(&LeadingDeletionStripper, &mut alignment, b"", b"ACG");
+        assert_eq!(alignment.reference_offset, 3);
+        assert!(alignment.cigar.is_empty());
     }
 }
